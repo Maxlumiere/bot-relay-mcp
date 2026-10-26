@@ -14,7 +14,8 @@
  *
  * THE CONTRACT:
  *   - Each component is lstat'ed. A symlink is followed by readlink: a relative target against the directory holding
- *     the link, an absolute one from its own root. A `..` steps up from the REAL directory reached so far.
+ *     the link, an absolute one from its own root. POSIX: a `..` steps up from the REAL directory reached so far
+ *     (open(2)); Windows: `..` is lexical (see WINDOWS).
  *   - At most `maxLinks` (40, Linux's MAXSYMLINKS) links are followed in one walk; one more is a "loop".
  *   - Every entry the walk passes through (each root, directory, link and file, including those inside a link's
  *     target) is returned in order, with where it led (`resolved`): a check judges every hop, not the endpoint.
@@ -27,6 +28,11 @@
  *   - A trailing separator requires the path to end at a directory, as open(2) does.
  *
  * WINDOWS (stated per form, not implied):
+ *   - `..` is resolved LEXICALLY, before any junction or link is followed: the Win32 layer normalizes a path
+ *     (GetFullPathName) before the filesystem sees it. MEASURED on windows-2022 (d727efc): reading `<junction>\..\x`
+ *     returned the file beside the junction, not the one beside its target. So the walk normalizes a Windows path
+ *     first, then walks it; a relative link target is still joined to the link's own directory. A \\?\ path is not
+ *     normalized by Windows, so one holding `.` or `..` is "unsupported".
  *   - A drive-absolute path (C:\x) and a UNC path (\\server\share\x) are walked. Junctions are followed exactly like
  *     symlinks: node's lstat reports a junction as a symbolic link and readlink returns its target.
  *   - A \\?\C:\ or \\?\UNC\server\share\ prefix (a link target may carry one) is rewritten to its plain form; any
@@ -172,8 +178,15 @@ export function walkPath(p: string, opts: WalkOptions = {}): WalkResult {
   if (platform === "win32" && /^[A-Za-z]:(?![\\/])/.test(p)) {
     throw new PathWalkError("unsupported", p, "a drive-relative Windows path: it depends on per-drive state");
   }
-  // Never normalized first: `..` is resolved against the real directory reached so far.
-  const abs = isAbsoluteFor(p, platform) ? p : `${opts.cwd ?? process.cwd()}${P.sep}${p}`;
+  // POSIX: never normalized first, `..` is resolved against the real directory reached so far. Windows: normalized
+  // LEXICALLY first, because that is what the OS does (see WINDOWS).
+  let abs = isAbsoluteFor(p, platform) ? p : `${opts.cwd ?? process.cwd()}${P.sep}${p}`;
+  if (platform === "win32") {
+    if (/^\\\\[?.]\\/.test(abs.replace(/\//g, "\\")) && /(?:^|[\\/])\.\.?(?:[\\/]|$)/.test(abs.slice(4))) {
+      throw new PathWalkError("unsupported", p, "a \\\\?\\ path holding . or ..: Windows passes it to the filesystem unnormalized");
+    }
+    abs = path.win32.normalize(abs);
+  }
   const trailingSep = platform === "win32" ? /[\\/]$/.test(abs) : abs.endsWith("/");
 
   const entries: WalkEntry[] = [];

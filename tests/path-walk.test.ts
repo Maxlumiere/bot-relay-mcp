@@ -50,6 +50,7 @@ beforeAll(() => {
   sub = path.join(real, "sub");
   fs.mkdirSync(sub, { recursive: true });
   fs.writeFileSync(path.join(real, "x"), "real/x");
+  fs.writeFileSync(path.join(sub, "leaf"), "sub/leaf");
   fs.writeFileSync(path.join(base, "x"), "base/x");
   alias = path.join(base, "alias");
   dirLink(sub, alias);
@@ -61,25 +62,29 @@ afterAll(() => {
   fs.rmSync(base, { recursive: true, force: true });
 });
 
-describe("path-walk: `..` is resolved against the REAL directory reached so far", () => {
-  it("alias/../x lands where the kernel lands (real/x), not where path.resolve says (base/x)", () => {
+describe("path-walk: `..` after a link lands where THIS OS's kernel lands", () => {
+  it("alias/../x: the walk agrees with the kernel (POSIX: real/x, physical; Windows: base/x, lexical)", () => {
     const p = `${alias}${path.sep}..${path.sep}x`;
-    expect(walkPath(p).real).toBe(path.join(real, "x"));
-    // The kernel agrees: reading through the same spelling returns real/x's bytes.
-    expect(fs.readFileSync(p, "utf-8")).toBe("real/x");
-    expect(path.resolve(p)).toBe(path.join(base, "x")); // the lexical answer this replaces
+    // The kernel's own answer, read through the same spelling.
+    const kernel = fs.readFileSync(p, "utf-8") === "real/x" ? path.join(real, "x") : path.join(base, "x");
+    expect(walkPath(p).real).toBe(kernel);
+    // MEASURED per OS: POSIX steps up from the link's target; Windows normalizes `..` before any junction
+    // (windows-2022, d727efc). A walk that applied one OS's rule on the other would land elsewhere than the kernel.
+    expect(kernel).toBe(WIN ? path.join(base, "x") : path.join(real, "x"));
+    if (!WIN) expect(path.resolve(p)).toBe(path.join(base, "x")); // the lexical answer this replaces on POSIX
   });
   it("known-good twin: a plain directory, where lexical and physical agree", () => {
     expect(walkPath(`${plain}${path.sep}sub${path.sep}..${path.sep}x`).real).toBe(path.join(plain, "x"));
   });
   it("reports every hop: the link, with where its target resolved to", () => {
-    const w = walkPath(`${alias}${path.sep}..${path.sep}x`);
+    const w = walkPath(path.join(alias, "leaf"));
     const link = w.entries.find((e) => e.path === alias);
     expect(link?.stat.isSymbolicLink()).toBe(true);
     expect(link?.resolved).toBe(sub);
     expect(w.entries[0].path).toBe(path.parse(base).root); // the root is an entry too: a per-hop check judges it
     expect(w.entries.map((e) => e.path)).toContain(sub); // the link's target components are entries
-    expect(w.entries.at(-1)?.path).toBe(path.join(real, "x"));
+    expect(w.entries.at(-1)?.path).toBe(path.join(sub, "leaf"));
+    expect(fs.readFileSync(path.join(alias, "leaf"), "utf-8")).toBe("sub/leaf"); // the kernel agrees
   });
 });
 
@@ -147,11 +152,12 @@ describe("path-walk: a missing tail", () => {
   it("known-good twin: without allowMissing the same path is \"missing\", never a guess", () => {
     expect(reason(() => walkPath(path.join(alias, "missing", "y")))).toBe("missing");
   });
-  it("a `..` cancels a missing name; one that climbs back out resumes the PHYSICAL walk", () => {
+  it("a `..` cancels a missing name; one that climbs back out resumes the walk by this OS's rule", () => {
     const sep = path.sep;
     expect(walkPath(`${alias}${sep}nope${sep}..${sep}x`, { allowMissing: true }).real).toBe(path.join(sub, "x"));
-    // nope/.. returns to alias's REAL target (real/sub); the next .. is its physical parent, real/.
-    expect(walkPath(`${alias}${sep}nope${sep}..${sep}..${sep}x`, { allowMissing: true }).real).toBe(path.join(real, "x"));
+    // POSIX: nope/.. returns to alias's REAL target (real/sub), and the next .. is its physical parent, real/.
+    // Windows: both are lexical, so they cancel `nope` and `alias`.
+    expect(walkPath(`${alias}${sep}nope${sep}..${sep}..${sep}x`, { allowMissing: true }).real).toBe(WIN ? path.join(base, "x") : path.join(real, "x"));
   });
   it.skipIf(WIN)("a dangling link lands on its target", () => {
     const dangling = path.join(base, "dangling");
@@ -251,11 +257,15 @@ describe("path-walk: Windows forms through the fs seam (every OS; ASSUMED shape 
   ])("%s is unsupported (fail closed)", (_label, p) => {
     expect(reason(() => walkPath(p, { ...W, fs: fakeFs("win32", {}), cwd: "C:\\cwd" }))).toBe("unsupported");
   });
-  it("a junction is followed like a link, its \\\\?\\ target rewritten, and `..` steps up from its target", () => {
-    const fake = fakeFs("win32", { links: { "C:\\j": "\\\\?\\C:\\real\\sub" }, files: ["C:\\real\\x"], dirs: ["C:\\real\\sub"] });
-    const w = walkPath("C:\\j\\..\\x", { ...W, fs: fake });
-    expect(w.real).toBe("C:\\real\\x");
+  it("a junction is followed like a link, its \\\\?\\ target rewritten; a `..` after it is LEXICAL (as Windows does)", () => {
+    const fake = fakeFs("win32", { links: { "C:\\j": "\\\\?\\C:\\real\\sub" }, files: ["C:\\real\\sub\\y", "C:\\x"] });
+    const w = walkPath("C:\\j\\y", { ...W, fs: fake });
+    expect(w.real).toBe("C:\\real\\sub\\y");
     expect(w.entries.find((e) => e.path === "C:\\j")?.resolved).toBe("C:\\real\\sub");
+    expect(walkPath("C:\\j\\..\\x", { ...W, fs: fake }).real).toBe("C:\\x");
+  });
+  it("a \\\\?\\ path holding . or .. is unsupported (Windows does not normalize it)", () => {
+    expect(reason(() => walkPath("\\\\?\\C:\\a\\..\\b", { ...W, fs: fakeFs("win32", { files: ["C:\\b"] }) }))).toBe("unsupported");
   });
   it("an 8.3 short name is expanded through the OS resolver to the same directory's long name", () => {
     const fake = fakeFs("win32", { dirs: ["C:\\Users\\RUNNER~1", "C:\\Users\\runneradmin\\t"], native: { "C:\\Users\\RUNNER~1": "C:\\Users\\runneradmin" } });
@@ -294,10 +304,12 @@ describe("path-walk: failures are named, never raw (fs seam)", () => {
 });
 
 describe("path-walk on the REAL Windows filesystem (the Windows CI job; skipped elsewhere)", () => {
-  it.skipIf(!WIN)("a real junction is followed, and `..` steps up from its target (MEASURED on windows-2022)", () => {
-    // `alias` is a junction here (dirLink): the shared fixture's first test already walks it with `..`.
+  it.skipIf(!WIN)("a real junction is followed, and a `..` after it is lexical, as the kernel resolves it (MEASURED on windows-2022)", () => {
+    // `alias` is a junction here (dirLink).
     expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
-    expect(walkPath(`${alias}\\..\\x`).real).toBe(path.join(real, "x"));
+    expect(walkPath(path.join(alias, "leaf")).real).toBe(path.join(sub, "leaf"));
+    expect(fs.readFileSync(`${alias}\\..\\x`, "utf-8")).toBe("base/x");
+    expect(walkPath(`${alias}\\..\\x`).real).toBe(path.join(base, "x"));
   });
   // MEASURED (fbca6f9, windows-2022): the test temp dir lives under the run's private HOME, so it carries NO short
   // name; C:\PROGRA~1 is probed too. Each prints whether it exercised an expansion: a run where neither did has
@@ -320,16 +332,20 @@ describe("path-walk on the REAL Windows filesystem (the Windows CI job; skipped 
 });
 
 describe("path-walk: parity with the operator tripwire's second copy (tests/_setup/operator-tripwire-preload.mjs)", () => {
-  // Where the two DIFFER by design (not compared here): a loop or an unreadable component (the tripwire's realpath
-  // catch-all reads it as missing and joins lexically; the walk fails closed), and a component below a file. Ticketed:
+  // Where the two DIFFER (not compared here): a loop or an unreadable component (the tripwire's realpath catch-all
+  // reads it as missing and joins lexically; the walk fails closed), a component below a file, and on WINDOWS a `..`
+  // after a junction (the tripwire steps up physically; Windows, and the walk, lexically: MEASURED d727efc). Ticketed:
   // two implementations of the walk, because the tripwire is a plain-JS preload that cannot import src.
   it.each([
     ["a plain path", () => path.join(plain, "x")],
-    ["`..` after a symlinked directory", () => `${alias}${path.sep}..${path.sep}x`],
     ["a missing tail below a link", () => path.join(alias, "missing", "leaf")],
     ["a `..` cancelling a missing name", () => `${real}${path.sep}nope${path.sep}..${path.sep}x`],
-  ])("%s", (_label, spell) => {
+  ] as Array<[string, () => string]>)("%s", (_label, spell) => {
     const p = spell();
+    expect(walkPath(p, { allowMissing: true }).real).toBe(canonicalPath(p, false));
+  });
+  it.skipIf(WIN)("`..` after a symlinked directory (POSIX only: on Windows the kernel and the walk resolve it lexically, the tripwire physically; ticketed)", () => {
+    const p = `${alias}${path.sep}..${path.sep}x`;
     expect(walkPath(p, { allowMissing: true }).real).toBe(canonicalPath(p, false));
   });
 });
