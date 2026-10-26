@@ -299,14 +299,20 @@ describe("path-walk on the REAL Windows filesystem (the Windows CI job; skipped 
     expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
     expect(walkPath(`${alias}\\..\\x`).real).toBe(path.join(real, "x"));
   });
-  it.skipIf(!WIN)("a real 8.3 short name in the temp dir is expanded to the OS's own long spelling", () => {
+  // MEASURED (fbca6f9, windows-2022): the test temp dir lives under the run's private HOME, so it carries NO short
+  // name; C:\PROGRA~1 is probed too. Each prints whether it exercised an expansion: a run where neither did has
+  // MEASURED nothing about real 8.3 names, and the job log says so.
+  it.skipIf(!WIN)("a real 8.3 short name (temp dir, C:\\PROGRA~1) is expanded to the OS's own long spelling", () => {
     const raw = fs.mkdtempSync(path.join(os.tmpdir(), "pw-short-"));
     try {
-      const exercised = /~\d/.test(raw);
-      console.error(`[path-walk] win32: temp dir ${JSON.stringify(raw)}, short-name expansion exercised = ${exercised}`);
-      const w = walkPath(raw);
-      expect(/~\d/.test(w.real)).toBe(false);
-      expect(samePath(w.real, fs.realpathSync.native(raw))).toBe(true);
+      for (const p of [raw, "C:\\PROGRA~1"]) {
+        const exists = fs.existsSync(p);
+        console.error(`[path-walk] win32: ${JSON.stringify(p)} exists=${exists}, short-name expansion exercised = ${exists && /~\d/.test(p)}`);
+        if (!exists) continue;
+        const w = walkPath(p);
+        expect(/~\d/.test(w.real)).toBe(false);
+        expect(samePath(w.real, fs.realpathSync.native(p))).toBe(true);
+      }
     } finally {
       fs.rmSync(raw, { recursive: true, force: true });
     }
