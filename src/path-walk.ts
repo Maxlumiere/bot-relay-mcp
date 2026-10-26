@@ -332,3 +332,9 @@ export function sameKey(a: PathKey, b: PathKey): boolean {
 export function samePath(a: string, b: string, opts: Omit<WalkOptions, "allowMissing"> = {}): boolean {
   return sameKey(pathKey(a, opts), pathKey(b, opts));
 }
+
+// ---- RED STAND-IN (replaced by the R2 fix commit): today's comparison behind the three-valued API. ----
+/** Today: a two-valued answer from the whole-path case probe. */
+export function comparePaths(a: string, b: string, opts: Omit<WalkOptions, "allowMissing"> = {}): "same" | "different" | "inconclusive" {
+  return samePath(a, b, opts) ? "same" : "different";
+}

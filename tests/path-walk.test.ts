@@ -6,14 +6,17 @@
 /**
  * src/path-walk.ts: THE path walk's contract, each clause with its known-good twin.
  *
- *   - `..` after a symlinked directory steps up PHYSICALLY (twin: a plain directory, where lexical and physical agree);
+ *   - `..` after a link lands where THIS OS's kernel lands (POSIX physical, Windows lexical; the test asks the kernel);
  *   - more than 40 links fail CLOSED as "loop" (twin: exactly 40 resolve), and a 2-link cycle is a loop;
- *   - a case-variant spelling maps to the SAME key on a case-insensitive volume (macOS and Windows CI), and to a
- *     DIFFERENT one on a case-sensitive volume (Linux CI); twin: a different name is always a different key;
  *   - a missing tail lands where a create-the-parents writer would (twin: without allowMissing it is "missing");
+ *   - comparing two paths is THREE-valued: same (one file, by dev + inode), different, or INCONCLUSIVE (missing
+ *     tails that differ only by case or Unicode form), on real mixed volumes too (macOS CI disk images);
+ *   - a link target ending in a separator must reach a directory; `.` and `..` are looked up (search permission);
  *   - every hop is reported (each link with where it led);
  *   - a component below a file is "not-a-directory";
- *   - Windows forms: drive / UNC / \\?\ / device / drive-relative / root-relative / junction / 8.3 short name, through
+ *   - Windows forms: drive / UNC / \\?\ / device / drive-relative / root-relative / junction / 8.3 short name, and the
+ *     REFUSED component forms (trailing period or space, reserved device names, `name:stream`) and target forms
+ *     (`.` / `..` inside a target, a device target), through
  *     the fs seam on every OS, and the junction and the short name for REAL on the Windows job (each test says which).
  *   - parity with the operator tripwire's second copy (tests/_setup/operator-tripwire-preload.mjs canonicalPath) on the
  *     fixtures where both are defined; where they differ by design is listed in that test.
@@ -22,7 +25,8 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { walkPath, pathKey, samePath, caseInsensitiveAt, PathWalkError, MAX_LINKS, type WalkFs, type WalkStat } from "../src/path-walk.js";
+import { spawnSync } from "child_process";
+import { walkPath, comparePaths, PathWalkError, MAX_LINKS, type WalkFs, type WalkStat } from "../src/path-walk.js";
 import { canonicalPath } from "./_setup/operator-tripwire-preload.mjs";
 
 const WIN = process.platform === "win32";
@@ -115,30 +119,90 @@ describe("path-walk: a loop fails CLOSED", () => {
   });
 });
 
-describe("path-walk: a case-variant spelling on a case-insensitive volume maps to the SAME key", () => {
-  it("probes the volume, and folds exactly when it is case-insensitive", () => {
+describe("path-walk: comparing two paths is THREE-valued (same / different / inconclusive), never a guessed case rule", () => {
+  it("two EXISTING spellings are the same iff the kernel resolves them to one file (dev + inode), on every volume", () => {
     const dir = path.join(base, "Case");
     fs.mkdirSync(path.join(dir, "Leaf"), { recursive: true });
     const variant = path.join(base, "CASE", "leaf");
-    const insensitive = caseInsensitiveAt(dir);
-    // MEASURED per CI OS (the job log carries this line): macOS and Windows runners are case-insensitive, Linux is not.
-    console.error(`[path-walk] ${process.platform}: case-insensitive volume at the fixture = ${insensitive}`);
-    if (process.env.CI && (process.platform === "darwin" || WIN)) expect(insensitive).toBe(true);
-    if (process.env.CI && process.platform === "linux") expect(insensitive).toBe(false);
-    const k1 = pathKey(path.join(dir, "Leaf"));
-    const k2 = pathKey(variant);
-    expect(k1.folded).toBe(insensitive);
-    expect(k1.key === k2.key).toBe(insensitive);
-    expect(samePath(path.join(dir, "Leaf"), variant)).toBe(insensitive);
-    // On a case-insensitive volume the kernel agrees: both spellings are one inode.
-    if (insensitive) expect(fs.statSync(variant).ino).toBe(fs.statSync(path.join(dir, "Leaf")).ino);
+    // The KERNEL's answer, independent of the walk: does the variant spelling open the same file?
+    let kernelSame: boolean;
+    try {
+      kernelSame = fs.statSync(variant).ino === fs.statSync(path.join(dir, "Leaf")).ino;
+    } catch {
+      kernelSame = false;
+    }
+    // MEASURED per CI OS (the job log carries this line): macOS and Windows runners resolve it, Linux does not.
+    console.error(`[path-walk] ${process.platform}: the case-variant spelling opens the same file = ${kernelSame}`);
+    if (process.env.CI && (process.platform === "darwin" || WIN)) expect(kernelSame).toBe(true);
+    if (process.env.CI && process.platform === "linux") expect(kernelSame).toBe(false);
+    expect(comparePaths(path.join(dir, "Leaf"), variant)).toBe(kernelSame ? "same" : "different");
   });
-  it("the same holds for a MISSING tail below the variant spelling", () => {
-    const insensitive = caseInsensitiveAt(path.join(base, "Case"));
-    expect(samePath(path.join(base, "Case", "nope", "config.json"), path.join(base, "CASE", "NOPE", "Config.json"))).toBe(insensitive);
+  it("two MISSING tails that differ only by case are INCONCLUSIVE on every volume (whether they would collide is the directory's, unmeasured)", () => {
+    expect(comparePaths(path.join(base, "Case", "nope", "config.json"), path.join(base, "Case", "NOPE", "Config.json"))).toBe("inconclusive");
   });
-  it("known-good twin: a different name is a different key on every volume", () => {
-    expect(samePath(path.join(base, "Case", "Leaf"), path.join(base, "Case", "Leaf2"))).toBe(false);
+  it("... and so are two that differ only by Unicode normalization (NFC vs NFD)", () => {
+    expect(comparePaths(path.join(base, "Case", "caf\u00e9"), path.join(base, "Case", "cafe\u0301"))).toBe("inconclusive");
+  });
+  it("known-good twins: an identical missing tail is the same; a different name is different, existing or not", () => {
+    expect(comparePaths(path.join(base, "Case", "nope", "x"), path.join(base, "Case", "nope", "x"))).toBe("same");
+    expect(comparePaths(path.join(base, "Case", "Leaf"), path.join(base, "Case", "Leaf2"))).toBe("different");
+    expect(comparePaths(path.join(base, "Case", "nope", "a"), path.join(base, "Case", "nope", "b"))).toBe("different");
+  });
+});
+
+// MIXED VOLUMES, MEASURED on the macOS CI runner only (hdiutil disk images; never attached on a developer machine): a
+// case-SENSITIVE volume mounted under the case-insensitive system volume, and a case-INSENSITIVE one mounted under it.
+// A whole-path case probe answers both wrong (Codex #357 R1 #2); the kernel's own answers are the expectations.
+// THE GATE: an explicit CI signal (GitHub Actions sets CI=true) AND macOS. It never attaches on a developer machine.
+const MOUNTS = process.platform === "darwin" && process.env.CI === "true";
+describe.skipIf(!MOUNTS)("path-walk: mixed volumes (macOS CI disk images)", () => {
+  const HDIUTIL = "/usr/bin/hdiutil";
+  let cs: string;
+  let ins: string;
+  /** The DEVICE each attach created (hdiutil's own plist answer), in attach order: only these are ever detached. */
+  const attached: string[] = [];
+  const hd = (args: string[]): string => {
+    const r = spawnSync(HDIUTIL, args, { encoding: "utf-8" });
+    if (r.status !== 0) throw new Error(`hdiutil ${args[0]} failed (${r.status}): ${r.stderr}`);
+    return r.stdout;
+  };
+  const attach = (img: string, at: string) => {
+    const dev = /<key>dev-entry<\/key>\s*<string>(\/dev\/disk\d+)<\/string>/.exec(hd(["attach", "-plist", "-nobrowse", "-noautoopen", "-mountpoint", at, img]))?.[1];
+    if (!dev) throw new Error(`hdiutil attach ${img}: no device in its answer`);
+    attached.push(dev);
+  };
+  const detachAll = () => {
+    for (const dev of attached.splice(0).reverse()) spawnSync(HDIUTIL, ["detach", dev, "-force"], { encoding: "utf-8" });
+  };
+  beforeAll(() => {
+    try {
+      cs = path.join(base, "cs");
+      fs.mkdirSync(cs);
+      hd(["create", "-size", "16m", "-fs", "Case-sensitive APFS", "-volname", "pwcs", "-type", "UDIF", path.join(base, "cs.dmg")]);
+      attach(path.join(base, "cs.dmg"), cs);
+      ins = path.join(cs, "ins");
+      fs.mkdirSync(ins);
+      hd(["create", "-size", "16m", "-fs", "APFS", "-volname", "pwins", "-type", "UDIF", path.join(base, "ins.dmg")]);
+      attach(path.join(base, "ins.dmg"), ins);
+      fs.writeFileSync(path.join(cs, "Config"), "cs");
+      fs.writeFileSync(path.join(ins, "Foo"), "ins");
+    } catch (err) {
+      detachAll(); // a half-built fixture never stays attached
+      throw err;
+    }
+  });
+  // afterAll runs whatever the tests did; a failed beforeAll detaches what it attached itself (its catch above).
+  afterAll(detachAll);
+  it("a case-SENSITIVE volume under an insensitive parent: existing Config vs config is DIFFERENT (the kernel: config does not exist)", () => {
+    expect(fs.existsSync(path.join(cs, "config"))).toBe(false);
+    expect(comparePaths(path.join(cs, "Config"), path.join(cs, "config"))).toBe("different");
+  });
+  it("... and two missing case variants there are INCONCLUSIVE, never \"same\" (the mount root answers to both spellings of its own name)", () => {
+    expect(comparePaths(path.join(cs, "Nope"), path.join(cs, "nope"))).toBe("inconclusive");
+  });
+  it("a case-INSENSITIVE volume under a sensitive parent: existing Foo vs foo is the SAME (the kernel: one inode)", () => {
+    expect(fs.statSync(path.join(ins, "foo")).ino).toBe(fs.statSync(path.join(ins, "Foo")).ino);
+    expect(comparePaths(path.join(ins, "Foo"), path.join(ins, "foo"))).toBe("same");
   });
 });
 
@@ -192,6 +256,56 @@ describe("path-walk: below a file is not-a-directory", () => {
   });
 });
 
+describe.skipIf(WIN)("path-walk: a link target ending in a separator must reach a directory (POSIX ENOTDIR; Codex #357 R1 #4)", () => {
+  const file = () => path.join(real, "x");
+  it.each([
+    ["an absolute target", (dir: string) => fs.symlinkSync(`${file()}/`, path.join(dir, "l"))],
+    ["a relative target", (dir: string) => fs.symlinkSync(`${path.relative(dir, file())}/`, path.join(dir, "l"))],
+    [
+      "a nested link (l -> m/, m -> the file)",
+      (dir: string) => {
+        fs.symlinkSync(file(), path.join(dir, "m"));
+        fs.symlinkSync("m/", path.join(dir, "l"));
+      },
+    ],
+  ])("%s", (_label, make) => {
+    const dir = fs.mkdtempSync(path.join(base, "tsep-"));
+    make(dir);
+    const l = path.join(dir, "l");
+    expect(() => fs.statSync(l), "the kernel refuses it").toThrow(/ENOTDIR/);
+    expect(reason(() => walkPath(l, { allowMissing: true }))).toBe("not-a-directory");
+  });
+  it("known-good twin: a target `dir/` reaching a directory resolves", () => {
+    const dir = fs.mkdtempSync(path.join(base, "tsep-"));
+    fs.symlinkSync(`${sub}/`, path.join(dir, "l"));
+    expect(walkPath(path.join(dir, "l")).real).toBe(sub);
+  });
+});
+
+describe.skipIf(WIN)("path-walk: `.` and `..` are looked up, so they need search permission (Codex #357 R1 #5)", () => {
+  // Root bypasses directory permissions, so this cannot be measured as root: skipped there, and the log says so.
+  const root = process.getuid?.() === 0;
+  if (root) console.error("[path-walk] running as root: the search-permission cases are NOT measured");
+  (root ? it.skip : it).each([
+    ["blocked/.", (b: string) => `${b}/.`],
+    ["blocked/../x", (b: string) => `${b}/../x`],
+  ])("%s, with no search permission on blocked, is unreadable (as the kernel says)", (_label, spell) => {
+    const b = fs.mkdtempSync(path.join(base, "blocked-"));
+    fs.chmodSync(b, 0o600);
+    try {
+      expect(() => fs.statSync(spell(b)), "the kernel refuses it").toThrow(/EACCES/);
+      expect(reason(() => walkPath(spell(b), { allowMissing: true }))).toBe("unreadable");
+    } finally {
+      fs.chmodSync(b, 0o700);
+    }
+  });
+  it("known-good twin: with search permission both resolve", () => {
+    const b = fs.mkdtempSync(path.join(base, "open-"));
+    expect(walkPath(`${b}/.`).real).toBe(b);
+    expect(walkPath(`${b}/../x`).real).toBe(path.join(base, "x"));
+  });
+});
+
 // ---- the fs seam: Windows forms and failures, on every OS ------------------------------------------------------------
 
 /** An absolute path in the fake fs's own flavour (the fake is win32-shaped on Windows, posix elsewhere). */
@@ -223,8 +337,16 @@ function fakeFs(flavour: Flavour, spec: { links?: Record<string, string>; files?
   };
   for (const p of [...Object.keys(spec.links ?? {}), ...(spec.files ?? []), ...(spec.dirs ?? [])]) addAncestors(p);
   const enoent = (p: string) => Object.assign(new Error(`ENOENT ${p}`), { code: "ENOENT" });
+  /** A lookup through a trailing `.` or `..` (the walk looks dots up): the fake resolves it on its own spellings. */
+  const dots = (p: string): string => {
+    const sep = flavour === "win32" ? "\\" : "/";
+    if (p.endsWith(`${sep}..`)) return P.dirname(p.slice(0, -3));
+    if (p.endsWith(`${sep}.`)) return p.slice(0, -2) || sep;
+    return p;
+  };
   return {
     lstatSync(p) {
+      p = dots(p);
       if (spec.unreadable?.includes(p)) throw Object.assign(new Error(`EACCES ${p}`), { code: "EACCES" });
       if (spec.links && p in spec.links) return stat("link");
       if (spec.files?.includes(p)) return stat("file");
@@ -232,6 +354,7 @@ function fakeFs(flavour: Flavour, spec: { links?: Record<string, string>; files?
       throw enoent(p);
     },
     readlinkSync(p) {
+      p = dots(p);
       if (spec.links && p in spec.links) return spec.links[p];
       throw Object.assign(new Error(`EINVAL ${p}`), { code: "EINVAL" });
     },
@@ -289,6 +412,42 @@ describe("path-walk: Windows forms through the fs seam (every OS; ASSUMED shape 
     const opaque = fakeFs("win32", { dirs: ["C:\\Users\\RUNNER~1"] });
     expect(reason(() => walkPath("C:\\Users\\RUNNER~1", { ...W, fs: opaque }))).toBe("unsupported");
   });
+  // Codex #357 R1 #1: a link TARGET is checked like the input. Windows substitutes a relative target lexically
+  // against the link's directory, which no native test here pins, so a target holding `.` or `..` is refused.
+  it.each([
+    ["a relative target holding ..", "j\\..\\x"],
+    ["a relative target holding .", ".\\x"],
+    ["a \\\\?\\ target holding ..", "\\\\?\\C:\\a\\..\\x"],
+    ["a target component with a trailing period", "x."],
+    ["a target component with a trailing space", "x "],
+    ["a target that is a device path", "\\\\.\\PIPE\\x"],
+    ["a target naming a reserved device", "NUL"],
+  ])("a link whose target is %s is unsupported", (_label, target) => {
+    const fake = fakeFs("win32", { links: { "C:\\b\\link": target, "C:\\b\\j": "C:\\other\\sub" }, files: ["C:\\b\\x", "C:\\x", "C:\\other\\x"], dirs: ["C:\\other\\sub", "C:\\a"] });
+    expect(reason(() => walkPath("C:\\b\\link", { ...W, fs: fake }))).toBe("unsupported");
+  });
+  it("known-good twin: a plain relative target resolves against the link's directory", () => {
+    const fake = fakeFs("win32", { links: { "C:\\b\\link": "sub\\y" }, files: ["C:\\b\\sub\\y"] });
+    expect(walkPath("C:\\b\\link", { ...W, fs: fake }).real).toBe("C:\\b\\sub\\y");
+  });
+  // Codex #357 R1 #3: Win32 trims a trailing period or space, maps reserved device names, and opens an alternate
+  // data stream through `name:stream`; the \\?\ namespace does none of that. No spelling with such a component is
+  // walked: each is refused, in the input and in a target.
+  it.each([
+    ["a trailing period", "C:\\safe\\config.json."],
+    ["a trailing space", "C:\\safe\\config.json "],
+    ["a reserved device name", "C:\\safe\\NUL"],
+    ["a reserved device name with an extension", "C:\\safe\\com1.txt"],
+    ["an alternate data stream", "C:\\safe\\config.json:evil"],
+    ["a trailing period inside \\\\?\\", "\\\\?\\C:\\safe\\config.json."],
+  ])("%s is unsupported", (_label, p) => {
+    const fake = fakeFs("win32", { files: ["C:\\safe\\config.json"] });
+    expect(reason(() => walkPath(p, { ...W, fs: fake, allowMissing: true }))).toBe("unsupported");
+  });
+  it("known-good twins: an inner period, a leading period, a name that only starts like a device", () => {
+    const fake = fakeFs("win32", { files: ["C:\\safe\\a.b", "C:\\safe\\.hidden", "C:\\safe\\nullable", "C:\\safe\\com10"] });
+    for (const p of ["C:\\safe\\a.b", "C:\\safe\\.hidden", "C:\\safe\\nullable", "C:\\safe\\com10"]) expect(walkPath(p, { ...W, fs: fake }).real).toBe(p);
+  });
   it("known-good twin: a ~ not followed by a digit is an ordinary name", () => {
     const fake = fakeFs("win32", { dirs: ["C:\\a~b"] });
     expect(walkPath("C:\\a~b", { ...W, fs: fake }).real).toBe("C:\\a~b");
@@ -323,6 +482,12 @@ describe("path-walk on the REAL Windows filesystem (the Windows CI job; skipped 
     expect(fs.readFileSync(`${alias}\\..\\x`, "utf-8")).toBe("base/x");
     expect(walkPath(`${alias}\\..\\x`).real).toBe(path.join(base, "x"));
   });
+  it.skipIf(!WIN)("a trailing period: Win32 opens the file WITHOUT it (MEASURED), so the walk refuses the spelling", () => {
+    const f = path.join(base, "pw-tail");
+    fs.writeFileSync(f, "tail");
+    expect(fs.readFileSync(`${f}.`, "utf-8"), "Win32 trims the trailing period").toBe("tail");
+    expect(reason(() => walkPath(`${f}.`))).toBe("unsupported");
+  });
   // MEASURED (fbca6f9, windows-2022): the test temp dir lives under the run's private HOME, so it carries NO short
   // name; C:\PROGRA~1 is probed too. Each prints whether it exercised an expansion: a run where neither did has
   // MEASURED nothing about real 8.3 names, and the job log says so.
@@ -335,7 +500,7 @@ describe("path-walk on the REAL Windows filesystem (the Windows CI job; skipped 
         if (!exists) continue;
         const w = walkPath(p);
         expect(/~\d/.test(w.real)).toBe(false);
-        expect(samePath(w.real, fs.realpathSync.native(p))).toBe(true);
+        expect(comparePaths(w.real, fs.realpathSync.native(p))).toBe("same");
       }
     } finally {
       fs.rmSync(raw, { recursive: true, force: true });
