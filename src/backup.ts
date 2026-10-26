@@ -32,8 +32,10 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { spawnSync } from "child_process";
 import { spawnSystem, systemBinary } from "./system-binary.js";
+import { gunzipToFile, extractBackupTar } from "./backup-archive.js";
+import zlib from "zlib";
+import { pipeline } from "stream/promises";
 import { withDeadline } from "./http-deadline.js";
 
 import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
@@ -110,24 +112,23 @@ function isoTimestamp(): string {
 
 /**
  * `tar` must be locatable at its TRUSTED system path BEFORE a backup or restore writes anything (SEC-22, ruled 20 Oct:
- * no partial archive, no staging, no safety backup, no DB swap). Throws the named SystemBinaryError. Windows runs tar
- * by name today (Git Bash's GNU tar can come first there): its own ticket, not SEC-22 POSIX.
+ * no partial archive, no staging, no safety backup, no DB swap). Throws the named SystemBinaryError. Every OS: on
+ * Windows it is %SystemRoot%\System32\tar.exe, never the tar first on PATH (Git Bash's GNU tar can come first there).
  */
 function assertTarLocatable(): void {
-  if (process.platform !== "win32") systemBinary("tar");
+  systemBinary("tar");
 }
 
+/**
+ * tar, PLAIN only (SEC-22 (iii)): compression is in-process (zlib), so tar is never asked to find or exec a
+ * compressor. COPYFILE_DISABLE=1 (named on the clean env) keeps macOS tar from adding AppleDouble `._` members.
+ */
 function runTar(args: string[], cwd: string): void {
-  const result = process.platform === "win32" ? runTarByNameOnWindows(args, cwd) : spawnSystem("tar", args, { cwd, encoding: "utf-8" });
+  const result = spawnSystem("tar", args, { cwd, encoding: "utf-8", named: { COPYFILE_DISABLE: "1" } });
   if (result.status !== 0) {
     const stderr = (result.stderr || "").trim();
     throw new Error(`tar ${args.join(" ")} failed (status=${result.status}): ${stderr}`);
   }
-}
-
-/** Windows only: tar BY NAME, as before SEC-22 POSIX (its own ticket: Windows' System32 tar.exe vs Git Bash's GNU tar). */
-function runTarByNameOnWindows(args: string[], cwd: string) {
-  return spawnSync("tar", args, { cwd, encoding: "utf-8" });
 }
 
 export interface ExportResult {
@@ -225,7 +226,11 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     // at its root, not a nested temp-dir path.
     const entries = ["relay.db", "manifest.json"];
     if (fs.existsSync(path.join(stagingDir, "config.json"))) entries.push("config.json");
-    runTar(["-czf", archivePath, ...entries], stagingDir);
+    // A PLAIN ustar archive (no pax or AppleDouble members: MEASURED on macOS with COPYFILE_DISABLE=1), gzipped
+    // in-process (SEC-22 (iii)).
+    const plainTar = path.join(stagingDir, ".archive.tar");
+    runTar(["--format=ustar", "-cf", plainTar, ...entries], stagingDir);
+    await pipeline(fs.createReadStream(plainTar), zlib.createGzip(), fs.createWriteStream(archivePath, { mode: 0o600 }));
 
     // v2.1 Phase 4c.4: narrow the archive to 0600 — the tarball contains a
     // full DB snapshot + any sensitive columns (encrypted but still copyable
@@ -250,6 +255,8 @@ export interface ImportResult {
   archive_format_version: number;
   previous_backup_path: string;
   row_counts: Record<string, number>;
+  /** Members the archive held that were SKIPPED, never extracted (a legacy macOS backup's `._` and pax members). */
+  skipped_members: string[];
 }
 
 interface ImportOptions {
@@ -301,38 +308,45 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     }
   }
 
-  // --- Step 1: safety-backup + capture the probe driver WHILE the connection is live ---
-  // #190 r3: the Step-5 integrity probe (openReadOnly) takes the driver EXPLICITLY
-  // — it cannot infer, because Step 2 closes the live DB before the probe (there is
-  // nothing to read then). Capture the driver here from the safety-backup's open
-  // handle. A truly-fresh restore has no existing DB (Finding 2: init nothing,
-  // manufacture nothing until validation); there the CONFIGURED driver IS the
-  // reality the process will instantiate — the one legitimate cold read of the env.
-  let previousBackupPath = "";
-  let probeDriver: SqliteDriver;
-  const srcDbPath = getDbPath();
-  if (fs.existsSync(srcDbPath)) {
-    const backupsDir = getBackupsDir();
-    // v2.1 Phase 4c.4: ensureSecureDir (vs bare mkdirSync) — same pattern as
-    // the primary export path; safety backups get 0700 directory treatment.
-    ensureSecureDir(backupsDir, 0o700);
-    const safetyPath = path.join(backupsDir, `pre-restore-${isoTimestamp()}.tar.gz`);
-    const pre = await exportRelayState({ destinationPath: safetyPath }); // inits + opens the live DB
-    // exportRelayState already chmod'd the file; no extra call needed here.
-    previousBackupPath = pre.archive_path;
-    probeDriver = driverOf(getDb()); // read from the LIVE connection, before Step 2 closes it
-  } else {
-    probeDriver = configuredDriver(); // truly fresh: no connection to read; request == reality
-  }
-
-  // --- Step 2: close our DB handle so the swap can rename the file ---
-  closeDb();
-
-  // --- Step 3: extract the archive to a staging dir ---
+  // --- Step 0b: read the archive IN-PROCESS into a private staging dir (src/backup-archive.ts), BEFORE the safety
+  // backup or anything else is written: a refused archive leaves no trace outside staging. ONE parser decides and
+  // extracts; no tar runs on restore (SEC-22, ruled 26 Oct).
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-import-"));
   try {
     assertPrivateStaging(stagingDir);
-    runTar(["-xzf", resolvedArchive, "-C", stagingDir], stagingDir);
+    const plainTar = path.join(stagingDir, ".archive.tar");
+    await gunzipToFile(resolvedArchive, plainTar);
+    const { skipped } = extractBackupTar(plainTar, stagingDir);
+    fs.rmSync(plainTar, { force: true });
+
+    // --- Step 1: safety-backup + capture the probe driver WHILE the connection is live ---
+    // #190 r3: the Step-5 integrity probe (openReadOnly) takes the driver EXPLICITLY
+    // — it cannot infer, because Step 2 closes the live DB before the probe (there is
+    // nothing to read then). Capture the driver here from the safety-backup's open
+    // handle. A truly-fresh restore has no existing DB (Finding 2: init nothing,
+    // manufacture nothing until validation); there the CONFIGURED driver IS the
+    // reality the process will instantiate — the one legitimate cold read of the env.
+    let previousBackupPath = "";
+    let probeDriver: SqliteDriver;
+    const srcDbPath = getDbPath();
+    if (fs.existsSync(srcDbPath)) {
+      const backupsDir = getBackupsDir();
+      // v2.1 Phase 4c.4: ensureSecureDir (vs bare mkdirSync) — same pattern as
+      // the primary export path; safety backups get 0700 directory treatment.
+      ensureSecureDir(backupsDir, 0o700);
+      const safetyPath = path.join(backupsDir, `pre-restore-${isoTimestamp()}.tar.gz`);
+      const pre = await exportRelayState({ destinationPath: safetyPath }); // inits + opens the live DB
+      // exportRelayState already chmod'd the file; no extra call needed here.
+      previousBackupPath = pre.archive_path;
+      probeDriver = driverOf(getDb()); // read from the LIVE connection, before Step 2 closes it
+    } else {
+      probeDriver = configuredDriver(); // truly fresh: no connection to read; request == reality
+    }
+
+    // --- Step 2: close our DB handle so the swap can rename the file ---
+    closeDb();
+
+    // --- Step 3: the archive was extracted in Step 0b ---
 
     const manifestPath = path.join(stagingDir, "manifest.json");
     const extractedDbPath = path.join(stagingDir, "relay.db");
@@ -422,6 +436,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       archive_format_version: manifest.archive_format_version,
       previous_backup_path: previousBackupPath,
       row_counts: manifest.row_counts ?? {},
+      skipped_members: skipped,
     };
   } finally {
     fs.rmSync(stagingDir, { recursive: true, force: true });

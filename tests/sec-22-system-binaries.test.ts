@@ -55,6 +55,7 @@ describe("SEC-22: systemBinary validates SystemRoot and fails CLOSED with a name
     expect(systemBinary("whoami")).toBe(path.win32.join(root, "System32", "whoami.exe"));
     expect(systemBinary("icacls")).toBe(path.win32.join(root, "System32", "icacls.exe"));
     expect(systemBinary("powershell")).toBe(path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
+    expect(systemBinary("tar")).toBe(path.win32.join(root, "System32", "tar.exe")); // `relay backup`: never the tar first on PATH
   });
 });
 
@@ -133,9 +134,6 @@ describe.runIf(process.platform === "win32")("SEC-22 (Windows): the host id (Mac
  * either moved to systemBinary or listed here with its reason.
  */
 const ALLOWLIST: Record<string, string> = {
-  // WINDOWS ONLY, TICKETED (not SEC-22 POSIX): `relay backup` keeps tar by name on Windows (System32 tar.exe vs Git
-  // Bash's GNU tar is its own change, with its own RED). POSIX tar goes through systemBinary.
-  "src/backup.ts::runTarByNameOnWindows::\"tar\"": "Windows tar by name: its own ticket (POSIX: spawnSystem)",
   // DELIBERATE: the user's own programs, found the way the user's shell finds them; not a security or liveness decision.
   "src/fleet-system.ts::<module>::\"node\"": "reports the user's own node on PATH (fleet view): deliberate",
   "src/spawn/dispatcher.ts::defaultHasBinary::probe": "a `command -v` probe: is the user's terminal app installed (asks PATH by design)",

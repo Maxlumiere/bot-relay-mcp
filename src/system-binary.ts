@@ -54,6 +54,7 @@ const WINDOWS_TOOLS = {
   icacls: ["System32", "icacls.exe"],
   reg: ["System32", "reg.exe"],
   powershell: ["System32", "WindowsPowerShell", "v1.0", "powershell.exe"],
+  tar: ["System32", "tar.exe"],
 } as const;
 
 /** The FHS directories a Linux system tool may come from: a CLOSED list (ruled 20 Oct). */
