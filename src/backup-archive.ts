@@ -40,8 +40,11 @@ export const EXPECTED_MEMBERS = ["relay.db", "manifest.json", "config.json"] as 
 export type ExpectedMember = (typeof EXPECTED_MEMBERS)[number];
 
 /**
- * The decompressed-size cap: 4 GiB. Its source: about 20 times the largest live relay DB MEASURED (179 MB, 26 Oct),
- * and below ustar's 8 GiB octal member limit. A larger archive is refused with this number in the message.
+ * The decompressed-size cap: 4 GiB. Its sources: about 20 times the largest live relay DB MEASURED (179 MB, 26 Oct);
+ * and why 4, not ustar's 8 GiB member limit: a restore holds the archive TWICE in its staging dir (the plain tar,
+ * then the extracted relay.db) before the plain tar is removed, so the cap bounds that temporary disk use, and how far
+ * a gzip bomb can fill it, to about 8 GiB. Export refuses an archive over it too (src/backup.ts), so `relay backup`
+ * never writes what `relay restore` would refuse. A larger archive is refused with this number in the message.
  */
 export const MAX_DECOMPRESSED_BYTES = 4 * 1024 ** 3;
 /** Per-member caps. relay.db is bounded by the archive cap; the JSON files are small by construction. */
