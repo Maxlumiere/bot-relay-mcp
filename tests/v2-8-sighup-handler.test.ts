@@ -42,7 +42,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -106,7 +106,7 @@ async function seedAgent(name: string, sessionId: string): Promise<void> {
     process.env.RELAY_DB_PATH = ${JSON.stringify(TEST_DB_PATH)};
     process.env.RELAY_CONFIG_PATH = ${JSON.stringify(path.join(TEST_ROOT, "config.json"))};
     (async () => {
-      const dbMod = await import(${JSON.stringify(path.join(REPO_ROOT, "dist", "db.js"))});
+      const dbMod = await import(${JSON.stringify(pathToFileURL(path.join(REPO_ROOT, "dist", "db.js")).href)});
       dbMod.initializeDb();
       const db = dbMod.getDb();
       const nowIso = new Date().toISOString();
