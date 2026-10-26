@@ -20,7 +20,7 @@ import { spawnSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import Database from "better-sqlite3";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -37,7 +37,7 @@ let stateDir: string;
 
 /** The build the WORKTREE's dist actually loads (a real stamp), so a CURRENT verdict is real. */
 const DIST_BUILD = JSON.parse(
-  spawnSync(process.execPath, ["--input-type=module", "-e", `import(${JSON.stringify(path.join(REPO, "dist", "loaded-build.js"))}).then((m) => process.stdout.write(JSON.stringify(m.LOADED_BUILD)))`], { encoding: "utf-8" }).stdout,
+  spawnSync(process.execPath, ["--input-type=module", "-e", `import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "loaded-build.js")).href)}).then((m) => process.stdout.write(JSON.stringify(m.LOADED_BUILD)))`], { encoding: "utf-8" }).stdout,
 ) as Record<string, unknown>;
 
 const NOW = Date.parse("2026-10-05T08:00:00.000Z");

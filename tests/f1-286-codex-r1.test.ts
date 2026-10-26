@@ -22,7 +22,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawn, spawnSync, execFileSync } from "child_process";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders, mintSecretFor } from "./_helpers/mint.js";
 import { ownRecordedPid, signalOwnedPid, type OwnedPid } from "./_helpers/recorded-pid.js";
@@ -76,7 +76,7 @@ exec "${REAL_NODE}" "$@"
 function seedDb(dbPath: string, agent: string, withTask = false): void {
   const script = `
     process.env.RELAY_DB_PATH = ${JSON.stringify(dbPath)};
-    const db = await import(${JSON.stringify(path.join(REPO_ROOT, "dist", "db.js"))});
+    const db = await import(${JSON.stringify(pathToFileURL(path.join(REPO_ROOT, "dist", "db.js")).href)});
     db.registerAgent("s", "s", []);
     db.registerAgent(${JSON.stringify(agent)}, "r", []);
     ${withTask ? `db.postTask("s", ${JSON.stringify(agent)}, "a task title", "d", "normal");` : ""}
@@ -467,7 +467,7 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
     seedDb(dbPath, "d1a");
     const send = spawnSync(REAL_NODE, ["--input-type=module", "-e", `
       process.env.RELAY_DB_PATH = ${JSON.stringify(dbPath)};
-      const db = await import(${JSON.stringify(path.join(REPO_ROOT, "dist", "db.js"))});
+      const db = await import(${JSON.stringify(pathToFileURL(path.join(REPO_ROOT, "dist", "db.js")).href)});
       db.sendMessage("s", "d1a", "hello without perl", "normal"); db.closeDb();`], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME: ROOT, RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json") } });
     expect(send.status, send.stderr).toBe(0);
     const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, { RELAY_AGENT_NAME: "d1a", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1" }) });
