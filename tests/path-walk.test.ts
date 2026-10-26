@@ -136,16 +136,52 @@ describe("path-walk: comparing two paths is THREE-valued (same / different / inc
     if (process.env.CI && process.platform === "linux") expect(kernelSame).toBe(false);
     expect(comparePaths(path.join(dir, "Leaf"), variant)).toBe(kernelSame ? "same" : "different");
   });
-  it("two MISSING tails that differ only by case are INCONCLUSIVE on every volume (whether they would collide is the directory's, unmeasured)", () => {
-    expect(comparePaths(path.join(base, "Case", "nope", "config.json"), path.join(base, "Case", "NOPE", "Config.json"))).toBe("inconclusive");
+  // Ruled on #357 R2 (D1): below the existing part NOTHING is folded or judged. Byte-identical missing tails
+  // under the same entry are "same"; ANY other pair of tails is "inconclusive", whether or not some casing or
+  // normalization rule would call them equal (σ/ς, ß/SS, İ/i: lowercasing is not Unicode case folding, and no fold is
+  // the filesystem's).
+  it.each([
+    ["ASCII case", "config.json", "Config.json"],
+    ["NFC vs NFD", "caf\u00e9", "cafe\u0301"],
+    ["Greek sigma (σ / ς)", "\u03c3x", "\u03c2x"],
+    ["German sharp s (ß / SS)", "stra\u00dfe", "STRASSE"],
+    ["Turkish dotted I (İ / i)", "\u0130d", "id"],
+    ["names no rule relates", "a", "b"],
+    ["tails of different length", "a", "a/b"],
+  ])("two MISSING tails that differ (%s) are INCONCLUSIVE, never different or same", (_label, x, y) => {
+    expect(comparePaths(path.join(base, "Case", "nope", x), path.join(base, "Case", "nope", y))).toBe("inconclusive");
   });
-  it("... and so are two that differ only by Unicode normalization (NFC vs NFD)", () => {
-    expect(comparePaths(path.join(base, "Case", "caf\u00e9"), path.join(base, "Case", "cafe\u0301"))).toBe("inconclusive");
-  });
-  it("known-good twins: an identical missing tail is the same; a different name is different, existing or not", () => {
+  it("known-good twins: a byte-identical missing tail is the same; different EXISTING entries are different", () => {
     expect(comparePaths(path.join(base, "Case", "nope", "x"), path.join(base, "Case", "nope", "x"))).toBe("same");
     expect(comparePaths(path.join(base, "Case", "Leaf"), path.join(base, "Case", "Leaf2"))).toBe("different");
-    expect(comparePaths(path.join(base, "Case", "nope", "a"), path.join(base, "Case", "nope", "b"))).toBe("different");
+  });
+  it("identity is (dev, ino) as BIGINT, end to end: the default fs yields bigints (no number ever stands in)", () => {
+    const st = walkPath(path.join(base, "Case", "Leaf")).existingStat;
+    expect(typeof st.dev).toBe("bigint");
+    expect(typeof st.ino).toBe("bigint");
+  });
+  it("two inodes a JavaScript number cannot tell apart (2^53 and 2^53+1, same dev) are DIFFERENT (fs seam)", () => {
+    const P = WIN ? path.win32 : path.posix;
+    const fake = fakeFs(WIN ? "win32" : "posix", { files: [abs("big1"), abs("big2")], inos: { [abs("big1")]: 2n ** 53n, [abs("big2")]: 2n ** 53n + 1n } });
+    const platform = WIN ? ("win32" as const) : ("linux" as const);
+    expect(Number(2n ** 53n) === Number(2n ** 53n + 1n), "the precondition: as numbers they are equal").toBe(true);
+    expect(comparePaths(abs("big1"), abs("big2"), { fs: fake, platform })).toBe("different");
+    expect(comparePaths(abs("big1"), P.join(abs(""), "big1"), { fs: fake, platform }), "twin: the same entry").toBe("same");
+  });
+});
+
+describe("path-walk: the ONLY sanctioned readers of a verdict (ruled on #357 R2)", () => {
+  it("isProtected: same and inconclusive are protected, different is not (a write guard's safe direction)", async () => {
+    const mod = (await import("../src/path-walk.js")) as Record<string, unknown>;
+    expect(typeof mod.isProtected, "isProtected is exported").toBe("function");
+    const isProtected = mod.isProtected as (r: string) => boolean;
+    expect([isProtected("same"), isProtected("inconclusive"), isProtected("different")]).toEqual([true, true, false]);
+  });
+  it("isTrustedMatch: ONLY same is a match (a trust check's safe direction)", async () => {
+    const mod = (await import("../src/path-walk.js")) as Record<string, unknown>;
+    expect(typeof mod.isTrustedMatch, "isTrustedMatch is exported").toBe("function");
+    const isTrustedMatch = mod.isTrustedMatch as (r: string) => boolean;
+    expect([isTrustedMatch("same"), isTrustedMatch("inconclusive"), isTrustedMatch("different")]).toEqual([true, false, false]);
   });
 });
 
@@ -264,11 +300,11 @@ function abs(name: string): string {
 }
 
 type Flavour = "win32" | "posix";
-function stat(kind: "dir" | "file" | "link", ino = 1): WalkStat {
+function stat(kind: "dir" | "file" | "link", ino: bigint = 1n): WalkStat {
   return {
     uid: 0,
     mode: kind === "dir" ? 0o40755 : 0o100644,
-    dev: 1,
+    dev: 1n,
     ino,
     isFile: () => kind === "file",
     isDirectory: () => kind === "dir",
@@ -276,7 +312,7 @@ function stat(kind: "dir" | "file" | "link", ino = 1): WalkStat {
   };
 }
 /** Directories, files and links by exact spelling; every ancestor of a listed path is a directory; anything else ENOENT. */
-function fakeFs(flavour: Flavour, spec: { links?: Record<string, string>; files?: string[]; dirs?: string[]; unreadable?: string[]; native?: Record<string, string> }): WalkFs {
+function fakeFs(flavour: Flavour, spec: { links?: Record<string, string>; files?: string[]; dirs?: string[]; unreadable?: string[]; native?: Record<string, string>; inos?: Record<string, bigint> }): WalkFs {
   const P = flavour === "win32" ? path.win32 : path.posix;
   const dirs = new Set<string>(spec.dirs ?? []);
   const addAncestors = (p: string) => {
@@ -299,7 +335,7 @@ function fakeFs(flavour: Flavour, spec: { links?: Record<string, string>; files?
       p = dots(p);
       if (spec.unreadable?.includes(p)) throw Object.assign(new Error(`EACCES ${p}`), { code: "EACCES" });
       if (spec.links && p in spec.links) return stat("link");
-      if (spec.files?.includes(p)) return stat("file");
+      if (spec.files?.includes(p)) return stat("file", spec.inos?.[p] ?? 1n);
       if (dirs.has(p)) return stat("dir");
       throw enoent(p);
     },
@@ -412,6 +448,33 @@ describe("path-walk: Windows forms through the fs seam (every OS; ASSUMED shape 
     const fake = fakeFs("win32", { links: { "C:\\b\\link": target }, dirs: ["C:\\x"] });
     expect(reason(() => walkPath("C:\\b\\link", { ...W, fs: fake, allowMissing: true }))).toBe("unsupported");
   });
+  // Ruled on #357 R2 (D3): the extended / device namespaces are accepted ONLY in their MEASURED canonical
+  // backslash spelling (\\?\<drive>:\ and \\?\UNC\, pinned by the native test below). A forward or mixed separator,
+  // \\.\, \??\ or any other unmeasured form is refused BEFORE any normalization, in the input and in a link target.
+  it.each([
+    ["\\\\?\\ with a forward slash inside", "\\\\?\\C:\\safe/x"],
+    ["\\\\?\\ spelled with forward slashes", "//?/C:/safe/x"],
+    ["\\\\?\\ with a mixed prefix", "\\\\?/C:\\safe\\x"],
+    ["\\\\?\\UNC\\ with a forward slash", "\\\\?\\UNC\\srv/share\\x"],
+    ["the NT object namespace \\??\\", "\\??\\C:\\safe\\x"],
+    ["the device namespace \\\\.\\ to a drive", "\\\\.\\C:\\safe\\x"],
+    ["\\\\?\\ to a volume GUID", "\\\\?\\Volume{0b1c}\\x"],
+  ])("an extended spelling outside the measured canonical form is unsupported: %s", (_label, p) => {
+    const fake = fakeFs("win32", { files: ["C:\\safe\\x", "\\\\srv\\share\\x"], dirs: ["\\\\srv\\share\\"] });
+    expect(reason(() => walkPath(p, { ...W, fs: fake, allowMissing: true }))).toBe("unsupported");
+  });
+  it.each([
+    ["a \\\\?\\ target with a forward slash", "\\\\?\\C:\\safe/x"],
+    ["a \\??\\ target", "\\??\\C:\\safe\\x"],
+  ])("the same holds for a link target: %s", (_label, target) => {
+    const fake = fakeFs("win32", { links: { "C:\\b\\link": target }, files: ["C:\\safe\\x"] });
+    expect(reason(() => walkPath("C:\\b\\link", { ...W, fs: fake, allowMissing: true }))).toBe("unsupported");
+  });
+  it("known-good twins: the canonical \\\\?\\<drive>:\\ and \\\\?\\UNC\\ spellings are walked as their plain form", () => {
+    const fake = fakeFs("win32", { files: ["C:\\safe\\x", "\\\\srv\\share\\x"], dirs: ["\\\\srv\\share\\"] });
+    expect(walkPath("\\\\?\\C:\\safe\\x", { ...W, fs: fake }).real).toBe("C:\\safe\\x");
+    expect(walkPath("\\\\?\\UNC\\srv\\share\\x", { ...W, fs: fake }).real).toBe("\\\\srv\\share\\x");
+  });
   it("known-good twins: an inner period, a leading period, a name that only starts like a device", () => {
     const ok = ["C:\\safe\\a.b", "C:\\safe\\.hidden", "C:\\safe\\nullable", "C:\\safe\\com10", "C:\\safe\\nullable.tar.gz", "C:\\safe\\com10.log.old", "C:\\safe\\a.nul"];
     const fake = fakeFs("win32", { files: ok });
@@ -450,6 +513,14 @@ describe("path-walk on the REAL Windows filesystem (the Windows CI job; skipped 
     expect(walkPath(path.join(alias, "leaf")).real).toBe(path.join(sub, "leaf"));
     expect(fs.readFileSync(`${alias}\\..\\x`, "utf-8")).toBe("base/x");
     expect(walkPath(`${alias}\\..\\x`).real).toBe(path.join(base, "x"));
+  });
+  it.skipIf(!WIN)("the canonical \\\\?\\<drive>:\\ spelling: node opens the same file through it, and the walk lands on its plain form (MEASURED)", () => {
+    const f = path.join(base, "pw-ext");
+    fs.writeFileSync(f, "ext");
+    expect(fs.readFileSync(`\\\\?\\${f}`, "utf-8"), "node reads the file through \\\\?\\").toBe("ext");
+    expect(walkPath(`\\\\?\\${f}`).real).toBe(f);
+    // What node's readlink returns for a real junction (the form a link TARGET takes), logged for the record.
+    console.error(`[path-walk] win32: readlink of a junction -> ${JSON.stringify(fs.readlinkSync(alias))}`);
   });
   it.skipIf(!WIN)("a trailing period is refused whatever node's open does with it (what node does is MEASURED and logged)", () => {
     const f = path.join(base, "pw-tail");
