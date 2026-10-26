@@ -39,7 +39,9 @@ const ALLOWLIST: Record<string, Allowed> = {
   // `relay test`'s OWN sandbox: a config file in a fresh tmp dir, set as the explicit override for its child run.
   'src/cli/test.ts::run::file-name:path.join(tmpDir, "config.json")': { count: 1, why: "relay test's own tmp sandbox config (set as RELAY_CONFIG_PATH), not the operator's" },
   // The CLI's source REPORT (cli | env | default) for --config: it names where a value came from, it resolves nothing.
-  'src/cli.ts::<module>::env-read:classify("config_path", "RELAY_CONFIG_PATH", flags.config, "__unreachable__")': { count: 1, why: "the source report names the env var a flag maps to" },
+  'src/cli.ts::applyCliToEnv::env-read:classify("config_path", "RELAY_CONFIG_PATH", flags.config, "__unreachable__")': { count: 1, why: "the source report names the env var a flag maps to" },
+  // The --help text: prose naming the default location, not a path the CLI builds.
+  'src/cli.ts::usage::file-name:"src/config.ts for the full schema. Default path: ~/.bot-relay/config.json"': { count: 1, why: "the --help text's prose" },
 };
 
 /** Judge sites against an allowlist: an unlisted key, a count that differs (more = a new site, fewer = stale), a listed key never seen. */
