@@ -65,7 +65,7 @@ What you will see, and what to do. Each item is detailed in its entry below.
   Not measured: 3.0.1's hooks, its HTTP daemon and its CLI against a v26 database. To be able to go back exactly, run `relay backup` before upgrading.
 
 How this list was built:
-- I read every heading and bullet of the 40 entries below, and each entry that changes behaviour a user or client can observe in full.
+- I read every heading and bullet of the 41 entries below, and each entry that changes behaviour a user or client can observe in full. (The first entry, the fast-uri, ip-address and vitest advisories, changes no behaviour.)
 - A separate read of the code from v3.0.1 to this release (`src/`, `bin/`, `hooks/`) added the Node, `relay pair`, hook-dependency, instance-fault, Windows ACL, throttle, `re-encrypt`, `get_outstanding` and open-mint items. It also corrected three items: the registration secret, the instance fault and the pending queue.
 - Every item was then checked against the code at v3.0.1 and at this release.
 - Not checked: `relay doctor` and `relay watch` exit codes in full; backup and restore beyond staging; the dashboard and `/api/*` other than `/api/send-message`; the Codex hook in depth; the VS Code extension; `scripts/`.
@@ -78,14 +78,15 @@ How this list was built:
 - **zod 4.6.7** (GHSA-mrhx-c7xc-m3w5), with the relay's tool schemas byte-identical.
 - **proxy-addr 2.0.8** (GHSA-jqcg-44mw-7w3h), and the relay's own trusted-proxy check fixed for the same class.
 - **The MCP SDK 1.32.0.**
-- **Not yet in this release:** fast-uri 4.2.1 and ip-address 10.7.3 still have open advisories; their fixes are a separate change.
+- **fast-uri 4.2.3** (GHSA-w74x-v6f9-j3xg, GHSA-wjr9-j795-jxcr, GHSA-333x-w4r6-6crp, GHSA-xhq7-xmqj-769h) and **ip-address 10.7.5** (GHSA-rxp7-6hxx-x8q5), in the server and the extension.
 - **The registration secret:** no new name gets a token over HTTP without a credential, except under `RELAY_ALLOW_OPEN_MINT=1`, which is for local development on a loopback bind only (a public bind refuses to start with it).
 - **A revoked agent can no longer send.**
 - **The hooks no longer put a token in a process's arguments or print it.**
 - **Development only, nothing that ships:**
   - source-map-js 1.2.2 (GHSA-68fv-2mgg-jv7q);
   - vite 8.2.4 / 7.3.7 (GHSA-698v-4r3x-3vcv, GHSA-r825-w8mm-5pxw, GHSA-587h-7wmj-h5pm);
-  - the extension's `@azure/msal-node` 7.1.0 (GHSA-xcx6-jx8p-x3h5) and vitest 5 (tinypool: GHSA-5gmw-xhrv-c9v3, GHSA-85c8-ppgw-ccpr).
+  - the extension's `@azure/msal-node` 7.1.0 (GHSA-xcx6-jx8p-x3h5) and vitest 5 (tinypool: GHSA-5gmw-xhrv-c9v3, GHSA-85c8-ppgw-ccpr);
+  - the server's vitest 5.0.3 (`@vitest/mocker`: GHSA-qxg6-89mg-rqv8, GHSA-xp26-3454-mjgp).
 
 
 ### Security: fast-uri, ip-address and vitest advisories
