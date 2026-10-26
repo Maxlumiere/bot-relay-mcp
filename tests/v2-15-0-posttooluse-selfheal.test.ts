@@ -14,7 +14,7 @@
  * rotated (no read reflood). If the shell gate ever regresses to PID-only, the
  * stale start survives and this test fails.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterAll } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -28,9 +28,11 @@ const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(__filename), "..");
 // Every PostToolUse step draws on the 5s hook's 2s margin, which a slow runner can spend before the self-heal runs
 // (bash SECONDS ticks on whole wall-clock seconds). These rows run a copy of the hooks whose budgeted steps read a
-// clock of 0 (RELAY_TEST_FEED, tests/_helpers/hook-budget-tree.ts), so a restamp, or a steady-state "no churn",
+// FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts), so a restamp, or a steady-state "no churn",
 // never depends on the runner (a skipped restamp would also read as "no churn"). The live hooks are unchanged.
-const HOOK = path.join(budgetTree(fs.mkdtempSync(path.join(os.tmpdir(), "v2150-fed-")), path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "post-tool-use-check.sh");
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "v2150-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "post-tool-use-check.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
 const STALE_START = "Mon Jan  1 00:00:00 2020";
 
@@ -87,7 +89,7 @@ function runPostToolUse(h: Harness, name: string, token: string): ReturnType<typ
       HOME: h.root, PATH: process.env.PATH || "/usr/bin:/bin", RELAY_HOME: h.root,
       RELAY_AGENT_NAME: name, RELAY_DB_PATH: h.dbPath,
       RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(h.port), RELAY_AGENT_TOKEN: token,
-      RELAY_TEST_FEED: "*",
+      RELAY_TEST_CLOCK: "0",
     },
   });
 }
