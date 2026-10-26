@@ -153,8 +153,8 @@ function plainWindowsPath(p: string): string {
   return s;
 }
 
-/** Win32 device names, which a Win32 path maps to the device whatever the directory or extension. */
-const WIN_RESERVED = /^(?:con|prn|aux|nul|conin\$|conout\$|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3])(?:\.[^.]*)?$/i;
+/** Win32 device names, which a Win32 path maps to the device whatever the directory, and whatever extension SUFFIX follows (`NUL.tar.gz` is `NUL`: Microsoft's naming rules). */
+const WIN_RESERVED = /^(?:con|prn|aux|nul|conin\$|conout\$|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3])(?:\..*)?$/i;
 
 /**
  * A Windows component the walk will not walk: one whose meaning Win32 changes (a trailing period or space is trimmed,
