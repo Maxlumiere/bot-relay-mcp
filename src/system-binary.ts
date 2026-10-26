@@ -172,13 +172,19 @@ export function systemBinary(
   throw new SystemBinaryError(`cannot locate the system ${name}: ${rejected.join("; ")}; ${hostClass} (SEC-22: never through PATH)`);
 }
 
-function windowsBinary(name: SystemBinaryName, env: Record<string, string | undefined>): string {
-  if (!(name in WINDOWS_TOOLS)) throw new SystemBinaryError(`cannot locate the system ${name}: it is not a Windows tool (SEC-22: never through PATH)`);
+/** SystemRoot, VALIDATED (drive-rooted, absolute): the one place both the exe path and the clean env take it from. */
+function validSystemRoot(name: SystemBinaryName, env: Record<string, string | undefined>): string {
   // process.env is case-insensitive on Windows; a plain object (a test's env) is not.
   const root = env.SystemRoot ?? env.SYSTEMROOT ?? Object.entries(env).find(([k]) => k.toLowerCase() === "systemroot")?.[1];
   if (!root || !/^[A-Za-z]:\\/.test(root) || !path.win32.isAbsolute(root)) {
     throw new SystemBinaryError(`cannot locate the system ${name}: SystemRoot invalid (${JSON.stringify(root ?? null)}; expected a drive-rooted path such as C:\\Windows)`);
   }
+  return root;
+}
+
+function windowsBinary(name: SystemBinaryName, env: Record<string, string | undefined>): string {
+  if (!(name in WINDOWS_TOOLS)) throw new SystemBinaryError(`cannot locate the system ${name}: it is not a Windows tool (SEC-22: never through PATH)`);
+  const root = validSystemRoot(name, env);
   const exe = path.win32.join(root, ...WINDOWS_TOOLS[name as WindowsToolName]);
   let st: fs.Stats | undefined;
   try {
@@ -191,34 +197,74 @@ function windowsBinary(name: SystemBinaryName, env: Record<string, string | unde
 }
 
 /**
+ * The CLEAN-BASE environment a system tool runs with (SEC-22 clause (ii), ruled 21 Oct): never the caller's env. The
+ * class this closes is "a trusted binary resolving another program or options from the caller's env" (GNU tar's -z
+ * finds gzip on PATH and reads TAR_OPTIONS; GZIP, the user's PATH and locale reach the same way), so NOTHING of the
+ * caller's env is copied:
+ *   - POSIX: PATH = this OS's trusted system directories only (the ones the tool map draws from), LC_ALL=C (ps and lsof
+ *     output is parsed);
+ *   - Windows: SystemRoot (the validated one systemBinary resolves with), and nothing else unless MEASURED as needed
+ *     by a tool (WINDOWS_TOOL_ENV).
+ * A call site that needs a variable NAMES it (`named`), and it is added on top: e.g. TZ for a start token, or the path
+ * powershell reads through $env:. A named variable may not replace PATH (POSIX) or SystemRoot (Windows).
+ */
+export function systemEnv(
+  name: SystemBinaryName,
+  named: Readonly<Record<string, string>> = {},
+  env: Record<string, string | undefined> = process.env,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  const base: Record<string, string> =
+    platform === "win32"
+      ? { SystemRoot: validSystemRoot(name, env), ...(WINDOWS_TOOL_ENV[name as WindowsToolName] ?? {}) }
+      : { PATH: (platform === "darwin" ? DARWIN_PATH : FHS_DIRS).join(":"), LC_ALL: "C" };
+  for (const k of Object.keys(named)) {
+    if (k.toUpperCase() === "PATH" || k.toLowerCase() === "systemroot") throw new SystemBinaryError(`${k} cannot be named for ${name}: the clean base sets it (SEC-22)`);
+  }
+  return { ...base, ...named };
+}
+
+/** The darwin system directories (the SIP-protected ones the darwin map draws from). */
+const DARWIN_PATH = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] as const;
+
+/** Per Windows tool, any variable beyond SystemRoot it is MEASURED to need on windows-2022 (none so far). */
+const WINDOWS_TOOL_ENV: Partial<Record<WindowsToolName, Record<string, string>>> = {};
+
+/** Options a system tool may be given: never `env` (systemEnv builds it), never `shell`, never `argv0`. */
+export type SystemSpawnOptions = Omit<SpawnSyncOptionsWithStringEncoding, "env" | "shell" | "argv0"> & { named?: Readonly<Record<string, string>> };
+
+/**
  * Run a system tool by its TRUSTED ABSOLUTE PATH (systemBinary), never by name and never through a shell (a shell
- * finds programs by name). A tool that cannot be located is a FAILED run carrying the named reason (status null, the
+ * finds programs by name), with the CLEAN-BASE env (systemEnv) and argv0 = the tool's name (a multi-call binary such as
+ * BusyBox dispatches on it). A tool that cannot be located is a FAILED run carrying the named reason (status null, the
  * reason as stderr and as `error`), the same shape as a tool that fails to start, so every caller's existing failure
  * path handles it; never a fallback to PATH. The ONE place a SystemBinaryError becomes a failed spawnSync result.
  */
-export function spawnSystem(name: SystemBinaryName, args: string[], opts: SpawnSyncOptionsWithStringEncoding): SpawnSyncReturns<string> {
+export function spawnSystem(name: SystemBinaryName, args: string[], opts: SystemSpawnOptions): SpawnSyncReturns<string> {
+  const { named, ...rest } = opts;
   try {
-    return spawnSync(systemBinary(name), args, { ...opts, shell: false });
+    return spawnSync(systemBinary(name), args, { ...rest, env: systemEnv(name, named), argv0: name, shell: false });
   } catch (err) {
     if (!(err instanceof SystemBinaryError)) throw err;
     return { pid: 0, output: [], stdout: "", stderr: err.message, status: null, signal: null, error: err };
   }
 }
 
-// ---- RED STAND-INS (replaced by the fix commit): today's behaviour behind the API the fix adds. ----
-/** Today: a system tool inherits the caller's env (no clean base). */
-export function systemEnv(
-  _name: SystemBinaryName,
-  named: Readonly<Record<string, string>> = {},
-  env: Record<string, string | undefined> = process.env,
-  _platform: NodeJS.Platform = process.platform,
-): Record<string, string> {
-  return { ...(env as Record<string, string>), ...named };
-}
-/** Today: execFileSync(systemBinary(name)) with the inherited env and no argv0 (as spawnSync, so a test can capture it). */
-export function execSystem(name: SystemBinaryName, args: string[], opts: Record<string, unknown> = {}): string {
-  const r = spawnSync(systemBinary(name), args, { ...opts, encoding: "utf-8", shell: false });
+/**
+ * execFileSync's contract on spawnSystem's path (execFileSync itself takes no argv0): the same trusted path, clean-base
+ * env and argv0. Returns stdout; THROWS when the tool cannot be located (the SystemBinaryError), fails to start or
+ * times out (its error), or exits non-zero or on a signal (an Error naming the status and stderr), as execFileSync does.
+ */
+export function execSystem(name: SystemBinaryName, args: string[], opts: Omit<SystemSpawnOptions, "encoding"> = {}): string {
+  const r = spawnSystem(name, args, { ...opts, encoding: "utf-8" });
   if (r.error) throw r.error;
-  if (r.status !== 0) throw new Error(`${name} failed (status=${r.status})`);
+  if (r.status !== 0) {
+    throw Object.assign(new Error(`${name} ${args.join(" ")} failed (status=${r.status}, signal=${r.signal}): ${(r.stderr ?? "").trim().slice(0, 500)}`), {
+      status: r.status,
+      signal: r.signal,
+      stdout: r.stdout,
+      stderr: r.stderr,
+    });
+  }
   return r.stdout ?? "";
 }

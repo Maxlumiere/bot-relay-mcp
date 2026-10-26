@@ -286,7 +286,7 @@ export function windowsOwner(path: string): string {
   const r = runSystem("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
     encoding: "utf-8",
     windowsHide: true,
-    env: { ...process.env, RELAY_OWNER_PATH: path },
+    named: { RELAY_OWNER_PATH: path }, // the clean base + the one variable the script reads (SEC-22 (ii))
   });
   const owner = r.status === 0 ? sddlOwner(r.stdout ?? "") : null;
   if (!owner) throw new Error(`the owner of "${path}" could not be read (powershell exit ${r.status}): ${(r.stderr || r.stdout || "").trim().slice(0, 200)}`);

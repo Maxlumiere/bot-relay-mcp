@@ -12,7 +12,10 @@
  *   - `relay backup` (export AND restore) fails BEFORE it writes anything: no archive, no backups dir, no staging,
  *     and a restore leaves the live DB untouched.
  * The unresolvable tool is simulated by mocking systemBinary for a chosen set of names (`UNRESOLVABLE`); every other
- * tool resolves as in production.
+ * tool resolves as in production. The two starters (spawnSystem, execSystem) call the module's OWN systemBinary,
+ * which a mock of the export cannot reach, so they are wrapped too: for an unresolvable name each answers exactly as
+ * the real one does when its systemBinary throws (spawnSystem: a failed run carrying the SystemBinaryError; execSystem:
+ * that error thrown); every other name goes to the real one.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "fs";
@@ -25,10 +28,24 @@ vi.mock("../src/system-binary.js", async (importOriginal) => {
   return {
     ...real,
     systemBinary: (name: string, ...rest: unknown[]) => {
-      if (UNRESOLVABLE.has(name)) throw new real.SystemBinaryError(`cannot locate the system ${name}: (test) no trusted candidate`);
+      if (UNRESOLVABLE.has(name)) throw unresolvable(name);
       return (real.systemBinary as (n: string, ...r: unknown[]) => string)(name, ...rest);
     },
+    spawnSystem: (name: string, ...rest: unknown[]) => {
+      if (UNRESOLVABLE.has(name)) {
+        const error = unresolvable(name);
+        return { pid: 0, output: [], stdout: "", stderr: error.message, status: null, signal: null, error };
+      }
+      return (real.spawnSystem as (n: string, ...r: unknown[]) => unknown)(name, ...rest);
+    },
+    execSystem: (name: string, ...rest: unknown[]) => {
+      if (UNRESOLVABLE.has(name)) throw unresolvable(name);
+      return (real.execSystem as (n: string, ...r: unknown[]) => unknown)(name, ...rest);
+    },
   };
+  function unresolvable(name: string) {
+    return new real.SystemBinaryError(`cannot locate the system ${name}: (test) no trusted candidate`);
+  }
 });
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "sec22-fail-closed-"));

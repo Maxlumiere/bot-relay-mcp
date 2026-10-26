@@ -41,8 +41,7 @@
  * extraction is unit-testable.
  */
 import fs from "node:fs";
-import { execFileSync } from "node:child_process";
-import { systemBinary, type SystemBinaryName } from "./system-binary.js";
+import { execSystem, type SystemBinaryName } from "./system-binary.js";
 import { log } from "./logger.js";
 import { profileProcessPatternSource } from "./agent-cli-profiles.js";
 
@@ -133,13 +132,13 @@ const RUNNER_TOOLS = new Set<SystemBinaryName>(["ps", "ioreg", "reg"]);
 const runSystemTool = (cmd: SystemBinaryName, args: string[], opts?: { startTokenForm?: StartTokenForm }): string =>
   // Every command runs under the start-token environment, so `ps -o lstart=` (here and in the process table) is the
   // ONE spelling above. ioreg and reg read neither the locale nor the clock.
-  execFileSync(systemBinary(cmd), args, {
-    encoding: "utf8",
+  execSystem(cmd, args, {
     timeout: 2000,
     stdio: ["ignore", "pipe", "ignore"],
-    env: startTokenEnv(process.env, opts?.startTokenForm ?? "utc"),
+    // The start-token variables ON the clean base (SEC-22 (ii)): never the caller's env, whose TZ the legacy form
+    // must not see anyway.
+    named: startTokenEnv({}, opts?.startTokenForm ?? "utc") as Record<string, string>,
     windowsHide: true,
-    shell: false,
   });
 
 const defaultRunner: CommandRunner = (cmd, args, opts) => {

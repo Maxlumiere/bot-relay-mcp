@@ -160,7 +160,9 @@ describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outsi
 
   it("every child_process call in src/ goes through systemBinary(...) or process.execPath, or is ALLOWLISTED; no allowlist entry is stale", () => {
     const sites = subprocessSites(srcProgram(), rel, (f) => f.startsWith("src/"));
-    expect(sites.length, "the scan found the spawn family at all").toBeGreaterThan(10);
+    // The floor: every allowlisted site plus spawnSystem's own (the other system-tool sites now go through the
+    // wrappers, so there are few direct calls left; the stale-entry check below shows each listed one is seen).
+    expect(sites.length, "the scan found the spawn family at all").toBeGreaterThanOrEqual(Object.keys(ALLOWLIST).length + 1);
     expect(scanOffenders(sites), "started by a bare name, an unchecked expression, or systemBinary(...) outside src/system-binary.ts: use spawnSystem / execSystem, or list it with a reason").toEqual([]);
     expect(sites.filter((s) => s.program === "systemBinary" && s.key.startsWith("src/system-binary.ts::")).length, "the scan sees spawnSystem's own systemBinary(...) site").toBeGreaterThan(0);
     const seen = new Set(sites.map((s) => s.key));
