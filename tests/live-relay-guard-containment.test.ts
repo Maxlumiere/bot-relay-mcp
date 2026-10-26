@@ -33,7 +33,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { spawnNestedRun } from "./_setup/operator-tripwire.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -46,7 +46,7 @@ const DIST_DB = path.join(REPO, "dist", "db.js");
 function homeWithInstance(name: string): string {
   const home = path.join(ROOT, `${name}-home`);
   fs.mkdirSync(path.join(home, ".bot-relay"), { recursive: true });
-  const r = spawnSync(process.execPath, ["--input-type=module", "-e", `const m = await import(${JSON.stringify(DIST_DB)}); m.getDb(); m.closeDb();`], {
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", `const m = await import(${JSON.stringify(pathToFileURL(DIST_DB).href)}); m.getDb(); m.closeDb();`], {
     encoding: "utf-8",
     env: { PATH: process.env.PATH ?? "", HOME: home, RELAY_DB_PATH: path.join(home, ".bot-relay", "relay.db") },
   });
