@@ -7,6 +7,7 @@
 # and what lives in the repo for humans is a separate question from what ships.
 #
 # FORMAT: one JavaScript regex per line. Blank lines and #-comments ignored.
+# Every pattern matches CASE-INSENSITIVELY (loadPatterns compiles it with the i flag).
 # Adding a future persona/codename is ONE line here — no code change.
 # `\b` word-boundaries keep `Maxime` from matching `Maxlumiere` (the public
 # GitHub handle) and `architect` from matching `architecture`.

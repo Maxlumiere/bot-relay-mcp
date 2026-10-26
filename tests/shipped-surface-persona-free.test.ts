@@ -63,6 +63,32 @@ describe("shipped-content guard — the npm tarball, not the source tree", () =>
     fs.rmSync(path.dirname(pkg), { recursive: true, force: true });
   });
 
+  // The names are built from fragments so this source file carries no persona literal of its own.
+  const owner = ["MAX", "IME"].join("");
+  const persona = ["VIC", "TRA"].join("");
+  const role = ["Archi", "tect"].join("");
+  it("HARM (must fail) — an UPPERCASE or Capitalised name is the same name: caught, and a case-sensitive compile would have missed it", () => {
+    const pkg = fixtureDir({
+      "CHANGELOG.md": `# notes\n> FLAGGED FOR ${owner} — decide\nnothing here\n${role}-designed (ADR-0005)\n`,
+      "dist/x.js": `// shipped by ${persona}\nmodule.exports = {};\n`,
+    });
+    const hits = scanDir(pkg, patterns).map((o) => `${o.file}:${o.line}`).sort();
+    expect(hits, "every case variant is caught, with file:line").toEqual(["CHANGELOG.md:2", "CHANGELOG.md:4", "dist/x.js:1"]);
+    const caseSensitive = patterns.map((p: { src: string }) => ({ src: p.src, re: new RegExp(p.src) }));
+    expect(scanDir(pkg, caseSensitive), "the defect: without the i flag none of these is caught").toEqual([]);
+    fs.rmSync(path.dirname(pkg), { recursive: true, force: true });
+  });
+
+  it("TWIN (must pass) — case-insensitivity keeps the word boundaries: the uppercase word for a building's design and the public handle are not names", () => {
+    const design = ["ARCHI", "TECTURE"].join("");
+    const pkg = fixtureDir({
+      "README.md": `# BOT-RELAY-MCP BY MAXLUMIERE\nTHE TRANSPORT ${design} IS FINE.\n`,
+      "dist/y.js": `module.exports = { ${design}: 1, Maxlumiere: 2 };\n`,
+    });
+    expect(scanDir(pkg, patterns)).toEqual([]);
+    fs.rmSync(path.dirname(pkg), { recursive: true, force: true });
+  });
+
   it("CONTROL (must pass) — a genuinely clean tarball is not flagged (guard is not always-fail)", () => {
     const pkg = fixtureDir({
       "dist/db.js": "'use strict';\nmodule.exports = { transportArchitecture: 'ok' };\n",
