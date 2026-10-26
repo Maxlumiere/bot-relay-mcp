@@ -51,16 +51,15 @@
  *     resolver (realpath.native: GetFinalPathNameByHandle), which must name an entry of the SAME directory, else
  *     "unsupported".
  *
- * COMPARING (comparePaths): THREE-valued, and no case rule is guessed. Two paths are walked (a missing tail allowed).
- *   - Their deepest EXISTING entries are different files (dev + inode) → "different". Whatever the volumes' case or
- *     normalization rules are, the kernel already applied them when it looked those names up.
- *   - The same file, and identical missing tails → "same".
- *   - The same file, and missing tails that differ ONLY by case or Unicode form → "inconclusive". Whether they would
- *     collide is decided by the directory they would be created in, and nothing here measures that (Codex #357 R1
- *     #2: a whole-path case probe answers wrong across a mount boundary). A security caller picks its own safe
- *     direction for "inconclusive" (a write guard treats it as protected).
- *   - Otherwise → "different".
- *   Two names for one file (a hard link) compare "same": the over-report direction.
+ * COMPARING (comparePaths): THREE-valued, and nothing is guessed (ruled on #357 R2). Two paths are walked
+ * (a missing tail allowed):
+ *   - their deepest EXISTING entries differ by (dev, ino), compared as bigint → "different";
+ *   - the same entry and BYTE-identical missing tails → "same";
+ *   - anything else → "inconclusive": no case fold, no Unicode normalization, nothing (σ/ς, ß/SS, İ/i, NFC/NFD and
+ *     plain ASCII case are all unjudged; whether two missing names would collide is the directory's rule).
+ *   A verdict is read ONLY through isProtected (same | inconclusive: a write guard's safe direction) or isTrustedMatch
+ *   (same only: a trust check's), enforced by a static scan. Two names for one file (a hard link) compare "same".
+ *   A verdict is about NOW: a later create, rename, mount or link change needs a new walk.
  */
 import fs from "fs";
 import path from "path";
@@ -69,8 +68,9 @@ import path from "path";
 export interface WalkStat {
   uid: number;
   mode: number;
-  dev: number;
-  ino: number;
+  /** The identity, as BIGINT end to end (ruled on #357 R2, D2): a number loses precision above 2^53. */
+  dev: bigint;
+  ino: bigint;
   isFile(): boolean;
   isDirectory(): boolean;
   isSymbolicLink(): boolean;
@@ -85,7 +85,11 @@ export interface WalkFs {
 }
 
 const nodeFs: WalkFs = {
-  lstatSync: (p) => fs.lstatSync(p),
+  lstatSync: (p) => {
+    const b = fs.lstatSync(p, { bigint: true });
+    // uid and mode are small; dev and ino stay bigint (no numeric identity anywhere).
+    return { uid: Number(b.uid), mode: Number(b.mode), dev: b.dev, ino: b.ino, isFile: () => b.isFile(), isDirectory: () => b.isDirectory(), isSymbolicLink: () => b.isSymbolicLink() };
+  },
   readlinkSync: (p) => fs.readlinkSync(p),
   realpathNativeSync: (p) => fs.realpathSync.native(p),
 };
@@ -186,6 +190,20 @@ function splitRoot(p: string, platform: NodeJS.Platform): { root: string; parts:
   return { root: normRoot, parts };
 }
 
+/**
+ * The extended / device namespaces (\\?\, \\.\, \??\) are accepted ONLY in their MEASURED canonical backslash
+ * spelling, \\?\<drive>:\ or \\?\UNC\ with no forward slash anywhere (ruled on #357 R2, D3: Windows
+ * does not convert slashes in an extended path, and no native test pins what node does with one). Anything else in
+ * those namespaces is "unsupported", checked BEFORE any normalization, for an input and for a link target alike.
+ */
+function refuseUnmeasuredNamespace(p: string, at: string): void {
+  const extended = /^[\\/]{2}[?.][\\/]/.test(p) || /^[\\/]\?\?[\\/]/.test(p);
+  if (!extended) return;
+  if (p.includes("/") || !/^\\\\\?\\(?:[A-Za-z]:\\|UNC\\)/i.test(p)) {
+    throw new PathWalkError("unsupported", at, "an extended or device path outside the measured canonical form (\\\\?\\<drive>:\\ or \\\\?\\UNC\\, backslashes only)");
+  }
+}
+
 /** A \\?\ path is passed to the filesystem unnormalized: one holding `.` or `..` is unsupported. */
 function refuseExtendedDots(p: string, at: string): void {
   if (/^\\\\[?.]\\/.test(p.replace(/\//g, "\\")) && /(?:^|[\\/])\.\.?(?:[\\/]|$)/.test(p.slice(4))) {
@@ -222,6 +240,7 @@ export function walkPath(p: string, opts: WalkOptions = {}): WalkResult {
   // LEXICALLY first, because that is what the OS does (see WINDOWS).
   let abs = isAbsoluteFor(p, platform) ? p : `${opts.cwd ?? process.cwd()}${P.sep}${p}`;
   if (platform === "win32") {
+    refuseUnmeasuredNamespace(abs, p);
     refuseExtendedDots(abs, p);
     abs = path.win32.normalize(abs);
   }
@@ -314,7 +333,10 @@ export function walkPath(p: string, opts: WalkOptions = {}): WalkResult {
         if (platform === "win32" && /^[\\/](?![\\/])/.test(target)) {
           throw new PathWalkError("unsupported", entry, "a root-relative Windows link target");
         }
-        if (platform === "win32") refuseExtendedDots(target, entry);
+        if (platform === "win32") {
+          refuseUnmeasuredNamespace(target, entry);
+          refuseExtendedDots(target, entry);
+        }
         const split = splitRoot(target, platform);
         cur = enterRoot(split.root);
         curIsDir = true;
@@ -357,22 +379,24 @@ export function walkPath(p: string, opts: WalkOptions = {}): WalkResult {
 
 export type Comparison = "same" | "different" | "inconclusive";
 
-const fold = (s: string) => s.normalize("NFC").toLowerCase();
-
-/**
- * Do two paths land on the same file? THREE-valued (see COMPARING): "same" / "different" / "inconclusive". Each walk
- * allows a missing tail; every other walk failure throws.
- */
 export function comparePaths(a: string, b: string, opts: Omit<WalkOptions, "allowMissing"> = {}): Comparison {
   const wa = walkPath(a, { ...opts, allowMissing: true });
   const wb = walkPath(b, { ...opts, allowMissing: true });
   if (wa.existingStat.dev !== wb.existingStat.dev || wa.existingStat.ino !== wb.existingStat.ino) return "different";
-  if (wa.missing.length !== wb.missing.length) return "different";
-  let inconclusive = false;
-  for (let i = 0; i < wa.missing.length; i++) {
-    if (wa.missing[i] === wb.missing[i]) continue;
-    if (fold(wa.missing[i]) !== fold(wb.missing[i])) return "different";
-    inconclusive = true; // equal but for case or Unicode form: whether they collide is the directory's, unmeasured
-  }
-  return inconclusive ? "inconclusive" : "same";
+  const identical = wa.missing.length === wb.missing.length && wa.missing.every((m, i) => m === wb.missing[i]);
+  return identical ? "same" : "inconclusive"; // no fold of any kind: any other pair of missing tails is unjudged
+}
+
+/**
+ * THE way a protect-list reads a verdict: "same" or "inconclusive" is protected (a write guard refuses both). The
+ * ONLY sanctioned readers are this and isTrustedMatch; tests/path-walk-verdict-scan.test.ts fails CI on any other use
+ * of comparePaths outside this file.
+ */
+export function isProtected(r: Comparison): boolean {
+  return r === "same" || r === "inconclusive";
+}
+
+/** THE way a trust check reads a verdict: ONLY "same" is a match. */
+export function isTrustedMatch(r: Comparison): boolean {
+  return r === "same";
 }
