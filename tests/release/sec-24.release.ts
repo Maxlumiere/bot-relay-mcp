@@ -12,6 +12,7 @@
  * element by element) and on a REST route. The twin: a legitimate resolve_messages of 100 real messages succeeds
  * (the bound refuses structure, never ordinary use). (A guard that refuses everything also passes the harm half.)
  */
+import crypto from "node:crypto";
 import { describe, it, expect, afterEach } from "vitest";
 import { sandbox, startHttpDaemon, type HttpDaemon } from "./_installed.js";
 
@@ -56,6 +57,24 @@ describe("SEC-24.T1: no oversized request structure reaches a validator (the ins
       expect(r.status, `${k}: ${r.text}`).toBe(400);
       expect(r.code, `${k}: ${r.text}`).toBe("BODY_STRUCTURE_LIMIT");
     }
+  });
+
+  it("SEC-24.T1 BOUNDARY with the HTTP transport secret set: an ordinary request with no credential gets 401, the oversized one gets 400 BODY_STRUCTURE_LIMIT, and the secret is accepted", async () => {
+    // authMiddleware is LIVE here (without a transport secret it passes every request through), so this pins that the
+    // bound runs BEFORE auth: moving it after auth turns the oversized answer into a 401.
+    const sb = sandbox("s24-secret");
+    const secret = crypto.randomBytes(24).toString("hex");
+    const d = await startHttpDaemon(sb, { httpSecret: secret });
+    daemons.push(d);
+    const ordinary = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+    const oversized = '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"register_agent","arguments":{"name":"sec24-y","role":"r","capabilities":' + HUGE + "}}}";
+    const withSecret = await post(d, "/mcp", { ...MCP, Authorization: `Bearer ${secret}` }, ordinary);
+    const noCredential = await post(d, "/mcp", MCP, ordinary);
+    const oversizedNoCredential = await post(d, "/mcp", MCP, oversized);
+    expect(withSecret.status, `the secret is accepted: ${withSecret.text}`).toBe(200);
+    expect(noCredential.status, `auth refuses an ordinary request with no credential: ${noCredential.text}`).toBe(401);
+    expect(oversizedNoCredential.status, `SEC-24 refuses the oversized one BEFORE auth: ${oversizedNoCredential.text}`).toBe(400);
+    expect(oversizedNoCredential.code, oversizedNoCredential.text).toBe("BODY_STRUCTURE_LIMIT");
   });
 
   it("SEC-24.T1 TWIN a legitimate resolve_messages of 100 real messages succeeds and resolves all 100", async () => {

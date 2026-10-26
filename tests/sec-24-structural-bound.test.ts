@@ -26,12 +26,16 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawn } from "child_process";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { structuralViolation, MAX_ARRAY, MAX_DEPTH } from "../src/structural-bound.js";
 import { sdkParsedBody } from "../src/transport/http.js";
+import { sandboxEnv } from "./_helpers/sandbox-env.js";
+import crypto from "crypto";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sec24-")));
+/** The HTTP transport secret of the "secret" child (>= 32 characters, as the relay requires). */
+const HTTP_SECRET = crypto.randomBytes(24).toString("hex");
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
 const nested = (depth: number) => JSON.parse("[".repeat(depth) + "]".repeat(depth));
@@ -57,7 +61,8 @@ describe("SEC-24, pure: the walk", () => {
 
 /** The child: the built daemon on an ephemeral port, the requests, then its own peak RSS, as one JSON line. */
 const CHILD = `
-const http = await import(${JSON.stringify(path.join(REPO, "dist", "transport", "http.js"))});
+// A file:// URL, never a bare absolute path: on Windows the ESM loader refuses "D:\\..." (ERR_UNSUPPORTED_ESM_URL_SCHEME).
+const http = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "transport", "http.js")).href)});
 const mode = process.env.SEC24_MODE;
 const server = http.startHttpServer(0, "127.0.0.1");
 await new Promise((r) => server.once("listening", r));
@@ -68,6 +73,22 @@ const MCP = { "Content-Type": "application/json", Accept: "application/json, tex
 const call = async (url, headers, body) => { const r = await fetch(base + url, { method: "POST", headers, body }); return { status: r.status, text: await r.text() }; };
 const rpc = (name, args, id) => JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
 const sse = (t) => { const d = t.split("\\n").find((l) => l.startsWith("data:")); return JSON.parse(d ? d.slice(5) : t); };
+if (mode === "secret") {
+  // BEFORE AUTH, with authMiddleware LIVE (the HTTP transport secret is set): an ordinary request with no credential
+  // is refused 401 by auth, the oversized one is refused 400 by SEC-24 first, and the secret itself is accepted (so the
+  // 401 is the gate, not a broken daemon).
+  const hugeArr = "[" + Array(500000).fill("1").join(",") + "]";
+  const ordinary = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+  const oversized = '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"register_agent","arguments":{"name":"fx-x","role":"r","capabilities":' + hugeArr + "}}}";
+  const o = {
+    ordinaryNoCredential: await call("/mcp", MCP, ordinary),
+    oversizedNoCredential: await call("/mcp", MCP, oversized),
+    ordinaryWithSecret: await call("/mcp", { ...MCP, Authorization: "Bearer " + process.env.RELAY_HTTP_SECRET }, ordinary),
+  };
+  for (const k of Object.keys(o)) o[k].text = o[k].text.slice(0, 300);
+  process.stdout.write("SEC24 " + JSON.stringify(o) + "\\n");
+  server.close(); process.exit(0);
+}
 const reg = sse((await call("/mcp", { ...MCP, "X-Relay-Secret": secret }, rpc("register_agent", { name: "fx-sec24", role: "r", capabilities: [] }, 1))).text);
 const token = JSON.parse(reg.result.content[0].text).agent_token;
 const out = { token: !!token };
@@ -100,16 +121,21 @@ process.stdout.write("SEC24 " + JSON.stringify(out) + "\\n");
 server.close(); process.exit(0);
 `;
 
-function runChild(mode: "hostile" | "control"): Promise<Record<string, any>> {
+function runChild(mode: "hostile" | "control" | "secret"): Promise<Record<string, any>> {
   const dir = fs.mkdtempSync(path.join(ROOT, `${mode}-`));
-  fs.mkdirSync(path.join(dir, "home"), { recursive: true });
+  // The DB lives INSIDE the child's home (as the release sandbox's relay home does): on Windows the only approved
+  // root for RELAY_DB_PATH is the home directory (src/approved-roots.ts; POSIX also approves /tmp and /var/folders).
+  const relayHome = path.join(dir, "home", ".bot-relay");
+  fs.mkdirSync(relayHome, { recursive: true });
   return new Promise((resolve, reject) => {
     // From a FILE, never `--input-type=module -e`: the daemon's bcrypt pool is an eval Worker, which inherits that
     // flag, parses as ESM and fails every token verify (MEASURED 24 Oct; a production daemon runs a file).
     const file = path.join(dir, "child.mjs");
     fs.writeFileSync(file, CHILD);
     const c = spawn(process.execPath, [file], {
-      env: { PATH: process.env.PATH ?? "", HOME: path.join(dir, "home"), RELAY_DB_PATH: path.join(dir, "relay.db"), SEC24_MODE: mode, RELAY_LOG_LEVEL: "error" },
+      // The sandboxed full env (tests/_helpers/sandbox-env.ts: no relay/test-runner vars, no NODE_OPTIONS), then this
+      // child's own settings. "secret" mode sets the HTTP transport secret, so authMiddleware is live.
+      env: { ...sandboxEnv(path.join(dir, "home")), RELAY_DB_PATH: path.join(relayHome, "relay.db"), SEC24_MODE: mode, RELAY_LOG_LEVEL: "error", ...(mode === "secret" ? { RELAY_HTTP_SECRET: HTTP_SECRET } : {}) },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let so = "", se = "";
@@ -153,6 +179,16 @@ describe("SEC-24, black-box: the built daemon in a child process", () => {
     }
 
   }, 200_000);
+});
+
+describe("SEC-24, black-box: BEFORE auth, with the HTTP transport secret set", () => {
+  it("with authMiddleware live, an ordinary request with no credential gets 401, the oversized one gets 400 BODY_STRUCTURE_LIMIT, and the secret is accepted", async () => {
+    const r = await runChild("secret");
+    expect(r.ordinaryWithSecret.status, `the secret is accepted: ${r.ordinaryWithSecret.text}`).toBe(200);
+    expect(r.ordinaryNoCredential.status, `auth refuses an ordinary request with no credential: ${r.ordinaryNoCredential.text}`).toBe(401);
+    expect(r.oversizedNoCredential.status, `SEC-24 refuses the oversized one BEFORE auth: ${r.oversizedNoCredential.text}`).toBe(400);
+    expect(JSON.parse(r.oversizedNoCredential.text).error_code).toBe("BODY_STRUCTURE_LIMIT");
+  }, 120_000);
 });
 
 describe("SEC-24: the MCP SDK never reads the request stream itself", () => {
