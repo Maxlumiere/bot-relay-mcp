@@ -25,7 +25,7 @@ import os from "os";
 import path from "path";
 import { spawn, spawnSync } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
-import { budgetTree, BUDGET_CLOCK_READ, BUDGET_CLOCK_SEAMED } from "./_helpers/hook-budget-tree.js";
+import { budgetTree, budgetGuardFindings, BUDGET_CLOCK_READ, BUDGET_CLOCK_SEAMED } from "./_helpers/hook-budget-tree.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOKS = path.join(REPO_ROOT, "hooks");
@@ -377,7 +377,8 @@ describe("Codex #291 R2 #1 — REMOTE path: after the resolver, every HTTP call 
       expect(r.verbs, r.out).toContain("where");
       expect(r.secs, r.out).toBeLessThan(BUDGET[hook]);
       // Vacuous when no call started: on a slow runner the probe's share can be spent too (above), so this row
-      // cannot guarantee a call and does not assert one. The cap property is asserted non-vacuously by the TWIN.
+      // cannot guarantee a call and does not assert one. (The TWIN asserts the caps an instant arrival gets, [1, 2];
+      // it does not assert this row's start + cap within the wall-clock deadline.)
       expectEveryCallInsideTheBudget(r, BUDGET[hook]);
       expect(r.curls.map((c) => c.kind), "the read that no longer fits is never started").not.toContain("mail");
       expect(r.verdict, r.out).not.toMatch(/VERDICT=HEALTHY/);
@@ -434,7 +435,17 @@ describe("the test seam's FIXED budget clock does not tick (Codex R1 on the seam
   // Every bash this run can reach: /bin/bash (3.2 on macOS) and the one on PATH (CI's). For each, the budget
   // arithmetic is read before and after a forced 2.2s wait (>= 2 wall-second boundaries): with RELAY_TEST_CLOCK=0 it
   // must not move while the shell's own SECONDS DID tick; the CONTROL without it must move (else the probe is blind).
-  const shells = [...new Set(["/bin/bash", "bash"].filter((b) => spawnSync(b, ["-c", "true"]).status === 0))];
+  // Distinct BINARIES only: /bin/bash and the bash on PATH can be the same file, which would count one shell twice.
+  const resolved = (b: string) => {
+    const where = b.includes("/") ? b : spawnSync("bash", ["-c", "command -v bash"], { encoding: "utf-8" }).stdout.trim();
+    return where && fs.existsSync(where) ? fs.realpathSync(where) : null;
+  };
+  const byBinary = new Map<string, string>();
+  for (const b of ["/bin/bash", "bash"]) {
+    const real = resolved(b);
+    if (real && !byBinary.has(real) && spawnSync(real, ["-c", "true"]).status === 0) byBinary.set(real, b);
+  }
+  const shells = [...byBinary.keys()];
   const probe = (bash: string, clock: string | undefined) => {
     const tree = starvedTree(`clock-${path.basename(bash)}-${clock ?? "none"}`);
     const r = spawnSync(bash, ["-c", `. "${path.join(tree, "_vault-helpers.sh")}"; RELAY_HOOK_BUDGET_SECS=5; a=$(relay_margin_secs); b=$(relay_pending_deadline 5); sleep 2.2; c=$(relay_margin_secs); d=$(relay_pending_deadline 5); echo "$a $b $c $d $SECONDS $BASH_VERSION"`], {
@@ -445,14 +456,34 @@ describe("the test seam's FIXED budget clock does not tick (Codex R1 on the seam
     const [a, b, c, d, secs, version] = r.stdout.trim().split(" ");
     return { before: [Number(a), Number(b)], after: [Number(c), Number(d)], secs: Number(secs), version, err: r.stderr };
   };
-  it("the seam rewrites exactly the budget arithmetic's 2 SECONDS reads (it refuses any other count)", () => {
-    expect(fs.readFileSync(path.join(HOOKS, "_vault-helpers.sh"), "utf-8").split(BUDGET_CLOCK_READ).length - 1).toBe(2);
+  it("the seam rewrites the ONE read in each budget function, and the live hooks hold no unclassified SECONDS read", () => {
+    expect(budgetGuardFindings(HOOKS), "every other SECONDS line is diagnostic text or the Stop stdin loop").toEqual([]);
     const copy = fs.readFileSync(path.join(starvedTree("clock-count"), "_vault-helpers.sh"), "utf-8");
-    expect(copy.split(BUDGET_CLOCK_SEAMED).length - 1, "both reads are seamed in the copy").toBe(2);
+    expect(copy.split(BUDGET_CLOCK_SEAMED).length - 1, "both functions' reads are seamed in the copy").toBe(2);
     expect(copy.split(BUDGET_CLOCK_SEAMED).join("").split(BUDGET_CLOCK_READ).length - 1, "no unseamed read is left in the copy").toBe(0);
+  });
+  it("HARM: a new SECONDS read on a budget path is REFUSED (the seam would look applied while it ticks), and the half-built copy is removed; TWIN: diagnostic text is allowed", () => {
+    const planted = (tag: string, line: string) => {
+      const d = path.join(ROOT, `guard-src-${tag}`);
+      fs.rmSync(d, { recursive: true, force: true });
+      fs.cpSync(HOOKS, d, { recursive: true });
+      fs.appendFileSync(path.join(d, "post-tool-use-check.sh"), `\n${line}\n`);
+      return d;
+    };
+    for (const [tag, line] of [["dollar", 'left=$(( 5 - $SECONDS - 3 ))'], ["bare", "left=$(( 5 - SECONDS - 3 ))"], ["default", 'left=$(( 5 - ${SECONDS:-0} ))']] as const) {
+      const src = planted(tag, line);
+      expect(budgetGuardFindings(src), `${tag}: the planted read is found`).toEqual([`post-tool-use-check.sh: ${line}`]);
+      const dest = path.join(ROOT, `guard-dest-${tag}`);
+      expect(() => budgetTree(dest, src, path.join(REPO_ROOT, "bin")), `${tag}: refused`).toThrow(/unclassified/);
+      expect(fs.existsSync(dest), `${tag}: the destination is removed on the failure`).toBe(false);
+    }
+    const twin = planted("diag", 'echo "spent (${SECONDS}s of 5s)" >&2');
+    expect(budgetGuardFindings(twin), "diagnostic text that prints ${SECONDS}s is allowed").toEqual([]);
   });
   for (const bash of shells) {
     it(`${bash}: with RELAY_TEST_CLOCK=0 the budget reads 2/2 before AND after 2.2s (SECONDS itself ticked to >= 2); the CONTROL without it drops`, () => {
+      const version = spawnSync(bash, ["--version"], { encoding: "utf-8" }).stdout.split("\n")[0];
+      console.log(`clock probe: ${byBinary.get(bash)} -> ${bash} (${version})`);
       const fixed = probe(bash, "0");
       expect(fixed.secs, `the shell's own SECONDS ticked (bash ${fixed.version}) ${fixed.err}`).toBeGreaterThanOrEqual(2);
       expect([fixed.before, fixed.after], `bash ${fixed.version}: the fixed clock never moved`).toEqual([[2, 2], [2, 2]]);
