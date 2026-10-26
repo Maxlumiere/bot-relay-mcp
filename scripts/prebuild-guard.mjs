@@ -34,6 +34,11 @@
  *   2. auto-detect: a loaded launchd plist or `~/.claude.json` mcpServers entry
  *      whose path points at THIS tree's dist/index.js (covers an unmarked tree).
  *
+ * PUBLISH MODE (`--publish`, run first by scripts/pre-publish-check.sh): the same detection, but
+ * RELAY_ALLOW_PROD_BUILD is IGNORED and the message points at a throwaway worktree. A publish never
+ * belongs in the serving tree: its `git pull` + `npm ci` swap the packages under the live dist (seen
+ * 26 Oct: zod 3 → 4 under the running daemon's build), before any step of the gate has run.
+ *
  * NOT shipped to npm users: `scripts/` is excluded from package.json `files`, and a
  * consumer never runs `npm run build` (dist ships prebuilt). This is a repo/dev
  * guard only. The decision is a pure function so the harm/allow cases are tested
@@ -89,6 +94,7 @@ function gatherConsumers(home) {
 }
 
 function main() {
+  const publish = process.argv.includes("--publish");
   let decision;
   try {
     const cwd = safeRealpath(process.cwd());
@@ -97,7 +103,7 @@ function main() {
       cwd,
       hasSentinel: fs.existsSync(path.join(cwd, ".relay-prod-tree")),
       consumers: gatherConsumers(home),
-      allow: process.env.RELAY_ALLOW_PROD_BUILD === "1",
+      allow: !publish && process.env.RELAY_ALLOW_PROD_BUILD === "1",
     });
   } catch (err) {
     // The guard itself must NEVER break a build. Any unexpected failure → build.
@@ -116,6 +122,15 @@ function main() {
   }
 
   // refuse
+  if (publish) {
+    process.stderr.write(
+      `\n\x1b[1;31m✖ REFUSING to run the pre-publish gate in the PRODUCTION relay tree.\x1b[0m\n` +
+        `  Positive signal: ${decision.hits.join("; ")}.\n` +
+        `  A publish installs, builds and packs here, under the live daemon's dist/ (no override).\n` +
+        `  Publish from a throwaway git worktree (or a fresh clone) at origin/main, with its own node_modules.\n\n`,
+    );
+    process.exit(1);
+  }
   process.stderr.write(
     `\n[1;31m✖ REFUSING to build in the PRODUCTION relay tree.[0m\n` +
       `  Positive signal: ${decision.hits.join("; ")}.\n` +

@@ -88,7 +88,7 @@ describe("prebuild-guard — shipped script end-to-end (HOME isolated)", () => {
   // A private HOME with no LaunchAgents and no ~/.claude.json → the auto-detector
   // sees nothing, so only the in-cwd sentinel can trigger. Isolates the test from
   // the real machine's live config.
-  const run = (cwd: string, env: Record<string, string> = {}) => {
+  const run = (cwd: string, env: Record<string, string> = {}, args: string[] = []) => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "guard-home-"));
     // The publish environment sets RELAY_ALLOW_PROD_BUILD=1 so `npm publish`'s own prebuild
     // is allowed. If we inherited it here it would leak into the spawned guard and turn the
@@ -97,7 +97,7 @@ describe("prebuild-guard — shipped script end-to-end (HOME isolated)", () => {
     const spawnEnv: NodeJS.ProcessEnv = { ...process.env, HOME: home, ...env };
     if (!("RELAY_ALLOW_PROD_BUILD" in env)) delete spawnEnv.RELAY_ALLOW_PROD_BUILD;
     try {
-      execFileSync("node", [GUARD], { cwd, env: spawnEnv, stdio: "pipe" });
+      execFileSync("node", [GUARD, ...args], { cwd, env: spawnEnv, stdio: "pipe" });
       return 0;
     } catch (e) {
       return (e as { status?: number }).status ?? -1;
@@ -130,6 +130,29 @@ describe("prebuild-guard — shipped script end-to-end (HOME isolated)", () => {
     fs.writeFileSync(path.join(dir, ".relay-prod-tree"), "");
     try {
       expect(run(dir, { RELAY_ALLOW_PROD_BUILD: "1" })).toBe(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // --publish (run first by scripts/pre-publish-check.sh): the same detection, NO override. The publish
+  // environment sets RELAY_ALLOW_PROD_BUILD=1, so honouring it here would wave a publish through the
+  // serving tree, the one place it must not run.
+  it("--publish in a prod dir → exit 1, EVEN with RELAY_ALLOW_PROD_BUILD=1 (no override for a publish)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guard-pub-prod-"));
+    fs.writeFileSync(path.join(dir, ".relay-prod-tree"), "");
+    try {
+      expect(run(dir, {}, ["--publish"])).toBe(1);
+      expect(run(dir, { RELAY_ALLOW_PROD_BUILD: "1" }, ["--publish"])).toBe(1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("TWIN: --publish in a clean dir (a throwaway worktree) → exit 0", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guard-pub-clean-"));
+    try {
+      expect(run(dir, { RELAY_ALLOW_PROD_BUILD: "1" }, ["--publish"])).toBe(0);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
