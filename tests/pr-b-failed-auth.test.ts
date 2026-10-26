@@ -555,7 +555,7 @@ const procDelta = (a: ReturnType<typeof procNow>, b: ReturnType<typeof procNow>)
 export const fmtProc = (p?: ProcCounters, why?: string) =>
   p
     ? `process-wide counters: voluntary cs ${p.volCs}, involuntary cs ${p.invCs}, CPU ${p.cpuMs.toFixed(1)} ms of ${p.wallMs.toFixed(1)} ms wall`
-    : `process-wide counters: not recorded: ${why ?? "this reading was not taken by measureWindow and names no reason"}`;
+    : `process-wide counters: not recorded: ${why?.trim() || "this reading was not taken by measureWindow and names no reason"}`;
 
 /**
  * Run `load` from a worker while timing the daemon's loop; `onLoop` runs ON the daemon's loop once the load has
@@ -1496,30 +1496,41 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     const withWhy = ceilingVerdict("t", [{ healthMax: 30, eldMax: 600, breaches: [b], sentinelGaps: [], procWhy: "replayed from a log" }]);
     expect(withWhy.why, "a reason given: the line carries it").toContain("process-wide counters: not recorded: replayed from a log");
     expect(fmtProc(undefined), "fmtProc never ends at a bare 'not recorded'").toMatch(/not recorded: \S/);
+    for (const blank of ["", "  "]) expect(fmtProc(undefined, blank), `an empty or blank reason (${JSON.stringify(blank)}) falls back`).toContain("not recorded: this reading was not taken by measureWindow and names no reason");
     const huge: ProcCounters = { volCs: 0, invCs: 1e6, cpuMs: 1e6, wallMs: 1 };
     expect(ceilingVerdict("t", [{ healthMax: 30, eldMax: 600, breaches: [b], sentinelGaps: [{ from: 1000, to: 1600 }], proc: huge }]).verdict, "the counters never change a verdict").toBe("NOT_EVALUATED");
   });
-  it("T-A DETAILs (b) and the unrounded tail: a line outside the serial bars step labels itself context; the BAR line's JSON tail carries the exact values the gate judged", () => {
+  it("T-A DETAIL (b) and the unrounded tail (serialization coverage; the BAR line itself is assembled in runBar): a line outside the serial bars step labels itself context; exactTail round-trips the exact values judge() saw and returned, and the rounded log reads a different verdict", () => {
     expect(contextLabel(true), "the serial bars step (RELAY_TIMING_BARS=1): no label, these are gate readings").toBe("");
     expect(contextLabel(false), "anywhere else: labelled").toBe("parallel suite: context, not a gate reading | ");
     expect(contextLabel(), "this run, by its own environment").toBe(process.env.RELAY_TIMING_BARS === "1" ? "" : CONTEXT_LABEL);
-    // The #332 replay's case: a median |a| just over the 25 ms limit prints as 25.0, and the rounded inputs read it as 25.
+    // Pinned fixtures, six distinct arrays. AVAILABILITY: every |control - control'| is 25.03 ms, just over the 25 ms
+    // noise limit (NOT_EVALUATED), yet each value prints with ONE decimal, so the logged pairs differ by exactly 25.0
+    // (not over the limit: PASS). LOOP: noise 10.02, d 10.24, PASS either way.
+    const fx = {
+      auth: { health: [110.1, 120.1, 130.1, 140.1, 150.1, 160.1, 170.1, 180.1, 190.1], eld: [30.37, 31.37, 32.37, 33.37, 34.37, 35.37, 36.37, 37.37, 38.37] },
+      control: { health: [100.04, 110.04, 120.04, 130.04, 140.04, 150.04, 160.04, 170.04, 180.04], eld: [20.13, 21.13, 22.13, 23.13, 24.13, 25.13, 26.13, 27.13, 28.13] },
+      control2: { health: [75.01, 85.01, 95.01, 105.01, 115.01, 125.01, 135.01, 145.01, 155.01], eld: [10.11, 11.11, 12.11, 13.11, 14.11, 15.11, 16.11, 17.11, 18.11] },
+    };
     const r = (healthMax: number, eldMax: number): Reading => ({ healthMax, eldMax, eldHist: 0, mainGapCount: 0, tickerBusy: 0, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0 });
-    const control = [60.0049, 70, 80, 90, 100, 110, 120, 130, 140].map((h) => r(h, 20));
-    const control2 = control.map((c) => r(c.healthMax - 25.0049, 20)); // every |control - control'| is 25.0049
-    const auth = control.map((c) => r(c.healthMax + 30, 20));
-    const judgeArms = (a: Reading[], c: Reading[], c2: Reading[], x: "healthMax" | "eldMax") => judge(a.map((q) => q[x]), c.map((q) => q[x]), c2.map((q) => q[x]));
-    const health = judgeArms(auth, control, control2, "healthMax");
-    const eld = judgeArms(auth, control, control2, "eldMax");
-    expect([health.noise > NOISE_LIMIT_MS, health.noise.toFixed(1)], "the motivating case: over the limit, printed AS the limit").toEqual([true, `${NOISE_LIMIT_MS}.0`]);
+    const arm = (a: { health: number[]; eld: number[] }) => a.health.map((h, i) => r(h, a.eld[i]));
+    const [auth, control, control2] = [arm(fx.auth), arm(fx.control), arm(fx.control2)];
+    const health = judge(fx.auth.health, fx.control.health, fx.control2.health);
+    const eld = judge(fx.auth.eld, fx.control.eld, fx.control2.eld);
+    expect([health.verdict, eld.verdict], "the gate's verdicts on the exact inputs (pinned)").toEqual(["NOT_EVALUATED", "PASS"]);
+    expect(health.noise, "AVAILABILITY noise, exact").toBeCloseTo(25.03, 9);
+    expect(health.d, "AVAILABILITY d, exact").toBeCloseTo(10.06, 9);
+    expect(eld.noise, "LOOP noise, exact").toBeCloseTo(10.02, 9);
+    expect(eld.d, "LOOP d, exact").toBeCloseTo(10.24, 9);
     const tail = exactTail({ auth, control, control2, health, eld });
     expect(tail.startsWith(" | exact {"), "the tail is its own BAR-line field").toBe(true);
     const parsed = JSON.parse(tail.slice(" | exact ".length));
-    expect(parsed.control.health, "the exact inputs, not the printed ones").toEqual(control.map((q) => q.healthMax));
-    expect(list(parsed.control.health).split("/")[0], "the BAR line itself still prints the rounded value").toBe("60.0");
-    expect(parsed.judged.health, "the gate's own outputs, unrounded").toEqual({ d: health.d, noise: health.noise, verdict: health.verdict });
-    const replayed = judge(parsed.auth.health, parsed.control.health, parsed.control2.health);
-    expect(replayed, "a replay from the tail judges exactly what the gate judged").toEqual(health);
+    expect({ auth: parsed.auth, control: parsed.control, control2: parsed.control2 }, "all six input arrays, exactly as judged").toEqual(fx);
+    expect(parsed.judged, "both output objects, exactly as returned").toEqual({ health: { d: health.d, noise: health.noise, verdict: "NOT_EVALUATED" }, eld: { d: eld.d, noise: eld.noise, verdict: "PASS" } });
+    expect(judge(parsed.auth.health, parsed.control.health, parsed.control2.health).verdict, "a replay from the tail: NOT_EVALUATED, as the gate judged").toBe("NOT_EVALUATED");
+    const logged = (xs: number[]) => list(xs).split("/").map(Number);
+    expect(list(fx.control.health).split("/")[0], "the BAR line itself prints one decimal").toBe("100.0");
+    expect(judge(logged(fx.auth.health), logged(fx.control.health), logged(fx.control2.health)).verdict, "a replay from the ROUNDED log reads PASS: the case the tail exists for").toBe("PASS");
   });
   it("THE (6) RULE's REDs (ruling of 2026-10-21): the f445297 replay reads NOT_EVALUATED (FAIL under the retired slack); a covered stall plus a >= 500 ms daemon tail FAILS; the NOT-CAUGHT case (a 510 ms freeze beside a 20 ms sentinel gap) reads NOT_EVALUATED; no overlap FAILS; two partial sentinel gaps count as their UNION", () => {
     const gap = (from: number, ms: number) => ({ from, to: from + ms });
