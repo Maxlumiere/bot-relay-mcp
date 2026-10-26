@@ -38,7 +38,9 @@
  *     against the link's directory, which no native test pins, so a target holding `.` or `..` is "unsupported":
  *     refused, never emulated.
  *   - A component whose meaning Win32 changes while \\?\ takes it literally is "unsupported", in the input and in a
- *     target: a trailing period or space (trimmed: MEASURED on windows-2022, `x.` opens `x`), a reserved device name
+ *     target: a trailing period or space (the Win32 API trims it, as Microsoft documents; node's own fs does NOT:
+ *     MEASURED on windows-2022 (6e9cc36), reading `x.` through node is ENOENT; so two programs can disagree on what
+ *     the same spelling opens, and the walk refuses it rather than pick one), a reserved device name
  *     (CON, NUL, COM1.txt ...), and `name:stream` (an alternate data stream of `name`).
  *   - A drive-absolute path (C:\x) and a UNC path (\\server\share\x) are walked. Junctions are followed exactly like
  *     symlinks: node's lstat reports a junction as a symbolic link and readlink returns its target.
@@ -161,7 +163,7 @@ const WIN_RESERVED = /^(?:con|prn|aux|nul|conin\$|conout\$|com[0-9\u00b9\u00b2\u
  */
 function checkWindowsComponent(c: string, at: string): void {
   if (c === "." || c === "..") return;
-  if (/[. ]$/.test(c)) throw new PathWalkError("unsupported", at, `the component ${JSON.stringify(c)} ends in a period or a space (Win32 trims it)`);
+  if (/[. ]$/.test(c)) throw new PathWalkError("unsupported", at, `the component ${JSON.stringify(c)} ends in a period or a space (the Win32 API trims it; node does not)`);
   if (c.includes(":")) throw new PathWalkError("unsupported", at, `the component ${JSON.stringify(c)} names an alternate data stream`);
   if (WIN_RESERVED.test(c)) throw new PathWalkError("unsupported", at, `the component ${JSON.stringify(c)} is a reserved device name`);
 }

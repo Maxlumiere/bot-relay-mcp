@@ -166,23 +166,28 @@ describe.skipIf(!MOUNTS)("path-walk: mixed volumes (macOS CI disk images)", () =
     if (r.status !== 0) throw new Error(`hdiutil ${args[0]} failed (${r.status}): ${r.stderr}`);
     return r.stdout;
   };
-  const attach = (img: string, at: string) => {
-    const dev = /<key>dev-entry<\/key>\s*<string>(\/dev\/disk\d+)<\/string>/.exec(hd(["attach", "-plist", "-nobrowse", "-noautoopen", "-mountpoint", at, img]))?.[1];
+  /** Attach `img` (at `at`, or hdiutil's default mount point) and return where it mounted. */
+  const attach = (img: string, at?: string): string => {
+    const out = hd(["attach", "-plist", "-nobrowse", "-noautoopen", ...(at ? ["-mountpoint", at] : []), img]);
+    const dev = /<key>dev-entry<\/key>\s*<string>(\/dev\/disk\d+)<\/string>/.exec(out)?.[1];
     if (!dev) throw new Error(`hdiutil attach ${img}: no device in its answer`);
     attached.push(dev);
+    const mounted = /<key>mount-point<\/key>\s*<string>([^<]+)<\/string>/.exec(out)?.[1];
+    if (!mounted) throw new Error(`hdiutil attach ${img}: no mount point in its answer`);
+    return mounted;
   };
   const detachAll = () => {
     for (const dev of attached.splice(0).reverse()) spawnSync(HDIUTIL, ["detach", dev, "-force"], { encoding: "utf-8" });
   };
   beforeAll(() => {
     try {
-      cs = path.join(base, "cs");
-      fs.mkdirSync(cs);
-      hd(["create", "-size", "16m", "-fs", "Case-sensitive APFS", "-volname", "pwcs", "-type", "UDIF", path.join(base, "cs.dmg")]);
-      attach(path.join(base, "cs.dmg"), cs);
+      // MEASURED (6e9cc36, macos runner): attaching at a mount point under the test's tmp is "Permission denied", so
+      // the case-sensitive volume mounts where hdiutil puts it (/Volumes), and the insensitive one inside it.
+      hd(["create", "-size", "16m", "-fs", "Case-sensitive APFS", "-volname", `pwcs-${process.pid}`, "-type", "UDIF", path.join(base, "cs.dmg")]);
+      cs = attach(path.join(base, "cs.dmg"));
       ins = path.join(cs, "ins");
       fs.mkdirSync(ins);
-      hd(["create", "-size", "16m", "-fs", "APFS", "-volname", "pwins", "-type", "UDIF", path.join(base, "ins.dmg")]);
+      hd(["create", "-size", "16m", "-fs", "APFS", "-volname", `pwins-${process.pid}`, "-type", "UDIF", path.join(base, "ins.dmg")]);
       attach(path.join(base, "ins.dmg"), ins);
       fs.writeFileSync(path.join(cs, "Config"), "cs");
       fs.writeFileSync(path.join(ins, "Foo"), "ins");
@@ -430,9 +435,9 @@ describe("path-walk: Windows forms through the fs seam (every OS; ASSUMED shape 
     const fake = fakeFs("win32", { links: { "C:\\b\\link": "sub\\y" }, files: ["C:\\b\\sub\\y"] });
     expect(walkPath("C:\\b\\link", { ...W, fs: fake }).real).toBe("C:\\b\\sub\\y");
   });
-  // Codex #357 R1 #3: Win32 trims a trailing period or space, maps reserved device names, and opens an alternate
-  // data stream through `name:stream`; the \\?\ namespace does none of that. No spelling with such a component is
-  // walked: each is refused, in the input and in a target.
+  // Codex #357 R1 #3: the Win32 API trims a trailing period or space (node's fs does not: MEASURED), maps reserved
+  // device names, and opens an alternate data stream through `name:stream`; the \\?\ namespace does none of that. No
+  // spelling with such a component is walked: each is refused, in the input and in a target.
   it.each([
     ["a trailing period", "C:\\safe\\config.json."],
     ["a trailing space", "C:\\safe\\config.json "],
@@ -482,11 +487,19 @@ describe("path-walk on the REAL Windows filesystem (the Windows CI job; skipped 
     expect(fs.readFileSync(`${alias}\\..\\x`, "utf-8")).toBe("base/x");
     expect(walkPath(`${alias}\\..\\x`).real).toBe(path.join(base, "x"));
   });
-  it.skipIf(!WIN)("a trailing period: Win32 opens the file WITHOUT it (MEASURED), so the walk refuses the spelling", () => {
+  it.skipIf(!WIN)("a trailing period is refused whatever node's open does with it (what node does is MEASURED and logged)", () => {
     const f = path.join(base, "pw-tail");
     fs.writeFileSync(f, "tail");
-    expect(fs.readFileSync(`${f}.`, "utf-8"), "Win32 trims the trailing period").toBe("tail");
-    expect(reason(() => walkPath(`${f}.`))).toBe("unsupported");
+    let opened: string;
+    try {
+      opened = fs.readFileSync(`${f}.`, "utf-8") === "tail" ? "opens the file without the period" : "opens another file";
+    } catch (err) {
+      opened = (err as NodeJS.ErrnoException).code ?? "error";
+    }
+    // MEASURED on windows-2022 (6e9cc36): ENOENT. The Win32 API itself trims (Microsoft's documentation), so a
+    // non-node program may open the file the walk would call missing: the spelling is refused, never judged.
+    console.error(`[path-walk] win32: node reading "<file>." -> ${opened}`);
+    expect(reason(() => walkPath(`${f}.`, { allowMissing: true }))).toBe("unsupported");
   });
   // MEASURED (fbca6f9, windows-2022): the test temp dir lives under the run's private HOME, so it carries NO short
   // name; C:\PROGRA~1 is probed too. Each prints whether it exercised an expansion: a run where neither did has
