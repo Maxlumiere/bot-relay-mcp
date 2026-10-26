@@ -20,6 +20,7 @@ import { inject } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { ReleaseInstall } from "./global-setup.js";
+import { sandboxEnv } from "../_helpers/sandbox-env.js";
 
 declare module "vitest" {
   interface TaskMeta {
@@ -72,13 +73,10 @@ export function sandbox(label: string, opts: { defaultPaths?: boolean } = {}): S
   if (!opts.defaultPaths) fs.mkdirSync(relayHome, { recursive: true, mode: 0o700 });
   const dbPath = path.join(relayHome, "relay.db");
   const configPath = path.join(relayHome, "config.json");
-  // The FULL parent env (a user's daemon has theirs), minus every relay and test-runner variable, with every HOME
-  // spelling pointed at the sandbox. (Windows' unreadable SID in CI was NOT the env: it persisted with the full env,
-  // and was the by-name whoami, SEC-22.) The operator tripwire still decorates each child it starts.
-  const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !/^(RELAY_|VITEST|__VITEST)/i.test(k)) env[k] = v;
-  Object.assign(env, { HOME: home, USERPROFILE: home });
-  if (process.platform === "win32") Object.assign(env, { HOMEDRIVE: path.parse(home).root.replace(/\\$/, ""), HOMEPATH: home.slice(path.parse(home).root.length - 1) });
+  // The FULL parent env minus every relay and test-runner variable and NODE_OPTIONS, every HOME spelling pointed at the
+  // sandbox (tests/_helpers/sandbox-env.ts). (Windows' unreadable SID in CI was NOT the env: it persisted with the full
+  // env, and was the by-name whoami, SEC-22.) The operator tripwire still decorates each child it starts.
+  const env = sandboxEnv(home);
   if (!opts.defaultPaths) Object.assign(env, { RELAY_HOME: relayHome, RELAY_DB_PATH: dbPath, RELAY_CONFIG_PATH: configPath });
   return { home, relayHome, dbPath, configPath, env, defaultPaths: opts.defaultPaths === true };
 }
@@ -95,8 +93,12 @@ export interface HttpDaemon {
   stop: () => Promise<void>;
 }
 
-/** Start the INSTALLED daemon over HTTP on a free loopback port, in `sb`. Resolves once /health answers. */
-export async function startHttpDaemon(sb: Sandbox): Promise<HttpDaemon> {
+/**
+ * Start the INSTALLED daemon over HTTP on a free loopback port, in `sb`. Resolves once /health answers (exempt from the
+ * HTTP transport secret). `httpSecret` sets that secret (RELAY_HTTP_SECRET), so authMiddleware is live; `rpc` sends no
+ * credential, so a test with a secret makes its own requests.
+ */
+export async function startHttpDaemon(sb: Sandbox, opts: { httpSecret?: string } = {}): Promise<HttpDaemon> {
   const { pkg } = installed();
   const port = await freePort();
   const dashboardSecret = crypto.randomBytes(24).toString("hex");
@@ -106,7 +108,7 @@ export async function startHttpDaemon(sb: Sandbox): Promise<HttpDaemon> {
     fs.writeFileSync(sb.configPath, JSON.stringify({ transport: "http", http_port: port, http_host: "127.0.0.1", dashboard_secret: dashboardSecret }), { mode: 0o600 });
   }
   const child = spawn(process.execPath, [path.join(pkg, "dist", "index.js")], {
-    env: { ...sb.env, RELAY_TRANSPORT: "http", RELAY_HTTP_PORT: String(port), RELAY_HTTP_HOST: "127.0.0.1", RELAY_DASHBOARD_SECRET: dashboardSecret },
+    env: { ...sb.env, RELAY_TRANSPORT: "http", RELAY_HTTP_PORT: String(port), RELAY_HTTP_HOST: "127.0.0.1", RELAY_DASHBOARD_SECRET: dashboardSecret, ...(opts.httpSecret ? { RELAY_HTTP_SECRET: opts.httpSecret } : {}) },
     stdio: ["ignore", "ignore", "pipe"],
   });
   let err = "";
