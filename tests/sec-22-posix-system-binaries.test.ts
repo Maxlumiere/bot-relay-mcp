@@ -161,4 +161,105 @@ describe("SEC-22 (POSIX): systemBinary resolves the macOS tools to their fixed s
     expect(() => check!("/usr/bin/x", fsApi(0o100757))).toThrow(/writable by group or other/);
     expect(() => check!("/usr/bin/x", fsApi(0o100755, 0o40777))).toThrow(/writable by group or other/);
   });
+
+  // Codex #342 R1 P1-B (ruled 21 Oct): EVERY hop of a symlink chain is validated, and the path returned (and executed)
+  // is the validated CANONICAL one, never the lexical candidate. A fake fs (a root-owned link or a sticky /tmp cannot be
+  // planted by an unprivileged test), with readlink: the check must follow links itself to see each hop.
+  describe("every symlink hop is validated; the canonical path is what is returned", () => {
+    type Node = { kind: "dir" | "file" | "link"; uid?: number; mode?: number; target?: string };
+    const fakeFs = (tree: Record<string, Node>) => {
+      const st = (n: Node) => ({
+        uid: n.uid ?? 0,
+        mode: n.mode ?? (n.kind === "dir" ? 0o40755 : n.kind === "file" ? 0o100755 : 0o120777),
+        dev: 1,
+        ino: 1,
+        isFile: () => n.kind === "file",
+        isDirectory: () => n.kind === "dir",
+        isSymbolicLink: () => n.kind === "link",
+      });
+      const enoent = (p: string) => Object.assign(new Error(`ENOENT ${p}`), { code: "ENOENT" });
+      const norm = (p: string) => (p.endsWith("/..") ? path.posix.dirname(p.slice(0, -3)) : p.endsWith("/.") ? p.slice(0, -2) || "/" : p);
+      const resolve = (p: string, depth = 0): string => {
+        // A naive full resolution, ONLY so that a check calling realpath sees the chain's end (as the old one did).
+        if (depth > 40) throw Object.assign(new Error("ELOOP"), { code: "ELOOP" });
+        const parts = p.split("/").filter(Boolean);
+        let cur = "/";
+        for (let i = 0; i < parts.length; i++) {
+          const next = path.posix.join(cur, parts[i]);
+          const n = tree[next];
+          if (!n) throw enoent(next);
+          if (n.kind === "link") {
+            const t = n.target as string;
+            return resolve(path.posix.join(t.startsWith("/") ? t : path.posix.join(cur, t), ...parts.slice(i + 1)), depth + 1);
+          }
+          cur = next;
+        }
+        return cur;
+      };
+      return {
+        lstatSync: (p: string) => {
+          const n = tree[norm(p)] ?? (norm(p) === "/" ? { kind: "dir" as const } : undefined);
+          if (!n) throw enoent(p);
+          return st(n);
+        },
+        readlinkSync: (p: string) => {
+          const n = tree[p];
+          if (!n || n.kind !== "link") throw Object.assign(new Error(`EINVAL ${p}`), { code: "EINVAL" });
+          return n.target as string;
+        },
+        realpathSync: (p: string) => resolve(p),
+        realpathNativeSync: (p: string) => resolve(p),
+      };
+    };
+    const ROOT_DIRS: Record<string, Node> = { "/usr": { kind: "dir" }, "/usr/bin": { kind: "dir" }, "/opt": { kind: "dir" }, "/trusted": { kind: "dir" }, "/usr/lib": { kind: "dir" }, "/usr/lib/x": { kind: "dir" } };
+    const check = async () => (await import("../src/system-binary.js")).assertTrustedSystemFile as (p: string, f?: unknown) => string;
+
+    it("HARM (Codex's chain): /usr/bin/ps (root link) -> /opt/redirect/ps (a USER-owned link) -> /trusted/ps (a trusted file) is refused", async () => {
+      const tree: Record<string, Node> = {
+        ...ROOT_DIRS,
+        "/opt/redirect": { kind: "dir" },
+        "/usr/bin/ps": { kind: "link", target: "/opt/redirect/ps" },
+        "/opt/redirect/ps": { kind: "link", uid: 501, target: "/trusted/ps" },
+        "/trusted/ps": { kind: "file" },
+      };
+      const c = await check();
+      expect(() => c("/usr/bin/ps", fakeFs(tree))).toThrow(/not owned by root \(\/opt\/redirect\/ps is owned by uid 501\)/);
+    });
+    it("HARM: an intermediate link whose OWN parent is writable by others (a sticky /tmp) is refused", async () => {
+      const tree: Record<string, Node> = {
+        ...ROOT_DIRS,
+        "/tmp": { kind: "dir", mode: 0o41777 },
+        "/usr/bin/ps": { kind: "link", target: "/tmp/ps" },
+        "/tmp/ps": { kind: "link", target: "/trusted/ps" },
+        "/trusted/ps": { kind: "file" },
+      };
+      const c = await check();
+      expect(() => c("/usr/bin/ps", fakeFs(tree))).toThrow(/writable by group or other at \/tmp/);
+    });
+    it("COVERAGE (the old check caught this one too, through its realpath walk): a chain ending in a directory writable by others is refused", async () => {
+      const tree: Record<string, Node> = {
+        ...ROOT_DIRS,
+        "/opt/bin": { kind: "dir", mode: 0o40777 },
+        "/usr/bin/ps": { kind: "link", target: "/usr/lib/x/ps" },
+        "/usr/lib/x/ps": { kind: "link", target: "../../../opt/bin/ps" },
+        "/opt/bin/ps": { kind: "file" },
+      };
+      const c = await check();
+      expect(() => c("/usr/bin/ps", fakeFs(tree))).toThrow(/writable by group or other at \/opt\/bin/);
+    });
+    it("TWIN: a legitimate root-owned chain is accepted, and the CANONICAL path (the chain's end) is returned, never the candidate", async () => {
+      const tree: Record<string, Node> = {
+        ...ROOT_DIRS,
+        "/usr/bin/ps": { kind: "link", target: "../lib/x/ps" },
+        "/usr/lib/x/ps": { kind: "link", target: "/trusted/ps" },
+        "/trusted/ps": { kind: "file", mode: 0o104755 },
+      };
+      const c = await check();
+      expect(c("/usr/bin/ps", fakeFs(tree))).toBe("/trusted/ps");
+    });
+    it("TWIN: \"missing\" still names the candidate itself", async () => {
+      const c = await check();
+      expect(() => c("/usr/bin/nope", fakeFs(ROOT_DIRS))).toThrow(/^\/usr\/bin\/nope: missing$/);
+    });
+  });
 });
