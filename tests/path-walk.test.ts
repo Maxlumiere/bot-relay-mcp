@@ -10,7 +10,7 @@
  *   - more than 40 links fail CLOSED as "loop" (twin: exactly 40 resolve), and a 2-link cycle is a loop;
  *   - a missing tail lands where a create-the-parents writer would (twin: without allowMissing it is "missing");
  *   - comparing two paths is THREE-valued: same (one file, by dev + inode), different, or INCONCLUSIVE (missing
- *     tails that differ only by case or Unicode form), on real mixed volumes too (macOS CI disk images);
+ *     tails that differ only by case or Unicode form); mixed volumes are NOT measured (ASSUMED: see that comment);
  *   - a link target ending in a separator must reach a directory; `.` and `..` are looked up (search permission);
  *   - every hop is reported (each link with where it led);
  *   - a component below a file is "not-a-directory";
@@ -25,7 +25,6 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { spawnSync } from "child_process";
 import { walkPath, comparePaths, PathWalkError, MAX_LINKS, type WalkFs, type WalkStat } from "../src/path-walk.js";
 import { canonicalPath } from "./_setup/operator-tripwire-preload.mjs";
 
@@ -150,66 +149,12 @@ describe("path-walk: comparing two paths is THREE-valued (same / different / inc
   });
 });
 
-// MIXED VOLUMES, MEASURED on the macOS CI runner only (hdiutil disk images; never attached on a developer machine): a
-// case-SENSITIVE volume mounted under the case-insensitive system volume, and a case-INSENSITIVE one mounted under it.
-// A whole-path case probe answers both wrong (Codex #357 R1 #2); the kernel's own answers are the expectations.
-// THE GATE: an explicit CI signal (GitHub Actions sets CI=true) AND macOS. It never attaches on a developer machine.
-const MOUNTS = process.platform === "darwin" && process.env.CI === "true";
-describe.skipIf(!MOUNTS)("path-walk: mixed volumes (macOS CI disk images)", () => {
-  const HDIUTIL = "/usr/bin/hdiutil";
-  let cs: string;
-  let ins: string;
-  /** The DEVICE each attach created (hdiutil's own plist answer), in attach order: only these are ever detached. */
-  const attached: string[] = [];
-  const hd = (args: string[]): string => {
-    const r = spawnSync(HDIUTIL, args, { encoding: "utf-8" });
-    if (r.status !== 0) throw new Error(`hdiutil ${args[0]} failed (${r.status}): ${r.stderr}`);
-    return r.stdout;
-  };
-  /** Attach `img` (at `at`, or hdiutil's default mount point) and return where it mounted. */
-  const attach = (img: string, at?: string): string => {
-    const out = hd(["attach", "-plist", "-nobrowse", "-noautoopen", ...(at ? ["-mountpoint", at] : []), img]);
-    const dev = /<key>dev-entry<\/key>\s*<string>(\/dev\/disk\d+)<\/string>/.exec(out)?.[1];
-    if (!dev) throw new Error(`hdiutil attach ${img}: no device in its answer`);
-    attached.push(dev);
-    const mounted = /<key>mount-point<\/key>\s*<string>([^<]+)<\/string>/.exec(out)?.[1];
-    if (!mounted) throw new Error(`hdiutil attach ${img}: no mount point in its answer`);
-    return mounted;
-  };
-  const detachAll = () => {
-    for (const dev of attached.splice(0).reverse()) spawnSync(HDIUTIL, ["detach", dev, "-force"], { encoding: "utf-8" });
-  };
-  beforeAll(() => {
-    try {
-      // MEASURED (6e9cc36, macos runner): attaching at a mount point under the test's tmp is "Permission denied", so
-      // the case-sensitive volume mounts where hdiutil puts it (/Volumes), and the insensitive one inside it.
-      hd(["create", "-size", "16m", "-fs", "Case-sensitive APFS", "-volname", `pwcs-${process.pid}`, "-type", "UDIF", path.join(base, "cs.dmg")]);
-      cs = attach(path.join(base, "cs.dmg"));
-      ins = path.join(cs, "ins");
-      fs.mkdirSync(ins);
-      hd(["create", "-size", "16m", "-fs", "APFS", "-volname", `pwins-${process.pid}`, "-type", "UDIF", path.join(base, "ins.dmg")]);
-      attach(path.join(base, "ins.dmg"), ins);
-      fs.writeFileSync(path.join(cs, "Config"), "cs");
-      fs.writeFileSync(path.join(ins, "Foo"), "ins");
-    } catch (err) {
-      detachAll(); // a half-built fixture never stays attached
-      throw err;
-    }
-  });
-  // afterAll runs whatever the tests did; a failed beforeAll detaches what it attached itself (its catch above).
-  afterAll(detachAll);
-  it("a case-SENSITIVE volume under an insensitive parent: existing Config vs config is DIFFERENT (the kernel: config does not exist)", () => {
-    expect(fs.existsSync(path.join(cs, "config"))).toBe(false);
-    expect(comparePaths(path.join(cs, "Config"), path.join(cs, "config"))).toBe("different");
-  });
-  it("... and two missing case variants there are INCONCLUSIVE, never \"same\" (the mount root answers to both spellings of its own name)", () => {
-    expect(comparePaths(path.join(cs, "Nope"), path.join(cs, "nope"))).toBe("inconclusive");
-  });
-  it("a case-INSENSITIVE volume under a sensitive parent: existing Foo vs foo is the SAME (the kernel: one inode)", () => {
-    expect(fs.statSync(path.join(ins, "foo")).ino).toBe(fs.statSync(path.join(ins, "Foo")).ino);
-    expect(comparePaths(path.join(ins, "Foo"), path.join(ins, "foo"))).toBe("same");
-  });
-});
+// MIXED VOLUMES are NOT measured here (ASSUMED). A case-sensitive disk image under the insensitive system volume, and an
+// insensitive one under that, would exercise comparePaths across mount boundaries; on the GitHub macOS runner `hdiutil
+// attach` is "Permission denied" both at a mount point under the test's tmp (job 121391950657, 6e9cc36) and at its
+// default /Volumes (job 121403898565, b1a9fb8). The design does not depend on it: comparePaths judges the existing part
+// by file identity (dev + inode), which the kernel resolves on whatever volume it is, and reports a missing case
+// variant as "inconclusive" without consulting any volume's case rule.
 
 describe("path-walk: a missing tail", () => {
   it("lands where a create-the-parents writer would, through the real directory", () => {
