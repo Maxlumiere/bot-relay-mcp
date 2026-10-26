@@ -37,6 +37,7 @@ import crypto from "crypto";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
 import { mintHeaders } from "./_helpers/mint.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(__filename), "..");
@@ -625,17 +626,31 @@ describe("stop-check.sh (Stop) and post-tool-use-check.sh (every tool call)", SL
     });
   }
 
-  it("PostToolUse liveness restamp: report_liveness carries the token in header and body, no argv held it", async () => {
+  // Every PostToolUse step draws on the 5s hook's 2s margin, which a slow runner can spend before the restamp runs
+  // (CI: "no time budget left for the liveness health probe (2s of 5s spent)" after 1.6s real). The run uses a copy
+  // of the hooks whose every budgeted step reads a clock of 0 (tests/_helpers/hook-budget-tree.ts), so this
+  // precondition never depends on the runner; the CONTROL below starves CI's step and reproduces CI's failure.
+  const ptuFed = (tag: string) => path.join(budgetTree(path.join(TEST_DIR, `fed-${tag}`), HOOKS_DIR, path.join(REPO_ROOT, "bin")), "post-tool-use-check.sh");
+  it("PostToolUse liveness restamp: report_liveness carries the token in header and body, no argv held it (every step on a fed clock)", async () => {
     const name = "argv-ptu-liveness";
     const token = dbRegister(name, "tester", []).plaintext_token as string;
     // A stored anchor that is NOT this hook's process, so the self-heal fires.
     getDb().prepare("UPDATE agents SET agent_pid = 999999, agent_pid_start = 'never' WHERE name = ?").run(name);
-    const r = await run([PTU_HOOK], localEnv(name, home("ptu-live"), token), PTU_STDIN);
+    const r = await run([ptuFed("ptu-live")], { ...localEnv(name, home("ptu-live"), token), RELAY_TEST_FEED: "*" }, PTU_STDIN);
+    expect(r.stderr, "no step was skipped for time").not.toMatch(/no time budget left/);
     const calls = toolCalls("report_liveness");
     expect(calls.length, `precondition: the restamp ran. stderr: ${r.stderr}`).toBe(1);
     expect(calls[0].headers["x-agent-token"]).toBe(token);
     expect(calls[0].args.agent_token).toBe(token);
     expectNoArgvHolds([token]);
+  });
+  it("CONTROL: the same run with ONLY the liveness health probe starved reproduces CI's failure: no restamp, the skip names the probe", async () => {
+    const name = "argv-ptu-liveness-ctl";
+    const token = dbRegister(name, "tester", []).plaintext_token as string;
+    getDb().prepare("UPDATE agents SET agent_pid = 999999, agent_pid_start = 'never' WHERE name = ?").run(name);
+    const r = await run([ptuFed("ptu-live-ctl")], { ...localEnv(name, home("ptu-live-ctl"), token), RELAY_TEST_FEED: "*", RELAY_TEST_STARVE: "the liveness health probe" }, PTU_STDIN);
+    expect(toolCalls("report_liveness").length, "the restamp never ran: CI's precondition failure, made deterministic").toBe(0);
+    expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the liveness health probe \(\d+s of 5s spent\): skipped\./);
   });
 });
 

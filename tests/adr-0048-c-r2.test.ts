@@ -25,6 +25,7 @@ import os from "os";
 import path from "path";
 import { spawn, spawnSync } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOKS = path.join(REPO_ROOT, "hooks");
@@ -380,12 +381,23 @@ describe("Codex #291 R2 #1 — REMOTE path: after the resolver, every HTTP call 
       expect(r.verdict, r.out).not.toMatch(/VERDICT=HEALTHY/);
     }, 40_000);
 
-    it(`${hook}: TWIN — a fast resolver and a healthy remote: the read runs, capped by what is left`, () => {
+    // The twin must not depend on how fast the runner reaches the remote steps (CI: "no time budget left for the
+    // remote mail read (2s of 5s spent)" after 1.5s real). Every budgeted step runs on a FED clock (read as 0), so
+    // the REAL caps are exactly what an instant arrival leaves: min(own, budget - margin).
+    it(`${hook}: TWIN — a fast resolver and a healthy remote: the read runs, capped by what is left (every step on a fed clock)`, () => {
       vaultToken();
-      const r = timed(hook, `b-${hook}`, { STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "8" }, JSON.stringify({ session_id: "s1" }));
+      const r = timed(hook, `b-${hook}`, { STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "8", RELAY_TEST_FEED: "*" }, JSON.stringify({ session_id: "s1" }), starvedTree(`feed-${hook}`));
       expect(r.curls.map((c) => c.kind), r.out).toEqual(["health", "mail"]);
-      expectEveryCallInsideTheBudget(r, BUDGET[hook]);
-      expect(r.secs, r.out).toBeLessThan(BUDGET[hook]);
+      expect(r.curls.map((c) => c.cap), "the REAL caps for an instant arrival: health min(1, 2) = 1, mail min(2, 2) = 2").toEqual([1, BUDGET[hook] - MARGIN]);
+      expect(r.out).not.toMatch(/no time budget left/);
+    }, 40_000);
+    // RED CONTROL (CI's failure, made deterministic): the same run with ONLY the remote mail read starved. The twin's
+    // own assertion would fail exactly as on CI: the read never starts, and the skip names it.
+    it(`${hook}: CONTROL — the twin with only the remote mail read starved reproduces CI's skip: no mail call, "no time budget left for the remote mail read"`, () => {
+      vaultToken();
+      const r = timed(hook, `bc-${hook}`, { STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "8", RELAY_TEST_FEED: "*", RELAY_TEST_STARVE: "the remote mail read" }, JSON.stringify({ session_id: "s1" }), starvedTree(`ctl-${hook}`));
+      expect(r.curls.map((c) => c.kind), r.out).toEqual(["health"]);
+      expect(r.out).toMatch(/\[bot-relay\] no time budget left for the remote mail read \(\d+s of 5s spent\): skipped\./);
     }, 40_000);
   }
 
@@ -407,28 +419,13 @@ describe("Codex #291 R2 #1 — REMOTE path: after the resolver, every HTTP call 
 });
 
 /**
- * A copy of the hooks whose relay_budget_for grants NO time to the steps matching
- * RELAY_TEST_STARVE (a case pattern), and passes every other step through
- * unchanged. The REAL relay_budget_for then takes its skip path, so the hooks'
- * own skip handling runs deterministically: no wall-clock race (bash's SECONDS
- * ticks on whole wall-clock seconds, so a timed row can never pin "no time left").
+ * A copy of the hooks with the deterministic budget seams (tests/_helpers/hook-budget-tree.ts): RELAY_TEST_STARVE
+ * grants NO time to the matching steps, so the REAL relay_budget_for takes its skip path; RELAY_TEST_FEED runs the
+ * matching steps on a clock read as 0, so a step a twin needs is never starved by a slow runner. No wall-clock
+ * race: bash's SECONDS ticks on whole wall-clock seconds, so a timed row can never pin "no time left", nor "time left".
  */
 function starvedTree(tag: string): string {
-  const base = path.join(ROOT, `starved-${tag}`, "bot-relay-mcp");
-  fs.rmSync(path.dirname(base), { recursive: true, force: true });
-  fs.cpSync(HOOKS, path.join(base, "hooks"), { recursive: true });
-  fs.symlinkSync(path.join(REPO_ROOT, "bin"), path.join(base, "bin"));
-  fs.appendFileSync(
-    path.join(base, "hooks", "_vault-helpers.sh"),
-    [
-      "",
-      "# TEST ONLY (starvedTree): starve the steps matching RELAY_TEST_STARVE.",
-      `eval "$(declare -f relay_budget_for | sed '1s/^relay_budget_for/relay_budget_for_real/')"`,
-      'relay_budget_for() { case "$1" in $RELAY_TEST_STARVE) relay_budget_for_real "$1" 0 "${3:-}" ;; *) relay_budget_for_real "$@" ;; esac; }',
-      "",
-    ].join("\n"),
-  );
-  return path.join(base, "hooks");
+  return budgetTree(path.join(ROOT, `starved-${tag}`), HOOKS, path.join(REPO_ROOT, "bin"));
 }
 
 describe("Codex #291 R2 #1 — a step with no time left is SKIPPED and said (the hooks' own skip handling, deterministic)", () => {
@@ -445,7 +442,7 @@ describe("Codex #291 R2 #1 — a step with no time left is SKIPPED and said (the
       expect(r.verdict, r.out).toMatch(/VERDICT=DEGRADED reason="no time budget left for the remote read"/);
     });
     it(`${hook}: TWIN — nothing starved: probe and read both run, never DEGRADED for time`, () => {
-      const r = timed(hook, `sn-${hook}`, { RELAY_AGENT_TOKEN: "tok_" + "n".repeat(20), RELAY_TEST_STARVE: "no-such-step", STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "0.1" }, JSON.stringify({ session_id: "s1" }), starvedTree(`n-${hook}`));
+      const r = timed(hook, `sn-${hook}`, { RELAY_AGENT_TOKEN: "tok_" + "n".repeat(20), RELAY_TEST_STARVE: "no-such-step", RELAY_TEST_FEED: "*", STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "0.1" }, JSON.stringify({ session_id: "s1" }), starvedTree(`n-${hook}`));
       expect(r.curls.map((c) => c.kind), r.out).toEqual(["health", "mail"]);
       expect(r.out).not.toMatch(/no time budget left/);
     });

@@ -6,7 +6,8 @@
 /**
  * v2.15.0 — HOOK-LEVEL regression for the PostToolUse presence self-heal.
  *
- * Runs the SHIPPED hooks/post-tool-use-check.sh as a subprocess against a real
+ * Runs the SHIPPED hooks/post-tool-use-check.sh (an unmodified copy plus the test-only budget seam of
+ * tests/_helpers/hook-budget-tree.ts) as a subprocess against a real
  * daemon and proves its self-heal gate keys on the FULL anchor (agent_pid AND
  * agent_pid_start), not just the PID: a row with the SAME agent_pid but a STALE
  * agent_pid_start is restamped to the correct start, and session_id is never
@@ -21,10 +22,15 @@ import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(__filename), "..");
-const HOOK = path.join(REPO_ROOT, "hooks", "post-tool-use-check.sh");
+// Every PostToolUse step draws on the 5s hook's 2s margin, which a slow runner can spend before the self-heal runs
+// (bash SECONDS ticks on whole wall-clock seconds). These rows run a copy of the hooks whose budgeted steps read a
+// clock of 0 (RELAY_TEST_FEED, tests/_helpers/hook-budget-tree.ts), so a restamp, or a steady-state "no churn",
+// never depends on the runner (a skipped restamp would also read as "no churn"). The live hooks are unchanged.
+const HOOK = path.join(budgetTree(fs.mkdtempSync(path.join(os.tmpdir(), "v2150-fed-")), path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "post-tool-use-check.sh");
 const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
 const STALE_START = "Mon Jan  1 00:00:00 2020";
 
@@ -81,6 +87,7 @@ function runPostToolUse(h: Harness, name: string, token: string): ReturnType<typ
       HOME: h.root, PATH: process.env.PATH || "/usr/bin:/bin", RELAY_HOME: h.root,
       RELAY_AGENT_NAME: name, RELAY_DB_PATH: h.dbPath,
       RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(h.port), RELAY_AGENT_TOKEN: token,
+      RELAY_TEST_FEED: "*",
     },
   });
 }
