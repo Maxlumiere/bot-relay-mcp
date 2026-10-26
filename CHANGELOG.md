@@ -88,6 +88,13 @@ How this list was built:
   - the extension's `@azure/msal-node` 7.1.0 (GHSA-xcx6-jx8p-x3h5) and vitest 5 (tinypool: GHSA-5gmw-xhrv-c9v3, GHSA-85c8-ppgw-ccpr).
 
 
+### Security: fast-uri, ip-address and vitest advisories
+
+- **fast-uri 4.2.3** in the server and the extension (was 4.2.1): GHSA-w74x-v6f9-j3xg and GHSA-wjr9-j795-jxcr (medium), GHSA-333x-w4r6-6crp and GHSA-xhq7-xmqj-769h (low), all URI parsing and normalization. The relay reaches fast-uri through ajv, which compiles the task schemas agents register and which the MCP SDK's server constructs. Our own override had pinned it to exactly 4.2.1, which blocked the automated fix. Now it is a floor, `^4.2.3`.
+- **ip-address 10.7.5** in the server and the extension (was 10.7.3): GHSA-rxp7-6hxx-x8q5 (medium; an IPv6 zone id matched in quadratic time). ip-address is used only by express-rate-limit, which only the MCP SDK's OAuth handlers import. The relay loads none of them.
+- **vitest 5.0.3** in the server's tests (was 5.0.0): GHSA-qxg6-89mg-rqv8 and GHSA-xp26-3454-mjgp (medium, `@vitest/mocker`). Development only.
+- The extension's `vite` and `qs` overrides are floors now (`^7.3.7`, `^6.16.1`), not exact pins. They resolve to the same versions as before.
+
 ### Security: no oversized request structure reaches a validator; body-parser and zod advisories
 
 - **HTTP bodies are bounded in structure (SEC-24).** A request body with an array of more than 1000 elements, or nesting deeper than 64 levels, is refused with HTTP 400 (`error_code: BODY_STRUCTURE_LIMIT`) before authentication and before any schema runs. A 1 MB body could otherwise make a validator allocate far more than the body: measured through the daemon, one 1 MB `resolve_messages` body took a relay process to 1.5 GB. The largest existing explicit array cap is 100 (`message_ids`); fields with no cap (e.g. `capabilities`) now refuse more than 1000 elements.
