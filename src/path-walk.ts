@@ -25,14 +25,21 @@
  *   - MISSING TAIL (allowMissing): from the first absent component on, nothing can be a link, so the rest is taken
  *     lexically, where a create-the-parents writer would land; a `..` cancels a missing name, and one that climbs
  *     back out of the missing part resumes the real walk from the existing directory.
- *   - A trailing separator requires the path to end at a directory, as open(2) does.
+ *   - A trailing separator requires the path to end at a directory, as open(2) does, and so does a link TARGET ending
+ *     in a separator. A `.` or `..` is LOOKED UP, the dot kept in the spelling, so a directory without search
+ *     permission fails as the kernel fails ("unreadable"), never skipped over.
  *
  * WINDOWS (stated per form, not implied):
  *   - `..` is resolved LEXICALLY, before any junction or link is followed: the Win32 layer normalizes a path
  *     (GetFullPathName) before the filesystem sees it. MEASURED on windows-2022 (d727efc): reading `<junction>\..\x`
  *     returned the file beside the junction, not the one beside its target. So the walk normalizes a Windows path
- *     first, then walks it; a relative link target is still joined to the link's own directory. A \\?\ path is not
- *     normalized by Windows, so one holding `.` or `..` is "unsupported".
+ *     first, then walks it. A \\?\ path is not normalized by Windows, so one holding `.` or `..` is "unsupported".
+ *   - A LINK TARGET is checked like the input (every rule here). Windows substitutes a relative target lexically
+ *     against the link's directory, which no native test pins, so a target holding `.` or `..` is "unsupported":
+ *     refused, never emulated.
+ *   - A component whose meaning Win32 changes while \\?\ takes it literally is "unsupported", in the input and in a
+ *     target: a trailing period or space (trimmed: MEASURED on windows-2022, `x.` opens `x`), a reserved device name
+ *     (CON, NUL, COM1.txt ...), and `name:stream` (an alternate data stream of `name`).
  *   - A drive-absolute path (C:\x) and a UNC path (\\server\share\x) are walked. Junctions are followed exactly like
  *     symlinks: node's lstat reports a junction as a symbolic link and readlink returns its target.
  *   - A \\?\C:\ or \\?\UNC\server\share\ prefix (a link target may carry one) is rewritten to its plain form; any
@@ -40,13 +47,18 @@
  *   - A drive-RELATIVE path (C:x) and a root-relative one (\x) are "unsupported": they depend on per-drive state.
  *   - An 8.3 short name (a component with ~<digit>, e.g. RUNNER~1) is expanded to its long name through the OS's own
  *     resolver (realpath.native: GetFinalPathNameByHandle), which must name an entry of the SAME directory, else
- *     "unsupported". Two spellings of one entry then compare equal under pathKey.
+ *     "unsupported".
  *
- * CASE (pathKey): a path's key is case-folded (and NFC-normalized) when the volume holding its deepest existing
- * directory is case-insensitive, PROBED (the case-swapped spelling names the same inode), never assumed from the
- * platform. samePath folds when EITHER side's volume is case-insensitive: two paths on volumes of different
- * sensitivity can then match by case alone, the over-report direction, chosen because its callers refuse on a match.
- * NOT covered: Unicode case rules beyond toLowerCase, and normalization-insensitive but case-sensitive volumes.
+ * COMPARING (comparePaths): THREE-valued, and no case rule is guessed. Two paths are walked (a missing tail allowed).
+ *   - Their deepest EXISTING entries are different files (dev + inode) → "different". Whatever the volumes' case or
+ *     normalization rules are, the kernel already applied them when it looked those names up.
+ *   - The same file, and identical missing tails → "same".
+ *   - The same file, and missing tails that differ ONLY by case or Unicode form → "inconclusive". Whether they would
+ *     collide is decided by the directory they would be created in, and nothing here measures that (Codex #357 R1
+ *     #2: a whole-path case probe answers wrong across a mount boundary). A security caller picks its own safe
+ *     direction for "inconclusive" (a write guard treats it as protected).
+ *   - Otherwise → "different".
+ *   Two names for one file (a hard link) compare "same": the over-report direction.
  */
 import fs from "fs";
 import path from "path";
@@ -103,6 +115,8 @@ export interface WalkResult {
   real: string;
   /** The deepest EXISTING directory (or file) the walk reached: `real` without the missing names. */
   existing: string;
+  /** Its lstat (never a link's): the identity (dev + ino) comparePaths judges by. */
+  existingStat: WalkStat;
   /** The absent names after `existing`, in order (empty when the whole path exists). */
   missing: string[];
   /** Every entry passed through, in walk order, roots included. */
@@ -137,6 +151,21 @@ function plainWindowsPath(p: string): string {
   return s;
 }
 
+/** Win32 device names, which a Win32 path maps to the device whatever the directory or extension. */
+const WIN_RESERVED = /^(?:con|prn|aux|nul|conin\$|conout\$|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3])(?:\.[^.]*)?$/i;
+
+/**
+ * A Windows component the walk will not walk: one whose meaning Win32 changes (a trailing period or space is trimmed,
+ * a reserved name is a device, `name:stream` is an alternate data stream of `name`) while \\?\ takes it literally.
+ * Native semantics are not pinned for any of them, so each FAILS CLOSED (Codex #357 R1 #3).
+ */
+function checkWindowsComponent(c: string, at: string): void {
+  if (c === "." || c === "..") return;
+  if (/[. ]$/.test(c)) throw new PathWalkError("unsupported", at, `the component ${JSON.stringify(c)} ends in a period or a space (Win32 trims it)`);
+  if (c.includes(":")) throw new PathWalkError("unsupported", at, `the component ${JSON.stringify(c)} names an alternate data stream`);
+  if (WIN_RESERVED.test(c)) throw new PathWalkError("unsupported", at, `the component ${JSON.stringify(c)} is a reserved device name`);
+}
+
 /** Split an ABSOLUTE path into its root and components. Windows: only a drive-absolute or UNC root. */
 function splitRoot(p: string, platform: NodeJS.Platform): { root: string; parts: string[] } {
   if (platform !== "win32") {
@@ -150,7 +179,16 @@ function splitRoot(p: string, platform: NodeJS.Platform): { root: string; parts:
     throw new PathWalkError("unsupported", p, "a drive-relative or root-relative Windows path: it depends on per-drive state");
   }
   const normRoot = drive ? `${root[0].toUpperCase()}:\\` : root.endsWith("\\") ? root : `${root}\\`;
-  return { root: normRoot, parts: s.slice(root.length).split(/\\+/).filter(Boolean) };
+  const parts = s.slice(root.length).split(/\\+/).filter(Boolean);
+  for (const c of parts) checkWindowsComponent(c, p);
+  return { root: normRoot, parts };
+}
+
+/** A \\?\ path is passed to the filesystem unnormalized: one holding `.` or `..` is unsupported. */
+function refuseExtendedDots(p: string, at: string): void {
+  if (/^\\\\[?.]\\/.test(p.replace(/\//g, "\\")) && /(?:^|[\\/])\.\.?(?:[\\/]|$)/.test(p.slice(4))) {
+    throw new PathWalkError("unsupported", at, "a \\\\?\\ path holding . or ..: Windows passes it to the filesystem unnormalized");
+  }
 }
 
 function isAbsoluteFor(p: string, platform: NodeJS.Platform): boolean {
@@ -182,9 +220,7 @@ export function walkPath(p: string, opts: WalkOptions = {}): WalkResult {
   // LEXICALLY first, because that is what the OS does (see WINDOWS).
   let abs = isAbsoluteFor(p, platform) ? p : `${opts.cwd ?? process.cwd()}${P.sep}${p}`;
   if (platform === "win32") {
-    if (/^\\\\[?.]\\/.test(abs.replace(/\//g, "\\")) && /(?:^|[\\/])\.\.?(?:[\\/]|$)/.test(abs.slice(4))) {
-      throw new PathWalkError("unsupported", p, "a \\\\?\\ path holding . or ..: Windows passes it to the filesystem unnormalized");
-    }
+    refuseExtendedDots(abs, p);
     abs = path.win32.normalize(abs);
   }
   const trailingSep = platform === "win32" ? /[\\/]$/.test(abs) : abs.endsWith("/");
@@ -200,11 +236,20 @@ export function walkPath(p: string, opts: WalkOptions = {}): WalkResult {
       throw new PathWalkError("unreadable", at, `lstat failed: ${code ?? (err as Error)?.message ?? "unknown error"}`);
     }
   };
+  let curStat: WalkStat | undefined;
   const enterRoot = (root: string): string => {
     const st = lstat(root);
     if (!st) throw new PathWalkError("missing", root, "the root does not exist");
     entries.push({ path: root, stat: st, resolved: root });
+    curStat = st;
     return root;
+  };
+  /** Look up a `.` or `..` in `cur` for real, the dot kept in the spelling: it needs search permission (Codex #357 R1 #5). */
+  const lookDot = (dot: "." | ".."): WalkStat => {
+    const spelled = cur.endsWith(P.sep) ? `${cur}${dot}` : `${cur}${P.sep}${dot}`;
+    const st = lstat(spelled);
+    if (!st) throw new PathWalkError("unreadable", spelled, "a dot lookup found nothing");
+    return st;
   };
 
   const { root, parts } = splitRoot(abs, platform);
@@ -233,8 +278,12 @@ export function walkPath(p: string, opts: WalkOptions = {}): WalkResult {
       continue;
     }
     if (!curIsDir) throw new PathWalkError("not-a-directory", cur, `"${t}" follows a non-directory`);
-    if (t === ".") continue;
+    if (t === ".") {
+      curStat = lookDot(".");
+      continue;
+    }
     if (t === "..") {
+      curStat = lookDot("..");
       cur = P.dirname(cur); // cur is real, so this is the PHYSICAL parent (the root's parent is the root)
       continue;
     }
@@ -255,21 +304,32 @@ export function walkPath(p: string, opts: WalkOptions = {}): WalkResult {
       }
       const index = entries.push({ path: entry, stat: st, resolved: "" }) - 1;
       stack.push({ end: index });
+      // A target ending in a separator must reach a directory (POSIX ENOTDIR; Codex #357 R1 #4): a "." looked up
+      // after its last component, before its end marker.
+      if (platform === "win32" ? /[\\/]$/.test(target) : target.endsWith("/")) stack.push(".");
+      let tparts: string[];
       if (isAbsoluteFor(target, platform)) {
         if (platform === "win32" && /^[\\/](?![\\/])/.test(target)) {
           throw new PathWalkError("unsupported", entry, "a root-relative Windows link target");
         }
+        if (platform === "win32") refuseExtendedDots(target, entry);
         const split = splitRoot(target, platform);
         cur = enterRoot(split.root);
         curIsDir = true;
-        for (let i = split.parts.length - 1; i >= 0; i--) stack.push(split.parts[i]);
+        tparts = split.parts;
       } else {
-        const tparts = target.split(platform === "win32" ? /[\\/]+/ : /\/+/).filter(Boolean);
         if (platform === "win32" && /^[A-Za-z]:/.test(target)) {
           throw new PathWalkError("unsupported", entry, "a drive-relative Windows link target");
         }
-        for (let i = tparts.length - 1; i >= 0; i--) stack.push(tparts[i]);
+        tparts = target.split(platform === "win32" ? /[\\/]+/ : /\/+/).filter(Boolean);
+        if (platform === "win32") for (const c of tparts) checkWindowsComponent(c, entry);
       }
+      // Windows substitutes a relative target LEXICALLY against the link's directory; no native test here pins that,
+      // so a Windows target holding `.` or `..` is refused, never emulated (Codex #357 R1 #1).
+      if (platform === "win32" && tparts.some((c) => c === "." || c === "..")) {
+        throw new PathWalkError("unsupported", entry, "a Windows link target holding . or .. (its substitution is not measured)");
+      }
+      for (let i = tparts.length - 1; i >= 0; i--) stack.push(tparts[i]);
       continue;
     }
     if (platform === "win32" && SHORT_NAME.test(t)) {
@@ -287,54 +347,30 @@ export function walkPath(p: string, opts: WalkOptions = {}): WalkResult {
     }
     entries.push({ path: entry, stat: st, resolved: entry });
     cur = entry;
+    curStat = st;
     curIsDir = st.isDirectory();
   }
-  return { real: here(), existing: cur, missing: missing.slice(), entries };
+  return { real: here(), existing: cur, existingStat: curStat as WalkStat, missing: missing.slice(), entries };
 }
 
-/** Is the volume holding `dir` (an existing, link-free path) case-insensitive? PROBED: its case-swapped spelling names the same inode. */
-export function caseInsensitiveAt(dir: string, fsApi: WalkFs = nodeFs): boolean {
-  const swapped = dir.replace(/[a-z]/gi, (c) => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()));
-  if (swapped === dir) return false; // no letter to swap: nothing to fold either
-  try {
-    const a = fsApi.lstatSync(dir);
-    const b = fsApi.lstatSync(swapped);
-    return a.ino === b.ino && a.dev === b.dev;
-  } catch {
-    return false;
-  }
-}
+export type Comparison = "same" | "different" | "inconclusive";
 
 const fold = (s: string) => s.normalize("NFC").toLowerCase();
 
-export interface PathKey {
-  /** Where the path lands (walkPath(..., allowMissing).real). */
-  real: string;
-  /** Whether its volume is case-insensitive (probed on its deepest existing directory). */
-  folded: boolean;
-  /** The comparable spelling: `real`, case-folded when `folded`. */
-  key: string;
-}
-
-/** A path's comparable key (see CASE). The walk allows a missing tail; every other walk failure throws. */
-export function pathKey(p: string, opts: Omit<WalkOptions, "allowMissing"> = {}): PathKey {
-  const w = walkPath(p, { ...opts, allowMissing: true });
-  const folded = caseInsensitiveAt(w.existing, opts.fs ?? nodeFs);
-  return { real: w.real, folded, key: folded ? fold(w.real) : w.real };
-}
-
-/** Do two keys name the same place? Folded when EITHER volume is case-insensitive (the over-report direction, see CASE). */
-export function sameKey(a: PathKey, b: PathKey): boolean {
-  return a.folded || b.folded ? fold(a.real) === fold(b.real) : a.real === b.real;
-}
-
-/** Do two paths land in the same place? */
-export function samePath(a: string, b: string, opts: Omit<WalkOptions, "allowMissing"> = {}): boolean {
-  return sameKey(pathKey(a, opts), pathKey(b, opts));
-}
-
-// ---- RED STAND-IN (replaced by the R2 fix commit): today's comparison behind the three-valued API. ----
-/** Today: a two-valued answer from the whole-path case probe. */
-export function comparePaths(a: string, b: string, opts: Omit<WalkOptions, "allowMissing"> = {}): "same" | "different" | "inconclusive" {
-  return samePath(a, b, opts) ? "same" : "different";
+/**
+ * Do two paths land on the same file? THREE-valued (see COMPARING): "same" / "different" / "inconclusive". Each walk
+ * allows a missing tail; every other walk failure throws.
+ */
+export function comparePaths(a: string, b: string, opts: Omit<WalkOptions, "allowMissing"> = {}): Comparison {
+  const wa = walkPath(a, { ...opts, allowMissing: true });
+  const wb = walkPath(b, { ...opts, allowMissing: true });
+  if (wa.existingStat.dev !== wb.existingStat.dev || wa.existingStat.ino !== wb.existingStat.ino) return "different";
+  if (wa.missing.length !== wb.missing.length) return "different";
+  let inconclusive = false;
+  for (let i = 0; i < wa.missing.length; i++) {
+    if (wa.missing[i] === wb.missing[i]) continue;
+    if (fold(wa.missing[i]) !== fold(wb.missing[i])) return "different";
+    inconclusive = true; // equal but for case or Unicode form: whether they collide is the directory's, unmeasured
+  }
+  return inconclusive ? "inconclusive" : "same";
 }
