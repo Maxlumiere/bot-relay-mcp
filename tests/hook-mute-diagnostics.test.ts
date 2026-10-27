@@ -31,7 +31,7 @@ import { execFileSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 const HOOK = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -94,7 +94,7 @@ function realInstanceDb(): void {
   const dist = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "db.js");
   execFileSync(process.execPath, ["--input-type=module", "-e", `
     process.env.RELAY_DB_PATH = ${JSON.stringify(instanceDb())};
-    const db = await import(${JSON.stringify(dist)});
+    const db = await import(${JSON.stringify(pathToFileURL(dist).href)});
     db.registerAgent("fx-probe", "r", []);
     db.closeDb();`], { env: { PATH: process.env.PATH ?? "", HOME: home, RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, stdio: "ignore" });
 }

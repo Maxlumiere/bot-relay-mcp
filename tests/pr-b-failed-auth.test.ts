@@ -253,9 +253,12 @@ const MAIN_GAP_KEEP = 65_536;
  * 608.7-610.3 ms). Absolute time is comparable across threads: MEASURED, a worker's stamp fell inside the main
  * thread's [send, receive] window in 3 x 2000 round trips (round trip <= 0.21 ms).
  */
-const TICKER_SRC = `(function makeTicker(floor, keep) {
+const TICKER_SRC = `(function makeTicker(floor, keep, manualStart) {
+  // manualStart (a number): a SCRIPTED ticker for a pure test. No interval runs; the test calls tick(now) itself, so
+  // the ring's record/evict/fault logic is driven deterministically, never by a real scheduler.
+  const manual = typeof manualStart === "number";
   const gaps = [];
-  let last = performance.timeOrigin + performance.now();
+  let last = manual ? manualStart : performance.timeOrigin + performance.now();
   let ticks = 0;
   // RING EVICTION IS A FAULT (ruling on the LOOP ticket): every eviction is counted, and the latest end of an evicted
   // gap is kept, so a snapshot that an evicted gap may overlap is refused (fault), never read as a smaller max.
@@ -263,8 +266,7 @@ const TICKER_SRC = `(function makeTicker(floor, keep) {
   let evictedTo = -Infinity;
   // The ticker's OWN cost on its thread (ms spent inside its callback), REPORTED ONLY.
   let busy = 0;
-  const timer = setInterval(() => {
-    const now = performance.timeOrigin + performance.now();
+  const onTick = (now) => {
     if (now - last >= floor) {
       gaps.push({ from: last, to: now });
       if (gaps.length > keep) {
@@ -275,9 +277,10 @@ const TICKER_SRC = `(function makeTicker(floor, keep) {
     }
     last = now;
     ticks++;
-    busy += performance.timeOrigin + performance.now() - now;
-  }, 1);
-  if (timer.unref) timer.unref();
+    if (!manual) busy += performance.timeOrigin + performance.now() - now;
+  };
+  const timer = manual ? null : setInterval(() => onTick(performance.timeOrigin + performance.now()), 1);
+  if (timer && timer.unref) timer.unref();
   // settled(to): resolves once a tick has landed at or after \`to\`, so every gap ending by then is RECORDED (a gap is
   // only recorded by the tick that ends it, and an overdue tick can run AFTER a pending message is handled). Bounded
   // in POLLS (each >= 1 ms of this thread running), so a host stop never spends the bound; exhausted: it rejects.
@@ -294,11 +297,22 @@ const TICKER_SRC = `(function makeTicker(floor, keep) {
   // fault(from, to): why a snapshot of [from, to] cannot be trusted (an evicted gap may overlap it), or null.
   const fault = (from, to) =>
     evictedTo > from ? "the ticker's ring evicted " + evictions + " gap(s), one ending at " + evictedTo.toFixed(1) + ", after the window opened at " + from.toFixed(1) + " (keep " + keep + "): its max cannot be trusted" : null;
-  return { gaps: (from, to) => gaps.filter((g) => g.to > from && g.from < to), fault, evictions: () => evictions, busy: () => busy, ticks: () => ticks, lastTick: () => last, settled, stop: () => clearInterval(timer) };
+  const inWindow = (from, to) => gaps.filter((g) => g.to > from && g.from < to);
+  // snapshot(from, to): the sentinel's reply, ONE rule: a fault (no stream) when an evicted gap may overlap the window,
+  // else the gaps. The worker replies with exactly this, and a pure test drives it through tick().
+  const snapshot = (from, to) => {
+    const f = fault(from, to);
+    return f === null ? { gaps: inWindow(from, to) } : { fault: f };
+  };
+  return { gaps: inWindow, fault, snapshot, tick: onTick, evictions: () => evictions, busy: () => busy, ticks: () => ticks, lastTick: () => last, settled, stop: () => timer && clearInterval(timer) };
 })`;
 interface Ticker {
   gaps: (from: number, to: number) => Gap[];
   fault: (from: number, to: number) => string | null;
+  /** The sentinel's reply for [from, to]: a fault (no stream) when an evicted gap may overlap it, else the gaps. */
+  snapshot: (from: number, to: number) => { gaps?: Gap[]; fault?: string };
+  /** A scripted tick at `now` (a manual ticker only: makeTicker(floor, keep, start)). */
+  tick: (now: number) => void;
   evictions: () => number;
   busy: () => number;
   ticks: () => number;
@@ -308,7 +322,7 @@ interface Ticker {
 }
 /** How many >= 1 ms polls a judging snapshot waits for its ticker to tick past the window's end: an INSTRUMENT FAULT beyond. */
 const SETTLE_POLLS = 2_000;
-const makeTicker = new Function(`return ${TICKER_SRC}`)() as (floor: number, keep: number) => Ticker;
+const makeTicker = new Function(`return ${TICKER_SRC}`)() as (floor: number, keep: number, manualStart?: number) => Ticker;
 /**
  * THE PLANT'S OWN MEASURE, ONE SOURCE for the main thread and the load worker (ruling R2, "confirm stimulated"): the
  * largest gap between two consecutive clock reads of the planting thread, from just BEFORE its kill(SIGSTOP) until a
@@ -513,6 +527,8 @@ interface Reading {
   prepStopMs?: number;
   /** T-A, REPORT ONLY (no verdict reads it): this window's process-wide counters (procCounters). */
   proc?: ProcCounters;
+  /** Why `proc` is absent (measureWindow sets one or the other for every reading it takes). */
+  procWhy?: string;
 }
 
 /**
@@ -534,8 +550,12 @@ const procDelta = (a: ReturnType<typeof procNow>, b: ReturnType<typeof procNow>)
   cpuMs: (b.ru.userCPUTime + b.ru.systemCPUTime - a.ru.userCPUTime - a.ru.systemCPUTime) / 1000,
   wallMs: b.at - a.at,
 });
-export const fmtProc = (p?: ProcCounters) =>
-  p ? `process-wide counters: voluntary cs ${p.volCs}, involuntary cs ${p.invCs}, CPU ${p.cpuMs.toFixed(1)} ms of ${p.wallMs.toFixed(1)} ms wall` : "process-wide counters: not recorded";
+/** Never a bare "not recorded": a reading without counters says why (a reading built outside measureWindow, e.g. a
+ * replayed CI log, names its source; one with no reason at all says that it has none). */
+export const fmtProc = (p?: ProcCounters, why?: string) =>
+  p
+    ? `process-wide counters: voluntary cs ${p.volCs}, involuntary cs ${p.invCs}, CPU ${p.cpuMs.toFixed(1)} ms of ${p.wallMs.toFixed(1)} ms wall`
+    : `process-wide counters: not recorded: ${why?.trim() || "this reading was not taken by measureWindow and names no reason"}`;
 
 /**
  * Run `load` from a worker while timing the daemon's loop; `onLoop` runs ON the daemon's loop once the load has
@@ -546,20 +566,12 @@ let mainTicker: Ticker | null = null;
 interface Sentinel {
   worker: Worker;
   ask: (from: number, to: number) => Promise<{ gaps?: Gap[]; fault?: string }>;
-  /** A PURE-TEST knob only: busy the sentinel's own thread for `ms` (its ring's eviction RED). */
-  block: (ms: number) => Promise<void>;
 }
 let sentinel: Sentinel | null = null;
 const SENTINEL_WORKER = `
 const { parentPort, workerData } = require("worker_threads");
 const t = (${TICKER_SRC})(${GAP_FLOOR_MS}, workerData.keep);
 parentPort.on("message", (m) => {
-  if (m.block) {
-    const end = performance.now() + m.block;
-    while (performance.now() < end) {}
-    parentPort.postMessage({ id: m.id, blocked: true });
-    return;
-  }
   if (m.arm) {
     const armed = () => (t.ticks() >= 2 ? parentPort.postMessage({ armed: true }) : setTimeout(armed, 1));
     armed();
@@ -568,10 +580,7 @@ parentPort.on("message", (m) => {
   // ARMED FOR THIS SNAPSHOT (Codex R2 P2a): reply only once a tick has landed at or after the requested end.
   // RING EVICTION IS A FAULT: an evicted gap that may overlap the snapshot is never a missing cover.
   t.settled(m.to, ${SETTLE_POLLS}).then(
-    () => {
-      const fault = t.fault(m.from, m.to);
-      parentPort.postMessage(fault === null ? { id: m.id, gaps: t.gaps(m.from, m.to) } : { id: m.id, fault });
-    },
+    () => parentPort.postMessage({ id: m.id, ...t.snapshot(m.from, m.to) }),
     (err) => parentPort.postMessage({ id: m.id, fault: String((err && err.message) || err) }),
   );
 });
@@ -617,7 +626,6 @@ async function startSentinel(keep: number): Promise<Sentinel> {
   return {
     worker,
     ask: (from, to) => send({ from, to }),
-    block: async (ms) => void (await send({ block: ms })),
   };
 }
 
@@ -714,6 +722,7 @@ async function measureWindow(port: number, load: Load, onLoop?: () => void, pool
           if (poolWork) reading.pool = occupancy(spans, t0, t1);
           if (typeof m.prepStopMs === "number") reading.prepStopMs = m.prepStopMs;
           if (procAtOpen && procAtClose) reading.proc = procDelta(procAtOpen, procAtClose);
+          else reading.procWhy = `measureWindow took no ${procAtOpen ? "closing" : "opening"} snapshot (process.resourceUsage)`;
           resolve(reading);
         })().catch(reject);
       });
@@ -817,6 +826,16 @@ const median = (xs: number[]) => {
   return a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2;
 };
 const list = (xs: number[]) => xs.map((x) => x.toFixed(1)).join("/");
+/**
+ * The unrounded tail (from the #332 replay): the BAR line prints each value with toFixed(1), so a median just over a
+ * threshold can print as the threshold itself, and a replay from the log then judges rounded inputs the gate never saw.
+ * The tail carries, as JSON, exactly the values the gate judged (each arm's healthMax and eldMax) and its outputs.
+ */
+export function exactTail(b: { auth: Reading[]; control: Reading[]; control2: Reading[]; health: InstrumentVerdict; eld: InstrumentVerdict }): string {
+  const arm = (rs: Reading[]) => ({ health: rs.map((r) => r.healthMax), eld: rs.map((r) => r.eldMax) });
+  const out = ({ d, noise, verdict }: InstrumentVerdict) => ({ d, noise, verdict });
+  return ` | exact ${JSON.stringify({ auth: arm(b.auth), control: arm(b.control), control2: arm(b.control2), judged: { health: out(b.health), eld: out(b.eld) } })}`;
+}
 
 type Verdict = "PASS" | "FAIL" | "NOT_EVALUATED";
 interface InstrumentVerdict {
@@ -866,7 +885,7 @@ export function unionOverlapMs(b: Gap, gaps: Gap[]): number {
  * reading and its loop-delay breaches are ONE source, the main ticker's gaps, so a loop reading over the ceiling always
  * carries its breach.) No sentinel stream: an INSTRUMENT FAULT.
  */
-export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "healthMax" | "eldMax" | "breaches" | "sentinelGaps"> & { sentinelFault?: string; proc?: ProcCounters }>): { verdict: Verdict; why: string } {
+export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "healthMax" | "eldMax" | "breaches" | "sentinelGaps"> & { sentinelFault?: string; proc?: ProcCounters; procWhy?: string }>): { verdict: Verdict; why: string } {
   const freezes: string[] = [];
   const hostStalls: string[] = [];
   readings.forEach((r, i) => {
@@ -875,7 +894,7 @@ export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "hea
     }
     const breaches = r.breaches.filter((b) => b.to - b.from >= CEILING_MS);
     if (r.healthMax >= CEILING_MS && !breaches.some((b) => b.kind === "/health")) {
-      freezes.push(`round ${i + 1} /health ${r.healthMax.toFixed(1)} ms with no sample interval to locate it (it cannot be covered); ${fmtProc(r.proc)}`);
+      freezes.push(`round ${i + 1} /health ${r.healthMax.toFixed(1)} ms with no sample interval to locate it (it cannot be covered); ${fmtProc(r.proc, r.procWhy)}`);
     }
     for (const b of breaches) {
       const ms = b.to - b.from;
@@ -883,7 +902,7 @@ export function ceilingVerdict(label: string, readings: Array<Pick<Reading, "hea
       const uncovered = ms - covered;
       // T-A (parked): a breach the sentinel does not overlap at all says so, with the window's counters (report only).
       const tA = covered === 0 ? "; no sentinel overlap: a daemon freeze or unseen contention (T-A parked)" : "";
-      const at = `round ${i + 1} ${b.kind} ${ms.toFixed(1)} ms, the sentinel covers ${covered.toFixed(1)} ms of it, uncovered ${uncovered.toFixed(1)} ms (a freeze iff >= ${CEILING_MS})${tA}; ${fmtProc(r.proc)}`;
+      const at = `round ${i + 1} ${b.kind} ${ms.toFixed(1)} ms, the sentinel covers ${covered.toFixed(1)} ms of it, uncovered ${uncovered.toFixed(1)} ms (a freeze iff >= ${CEILING_MS})${tA}; ${fmtProc(r.proc, r.procWhy)}`;
       (uncovered >= CEILING_MS ? freezes : hostStalls).push(at);
     }
   });
@@ -906,10 +925,10 @@ export function breachDiagnostics(label: string, b: Pick<BarStats, "auth" | "con
         const ms = x.to - x.from;
         const covered = Array.isArray(r.sentinelGaps) ? unionOverlapMs(x, r.sentinelGaps) : null;
         const cov = covered === null ? "no sentinel stream" : `the sentinel covers ${covered.toFixed(1)} ms, uncovered ${(ms - covered).toFixed(1)} ms${covered === 0 ? " (no sentinel overlap)" : ""}`;
-        out.push(`BREACH ${label} | arm ${arm} round ${i + 1} | ${x.kind} ${ms.toFixed(1)} ms, ${cov} | ${fmtProc(r.proc)}`);
+        out.push(`BREACH ${label} | arm ${arm} round ${i + 1} | ${x.kind} ${ms.toFixed(1)} ms, ${cov} | ${fmtProc(r.proc, r.procWhy)}`);
       }
       if (r.healthMax >= CEILING_MS && !located.some((x) => x.kind === "/health")) {
-        out.push(`BREACH ${label} | arm ${arm} round ${i + 1} | /health ${r.healthMax.toFixed(1)} ms with no sample interval to locate it | ${fmtProc(r.proc)}`);
+        out.push(`BREACH ${label} | arm ${arm} round ${i + 1} | /health ${r.healthMax.toFixed(1)} ms with no sample interval to locate it | ${fmtProc(r.proc, r.procWhy)}`);
       }
     });
   }
@@ -1128,8 +1147,16 @@ interface BarStats {
   pooled: boolean;
 }
 
+/**
+ * DETAIL (b), T-A's ruling: only the SERIAL bars step (RELAY_TIMING_BARS=1, scripts/run-timing-bars.mjs) takes gate
+ * readings. A line printed anywhere else (the parallel suite: the pure tests, a replayed CI log) is context, and says so.
+ */
+export const CONTEXT_LABEL = "parallel suite: context, not a gate reading | ";
+export const contextLabel = (serial: boolean = process.env.RELAY_TIMING_BARS === "1"): string => (serial ? "" : CONTEXT_LABEL);
+
 /** A NOT_EVALUATED bar is announced LOUDLY: the log, and the CI job summary when there is one. */
-function announce(line: string): void {
+function announce(bare: string): void {
+  const line = contextLabel() + bare;
   console.log(line);
   const summary = process.env.GITHUB_STEP_SUMMARY;
   if (summary && /NOT_EVALUATED/.test(line)) {
@@ -1186,7 +1213,8 @@ async function runBar(
       ` | load-worker max gap (report only) auth ${list(auth.map((r) => r.loadGapMax))}` +
       ` | eld (histogram, report only) auth ${list(auth.map((r) => r.eldHist))} control ${list(control.map((r) => r.eldHist))} control' ${list(control2.map((r) => r.eldHist))}` +
       ` | main ticker (report only) gaps per window max ${Math.max(...[...auth, ...control, ...control2].map((r) => r.mainGapCount))}, own busy ms per window auth ${list(auth.map((r) => r.tickerBusy))} control ${list(control.map((r) => r.tickerBusy))}` +
-      ` | main-thread GC max pause (report only) auth ${list(auth.map((r) => r.gcMax))} control ${list(control.map((r) => r.gcMax))} control' ${list(control2.map((r) => r.gcMax))}`,
+      ` | main-thread GC max pause (report only) auth ${list(auth.map((r) => r.gcMax))} control ${list(control.map((r) => r.gcMax))} control' ${list(control2.map((r) => r.gcMax))}` +
+      exactTail({ auth, control, control2, health, eld }),
   );
   for (const line of breachDiagnostics(label, { auth, control, control2 })) announce(line); // T-A, report only
   return { label, control, control2, auth, compares: count, perRound, health, eld, pooled: opts.poolControl !== undefined };
@@ -1331,7 +1359,7 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     expect(msg, "a final NOT_EVALUATED is labelled as such: it never asserts a code failure").not.toMatch(/\bFAIL\b/);
   });
   it("THE RETRY SELF-TEST (ruling R1), REPLAYING CI run 38701178186 a1 (macOS) under the (6) rule: attempt 1 planted and covered; attempt 2 UNPLANTED (517.6 ms, the sentinel 176.4 ms inside it: 341.2 ms uncovered, so NOT_EVALUATED now); attempt 3 an unplanted natural breach the sentinel does not overlap at all (FAIL). The old self-test asserted the live verdict and goes red; the new one asserts the retry machinery and REPORTS the FAIL", async () => {
-    const r = (o: Partial<Reading> = {}): Reading => ({ healthMax: 60, eldMax: 60, eldHist: 60, mainGapCount: 0, tickerBusy: 0, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0, ...o });
+    const r = (o: Partial<Reading> = {}): Reading => ({ healthMax: 60, eldMax: 60, eldHist: 60, mainGapCount: 0, tickerBusy: 0, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0, procWhy: "a replayed reading (CI run 38701178186's logged values, or a synthetic one of their shape), which carries no counters", ...o });
     const controlHealth = [63.2, 150.8, 127.8, 73.8, 64.9, 58.5, 61.8, 37.4, 98.3]; // attempt 2's control arm, as logged
     const bar = (label: string, auth: Reading[]): BarStats => ({
       label,
@@ -1463,8 +1491,46 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     expect(covered.why).not.toContain("T-A parked");
     const noProc = ceilingVerdict("t", [{ healthMax: 30, eldMax: 600, breaches: [b], sentinelGaps: [] }]);
     expect([noProc.verdict, noProc.why.includes("process-wide counters: not recorded")], "no counters: the same verdict, said so").toEqual(["FAIL", true]);
+    // DETAIL (a): never a bare "not recorded". A reading without counters says why: its own reason, or that it has none.
+    expect(noProc.why, "no reason given: the line says the reading names none").toContain("process-wide counters: not recorded: this reading was not taken by measureWindow and names no reason");
+    const withWhy = ceilingVerdict("t", [{ healthMax: 30, eldMax: 600, breaches: [b], sentinelGaps: [], procWhy: "replayed from a log" }]);
+    expect(withWhy.why, "a reason given: the line carries it").toContain("process-wide counters: not recorded: replayed from a log");
+    expect(fmtProc(undefined), "fmtProc never ends at a bare 'not recorded'").toMatch(/not recorded: \S/);
+    for (const blank of ["", "  "]) expect(fmtProc(undefined, blank), `an empty or blank reason (${JSON.stringify(blank)}) falls back`).toContain("not recorded: this reading was not taken by measureWindow and names no reason");
     const huge: ProcCounters = { volCs: 0, invCs: 1e6, cpuMs: 1e6, wallMs: 1 };
     expect(ceilingVerdict("t", [{ healthMax: 30, eldMax: 600, breaches: [b], sentinelGaps: [{ from: 1000, to: 1600 }], proc: huge }]).verdict, "the counters never change a verdict").toBe("NOT_EVALUATED");
+  });
+  it("T-A DETAIL (b) and the unrounded tail (serialization coverage; the BAR line itself is assembled in runBar): a line outside the serial bars step labels itself context; exactTail round-trips the exact values judge() saw and returned, and the rounded log reads a different verdict", () => {
+    expect(contextLabel(true), "the serial bars step (RELAY_TIMING_BARS=1): no label, these are gate readings").toBe("");
+    expect(contextLabel(false), "anywhere else: labelled").toBe("parallel suite: context, not a gate reading | ");
+    expect(contextLabel(), "this run, by its own environment").toBe(process.env.RELAY_TIMING_BARS === "1" ? "" : CONTEXT_LABEL);
+    // Pinned fixtures, six distinct arrays. AVAILABILITY: every |control - control'| is 25.03 ms, just over the 25 ms
+    // noise limit (NOT_EVALUATED), yet each value prints with ONE decimal, so the logged pairs differ by exactly 25.0
+    // (not over the limit: PASS). LOOP: noise 10.02, d 10.24, PASS either way.
+    const fx = {
+      auth: { health: [110.1, 120.1, 130.1, 140.1, 150.1, 160.1, 170.1, 180.1, 190.1], eld: [30.37, 31.37, 32.37, 33.37, 34.37, 35.37, 36.37, 37.37, 38.37] },
+      control: { health: [100.04, 110.04, 120.04, 130.04, 140.04, 150.04, 160.04, 170.04, 180.04], eld: [20.13, 21.13, 22.13, 23.13, 24.13, 25.13, 26.13, 27.13, 28.13] },
+      control2: { health: [75.01, 85.01, 95.01, 105.01, 115.01, 125.01, 135.01, 145.01, 155.01], eld: [10.11, 11.11, 12.11, 13.11, 14.11, 15.11, 16.11, 17.11, 18.11] },
+    };
+    const r = (healthMax: number, eldMax: number): Reading => ({ healthMax, eldMax, eldHist: 0, mainGapCount: 0, tickerBusy: 0, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0 });
+    const arm = (a: { health: number[]; eld: number[] }) => a.health.map((h, i) => r(h, a.eld[i]));
+    const [auth, control, control2] = [arm(fx.auth), arm(fx.control), arm(fx.control2)];
+    const health = judge(fx.auth.health, fx.control.health, fx.control2.health);
+    const eld = judge(fx.auth.eld, fx.control.eld, fx.control2.eld);
+    expect([health.verdict, eld.verdict], "the gate's verdicts on the exact inputs (pinned)").toEqual(["NOT_EVALUATED", "PASS"]);
+    expect(health.noise, "AVAILABILITY noise, exact").toBeCloseTo(25.03, 9);
+    expect(health.d, "AVAILABILITY d, exact").toBeCloseTo(10.06, 9);
+    expect(eld.noise, "LOOP noise, exact").toBeCloseTo(10.02, 9);
+    expect(eld.d, "LOOP d, exact").toBeCloseTo(10.24, 9);
+    const tail = exactTail({ auth, control, control2, health, eld });
+    expect(tail.startsWith(" | exact {"), "the tail is its own BAR-line field").toBe(true);
+    const parsed = JSON.parse(tail.slice(" | exact ".length));
+    expect({ auth: parsed.auth, control: parsed.control, control2: parsed.control2 }, "all six input arrays, exactly as judged").toEqual(fx);
+    expect(parsed.judged, "both output objects, exactly as returned").toEqual({ health: { d: health.d, noise: health.noise, verdict: "NOT_EVALUATED" }, eld: { d: eld.d, noise: eld.noise, verdict: "PASS" } });
+    expect(judge(parsed.auth.health, parsed.control.health, parsed.control2.health).verdict, "a replay from the tail: NOT_EVALUATED, as the gate judged").toBe("NOT_EVALUATED");
+    const logged = (xs: number[]) => list(xs).split("/").map(Number);
+    expect(list(fx.control.health).split("/")[0], "the BAR line itself prints one decimal").toBe("100.0");
+    expect(judge(logged(fx.auth.health), logged(fx.control.health), logged(fx.control2.health)).verdict, "a replay from the ROUNDED log reads PASS: the case the tail exists for").toBe("PASS");
   });
   it("THE (6) RULE's REDs (ruling of 2026-10-21): the f445297 replay reads NOT_EVALUATED (FAIL under the retired slack); a covered stall plus a >= 500 ms daemon tail FAILS; the NOT-CAUGHT case (a 510 ms freeze beside a 20 ms sentinel gap) reads NOT_EVALUATED; no overlap FAILS; two partial sentinel gaps count as their UNION", () => {
     const gap = (from: number, ms: number) => ({ from, to: from + ms });
@@ -1513,7 +1579,7 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     await new Promise((res) => setTimeout(res, 20)); // the overdue ticks land before close (the histogram's included)
     atOpen.close();
     const r = await atOpen.read();
-    console.log(`LOOP pure, block at open ${CEILING_MS + 20} ms: ticker max ${r.max.toFixed(1)} ms, histogram (report only) ${r.histMax.toFixed(1)} ms`);
+    console.log(contextLabel() + `LOOP pure, block at open ${CEILING_MS + 20} ms: ticker max ${r.max.toFixed(1)} ms, histogram (report only) ${r.histMax.toFixed(1)} ms`);
     expect(r.max, "the ticker sees a stall right as the window opens").toBeGreaterThanOrEqual(CEILING_MS + 20);
     expect(r.breaches.length, "a LOOP reading over the ceiling carries its breach: one source").toBe(1);
     const mid = openLoopWindow(mainTicker!);
@@ -1522,10 +1588,10 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
     await new Promise((res) => setTimeout(res, 20));
     mid.close();
     const m = await mid.read();
-    console.log(`LOOP pure twin, block mid-window 300 ms: ticker max ${m.max.toFixed(1)} ms, histogram (report only) ${m.histMax.toFixed(1)} ms`);
+    console.log(contextLabel() + `LOOP pure twin, block mid-window 300 ms: ticker max ${m.max.toFixed(1)} ms, histogram (report only) ${m.histMax.toFixed(1)} ms`);
     expect(m.max, "the twin: mid-window").toBeGreaterThanOrEqual(300);
     expect(m.breaches, "under the ceiling: no breach").toEqual([]);
-    const noGaps: Ticker = { gaps: () => [], fault: () => null, evictions: () => 0, busy: () => 0, ticks: () => 2, lastTick: absNow, settled: async () => {}, stop: () => {} };
+    const noGaps: Ticker = { gaps: () => [], fault: () => null, snapshot: () => ({ gaps: [] }), tick: () => {}, evictions: () => 0, busy: () => 0, ticks: () => 2, lastTick: absNow, settled: async () => {}, stop: () => {} };
     const quiet = openLoopWindow(noGaps);
     quiet.close();
     expect((await quiet.read()).max, "no gap at or over the floor reads as the floor").toBe(MAIN_GAP_FLOOR_MS);
@@ -1565,29 +1631,50 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
       roomy.stop();
     }
   }, 20_000);
-  it("RING EVICTION IS A FAULT (the sentinel's ring): a tiny ring, one large sentinel gap, then filler past the keep → the reply is a FAULT with no stream (an INSTRUMENT FAULT at the ceiling), never a missing cover; the twin with room returns the large gap", async () => {
-    const burst = async (s: Sentinel) => {
-      const from = absNow();
-      await s.block(150); // the large gap
-      for (let i = 0; i < 10; i++) await s.block(GAP_FLOOR_MS + 10); // filler: >= the sentinel's 20 ms floor, past a keep of 4
-      return s.ask(from, absNow());
+  it("THE LIVE BURST'S RACE, replayed on a scripted ticker: CI's measured ticks (a 150.8 ms gap, then ten filler blocks with ONE tick between them) give 3 gaps, under the keep of 4, so the ring never evicts: why a live burst cannot pin eviction", () => {
+    // CI run 40150772848 (Linux), the LIVE sentinel's three gaps: 69908.4 -> 70059.2 -> 70089.9 -> 70362.3 (relative
+    // 150.8, 30.7, 272.4 ms). The worker ran nine of the ten filler blocks back to back, with no tick between them: a gap
+    // is recorded only by the tick that ends it, so a live burst's gap COUNT depends on the scheduler. The test below
+    // scripts every tick instead.
+    const t = makeTicker(GAP_FLOOR_MS, 4, 0);
+    for (const at of [150.8, 181.5, 453.9]) t.tick(at);
+    const r = t.snapshot(0, 454);
+    expect(r.fault, "no eviction: the ring held every gap").toBeUndefined();
+    expect(r.gaps?.length).toBe(3);
+    expect(t.evictions()).toBe(0);
+  });
+  it("RING EVICTION IS A FAULT (the sentinel's ring), on a scripted ticker: a tiny ring, one large gap, then ten filler gaps each ended by its own tick → the reply is a FAULT with no stream (an INSTRUMENT FAULT at the ceiling), never a missing cover; the twin with room reads the large gap", () => {
+    // Every tick is scripted, so the gap count is the construction's, never the scheduler's: one 150 ms gap, then ten
+    // gaps of 30 ms (>= the sentinel's 20 ms floor), eleven in all, past a keep of 4.
+    const ticks = [150, ...Array.from({ length: 10 }, (_, i) => 150 + 30 * (i + 1))];
+    const burst = (keep: number) => {
+      const t = makeTicker(GAP_FLOOR_MS, keep, 0);
+      for (const at of ticks) t.tick(at);
+      return { t, r: t.snapshot(0, ticks[ticks.length - 1] + 1) };
     };
-    const tiny = await startSentinel(4);
-    const roomy = await startSentinel(GAP_KEEP);
-    try {
-      const evicted = await burst(tiny);
-      expect(evicted.gaps, "an evicted gap may overlap the snapshot: no stream").toBeUndefined();
-      expect(evicted.fault).toMatch(/the ticker's ring evicted \d+ gap/);
-      const reading = { healthMax: 30, eldMax: 20, breaches: [], sentinelGaps: evicted.gaps, sentinelFault: evicted.fault };
-      expect(() => ceilingVerdict("evicted", [reading])).toThrow(/INSTRUMENT FAULT \(evicted\): reading 1 has no sentinel stream \(the ticker's ring evicted/);
-      const twin = await burst(roomy);
-      expect(twin.fault).toBeUndefined();
-      expect(Math.max(...twin.gaps!.map((g) => g.to - g.from)), "the twin, with room: the large gap is there").toBeGreaterThanOrEqual(150);
-    } finally {
-      await tiny.worker.terminate();
-      await roomy.worker.terminate();
-    }
-  }, 20_000);
+    const tiny = burst(4);
+    expect(tiny.t.evictions(), "11 gaps in a ring of 4: 7 evicted").toBe(7);
+    expect(tiny.r.gaps, "an evicted gap may overlap the snapshot: no stream").toBeUndefined();
+    expect(tiny.r.fault).toMatch(/the ticker's ring evicted 7 gap/);
+    // FIFO, and the eviction cutoff: the ring keeps the NEWEST four gaps, so a window from 330 (the end of the last
+    // evicted gap) reads exactly those, with no fault; a window opening just before 330 may overlap an evicted gap: a
+    // fault. (Evicting the newest instead would keep [0,150] and the next three, and fault from 330 on.)
+    expect(tiny.t.snapshot(330, 450), "a window from the cutoff: exactly the four newest gaps, oldest first").toEqual({
+      gaps: [
+        { from: 330, to: 360 },
+        { from: 360, to: 390 },
+        { from: 390, to: 420 },
+        { from: 420, to: 450 },
+      ],
+    });
+    expect(tiny.t.snapshot(329.9, 450).fault, "a window opening just before the cutoff: a fault").toMatch(/the ticker's ring evicted 7 gap\(s\), one ending at 330\.0/);
+    const reading = { healthMax: 30, eldMax: 20, breaches: [], sentinelGaps: tiny.r.gaps, sentinelFault: tiny.r.fault };
+    expect(() => ceilingVerdict("evicted", [reading])).toThrow(/INSTRUMENT FAULT \(evicted\): reading 1 has no sentinel stream \(the ticker's ring evicted/);
+    const roomy = burst(GAP_KEEP);
+    expect(roomy.r.fault, "the twin, with room: no eviction").toBeUndefined();
+    expect(roomy.r.gaps?.length).toBe(11);
+    expect(Math.max(...roomy.r.gaps!.map((g) => g.to - g.from)), "the twin: the large gap is there").toBe(150);
+  });
   it("THE SENTINEL's snapshot is ARMED per request (the call site of settled): its reply never comes before a sentinel tick at or after the asked end; a request that cannot settle comes back as a fault, and a reading without a stream carries that reason into the INSTRUMENT FAULT", async () => {
     await armInstruments();
     const end = absNow() + 200; // an end in the near future: the sentinel must tick past it before it answers
@@ -1847,7 +1934,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     const child = spawn(process.execPath, ["-e", helper, String(pid)], { stdio: ["ignore", "pipe", "ignore"] });
     const childPid = child.pid;
     expect(childPid).toBeGreaterThan(1);
-    console.log(`HOST-STALL helper pid ${childPid} targets the test process pid ${pid} (SIGSTOP on itself only)`);
+    console.log(contextLabel() + `HOST-STALL helper pid ${childPid} targets the test process pid ${pid} (SIGSTOP on itself only)`);
     const exited = new Promise<void>((res) => child.once("exit", () => res()));
     await new Promise<void>((res, rej) => {
       child.stdout!.once("data", () => res());
@@ -2032,7 +2119,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
       const covering = (r.sentinelGaps ?? []).filter((g) => g.to <= r.windowFrom && pre.some((b) => overlapMs(g, b) > 0));
       const c = ceilingVerdict("preparation-period host stall", [r]);
       // Logged FIRST, so a red run still shows what the instrument saw and what the ceiling decided.
-      console.log(`PREP-STALL verdict ${c.verdict} | window opened ${r.windowFrom.toFixed(1)} | /health breaches before it: ${pre.map((b) => `[${b.from.toFixed(1)}, ${b.to.toFixed(1)}] (starts ${(r.windowFrom - b.from).toFixed(1)} ms before; uncovered ${(b.to - b.from - unionOverlapMs(b, r.sentinelGaps ?? [])).toFixed(1)} ms)`).join(", ") || "none"} | covering sentinel gaps: ${covering.map((g) => `[${g.from.toFixed(1)}, ${g.to.toFixed(1)}] (ends ${(r.windowFrom - g.to).toFixed(1)} ms before)`).join(", ") || "none in the stream"}`);
+      console.log(contextLabel() + `PREP-STALL verdict ${c.verdict} | window opened ${r.windowFrom.toFixed(1)} | /health breaches before it: ${pre.map((b) => `[${b.from.toFixed(1)}, ${b.to.toFixed(1)}] (starts ${(r.windowFrom - b.from).toFixed(1)} ms before; uncovered ${(b.to - b.from - unionOverlapMs(b, r.sentinelGaps ?? [])).toFixed(1)} ms)`).join(", ") || "none"} | covering sentinel gaps: ${covering.map((g) => `[${g.from.toFixed(1)}, ${g.to.toFixed(1)}] (ends ${(r.windowFrom - g.to).toFixed(1)} ms before)`).join(", ") || "none in the stream"}`);
       expect(pre.length, `precondition: a /health breach started BEFORE the window opened (${JSON.stringify(r.breaches)}, window from ${r.windowFrom})`).toBeGreaterThanOrEqual(1);
       expect(c.verdict, c.why).toBe("NOT_EVALUATED");
       expect(covering.length, `and its covering sentinel gap ENDS before the window opens, so a query from the window's start would miss it (${JSON.stringify(r.sentinelGaps)})`).toBeGreaterThanOrEqual(1);

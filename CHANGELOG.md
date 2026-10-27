@@ -1,6 +1,100 @@
 # Changelog
 
-## Unreleased
+## v4.0.0 — 2026-10-25 — BREAKING: a new agent name over HTTP needs the registration secret; stricter instance and path rules; the pending queue is never windowed
+
+Everything since v3.0.1 (13 Aug). The relay's tool contract gains features and changes some behaviour, so this is a major version. Read **Upgrading from 3.x** before you upgrade a running fleet. The full entries follow it, unchanged.
+
+### Upgrading from 3.x
+
+What you will see, and what to do. Each item is detailed in its entry below.
+
+- **Node.js 22 or later is required.** `engines` is `>=22` (3.0.1 declared `>=20` and refused only below 18). The relay server exits 1 at start below Node 22 and says why. Upgrade Node before you upgrade the relay.
+- **An HTTP client that registers a NEW agent name needs the registration secret.**
+  - What you will see: `MINT_SECRET_REQUIRED`. It also applies to `register_agent` with `on_name_collision: "suffix"`, and to a tokenless pre-v1.7 agent re-registering over HTTP.
+  - The secret is `secrets/mint.secret` next to the relay DB. The HTTP daemon creates it at start.
+  - If your relay has an `http_secret`, the secret is seeded from it, so remote clients that already send `http_secret` keep working with no action.
+  - If it has none (e.g. a loopback daemon), the secret is a new random value. Any HTTP client that registers new names, e.g. your own scripts or a third-party client, must then send it as `X-Relay-Secret` or `Authorization: Bearer`. The relay's own hooks read it locally.
+  - What stays: an agent with a token re-registers with it as before. Stdio connections are not affected. `RELAY_ALLOW_OPEN_MINT=1` turns the check off for local development only, and a daemon bound to a non-loopback host refuses to start with it.
+- **`relay pair` no longer takes `--secret`, and needs `--output` to a new file.** It refuses `--secret`: use `--secret-file`, `--secret-stdin` or the prompt. It never overwrites an existing output file, and it never prints a credential.
+- **A window started without a relay name no longer registers as `default`.** The SessionStart hook says `unnamed: not registered`, and no hook reads mail for `default`. Set `RELAY_AGENT_NAME` or run `relay init --agent <name>`.
+- **The PostToolUse and Stop hooks need `node` and the relay CLI.** In 3.0.1 they read with `sqlite3`/`python3`. Now they run `../bin/relay` beside them. A hook copied out of the package, or no `node` on `PATH`, reports `DEGRADED` or `CANNOT-JUDGE` on every turn. Point your hook config at the installed package's `hooks/`.
+- **The PostToolUse hook no longer delivers mail.** In 3.0.1 it drained the mailbox and injected the bodies. Now it shows a metadata-only notice, and mail stays pending until the agent calls `get_messages`. With a local relay, both hooks read it locally and never fall back to HTTP. An unreadable local relay is reported as `DEGRADED`, never as an empty mailbox.
+- **An instance-selection fault now stops the daemon and the CLI.**
+  - 3.0.1 already refused to start when instances existed and none was selected (`RELAY_ALLOW_LEGACY_FALLBACK=1` still overrides that case).
+  - New: a permission or I/O error under `~/.bot-relay` (e.g. on `instances/`) used to land silently on the flat `~/.bot-relay/relay.db`; now it is an error.
+  - `relay mint-token` exits 2 on a fault. So do `relay send` and `relay resolve` when they look up the agent's token themselves. With a valid-shaped `RELAY_AGENT_TOKEN` set, they skip local credential resolution, read the endpoint from the config, and fall back to the environment or the default only if the config cannot be loaded. `relay watch` reports DEGRADED, and `relay list-instances` exits 1.
+  - If the relay will not start, run `relay doctor`: its first line names the cause, e.g. run `relay use-instance <id>`.
+- **Stricter DB and staging paths.** Paths are checked by their real, on-disk form. Refused:
+  - a DB whose parent is a symlink out of your home and temp directories;
+  - a DB path through `/tmp` that lacks the sticky bit, or that has a part another user owns or can write;
+  - a backup or restore staging directory under `$TMPDIR` that other users can write.
+- **Windows: the relay tries to restrict its DB folder and files to your account.** It removes inheritance and grants only the relay's user (SYSTEM is tolerated). When that works, other accounts, Administrators included, lose access. When it fails, the relay logs the folder as not private (DEGRADED) and keeps running.
+- **A revoked agent's token is refused everywhere.**
+  - `relay send` from a revoked agent gets `AUTH_FAILED`.
+  - `relay mint-token`, `relay send` and `relay resolve` no longer hand its token back.
+  - `relay mint-token --force` no longer brings a revoked agent back. Use `relay recover`.
+- **Wrong tokens are rate-limited.** There are three paths:
+  - A token whose stored lookup digest does not match is refused at once, and charges nothing.
+  - A named check that needs bcrypt (no usable digest, e.g. a row from 3.0.1 before its digest is rewritten) is throttled per source and name: a burst of 5, then one every 2 s. A correct token is refunded.
+  - A token-only call that has to scan is throttled per source: a burst of 3, then one every 5 s.
+  - At most 16 bcrypt checks queue at once.
+  Beyond those limits a call gets `RATE_LIMITED` (HTTP 429 on `/api/send-message`) or "busy, retry".
+- **`relay re-encrypt --verify-clean <old key>` reports UNSAFE at first.** Token lookup digests written by 3.0.1 carry no key id, so each one counts as a blocker, the current-token and previous-token digests alike.
+  - An ordinary authenticated tool call, e.g. `get_messages`, attempts to rewrite the digest of the token it used. The attempt is best effort: it can be skipped (the row changed meanwhile) or fail (logged as a warning only). `register_agent` does not attempt it: a re-register with the same token keeps the old digest.
+  - A previous token's digest is attempted only when that previous token is used, so it can keep blocking.
+  - Retire the key only once `--verify-clean` reports SAFE.
+- **`get_messages(status="pending")` and `get_messages_summary` are no longer windowed by default.**
+  - What you will see: mail that a previous session read but never acked comes back on every new session until it is acked or purged (after 7 days). `total_pending` is now always the full queue.
+  - What to do: drain with `ack: true`, or `resolve_messages` the ids. Pass an explicit `since` to window a read.
+- **`get_outstanding`'s `state` values are renamed:** `unread` → `undrained`, `read-unresolved` → `drained-unresolved` (`resolved` is unchanged). Update any code that matches on them.
+- **`get_messages(ack=true)` receipts report what the database did.**
+  - On a pending read with `ack: true`, `acked` is true only when the resolve ran or there was nothing to ack. Otherwise the reply carries `ack_not_applied`.
+  - `resolved_count` is the number of rows changed.
+  - An agent with no session gets `warning: { code: "session_unbound" }`.
+- **A message's priority must be `critical`, `high`, `normal` or `low`.** Database triggers refuse any other value, including from a direct writer. This covers channel messages too.
+- **A request body with an array over 1000 elements, or nesting over 64 levels, is refused** (HTTP 400, `BODY_STRUCTURE_LIMIT`, SEC-24), before authentication. The largest explicit array cap in any tool is 100. A field with no cap (e.g. `capabilities`) now refuses more than 1000 elements.
+- **`trusted_proxies` never trusts an ambiguous form:**
+  - a zone id (`fe80::1%en0`), the old IPv4-compatible form (`::1.2.3.4`), or anything that is not fully an address;
+  - an IPv4 address matches an IPv6 block only when the block is a real IPv4-mapped block (`::ffff:0:0/96` or longer).
+- **A recovery whose token cannot be saved no longer prints the token.** It says to run `relay recover`. Hook debug output prints one fixed line, never the server's reply.
+- **The database schema is migrated in place on first start** (v24 in 3.0.1, v26 now). `relay pending` refuses a DB older than v2.12: start the current relay once against it, then retry.
+- **Going back to 3.0.1 after upgrading.** 3.0.1 does not refuse a 4.0.0 database and does not warn about it. It leaves the schema at v26 and keeps working on it. Measured, with an MCP client over stdio in a sandbox:
+  - 4.0.0 created the database;
+  - 3.0.1 then ran `health_check`, `register_agent`, `discover_agents`, `get_messages` (with an ack), `send_message`, `post_task` and `set_status` on it, and read the message 4.0.0 had sent;
+  - 4.0.0 then re-opened it and read the messages and the task 3.0.1 had written.
+  Not measured: 3.0.1's hooks, its HTTP daemon and its CLI against a v26 database. To be able to go back exactly, run `relay backup` before upgrading.
+
+How this list was built:
+- I read every heading and bullet of the 41 entries below, and each entry that changes behaviour a user or client can observe in full. (The first entry, the fast-uri, ip-address and vitest advisories, changes no behaviour.)
+- A separate read of the code from v3.0.1 to this release (`src/`, `bin/`, `hooks/`) added the Node, `relay pair`, hook-dependency, instance-fault, Windows ACL, throttle, `re-encrypt`, `get_outstanding` and open-mint items. It also corrected three items: the registration secret, the instance fault and the pending queue.
+- Every item was then checked against the code at v3.0.1 and at this release.
+- Not checked: `relay doctor` and `relay watch` exit codes in full; backup and restore beyond staging; the dashboard and `/api/*` other than `/api/send-message`; the Codex hook in depth; the VS Code extension; `scripts/`.
+- The new features (`relay watch --until-wake`, the doorbell, `relay fleet`, `relay pending`, `relay bind`, `relay where`, `RELAY_FOCUS_DRY_RUN`, `on_name_collision`) are additive and are not listed.
+
+### Security summary
+
+- **SEC-24:** HTTP request bodies are bounded in structure before authentication (above).
+- **body-parser 2.4.0** (GHSA-27r3-jxmh-p828): one unauthenticated request could crash the relay before routing.
+- **zod 4.6.7** (GHSA-mrhx-c7xc-m3w5), with the relay's tool schemas byte-identical.
+- **proxy-addr 2.0.8** (GHSA-jqcg-44mw-7w3h), and the relay's own trusted-proxy check fixed for the same class.
+- **The MCP SDK 1.32.0.**
+- **fast-uri 4.2.3** (GHSA-w74x-v6f9-j3xg, GHSA-wjr9-j795-jxcr, GHSA-333x-w4r6-6crp, GHSA-xhq7-xmqj-769h) and **ip-address 10.7.5** (GHSA-rxp7-6hxx-x8q5), in the server and the extension.
+- **The registration secret:** no new name gets a token over HTTP without a credential, except under `RELAY_ALLOW_OPEN_MINT=1`, which is for local development on a loopback bind only (a public bind refuses to start with it).
+- **A revoked agent can no longer send.**
+- **The hooks no longer put a token in a process's arguments or print it.**
+- **Development only, nothing that ships:**
+  - source-map-js 1.2.2 (GHSA-68fv-2mgg-jv7q);
+  - vite 8.2.4 / 7.3.7 (GHSA-698v-4r3x-3vcv, GHSA-r825-w8mm-5pxw, GHSA-587h-7wmj-h5pm);
+  - the extension's `@azure/msal-node` 7.1.0 (GHSA-xcx6-jx8p-x3h5) and vitest 5 (tinypool: GHSA-5gmw-xhrv-c9v3, GHSA-85c8-ppgw-ccpr);
+  - the server's vitest 5.0.3 (`@vitest/mocker`: GHSA-qxg6-89mg-rqv8, GHSA-xp26-3454-mjgp).
+
+
+### Security: fast-uri, ip-address and vitest advisories
+
+- **fast-uri 4.2.3** in the server and the extension (was 4.2.1): GHSA-w74x-v6f9-j3xg and GHSA-wjr9-j795-jxcr (medium), GHSA-333x-w4r6-6crp and GHSA-xhq7-xmqj-769h (low), all URI parsing and normalization. The relay reaches fast-uri through ajv, which compiles the task schemas agents register and which the MCP SDK's server constructs. Our own override had pinned it to exactly 4.2.1, which blocked the automated fix. Now it is a floor, `^4.2.3`.
+- **ip-address 10.7.5** in the server and the extension (was 10.7.3): GHSA-rxp7-6hxx-x8q5 (medium; an IPv6 zone id matched in quadratic time). ip-address is used only by express-rate-limit, which only the MCP SDK's OAuth handlers import. The relay loads none of them.
+- **vitest 5.0.3** in the server's tests (was 5.0.0): GHSA-qxg6-89mg-rqv8 and GHSA-xp26-3454-mjgp (medium, `@vitest/mocker`). Development only.
+- The extension's `vite` and `qs` overrides are floors now (`^7.3.7`, `^6.16.1`), not exact pins. They resolve to the same versions as before.
 
 ### Security: no oversized request structure reaches a validator; body-parser and zod advisories
 
@@ -272,7 +366,7 @@ Tests: `tests/start-token-utc.test.ts`: the same live process read with `TZ` set
 
 ### Changed — instance resolution is one strict function: a fault never selects a different DB
 
-Every process picked its relay DB through helpers that swallowed file-system errors. An unreadable `~/.bot-relay/active-instance`, an I/O or permission error on `instances/`, or a marker that could not be read therefore landed the process on the flat `~/.bot-relay/relay.db`. Nothing said so: the relay looked healthy and read an empty mailbox. Now one resolver, `resolveInstance()`, serves the daemon and the CLI:
+Every process picked its relay DB through helpers that swallowed file-system errors. An unreadable `~/.bot-relay/active-instance`, an I/O or permission error on `instances/`, or a marker that could not be read therefore landed a process on the flat `~/.bot-relay/relay.db`. Nothing said so: the relay looked healthy and read an empty mailbox. (The daemon already refused to start when a marker existed but could not be read, or when instances existed with none selected. The CLI and the hooks did not, and neither did the daemon on an error listing `instances/`.) Now one resolver, `resolveInstance()`, serves the daemon and the CLI:
 
 - **The flat DB only on a positive absence** (no marker, and no instance directory). Any other fault is an error.
 - **The daemon refuses to start on an error.** **If you upgrade and the relay will not start:** run `relay doctor`. It reads the instance selection once and checks exactly the config and DB it reports; a file it cannot stat is a FAIL line, never a crash. Its first line, "instance resolution", names the cause (for example a permission error on `~/.bot-relay/instances`, or instances present but none selected: `relay use-instance <id>`).
@@ -359,7 +453,7 @@ Every `agent_bindings` key was a bare name or anchor. Once federation lets one t
 
 ### Changed — the pending queue is never windowed by default, and a window that hides pending mail says so
 
-**Release note:** after upgrading, `get_messages(status='pending')` returns mail it previously left out: messages you received and a previous session read, but that were never acked (resolved). Existing callers may therefore see up to 7 days of such mail resurface **once** (older mail has already been purged). **One ack clears it permanently**: drain with `ack: true`, or `resolve_messages` the ids.
+**Release note:** after upgrading, `get_messages(status='pending')` returns mail it previously left out: messages you received and a previous session read, but that were never acked (resolved). Existing callers may therefore see such mail resurface on every new session, until it is acked or is purged after 7 days. **One ack clears it permanently**: drain with `ack: true`, or `resolve_messages` the ids.
 
 Unresolved mail read by a previous session stays pending, because it is unfinished work. But `get_messages` applied a default `since` of `24h`, so once such mail was more than a day old it silently left the queue. It wasn't returned, it wasn't counted in `total_pending`, and there was no hint, because the hint only fired when zero messages came back. Unfinished work disappeared without a trace.
 
