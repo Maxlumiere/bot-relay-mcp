@@ -273,4 +273,30 @@ describe("end to end (importRelayState / exportRelayState)", () => {
     expect(fs.existsSync(backups) ? fs.readdirSync(backups).filter((f) => f.startsWith("pre-restore-")) : []).toEqual([]);
     expect(fs.readFileSync(DB_PATH)).toEqual(before);
   });
+  // Codex #342 R2 (DESIGN, ruled): restore validates COMPLETELY in staging (required members, the manifest, the
+  // schema, the staged DB's integrity) BEFORE the safety backup, initializeDb() or closing the live connection. Each
+  // refusal leaves no safety backup, the live connection open (the same handle) and the live data unchanged.
+  const refusals: Array<[string, () => Buffer]> = [
+    ["an EMPTY archive (only the two end-of-archive zero blocks)", () => craftTar([])],
+    ["a missing relay.db", () => craftTar([{ name: "manifest.json", data: JSON.stringify({ schema_version: 1, archive_format_version: 1 }) }])],
+    ["a manifest that is not JSON", () => craftTar([{ name: "relay.db", data: DB }, { name: "manifest.json", data: "{not json" }])],
+    ["an incompatible (newer) schema", () => craftTar([{ name: "relay.db", data: DB }, { name: "manifest.json", data: JSON.stringify({ schema_version: 100000, archive_format_version: 1 }) }])],
+    ["a corrupt DB", () => craftTar([{ name: "relay.db", data: Buffer.from("SQLite format 3\0" + "garbage".repeat(200)) }, { name: "manifest.json", data: JSON.stringify({ schema_version: 1, archive_format_version: 1 }) }])],
+  ];
+  it.each(refusals)("REFUSED in staging, before ANY live mutation: %s", async (_label, make) => {
+    const db = (await import("../src/db.js")) as typeof import("../src/db.js") & { peekDb?: () => unknown };
+    await db.initializeDb();
+    db.registerAgent("alpha", "r", []);
+    const handle = db.peekDb?.();
+    const crafted = path.join(ROOT, "refused.tar.gz");
+    fs.writeFileSync(crafted, gzip(make()));
+    const { importRelayState } = await import("../src/backup.js");
+    await expect(importRelayState(crafted, { force: true })).rejects.toThrow();
+    const backups = path.join(ROOT, "backups");
+    expect(fs.existsSync(backups) ? fs.readdirSync(backups).filter((f) => f.startsWith("pre-restore-")) : [], "no safety backup was made").toEqual([]);
+    expect(typeof db.peekDb, "db.peekDb exists (a read of the live handle that never opens one)").toBe("function");
+    expect(handle, "a live connection was open before").toBeTruthy();
+    expect(db.peekDb!(), "the live connection is the same, still open").toBe(handle);
+    expect(db.getAgents().map((a: { name: string }) => a.name), "the live data is unchanged").toContain("alpha");
+  });
 });
