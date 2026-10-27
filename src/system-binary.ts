@@ -20,8 +20,9 @@
  *     (the stated same-user boundary).
  *   - macOS: ONE system path per tool (the SIP-protected /bin, /usr/bin, /usr/sbin).
  *   - Linux: a CLOSED list of FHS directories per tool (/usr/bin, /bin, /usr/sbin, /sbin), the first that passes.
- *   - POSIX, every candidate is TRUST-CHECKED (assertTrustedSystemFile): it and every directory above it, on its own
- *     path and on its realpath, are owned by root and not writable by group or other; the file is a regular file.
+ *   - POSIX, every candidate is TRUST-CHECKED (assertTrustedSystemFile) on the path walk: every entry it resolves
+ *     through, each symlink hop included, is owned by root and (unless a link) not writable by group or other; the end
+ *     is a regular file; the CANONICAL path is what is returned, and what runs.
  * Otherwise this THROWS a named SystemBinaryError, never a silent fallback to PATH (ruled 20 Oct: FAIL CLOSED on a
  * non-FHS host such as NixOS or Guix; no config opt-in, not even a trust-checked PATH lookup, because a root-installed
  * GNU tool breaks the PARSE, as Homebrew's ps did). tests/sec-22-system-binaries.test.ts fails CI on a subprocess in
@@ -29,6 +30,7 @@
  */
 import fs from "fs";
 import path from "path";
+import { walkPath, PathWalkError, type WalkFs, type WalkResult } from "./path-walk.js";
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "child_process";
 
 /**
@@ -86,9 +88,27 @@ export type SystemBinaryName = WindowsToolName | PosixToolName;
 /** The filesystem calls the trust check makes: a seam for tests (a root-owned or writable file cannot be planted). */
 export interface TrustFs {
   lstatSync(p: string): { uid: number; mode: number; isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean };
-  realpathSync(p: string): string;
+  /** The walk follows each link itself, hop by hop: a link's target is read, never a whole-chain realpath. */
+  readlinkSync(p: string): string;
 }
-const nodeFs: TrustFs = { lstatSync: (p) => fs.lstatSync(p), realpathSync: (p) => fs.realpathSync(p) };
+const nodeFs: TrustFs = { lstatSync: (p) => fs.lstatSync(p), readlinkSync: (p) => fs.readlinkSync(p) };
+
+/**
+ * The walk's fs, over a TrustFs. The trust check judges ownership and mode only and never compares identities, so
+ * dev / ino are not read (0n here, never compared: a verdict between two paths is comparePaths' job, not this one's).
+ */
+function walkFsOf(f: TrustFs): WalkFs {
+  return {
+    lstatSync: (p) => {
+      const st = f.lstatSync(p);
+      return { uid: st.uid, mode: st.mode, dev: 0n, ino: 0n, isFile: () => st.isFile(), isDirectory: () => st.isDirectory(), isSymbolicLink: () => st.isSymbolicLink() };
+    },
+    readlinkSync: (p) => f.readlinkSync(p),
+    realpathNativeSync: (p) => {
+      throw new SystemBinaryError(`${p}: an 8.3 short name in a POSIX tool path`);
+    },
+  };
+}
 
 /** Why a path cannot be stat'ed, in the ruled words ("missing" for ENOENT / ENOTDIR). */
 function statFailure(err: unknown): string {
@@ -97,48 +117,43 @@ function statFailure(err: unknown): string {
 }
 
 /**
- * The trust check, ONE function for every POSIX tool: `p` is returned only when the file at `p` exists, is owned by
- * root, and (through its realpath) is a regular file owned by root and not writable by group or other, and every
- * directory above `p` AND above its realpath is owned by root and not writable by group or other (a symlink in the
- * chain is judged by its owner, its target by the realpath walk). Anything else THROWS a SystemBinaryError
- * "<path>: <why>" (why = missing / not a regular file / not owned by root / writable by group or other at <path>).
+ * The trust check, ONE function for every POSIX tool, on THE path walk (src/path-walk.ts; SEC-22 clause (i), Codex
+ * #342 R1 P1-B): the walk resolves `p` one component at a time and follows each symlink itself, so EVERY entry it
+ * passes through is judged, the links in the middle of a chain and every directory their targets go through, not
+ * only the candidate's ancestors and the end of the chain. Each entry must be owned by root, and each one that is not
+ * a link must not be writable by group or other (a link's own mode means nothing); the end must be a regular file.
+ * RETURNS THE CANONICAL PATH the walk reached, which is what is executed: re-resolving the lexical candidate at
+ * exec time would follow links nobody re-checked. Every component of the returned path is root-owned and not
+ * writable by others, so it cannot change after this check without root (the stated model).
+ * Anything else THROWS a SystemBinaryError "<path>: <why>" (why = missing / not a regular file / not owned by root /
+ * writable by group or other at <path> / the walk's own failure, e.g. a loop). A walk that throws is NEVER trusted.
  */
 export function assertTrustedSystemFile(p: string, fsApi: TrustFs = nodeFs): string {
   const fail = (why: string): never => {
     throw new SystemBinaryError(`${p}: ${why}`);
   };
-  const lstat = (x: string) => {
-    try {
-      return fsApi.lstatSync(x);
-    } catch (err) {
-      return fail(x === p ? statFailure(err) : `${x} ${statFailure(err)}`);
-    }
-  };
-  const owned = (x: string, st: { uid: number; mode: number; isSymbolicLink(): boolean }) => {
-    if (st.uid !== 0) fail(`not owned by root (${x} is owned by uid ${st.uid})`);
-    if (!st.isSymbolicLink() && st.mode & 0o022) fail(`writable by group or other at ${x} (mode 0${(st.mode & 0o7777).toString(8)})`);
-  };
-  /** Every directory above `x`, up to the root. */
-  const ancestors = (x: string) => {
-    for (let d = path.posix.dirname(x); ; d = path.posix.dirname(d)) {
-      owned(d, lstat(d));
-      if (d === "/") return;
-    }
-  };
   if (!path.posix.isAbsolute(p)) fail("not an absolute path");
-  owned(p, lstat(p)); // the file (or the link) itself, first: "missing" names the candidate
-  ancestors(p);
-  let real: string;
   try {
-    real = fsApi.realpathSync(p);
+    fsApi.lstatSync(p); // the candidate itself, first: "missing" names the candidate
   } catch (err) {
-    return fail(`its target is ${statFailure(err)}`);
+    fail(statFailure(err));
   }
-  const st = lstat(real);
-  if (!st.isFile()) fail(`not a regular file (${real})`);
-  owned(real, st);
-  if (real !== p) ancestors(real);
-  return p;
+  let w: WalkResult | undefined;
+  try {
+    w = walkPath(p, { fs: walkFsOf(fsApi), platform: "linux" }); // POSIX semantics, on macOS too
+  } catch (err) {
+    if (err instanceof SystemBinaryError) throw err;
+    if (err instanceof PathWalkError) fail(err.reason === "missing" ? `${err.at} missing` : `${err.reason} at ${err.at} (${err.message})`);
+    fail(`unreadable (${(err as Error)?.message ?? String(err)})`);
+  }
+  const walked = w as WalkResult;
+  for (const e of walked.entries) {
+    if (e.stat.uid !== 0) fail(`not owned by root (${e.path} is owned by uid ${e.stat.uid})`);
+    if (!e.stat.isSymbolicLink() && e.stat.mode & 0o022) fail(`writable by group or other at ${e.path} (mode 0${(e.stat.mode & 0o7777).toString(8)})`);
+  }
+  const end = walked.entries[walked.entries.length - 1];
+  if (!end.stat.isFile()) fail(`not a regular file (${walked.real})`);
+  return walked.real;
 }
 
 /**

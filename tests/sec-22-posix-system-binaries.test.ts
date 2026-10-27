@@ -120,7 +120,8 @@ describe("SEC-22 (POSIX): systemBinary resolves the macOS tools to their fixed s
     ["launchctl", "/bin/launchctl"],
     ["plutil", "/usr/bin/plutil"],
     ["lsof", "/usr/sbin/lsof"],
-    ["tar", "/usr/bin/tar"],
+    // /usr/bin/tar is a root-owned link to bsdtar: the CANONICAL path is what is returned and run (with argv0 "tar").
+    ["tar", "/usr/bin/bsdtar"],
   ] as const) {
     it(`TWIN (macOS) ${name} → ${want}`, async (ctx) => {
       if (process.platform !== "darwin") ctx.skip("macOS paths");
@@ -256,6 +257,11 @@ describe("SEC-22 (POSIX): systemBinary resolves the macOS tools to their fixed s
       };
       const c = await check();
       expect(c("/usr/bin/ps", fakeFs(tree))).toBe("/trusted/ps");
+    });
+    it("a walk that THROWS is never trusted: a link loop in the chain is a named refusal", async () => {
+      const tree: Record<string, Node> = { ...ROOT_DIRS, "/usr/bin/ps": { kind: "link", target: "/usr/lib/x/ps" }, "/usr/lib/x/ps": { kind: "link", target: "/usr/bin/ps" } };
+      const c = await check();
+      expect(() => c("/usr/bin/ps", fakeFs(tree))).toThrow(/^\/usr\/bin\/ps: loop at /);
     });
     it("TWIN: \"missing\" still names the candidate itself", async () => {
       const c = await check();
