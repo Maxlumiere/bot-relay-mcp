@@ -226,6 +226,19 @@ describe("SEC-23: what a backup carries, and what it states", () => {
     expect(cfg.trusted_proxies).toEqual(["10.0.0.0/8"]);
   });
 
+  it("the archived config: an UNKNOWN key (a made-up key with a unique value) is DROPPED; its value is nowhere in the archive bytes, its name is listed", async () => {
+    const canary = "UNKNOWN-KEY-CANARY-" + crypto.randomBytes(12).toString("hex");
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify({ http_port: 4124, zz_not_a_relay_field: canary }));
+    await seed();
+    const { exportRelayState } = await import("../src/backup.js");
+    const exp = (await exportRelayState({ destinationPath: path.join(ROOT, "canary.tar.gz") })) as unknown as Record<string, unknown>;
+    const bytes = archiveBytes(String(exp.archive_path));
+    expect(holds(bytes, canary), "the canary value is not in the archive (gz or plain)").toBe(false);
+    const manifest = manifestOf(bytes.plain) as { config?: { dropped?: string[] } };
+    expect(manifest.config?.dropped, "dropped, by name").toEqual(["zz_not_a_relay_field"]);
+    expect(JSON.parse(memberOf(bytes.plain, "config.json") ?? "null").http_port, "the twin: a known field survives").toBe(4124);
+  });
+
   it("the mint secret is not in the archive (a PIN: the 3 fixed members already exclude it)", async () => {
     const mintValue = "MINT-" + crypto.randomBytes(16).toString("hex");
     fs.mkdirSync(path.join(ROOT, "secrets"), { recursive: true });
