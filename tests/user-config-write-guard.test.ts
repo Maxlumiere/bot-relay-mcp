@@ -99,14 +99,14 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     // _setAccountHomeForTests points the guard's notion of "the account" at a
     // temp dir, so a BROKEN guard writes a temp file here — never the real
     // config (the negative-control paradox solved).
-    _setAccountHomeForTests(SANDBOX);
+    _setAccountHomeForTests(SANDBOX, []);
     const target = path.join(SANDBOX, ".claude.json");
     expect(() => atomicWriteJson(target, { clobbered: true })).toThrow(/config-guard/);
     expect(fs.existsSync(target)).toBe(false); // the write NEVER landed
   });
 
   it("(G5) settings.json + relay config.json are protected by the same chokepoint", () => {
-    _setAccountHomeForTests(SANDBOX);
+    _setAccountHomeForTests(SANDBOX, []);
     for (const target of [
       path.join(SANDBOX, ".claude", "settings.json"),
       path.join(SANDBOX, ".bot-relay", "config.json"),
@@ -125,7 +125,7 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     const alias = path.join(SANDBOX, "alias");
     fs.mkdirSync(home, { recursive: true });
     fs.symlinkSync(home, alias);
-    _setAccountHomeForTests(home);
+    _setAccountHomeForTests(home, []);
     const viaAlias = path.join(alias, ".claude.json");
     expect(() => atomicWriteJson(viaAlias, { clobbered: true })).toThrow(/config-guard/);
     expect(fs.existsSync(path.join(home, ".claude.json"))).toBe(false); // nothing landed through the link
@@ -135,14 +135,14 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
   // The guard refuses every instance config STRUCTURALLY (any valid id, active or not, symlink- or env-selected) by
   // pure path comparison: nothing of the operator's tree is read to work out what to protect.
   it("(G7) atomicWriteJson refuses a PER-INSTANCE relay config under the account home, and nothing is written", () => {
-    _setAccountHomeForTests(SANDBOX);
+    _setAccountHomeForTests(SANDBOX, []);
     const target = path.join(SANDBOX, ".bot-relay", "instances", "fbd470d2-0000-4000-8000-000000000001", "config.json");
     expect(() => atomicWriteJson(target, { clobbered: true })).toThrow(/config-guard/);
     expect(fs.existsSync(target), "the write NEVER landed").toBe(false);
   });
 
   it("(G7b) the pure check names an instance config under the account home, for ANY valid id (not only the active one)", () => {
-    _setAccountHomeForTests(SANDBOX);
+    _setAccountHomeForTests(SANDBOX, []);
     for (const id of ["work", "fbd470d2-0000-4000-8000-000000000002", "an_inactive-one"]) {
       const target = path.join(SANDBOX, ".bot-relay", "instances", id, "config.json");
       expect(() => assertNotRealUserConfigWrite(target), id).toThrow(/config-guard/);
@@ -155,13 +155,13 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     fs.mkdirSync(inst, { recursive: true });
     const alias = path.join(SANDBOX, "alias-7c");
     fs.symlinkSync(inst, alias);
-    _setAccountHomeForTests(home);
+    _setAccountHomeForTests(home, []);
     expect(() => atomicWriteJson(path.join(alias, "config.json"), { clobbered: true })).toThrow(/config-guard/);
     expect(fs.existsSync(path.join(inst, "config.json"))).toBe(false);
   });
 
   it("(G7d) TWIN: with the protected configs PRESENT, only an instance's config.json is refused, not its siblings, not a nested look-alike, not another root", () => {
-    _setAccountHomeForTests(SANDBOX);
+    _setAccountHomeForTests(SANDBOX, []);
     // The protected files EXIST (as on a configured machine): the siblings below are then other files by identity.
     // With a protected file MISSING the guard refuses them too (inconclusive is protected): (G8f) pins that.
     for (const f of [path.join(SANDBOX, ".claude.json"), path.join(SANDBOX, ".claude", "settings.json"), path.join(SANDBOX, ".bot-relay", "config.json"), path.join(SANDBOX, ".bot-relay", "instances", "work", "config.json")]) {
@@ -189,7 +189,7 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     fs.mkdirSync(path.join(home, ".bot-relay", "instances"), { recursive: true });
     fs.mkdirSync(elsewhere, { recursive: true });
     fs.symlinkSync(elsewhere, path.join(home, ".bot-relay", "instances", "work"));
-    _setAccountHomeForTests(home);
+    _setAccountHomeForTests(home, []);
     const target = path.join(home, ".bot-relay", "instances", "work", "config.json");
     expect(() => atomicWriteJson(target, { clobbered: true })).toThrow(/config-guard/);
     expect(fs.existsSync(path.join(elsewhere, "config.json")), "nothing landed through the link").toBe(false);
@@ -201,7 +201,7 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     const other = path.join(SANDBOX, "other.json");
     fs.writeFileSync(other, "{}");
     fs.symlinkSync(other, path.join(inst, "config.json"));
-    _setAccountHomeForTests(home);
+    _setAccountHomeForTests(home, []);
     expect(() => atomicWriteJson(path.join(inst, "config.json"), { clobbered: true })).toThrow(/config-guard/);
     expect(fs.lstatSync(path.join(inst, "config.json")).isSymbolicLink(), "the protected entry is untouched").toBe(true);
   });
@@ -211,7 +211,7 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     fs.mkdirSync(path.join(inst, "sub"), { recursive: true });
     const alias = path.join(SANDBOX, "alias-8c");
     fs.symlinkSync(path.join(inst, "sub"), alias);
-    _setAccountHomeForTests(home);
+    _setAccountHomeForTests(home, []);
     expect(() => atomicWriteJson(`${alias}${path.sep}..${path.sep}config.json`, { clobbered: true })).toThrow(/config-guard/);
     expect(fs.existsSync(path.join(inst, "config.json"))).toBe(false);
   });
@@ -220,7 +220,7 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     const inst = path.join(home, ".bot-relay", "instances", "work");
     fs.mkdirSync(inst, { recursive: true });
     fs.writeFileSync(path.join(inst, "config.json"), "{}");
-    _setAccountHomeForTests(home);
+    _setAccountHomeForTests(home, []);
     const variant = path.join(inst, "Config.json");
     const sameFile = fs.existsSync(variant); // the kernel's own answer (a case-insensitive volume opens it)
     if (sameFile) expect(() => assertNotRealUserConfigWrite(variant)).toThrow(/config-guard/);
@@ -229,13 +229,13 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
   it("(G8e) a case variant of a MISSING protected config is refused (inconclusive is protected), on every volume", () => {
     const home = path.join(SANDBOX, "acct-8e");
     fs.mkdirSync(path.join(home, ".bot-relay", "instances", "work"), { recursive: true });
-    _setAccountHomeForTests(home);
+    _setAccountHomeForTests(home, []);
     expect(() => assertNotRealUserConfigWrite(path.join(home, ".bot-relay", "instances", "work", "Config.json"))).toThrow(/config-guard/);
   });
   it("(G8f) with a protected config MISSING, a write sharing its nearest existing directory is refused: a sibling, a nested look-alike, another name (the stated over-block)", () => {
     const home = path.join(SANDBOX, "acct-8f");
     fs.mkdirSync(path.join(home, ".bot-relay", "instances", "work"), { recursive: true });
-    _setAccountHomeForTests(home);
+    _setAccountHomeForTests(home, []);
     for (const t of [
       path.join(home, ".bot-relay", "instances", "work", "other.json"),
       path.join(home, ".bot-relay", "instances", "work", "sub", "config.json"),
@@ -248,7 +248,7 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
   it("(G8i) a FRESH account home (nothing under it): a new file directly under it, and a path through a wholly missing subtree, are refused; a write under a directory that already exists below it is not", () => {
     const home = path.join(SANDBOX, "acct-8i-fresh");
     fs.mkdirSync(home, { recursive: true }); // the home exists, nothing under it
-    _setAccountHomeForTests(home);
+    _setAccountHomeForTests(home, []);
     for (const t of [path.join(home, "new.json"), path.join(home, "a", "b", "c.json"), path.join(home, ".bot-relay", "notes.json")]) {
       expect(() => atomicWriteJson(t, { x: 1 }), t).toThrow(/config-guard/);
       expect(fs.existsSync(t), t).toBe(false);
@@ -265,12 +265,12 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     fs.mkdirSync(path.join(home, ".bot-relay"), { recursive: true });
     fs.symlinkSync(path.join(SANDBOX, "loop-b"), path.join(SANDBOX, "loop-a"));
     fs.symlinkSync(path.join(SANDBOX, "loop-a"), path.join(SANDBOX, "loop-b"));
-    _setAccountHomeForTests(home);
+    _setAccountHomeForTests(home, []);
     expect(() => assertNotRealUserConfigWrite(path.join(SANDBOX, "loop-a", "config.json"))).toThrow(/config-guard/);
   });
   it("(G8h) PRODUCTION: with VITEST and NODE_ENV unset the guard is inactive, so a first-time write on a FRESH account home lands", () => {
     const home = path.join(SANDBOX, "acct-8h-fresh");
-    _setAccountHomeForTests(home); // nothing exists under it: a fresh install
+    _setAccountHomeForTests(home, []); // nothing exists under it: a fresh install
     const saved = { vitest: process.env.VITEST, nodeEnv: process.env.NODE_ENV };
     delete process.env.VITEST;
     delete process.env.NODE_ENV;
@@ -292,7 +292,6 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     expect(typeof instanceInventory, "the tripwire base exports instanceInventory").toBe("function");
     return instanceInventory!(path.join(home, ".bot-relay")).configs;
   };
-  const point = _setAccountHomeForTests as unknown as (p: string | null, inventory?: string[]) => void;
   it.skipIf(posixOnly)("(G9a) a DIRECT write to an instance's link target (instances/work -> relocated-prod; write relocated-prod/config.json) is refused", async () => {
     const home = path.join(SANDBOX, "acct-9a");
     const relocated = path.join(SANDBOX, "relocated-prod-9a");
@@ -300,7 +299,7 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     fs.mkdirSync(relocated, { recursive: true });
     fs.writeFileSync(path.join(relocated, "config.json"), '{"live":true}');
     fs.symlinkSync(relocated, path.join(home, ".bot-relay", "instances", "work"));
-    point(home, await inv(home));
+    _setAccountHomeForTests(home, await inv(home));
     expect(() => atomicWriteJson(path.join(relocated, "config.json"), { clobbered: true })).toThrow(/config-guard/);
     expect(fs.readFileSync(path.join(relocated, "config.json"), "utf-8")).toBe('{"live":true}');
   });
@@ -313,7 +312,7 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     fs.symlinkSync(relocated, path.join(home, ".bot-relay", "instances", "work"));
     const alias = path.join(SANDBOX, "not an id 9b");
     fs.symlinkSync(relocated, alias);
-    point(home, await inv(home));
+    _setAccountHomeForTests(home, await inv(home));
     expect(() => atomicWriteJson(path.join(alias, "config.json"), { clobbered: true })).toThrow(/config-guard/);
     expect(fs.readFileSync(path.join(relocated, "config.json"), "utf-8")).toBe('{"live":true}');
   });
@@ -324,7 +323,7 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     const live = path.join(SANDBOX, "live-9c.json");
     fs.writeFileSync(live, '{"live":true}');
     fs.symlinkSync(live, path.join(inst, "config.json"));
-    point(home, await inv(home));
+    _setAccountHomeForTests(home, await inv(home));
     expect(() => atomicWriteJson(live, { clobbered: true })).toThrow(/config-guard/);
     expect(fs.readFileSync(live, "utf-8")).toBe('{"live":true}');
   });
@@ -341,7 +340,7 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     const home = path.join(SANDBOX, "acct-9e");
     fs.mkdirSync(path.join(home, ".bot-relay", "instances", "work"), { recursive: true });
     fs.writeFileSync(path.join(home, ".bot-relay", "instances", "work", "config.json"), "{}");
-    point(home, await inv(home));
+    _setAccountHomeForTests(home, await inv(home));
     const t = path.join(SANDBOX, "unrelated-9e", "config.json");
     atomicWriteJson(t, { ok: true });
     expect(JSON.parse(fs.readFileSync(t, "utf-8"))).toEqual({ ok: true });

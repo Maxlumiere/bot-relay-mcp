@@ -59,11 +59,18 @@ let accountInventoryOverride: readonly string[] | null = null;
  *  own negative controls exercise the FULL chokepoint against a temp "account
  *  home" — a broken guard then writes a temp file, never the real config. A test
  *  that points the account home names ITS protected instance inventory too (the
- *  tripwire's snapshot describes the real account, not the temp one); none given
- *  is an empty inventory. */
-export function _setAccountHomeForTests(p: string | null, inventory: readonly string[] = []): void {
+ *  tripwire's snapshot describes the real account, not the temp one): REQUIRED,
+ *  an explicit [] for a sandbox with no instances. */
+export function _setAccountHomeForTests(p: null): void;
+export function _setAccountHomeForTests(p: string, inventory: readonly string[]): void;
+export function _setAccountHomeForTests(p: string | null, inventory?: readonly string[]): void {
+  // REQUIRED with a home: `[]` says "this sandbox has no instances" explicitly; a missing one is refused here (and a
+  // type error), never a silently empty inventory that would weaken the guard by omission.
+  if (p !== null && (!Array.isArray(inventory) || !inventory.every((x) => typeof x === "string" && path.isAbsolute(x)))) {
+    throw new Error("_setAccountHomeForTests: a test that points the account home must name its protected instance inventory (an explicit [] for none)");
+  }
   accountHomeOverride = p;
-  accountInventoryOverride = p === null ? null : inventory;
+  accountInventoryOverride = p === null ? null : (inventory as readonly string[]);
 }
 
 /**
