@@ -170,6 +170,20 @@ describe("DISCOVERY: every operator root and config, failing CLOSED", () => {
     expect(op.ports.sort()).toEqual([3777, 4001, 4002, 4003, 4004, 4005]);
     expect(op.roots).toEqual([r1, r2, cfg]);
   });
+  it.skipIf(process.platform === "win32")("an instance that is a SYMLINK to a directory elsewhere: its resolved target is a root too (SEC-11, #343 R2)", () => {
+    const home = path.join(dir, "home-sym");
+    const relocated = path.join(dir, "relocated-target");
+    fs.mkdirSync(path.join(home, ".bot-relay", "instances"), { recursive: true });
+    fs.mkdirSync(relocated, { recursive: true });
+    fs.symlinkSync(relocated, path.join(home, ".bot-relay", "instances", "work"));
+    const op = discoverOperator({}, home) as { roots: string[] };
+    expect(op.roots).toContain(fs.realpathSync.native(relocated));
+  });
+  it("TWIN: an instance that is an ordinary directory under the root adds no root", () => {
+    const home = path.join(dir, "home-plain");
+    fs.mkdirSync(path.join(home, ".bot-relay", "instances", "work"), { recursive: true });
+    expect((discoverOperator({}, home) as { roots: string[] }).roots).toEqual([path.join(home, ".bot-relay")]);
+  });
   it("RELATIVE overrides are discovered as production resolves them, against the launch cwd (Codex #305 R2 NEW-2)", () => {
     const home = path.join(dir, "home-3");
     const cwd = path.join(dir, "launch");
