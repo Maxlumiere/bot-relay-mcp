@@ -17,13 +17,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const calls: Array<{ file: string; args: string[]; opts: Record<string, unknown> }> = [];
+/** What the mocked spawnSync answers next (a test sets a failure; reset to success before each test). */
+const next = vi.hoisted(() => ({ status: 0 as number | null, stderr: "" }));
 vi.mock("child_process", async (importOriginal) => {
   const real = await importOriginal<typeof import("child_process")>();
   return {
     ...real,
     spawnSync: (file: string, args: string[], opts: Record<string, unknown>) => {
       calls.push({ file, args, opts });
-      return { pid: 1, output: [], stdout: "Mon Oct 26 02:42:04 2026\n", stderr: "", status: 0, signal: null };
+      return { pid: 1, output: [], stdout: "Mon Oct 26 02:42:04 2026\n", stderr: next.stderr, status: next.status, signal: null };
     },
   };
 });
@@ -51,6 +53,8 @@ const saved: Record<string, string | undefined> = {};
 let savedPath: string | undefined;
 beforeEach(() => {
   calls.length = 0;
+  next.status = 0;
+  next.stderr = "";
   for (const [k, v] of Object.entries(HOSTILE)) {
     saved[k] = process.env[k];
     process.env[k] = v;
@@ -102,12 +106,29 @@ describe("SEC-22 (ii): a system tool runs with the clean-base env and argv0 = it
     expect(calls).toHaveLength(0);
   });
 
-  it("execSystem: the same clean base and argv0; a non-zero exit throws, as execFileSync does", () => {
+  it("execSystem: the same clean base and argv0", () => {
     expect(execSystem(TOOL, [])).toContain("2026");
     expectCleanBase(calls[0].opts.env as Record<string, string>);
     expect(calls[0].opts.argv0).toBe(TOOL);
   });
 
+  it("execSystem: a NONZERO exit throws, carrying the status and the tool's stderr (as execFileSync does)", () => {
+    next.status = 3;
+    next.stderr = "boom: the tool failed";
+    let err: (Error & { status?: number | null; stderr?: string }) | undefined;
+    try {
+      execSystem(TOOL, ["-x"]);
+    } catch (e) {
+      err = e as Error & { status?: number | null; stderr?: string };
+    }
+    expect(err, "execSystem threw").toBeInstanceOf(Error);
+    expect(err?.status).toBe(3);
+    expect(err?.stderr).toBe("boom: the tool failed");
+    expect(err?.message).toMatch(/failed \(status=3/);
+  });
+  it("known-good twin: a zero exit returns stdout, no throw", () => {
+    expect(execSystem(TOOL, [])).toContain("2026");
+  });
   it("systemEnv on Windows: SystemRoot only, from the validated root (the seam, every OS)", () => {
     expect(systemEnv("whoami", {}, { SystemRoot: "C:\\Windows", PSModulePath: "C:\\evil", PATH: "C:\\evil" }, "win32")).toEqual({ SystemRoot: "C:\\Windows" });
     expect(() => systemEnv("whoami", {}, { SystemRoot: "Windows" }, "win32")).toThrow(SystemBinaryError);

@@ -320,8 +320,9 @@ export async function importRelayState(archivePath: string, options: ImportOptio
   }
 
   // --- Step 0b: read the archive IN-PROCESS into a private staging dir (src/backup-archive.ts), BEFORE the safety
-  // backup or anything else is written: a refused archive leaves no trace outside staging. ONE parser decides and
-  // extracts; no tar runs on restore (SEC-22, ruled 26 Oct).
+  // backup or anything else is written: an archive the READER refuses leaves no trace outside staging (the content
+  // checks below still run after the safety backup: tracked). ONE parser decides and extracts; no tar extracts the
+  // input archive (SEC-22, ruled 26 Oct; the safety backup still writes with tar).
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-import-"));
   try {
     assertPrivateStaging(stagingDir);

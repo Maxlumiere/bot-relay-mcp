@@ -5,7 +5,7 @@
 
 /**
  * SEC-22: RESTORE reads a backup archive IN-PROCESS (src/backup-archive.ts): ONE parser decides and extracts, and no
- * tar runs on restore. Only relay.db, manifest.json and config.json ever land. What macOS tar always added (an
+ * tar extracts the input archive (the safety backup still writes with tar). Only relay.db, manifest.json and config.json ever land. What macOS tar always added (an
  * AppleDouble `._<name>`, a pax header with xattr / time keys) is SKIPPED and reported; anything else is REFUSED.
  *
  * Each refused form is a crafted archive (tests/_helpers/ustar.ts), and each refusal leaves nothing but expected
