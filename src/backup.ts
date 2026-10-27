@@ -38,7 +38,7 @@ import zlib from "zlib";
 import { pipeline } from "stream/promises";
 import { withDeadline } from "./http-deadline.js";
 
-import { getDbPath, getDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
+import { getDbPath, getDb, peekDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
 import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDriver } from "./sqlite-compat.js";
 import { VERSION } from "./version.js";
@@ -320,9 +320,9 @@ export async function importRelayState(archivePath: string, options: ImportOptio
   }
 
   // --- Step 0b: read the archive IN-PROCESS into a private staging dir (src/backup-archive.ts), BEFORE the safety
-  // backup or anything else is written: an archive the READER refuses leaves no trace outside staging (the content
-  // checks below still run after the safety backup: tracked). ONE parser decides and extracts; no tar extracts the
-  // input archive (SEC-22, ruled 26 Oct; the safety backup still writes with tar).
+  // backup or anything else is written; Step 1 then validates its contents there too, so ANY refused archive leaves
+  // no trace outside staging. ONE parser decides and extracts; no tar extracts the input archive (SEC-22, ruled 26
+  // Oct; the safety backup still writes with tar).
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-import-"));
   try {
     assertPrivateStaging(stagingDir);
@@ -331,35 +331,10 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     const { skipped } = extractBackupTar(plainTar, stagingDir);
     fs.rmSync(plainTar, { force: true });
 
-    // --- Step 1: safety-backup + capture the probe driver WHILE the connection is live ---
-    // #190 r3: the Step-5 integrity probe (openReadOnly) takes the driver EXPLICITLY
-    // — it cannot infer, because Step 2 closes the live DB before the probe (there is
-    // nothing to read then). Capture the driver here from the safety-backup's open
-    // handle. A truly-fresh restore has no existing DB (Finding 2: init nothing,
-    // manufacture nothing until validation); there the CONFIGURED driver IS the
-    // reality the process will instantiate — the one legitimate cold read of the env.
-    let previousBackupPath = "";
-    let probeDriver: SqliteDriver;
-    const srcDbPath = getDbPath();
-    if (fs.existsSync(srcDbPath)) {
-      const backupsDir = getBackupsDir();
-      // v2.1 Phase 4c.4: ensureSecureDir (vs bare mkdirSync) — same pattern as
-      // the primary export path; safety backups get 0700 directory treatment.
-      ensureSecureDir(backupsDir, 0o700);
-      const safetyPath = path.join(backupsDir, `pre-restore-${isoTimestamp()}.tar.gz`);
-      const pre = await exportRelayState({ destinationPath: safetyPath }); // inits + opens the live DB
-      // exportRelayState already chmod'd the file; no extra call needed here.
-      previousBackupPath = pre.archive_path;
-      probeDriver = driverOf(getDb()); // read from the LIVE connection, before Step 2 closes it
-    } else {
-      probeDriver = configuredDriver(); // truly fresh: no connection to read; request == reality
-    }
-
-    // --- Step 2: close our DB handle so the swap can rename the file ---
-    closeDb();
-
-    // --- Step 3: the archive was extracted in Step 0b ---
-
+    // --- Step 1: VALIDATE COMPLETELY IN STAGING, before ANY live mutation (Codex #342 R2, ruled): the required members,
+    // the manifest, the schema and the staged DB's integrity all pass BEFORE the safety backup, initializeDb() or
+    // closing the live connection, so a refused archive (an empty one included) leaves no safety backup and the live
+    // DB and connection unchanged.
     const manifestPath = path.join(stagingDir, "manifest.json");
     const extractedDbPath = path.join(stagingDir, "relay.db");
     if (!fs.existsSync(manifestPath)) {
@@ -379,7 +354,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       throw new Error(`Archive manifest.json is missing required fields (schema_version, archive_format_version).`);
     }
 
-    // --- Step 4: schema-version guard ---
+    // The schema-version guard.
     if (manifest.schema_version > SCHEMA_VERSION) {
       throw new BackupError(
         ERROR_CODES.SCHEMA_MISMATCH,
@@ -393,11 +368,15 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       );
     }
 
-    // --- Step 5: integrity check the extracted DB ---
-    // #171/#190: driver-aware read-only open of the ARCHIVE, driver passed
-    // EXPLICITLY — captured in Step 1 while the connection was live (or the
-    // configured driver on a fresh restore). No main-DB init, so a corrupt archive
-    // manufactures no state.
+    // SLOT (SEC-23): the keyring check goes HERE, still before any mutation: every key id the manifest records must be
+    // available, else a named refusal listing the missing ids. Not in this change: SEC-23 adds it with its own RED.
+
+    // The integrity check of the STAGED DB. #171/#190: a driver-aware read-only open of the ARCHIVE, the driver passed
+    // EXPLICITLY (openReadOnly never infers): the LIVE connection's when one is open (peekDb: a read that opens
+    // nothing), else the configured driver, which is the one this process would instantiate (#190 r3). No main-DB
+    // init, so a corrupt archive manufactures no state.
+    const live = peekDb();
+    const probeDriver: SqliteDriver = live ? driverOf(live) : configuredDriver();
     const probe = await openReadOnly(extractedDbPath, probeDriver);
     try {
       const check = probe.prepare("PRAGMA integrity_check").get() as { integrity_check: string } | undefined;
@@ -408,7 +387,24 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       probe.close();
     }
 
-    // --- Step 6: atomic swap (v2.1 Phase 4q MED #5) ---
+    // --- Step 2: the safety backup, only now that the archive is fully validated ---
+    let previousBackupPath = "";
+    const srcDbPath = getDbPath();
+    if (fs.existsSync(srcDbPath)) {
+      const backupsDir = getBackupsDir();
+      // v2.1 Phase 4c.4: ensureSecureDir (vs bare mkdirSync) — same pattern as
+      // the primary export path; safety backups get 0700 directory treatment.
+      ensureSecureDir(backupsDir, 0o700);
+      const safetyPath = path.join(backupsDir, `pre-restore-${isoTimestamp()}.tar.gz`);
+      const pre = await exportRelayState({ destinationPath: safetyPath }); // inits + opens the live DB
+      // exportRelayState already chmod'd the file; no extra call needed here.
+      previousBackupPath = pre.archive_path;
+    }
+
+    // --- Step 3: close our DB handle so the swap can rename the file ---
+    closeDb();
+
+    // --- Step 4: atomic swap (v2.1 Phase 4q MED #5) ---
     // POSIX `rename(2)` atomically replaces the destination without a window
     // where the file is missing. The prior implementation unlinked srcDbPath
     // before the rename, leaving a gap where a concurrent daemon startup or
