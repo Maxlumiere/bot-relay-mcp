@@ -209,6 +209,8 @@ interface RunResult {
  */
 let SEAMED_HOOKS: string | null = null;
 const seamedPath = (p: string) => (SEAMED_HOOKS && p.startsWith(HOOKS_DIR + path.sep) ? path.join(SEAMED_HOOKS, path.relative(HOOKS_DIR, p)) : p);
+/** EVERY argument, not only the first: the `bash -x` trace mode runs ["-x", <hook>], where args[0] is the flag. */
+const routeArgs = (args: string[]) => args.map(seamedPath);
 
 function run(args: string[], env: Record<string, string>, stdin = "", fd5?: string): Promise<RunResult> {
   fs.rmSync(ARGV_DIR, { recursive: true, force: true });
@@ -218,7 +220,7 @@ function run(args: string[], env: Record<string, string>, stdin = "", fd5?: stri
   return new Promise<RunResult>((resolve, reject) => {
     const stdio: cp.StdioOptions = f5 === undefined ? "pipe" : ["pipe", "pipe", "pipe", "ignore", "ignore", f5];
     // TMPDIR: a hook's mktemp files land in this test's sandbox, never the machine's temp directory.
-    const routed = args.length ? [seamedPath(args[0]), ...args.slice(1)] : args;
+    const routed = routeArgs(args);
     const child = cp.spawn(BASH, routed, { env: { PATH: SHIM_DIR, TMPDIR: TEST_TMP, RELAY_TEST_CLOCK: "0", ...env }, stdio }) as cp.ChildProcessWithoutNullStreams;
     let stdout = "";
     let stderr = "";
@@ -350,6 +352,29 @@ describe("the harness sandbox", () => {
       expect(fs.existsSync(routed), routed).toBe(true);
     }
     expect(fs.readFileSync(path.join(SEAMED_HOOKS!, "_vault-helpers.sh"), "utf-8")).toContain(BUDGET_CLOCK_SEAMED);
+    // The flagged form the trace modes use (`bash -x <hook>`): the hook argument is routed too, wherever it sits.
+    for (const h of [CHECK_RELAY, STOP_HOOK, PTU_HOOK]) {
+      expect(routeArgs(["-x", h]), `bash -x ${path.basename(h)}`).toEqual(["-x", seamedPath(h)]);
+      expect(routeArgs(["-x", h])[1]).not.toBe(h);
+    }
+    expect(routeArgs(["-c", "exit 0"]), "a script string is not a hook path: untouched").toEqual(["-c", "exit 0"]);
+  });
+  // Every hook silences tracing as its FIRST statement (so a trace cannot print a credential), so a trace cannot show
+  // which file ran. BASH_ENV runs before the hook's first line, but there $0 is the SHELL (MEASURED, bash 3.2:
+  // "/bin/bash"), so the probe records the process's own command line instead ("bash -x <script>"). The FIRST line is
+  // the hook process itself (later lines are its own sub-shells).
+  it("the SPAWNED child really runs from the seamed copy, in the flagged form too (its own command line, via BASH_ENV)", async () => {
+    const probe = path.join(TEST_DIR, "cmdline-probe.sh");
+    fs.writeFileSync(probe, 'ps -o args= -p $$ >> "$PROBE_OUT"\n');
+    for (const h of [STOP_HOOK, PTU_HOOK]) {
+      const out = path.join(TEST_DIR, `cmdline-${path.basename(h)}.txt`);
+      fs.rmSync(out, { force: true });
+      await run(["-x", h], { BASH_ENV: probe, PROBE_OUT: out }, "");
+      const first = (fs.existsSync(out) ? fs.readFileSync(out, "utf-8").split("\n")[0] : "").trim();
+      expect(first, `bash -x ${path.basename(h)}: the probe saw the hook's own command line`).toMatch(/ -x /);
+      expect(first.endsWith(" " + seamedPath(h)), `bash -x ${path.basename(h)} ran the seamed copy: "${first}"`).toBe(true);
+      expect(first.includes(HOOKS_DIR + path.sep), `bash -x ${path.basename(h)}: not the real hooks dir`).toBe(false);
+    }
   });
   it("hook children get the test's own TMPDIR: TMPDIR-honouring tools put their temp files in the sandbox", async () => {
     const r = await run(["-c", 'printf "%s\\n" "$TMPDIR"; python3 -c "import tempfile; print(tempfile.gettempdir())"; mktemp'], {});
