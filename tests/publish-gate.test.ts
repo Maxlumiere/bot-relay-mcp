@@ -8,8 +8,11 @@
  * (fail-closed), and the registry the login is checked against is the one npm uploads to.
  *   - decide(): every condition, alone, refuses with its own named reason; a qualifying set passes.
  *   - the gatherer, on a REAL git fixture (a bare origin, a main checkout, .worktrees/ beside it): the main
- *     checkout, a linked node_modules, a dirty tree, HEAD not the remote's main and git unavailable are each
- *     refused; a fresh release worktree, minted before npm ci, passes.
+ *     checkout, a linked node_modules, a node_modules entry or a dist/ linked out of the tree, a dirty tree, HEAD
+ *     not the remote's main, a copied / re-minted / edited marker and git unavailable are each refused; a fresh
+ *     release worktree, minted before npm ci, passes. NOT CAUGHT (accident gate, named): a hard-linked file.
+ *   - every subprocess (git and npm) runs in an ISOLATED env: a temp HOME, no system or global git config, hooks
+ *     off, a private npm userconfig. gather() forwards that env to git.
  *   - the PROPERTY the registry check relies on, with the npm on PATH (its version is in the row's messages):
  *     with no publishConfig, `npm config get registry` run inside prepublishOnly names the registry npm would
  *     publish to (the one its own ENEEDAUTH refusal names), for a CLI --registry, both env spellings and .npmrc.
@@ -30,7 +33,9 @@ afterAll(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
 type Facts = Record<string, unknown>;
 const SHA = "a".repeat(40);
+const MARKER = { v: 1, sha: SHA, minted_at: "2026-10-27T00:00:00.000Z", tree: "/ws/.worktrees/rel", git_dir: "/ws/main/.git/worktrees/rel" };
 const qualifying = (): Facts => ({
+  top: "/ws/.worktrees/rel",
   gitDir: "/ws/main/.git/worktrees/rel",
   commonDir: "/ws/main/.git",
   sanctionedRoot: "/ws/.worktrees",
@@ -38,10 +43,12 @@ const qualifying = (): Facts => ({
   head: SHA,
   prodMarker: false,
   nodeModules: { root: "real", "extensions/vscode": "real" },
+  nmLinksOut: [],
+  dist: "real",
   dirty: [],
   remoteMain: SHA,
   remoteTag: null,
-  marker: { sha: SHA },
+  marker: { ...MARKER },
   pkg: { name: "bot-relay-mcp", version: "9.9.9", publishConfigRegistry: null },
   workspaceEnv: null,
 });
@@ -53,7 +60,7 @@ describe("decide(): each condition alone refuses, named; the qualifying set pass
   });
   const cases: Array<[string, Facts, string, RegExp]> = [
     ["git unavailable (undecidable)", { gitError: "spawn git ENOENT" }, "git", /git could not be asked \(spawn git ENOENT\)/],
-    ["the main checkout", { gitDir: "/ws/main/.git" }, "worktree", /the main checkout, not a linked worktree/],
+    ["the main checkout", { gitDir: "/ws/main/.git", marker: { ...MARKER, git_dir: "/ws/main/.git" } }, "worktree", /the main checkout, not a linked worktree/],
     ["a worktree outside the sanctioned root", { underSanctionedRoot: false }, "worktree", /not under the sanctioned worktree root \(\/ws\/\.worktrees\)/],
     ["the serving-tree marker", { prodMarker: true }, "prod-marker", /\.relay-prod-tree/],
     ["a linked root node_modules", { nodeModules: { root: "link", "extensions/vscode": "real" } }, "node_modules", /root node_modules is a link/],
@@ -65,7 +72,19 @@ describe("decide(): each condition alone refuses, named; the qualifying set pass
     ["the remote unreadable (undecidable)", { remoteError: "Could not read from remote repository." }, "head", /remote's main could not be read/],
     ["no release marker", { marker: null }, "marker", /no release marker/],
     ["an unreadable marker", { marker: "unreadable" }, "marker", /could not be read/],
-    ["a marker for another SHA", { marker: { sha: "c".repeat(40) } }, "marker", /minted for ccccccc, not HEAD aaaaaaa/],
+    ["a marker for another SHA", { marker: { ...MARKER, sha: "c".repeat(40) } }, "marker", /minted for ccccccc, not HEAD aaaaaaa/],
+    ["a marker of an unknown version", { marker: { ...MARKER, v: 2 } }, "marker", /unknown version \(2\)/],
+    ["a marker whose sha is not a full commit id", { marker: { ...MARKER, sha: "abc123" } }, "marker", /not a full commit id/],
+    ["a marker whose minted_at is not an ISO time", { marker: { ...MARKER, minted_at: "yesterday" } }, "marker", /minted_at is not an ISO time/],
+    ["a marker minted for ANOTHER tree (copied)", { marker: { ...MARKER, tree: "/ws/.worktrees/other" } }, "marker", /minted for another tree \(\/ws\/\.worktrees\/other\)/],
+    ["a marker naming another git dir (copied)", { marker: { ...MARKER, git_dir: "/ws/main/.git/worktrees/other" } }, "marker", /names another git dir: it was copied/],
+    ["a marker with no tree binding (the old shape)", { marker: { v: 1, sha: SHA, minted_at: MARKER.minted_at } }, "marker", /minted for another tree \(none\)/],
+    ["a serving-tree marker that cannot be inspected", { prodMarker: "EACCES" }, "prod-marker", /could not be inspected \(EACCES\)/],
+    ["a node_modules entry linked out of the tree", { nmLinksOut: ["node_modules/x → /elsewhere/x"] }, "node_modules", /1 node_modules entry is a link out of the tree \(e\.g\. node_modules\/x → \/elsewhere\/x\)/],
+    ["node_modules entries that cannot be inspected", { nmScanError: "EACCES" }, "node_modules", /entries could not be inspected \(EACCES\)/],
+    ["a linked dist/", { dist: "link" }, "dist", /dist\/ is a link: the build would write through it/],
+    ["a dist/ resolving outside the tree", { dist: "outside" }, "dist", /resolves outside the tree/],
+    ["a dist/ that cannot be inspected", { dist: "error" }, "dist", /could not be inspected/],
     ["publishConfig.registry", { pkg: { name: "bot-relay-mcp", version: "9.9.9", publishConfigRegistry: "https://r.test/" } }, "registry", /publishConfig\.registry: not supported/],
     ["a scoped name", { pkg: { name: "@x/bot-relay-mcp", version: "9.9.9", publishConfigRegistry: null } }, "registry", /is scoped/],
     ["a workspace publish", { workspaceEnv: "npm_config_workspace=a" }, "workspace", /workspace publish \(npm_config_workspace=a\)/],
@@ -82,29 +101,50 @@ describe("decide(): each condition alone refuses, named; the qualifying set pass
     expect(checks({ ...qualifying(), remoteMain: "b".repeat(40), remoteTag: SHA })).toEqual([]);
     expect(checks({ ...qualifying(), remoteMain: "b".repeat(40), remoteTag: "d".repeat(40) }).map((x) => x.check)).toEqual(["head"]);
   });
-  it("--mint: refused once real node_modules exist (minted at creation, before npm ci); a link or none is fine; no marker needed", () => {
-    expect(checks({ ...qualifying(), marker: null, nodeModules: { root: "link", "extensions/vscode": "absent" } }, true)).toEqual([]);
-    const r = checks({ ...qualifying(), marker: null }, true);
+  it("--mint: only an ABSENT or LINKED node_modules (before npm ci); installed, outside or uninspectable are refused; no marker may exist", () => {
+    const fresh = { ...qualifying(), marker: null, dist: "absent", nodeModules: { root: "link", "extensions/vscode": "absent" } };
+    expect(checks(fresh, true)).toEqual([]);
+    const r = checks({ ...fresh, nodeModules: { root: "real", "extensions/vscode": "outside" } }, true);
     expect(r.map((x) => x.check)).toEqual(["node_modules", "node_modules"]);
     expect(r[0].reason).toMatch(/already installed: mint the marker when the tree is created/);
+    expect(r[1].reason).toMatch(/extensions\/vscode node_modules resolves outside the tree: a tree is minted before npm ci/);
+    expect(checks({ ...fresh, nodeModules: { root: "error", "extensions/vscode": "absent" } }, true)[0].reason).toMatch(/could not be inspected/);
+    const again = checks({ ...fresh, marker: { ...MARKER } }, true);
+    expect(again.map((x) => x.check)).toEqual(["marker"]);
+    expect(again[0].reason).toMatch(/already exists for this tree: a tree is minted once/);
   });
 });
 
 describe("the gatherer on a REAL git fixture (bare origin, main checkout, .worktrees/ beside it)", () => {
+  // ISOLATED: no system or global git config (a real one could sign, route or hook), a temp HOME; hooks off.
+  const ISO_HOME = path.join(TMP, "iso-home");
+  fs.mkdirSync(ISO_HOME, { recursive: true });
+  fs.writeFileSync(path.join(ISO_HOME, "gitconfig"), "");
+  const ISO_ENV: Record<string, string> = {
+    PATH: process.env.PATH ?? "",
+    HOME: ISO_HOME,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: path.join(ISO_HOME, "gitconfig"),
+    GIT_TERMINAL_PROMPT: "0",
+  };
   const git = (cwd: string, ...args: string[]) =>
-    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t.test", "-c", "init.defaultBranch=main", ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t.test", "-c", "init.defaultBranch=main", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...args], { cwd, env: ISO_ENV, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
   let n = 0;
-  /** A workspace: ws/origin.git (bare), ws/main (its clone), ws/.worktrees/<name> (a linked worktree at origin/main). */
-  const workspace = (pkg: Record<string, unknown> = { name: "bot-relay-mcp", version: "9.9.9" }) => {
+  /** A workspace: ws/origin.git (bare), ws/main (its clone), ws/.worktrees/<name> (a linked worktree at origin/main).
+   *  extIgnored: extensions/ is untracked and ignored (so a fixture can replace it with a link without dirtying the tree). */
+  const workspace = (pkg: Record<string, unknown> = { name: "bot-relay-mcp", version: "9.9.9" }, { extIgnored = false } = {}) => {
     const ws = path.join(TMP, `ws${++n}`);
     fs.mkdirSync(ws);
     git(ws, "init", "--bare", "-q", "origin.git");
     git(ws, "clone", "-q", path.join(ws, "origin.git"), "main");
     const main = path.join(ws, "main");
     fs.writeFileSync(path.join(main, "package.json"), JSON.stringify(pkg));
-    fs.writeFileSync(path.join(main, ".gitignore"), "node_modules\n"); // no trailing slash: a LINKED node_modules is ignored too (the row tests the link, not the status)
-    fs.mkdirSync(path.join(main, "extensions", "vscode"), { recursive: true });
-    fs.writeFileSync(path.join(main, "extensions", "vscode", "package.json"), "{}");
+    // No trailing slashes: a LINKED node_modules or dist is ignored too (the rows test the link, not the status).
+    fs.writeFileSync(path.join(main, ".gitignore"), `node_modules\ndist\n${extIgnored ? "extensions\n" : ""}`);
+    if (!extIgnored) {
+      fs.mkdirSync(path.join(main, "extensions", "vscode"), { recursive: true });
+      fs.writeFileSync(path.join(main, "extensions", "vscode", "package.json"), "{}");
+    }
     git(main, "add", "-A");
     git(main, "commit", "-q", "-m", "init");
     git(main, "push", "-q", "origin", "HEAD:main");
@@ -116,11 +156,25 @@ describe("the gatherer on a REAL git fixture (bare origin, main checkout, .workt
     for (const d of [".", "extensions/vscode"]) fs.mkdirSync(path.join(tree, d, "node_modules", ".bin"), { recursive: true });
   };
   const runGate = (cwd: string, args: string[] = [], env: Record<string, string> = {}) => {
-    const r = spawnSync(process.execPath, [GATE, ...args], { cwd, encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: TMP, ...env } });
+    const r = spawnSync(process.execPath, [GATE, ...args], { cwd, encoding: "utf8", env: { ...ISO_ENV, ...env } });
     return { status: r.status, err: r.stderr };
   };
-  const refusedChecks = (cwd: string, env: Record<string, string> = {}) =>
-    (decide(gather({ cwd, env: { ...env } })) as Array<{ check: string }>).map((x) => x.check);
+  const refusals = (cwd: string, env: Record<string, string> = {}) =>
+    decide(gather({ cwd, env: { ...ISO_ENV, ...env } })) as Array<{ check: string; reason: string }>;
+  const refusedChecks = (cwd: string, env: Record<string, string> = {}) => refusals(cwd, env).map((x) => x.check);
+  /** A minted, installed tree that qualifies (the base each isolation row changes ONE thing in). */
+  const qualifiedTree = () => {
+    const w = workspace();
+    expect(runGate(w.tree, ["--mint"]).status).toBe(0);
+    install(w.tree);
+    expect(refusedChecks(w.tree), "precondition: the tree qualifies").toEqual([]);
+    return w;
+  };
+  const outsideDir = (tag: string) => {
+    const d = path.join(TMP, `outside-${tag}-${++n}`);
+    fs.mkdirSync(d, { recursive: true });
+    return d;
+  };
 
   it("TWIN: a fresh release worktree, minted BEFORE npm ci, then installed → --check passes (exit 0); the marker lives in its private git dir", () => {
     const { tree } = workspace();
@@ -190,6 +244,83 @@ describe("the gatherer on a REAL git fixture (bare origin, main checkout, .workt
     expect(refusedChecks(tree)).toEqual(["head"]);
   });
 
+  it("HARM: a dist/ LINKED out of the tree is refused [dist] (the build would write through it)", () => {
+    const { tree } = qualifiedTree();
+    fs.symlinkSync(outsideDir("dist"), path.join(tree, "dist"), "junction");
+    expect(refusedChecks(tree)).toEqual(["dist"]);
+  });
+
+  it("HARM: a top-level node_modules entry, or a SCOPED one, LINKED out of the tree is refused [node_modules] (npm link's shape); TWIN: a link inside the tree passes", () => {
+    const a = qualifiedTree();
+    fs.symlinkSync(outsideDir("pkg"), path.join(a.tree, "node_modules", "linked-pkg"), "junction");
+    const r = refusals(a.tree);
+    expect(r.map((x) => x.check)).toEqual(["node_modules"]);
+    expect(r[0].reason).toMatch(/node_modules\/linked-pkg → /);
+    const b = qualifiedTree();
+    fs.mkdirSync(path.join(b.tree, "extensions", "vscode", "node_modules", "@scope"), { recursive: true });
+    fs.symlinkSync(outsideDir("scoped"), path.join(b.tree, "extensions", "vscode", "node_modules", "@scope", "pkg"), "junction");
+    expect(refusals(b.tree)[0]?.reason).toMatch(/node_modules\/@scope\/pkg → /);
+    const c = qualifiedTree();
+    fs.mkdirSync(path.join(c.tree, "node_modules", "real-pkg"));
+    fs.symlinkSync(path.join(c.tree, "node_modules", "real-pkg"), path.join(c.tree, "node_modules", "alias-pkg"), "junction");
+    expect(refusedChecks(c.tree), "a link that stays inside the tree is not refused").toEqual([]);
+  });
+
+  it("NOT CAUGHT (a named exclusion of the accident gate): a HARD-LINKED file shared with another tree passes", () => {
+    const { tree } = qualifiedTree();
+    const shared = path.join(outsideDir("hard"), "index.js");
+    fs.writeFileSync(shared, "module.exports = 1;\n");
+    fs.mkdirSync(path.join(tree, "node_modules", "hard-pkg"));
+    fs.linkSync(shared, path.join(tree, "node_modules", "hard-pkg", "index.js"));
+    expect(fs.statSync(shared).nlink, "precondition: the file really is shared").toBe(2);
+    expect(refusedChecks(tree), "pinned: a hard link is a plain file, not compared across trees").toEqual([]);
+  });
+
+  it("HARM: --mint refuses a node_modules that a LINKED ANCESTOR routes outside the tree (state 'outside', not only 'real')", () => {
+    const { tree } = workspace({ name: "bot-relay-mcp", version: "9.9.9" }, { extIgnored: true });
+    const elsewhere = outsideDir("ext");
+    fs.mkdirSync(path.join(elsewhere, "node_modules"));
+    fs.mkdirSync(path.join(tree, "extensions"));
+    fs.symlinkSync(elsewhere, path.join(tree, "extensions", "vscode"), "junction");
+    const r = runGate(tree, ["--mint"]);
+    expect(r.status).toBe(1);
+    expect(r.err).toMatch(/\[node_modules\] extensions\/vscode node_modules resolves outside the tree: a tree is minted before npm ci/);
+  });
+
+  it.skipIf(process.platform === "win32")("HARM: a DANGLING .relay-prod-tree link counts as the marker (existsSync would read it as absent)", () => {
+    const { tree } = qualifiedTree();
+    const p = path.join(tree, ".relay-prod-tree");
+    fs.symlinkSync(path.join(TMP, "nowhere-at-all"), p);
+    expect(fs.existsSync(p), "precondition: existsSync follows the link and says absent").toBe(false);
+    expect(refusedChecks(tree)).toContain("prod-marker");
+  });
+
+  it("HARM: a marker COPIED from another worktree at the SAME SHA is refused (it names that tree and git dir)", () => {
+    const { main, tree } = qualifiedTree();
+    const other = path.join(path.dirname(tree), "rel2");
+    git(main, "worktree", "add", "-q", "--detach", other, "origin/main");
+    install(other);
+    const from = path.join(git(tree, "rev-parse", "--absolute-git-dir"), MARKER_NAME);
+    fs.copyFileSync(from, path.join(git(other, "rev-parse", "--absolute-git-dir"), MARKER_NAME));
+    const r = refusals(other);
+    expect(r.map((x) => x.check)).toEqual(["marker"]);
+    expect(r[0].reason).toMatch(/minted for another tree/);
+  });
+
+  it("HARM: a tree is minted ONCE (a second --mint is refused, the marker unchanged); an edited minted_at is refused", () => {
+    const { tree } = workspace();
+    expect(runGate(tree, ["--mint"]).status).toBe(0);
+    const p = path.join(git(tree, "rev-parse", "--absolute-git-dir"), MARKER_NAME);
+    const before = fs.readFileSync(p, "utf8");
+    const again = runGate(tree, ["--mint"]);
+    expect(again.status).toBe(1);
+    expect(again.err).toMatch(/already exists for this tree: a tree is minted once/);
+    expect(fs.readFileSync(p, "utf8")).toBe(before);
+    install(tree);
+    fs.writeFileSync(p, JSON.stringify({ ...JSON.parse(before), minted_at: "not-a-time" }));
+    expect(refusals(tree)[0]?.reason).toMatch(/minted_at is not an ISO time/);
+  });
+
   it("HARM: publishConfig.registry, a scoped name and a workspace publish are each refused on an otherwise qualifying tree", () => {
     for (const [pkg, env, check] of [
       [{ name: "bot-relay-mcp", version: "9.9.9", publishConfig: { registry: "https://r.test/" } }, {}, "registry"],
@@ -206,7 +337,12 @@ describe("the gatherer on a REAL git fixture (bare origin, main checkout, .workt
 });
 
 describe.skipIf(process.platform === "win32")("the PROPERTY the registry check relies on (the npm on PATH, no publishConfig)", () => {
-  const npmVersion = spawnSync("npm", ["--version"], { encoding: "utf8" }).stdout.trim();
+  const NPM_HOME = path.join(TMP, "npm-version-home");
+  fs.mkdirSync(NPM_HOME, { recursive: true });
+  const npmVersion = spawnSync("npm", ["--version"], {
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "", HOME: NPM_HOME, npm_config_userconfig: path.join(NPM_HOME, ".npmrc"), npm_config_globalconfig: path.join(NPM_HOME, "globalnpmrc") },
+  }).stdout.trim();
   it(`npm ${npmVersion}: inside prepublishOnly, \`npm config get registry\` is the registry npm would publish to (CLI, both env spellings, .npmrc)`, () => {
     const D = path.join(TMP, "npm-property");
     fs.mkdirSync(path.join(D, "home"), { recursive: true });

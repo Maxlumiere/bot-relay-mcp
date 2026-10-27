@@ -7,37 +7,59 @@
 /**
  * PUBLISH GATE: POSITIVE QUALIFICATION. A real `npm publish` (prepublishOnly) is refused unless the tree
  * PROVES it is a fresh release tree. It fails CLOSED: a check it cannot decide (git missing, the remote
- * unreachable, a file it cannot read) is a refusal, named. This replaces detecting the serving tree by its
+ * unreachable, a file it cannot inspect) is a refusal, named. This replaces detecting the serving tree by its
  * consumers (a parser that misses forms, and fails open); prebuild-guard.mjs keeps that parser for BUILDS.
+ *
+ * THREAT MODEL: an ACCIDENT gate. It stops an honest operator publishing from the wrong or a contaminated tree
+ * (the 26 Oct incident: a publish in the serving tree swapped packages under the live daemon). It is NOT a
+ * defence against someone with write access to the checkout, who can edit this script. So it checks what an
+ * accident leaves (a link to another checkout, the serving tree's marker, a tree at the wrong SHA), and NAMES
+ * what it does not check (NOT CAUGHT, below), each pinned by a test.
  *
  * A release tree, all of:
  *   1. a LINKED git worktree (its git dir is not the common dir), under the sanctioned root
  *      <parent of the main checkout>/.worktrees (the main checkout is the common dir's parent);
- *   2. no .relay-prod-tree marker (the serving tree's);
- *   3. its OWN node_modules, root and extensions/vscode: real directories inside the tree, never a link
- *      (a worktree tool links them to the main checkout until `npm ci`);
+ *   2. no .relay-prod-tree entry (the serving tree's marker; any entry counts, a dangling link included; an
+ *      entry that cannot be inspected is a refusal);
+ *   3. ISOLATED build inputs and outputs: node_modules (root and extensions/vscode) are real directories inside
+ *      the tree, never a link (a worktree tool links them to the main checkout until `npm ci`), and none of their
+ *      top-level entries (scoped ones included) is a link resolving outside the tree (what `npm link` or a hand
+ *      link leaves; `npm ci` never does); dist/ is absent or a real directory inside the tree, never a link;
  *   4. a clean tree whose HEAD is the remote's main (`git ls-remote`, read live) or the remote's tag
  *      v<package version>;
- *   5. a release marker minted for HEAD when the tree was created (`--mint`, below).
- * And the package, for the registry the login is checked against (measured on npm 11.6.2: inside
+ *   5. a release marker minted for this tree, at HEAD (below).
+ * And the package, for the registry the login is checked against (measured on npm 11.6.2 and 10.9.9: inside
  * prepublishOnly, `npm config get registry` names the real target for a CLI flag, either env spelling and
  * .npmrc, but NOT when publishConfig.registry is set, where a CLI and an env registry look identical):
  *   6. no publishConfig.registry;
  *   7. an UNSCOPED name (an @scope:registry mapping could override; not measured);
  *   8. no workspace publish (npm_config_workspace / npm_config_workspaces; not measured).
+ * Inside prepublishOnly this runs AFTER any `npm ci`, so the isolation in 3 is checked on the installed tree.
  *
- * THE MARKER: <the worktree's private git dir>/relay-release-tree.json, {v:1, sha, minted_at}. It is not in
- * the working tree (so it cannot dirty it) and `git worktree remove` deletes it with the tree. `--mint`
- * writes it only for a tree that passes 1, 2 and 4 and has NO real node_modules yet: minted at creation,
- * before `npm ci`, for the SHA the tree was created at.
+ * THE MARKER: <the worktree's private git dir>/relay-release-tree.json, {v:1, sha, minted_at, tree, git_dir}:
+ * the SHA, an ISO time, and the canonical paths of the tree and of its private git dir, all validated. It is not
+ * in the working tree (so it cannot dirty it) and `git worktree remove` deletes it with the tree. `--mint` writes
+ * it once (never over an existing one) and only for a tree that passes 1, 2, 3's dist/ rule and 4, with no
+ * node_modules installed yet (absent, or a link): minted at creation, before `npm ci`. It is an OPERATOR-
+ * CONTROLLED ASSERTION ("this tree was created for this release"), not provenance: anyone who can write the
+ * git dir can write it. Stronger provenance would need a trusted creator outside the mutable checkout.
+ *
+ * NOT CAUGHT (named exclusions, each pinned by a test or stated as untestable here):
+ *   - a HARD-LINKED file inside node_modules or dist/ shared with another tree (a hard link is a plain file;
+ *     nothing tells it apart without comparing inodes across trees): pinned by a NOT-caught test;
+ *   - a BIND MOUNT over a directory (needs privileges to make; not tested here);
+ *   - links BELOW the top level of node_modules (only the entries npm itself places are inspected);
+ *   - the HEAD rule accepts a lightweight tag, a tag off main or ahead of it, and trusts whatever URL `origin`
+ *     points at: the rule as written, not verified release provenance.
  *
  * MODES: no flag (what pre-publish-check.sh runs inside prepublishOnly) or `--check` (the same qualification,
- * on demand, for the release procedure) refuse unless 1-8 hold; `--mint` writes the marker (above).
+ * on demand, for the release procedure) refuse unless 1-8 hold; `--mint` writes the marker (above). `--check`
+ * proves QUALIFICATION only, never that the whole gate passed.
  *
  * KNOWN LIMIT: `npm publish --ignore-scripts` skips prepublishOnly, and with it this whole gate. Nothing that
  * runs at publish time could stop it, so a "gate passed" record would be a claim nothing reads. The procedure
- * (pre-publish-check.sh's header) allows --ignore-scripts only to retry an upload right after a fully gated run
- * on the same tree at the same SHA, with `--check` passing there again first.
+ * (pre-publish-check.sh's header) allows it only to retry the UPLOAD after a run that completed every step and
+ * failed at the upload itself, on the same tree at the same SHA.
  *
  * THE LAYOUT IS THIS WORKSPACE'S: condition 1 encodes it (worktrees beside the main checkout, in .worktrees/).
  * A publish from any other layout is refused by design: only the owner publishes.
@@ -51,6 +73,13 @@ import { isDirectRun } from "./lib/entrypoint.mjs";
 
 export const MARKER_NAME = "relay-release-tree.json";
 
+const NM_WHY = {
+  absent: "is missing",
+  link: "is a link (to another checkout's packages)",
+  outside: "resolves outside the tree",
+  error: "could not be inspected",
+};
+
 /** The refusals for a set of gathered facts (pure). An empty list qualifies the tree. */
 export function decide(f, { mint = false } = {}) {
   const out = [];
@@ -63,16 +92,23 @@ export function decide(f, { mint = false } = {}) {
   if (f.gitDir === f.commonDir) no("worktree", "this is the main checkout, not a linked worktree: publish from a fresh worktree created for the release");
   else if (!f.underSanctionedRoot) no("worktree", `the tree is not under the sanctioned worktree root (${f.sanctionedRoot})`);
   // 2
-  if (f.prodMarker) no("prod-marker", "this tree carries .relay-prod-tree: it is the serving tree");
+  if (f.prodMarker === true) no("prod-marker", "this tree carries .relay-prod-tree: it is the serving tree");
+  else if (f.prodMarker !== false) no("prod-marker", `.relay-prod-tree could not be inspected (${f.prodMarker})`);
   // 3
   for (const [where, state] of Object.entries(f.nodeModules)) {
     if (mint) {
       if (state === "real") no("node_modules", `${where} node_modules is already installed: mint the marker when the tree is created, before npm ci`);
-      else if (state === "error") no("node_modules", `${where} node_modules could not be inspected`);
+      else if (state !== "absent" && state !== "link") no("node_modules", `${where} node_modules ${NM_WHY[state] ?? state}: a tree is minted before npm ci`);
     } else if (state !== "real") {
-      const why = { absent: "is missing", link: "is a link (to another checkout's packages)", outside: "resolves outside the tree", error: "could not be inspected" }[state] ?? state;
-      no("node_modules", `${where} node_modules ${why}: run npm ci in this tree`);
+      no("node_modules", `${where} node_modules ${NM_WHY[state] ?? state}: run npm ci in this tree`);
     }
+  }
+  if (!mint) {
+    if (f.nmScanError) no("node_modules", `node_modules entries could not be inspected (${f.nmScanError})`);
+    else if (f.nmLinksOut && f.nmLinksOut.length) no("node_modules", `${f.nmLinksOut.length} node_modules entr${f.nmLinksOut.length === 1 ? "y is a link" : "ies are links"} out of the tree (e.g. ${f.nmLinksOut[0]}): a linked package is not this tree's`);
+  }
+  if (f.dist && f.dist !== "absent" && f.dist !== "real") {
+    no("dist", `dist/ ${{ link: "is a link: the build would write through it", outside: "resolves outside the tree", error: "could not be inspected" }[f.dist] ?? f.dist}`);
   }
   // 4
   if (f.dirty === null) no("clean", `the tree's status could not be read (${f.statusError})`);
@@ -82,10 +118,11 @@ export function decide(f, { mint = false } = {}) {
     no("head", `HEAD ${short(f.head)} is neither the remote's main (${short(f.remoteMain)}) nor its tag v${f.pkg?.version ?? "?"}${f.remoteTag ? ` (${short(f.remoteTag)})` : " (absent)"}`);
   }
   // 5
-  if (!mint) {
-    if (f.marker === null) no("marker", `no release marker: create the tree with \`node scripts/publish-gate.mjs --mint\` before npm ci`);
-    else if (f.marker === "unreadable") no("marker", "the release marker could not be read");
-    else if (f.marker.sha !== f.head) no("marker", `the release marker was minted for ${short(f.marker.sha)}, not HEAD ${short(f.head)}`);
+  if (mint) {
+    if (f.marker !== null) no("marker", "a release marker already exists for this tree: a tree is minted once (never re-minted)");
+  } else {
+    const bad = markerProblem(f);
+    if (bad) no("marker", bad);
   }
   // 6-8
   if (!mint) {
@@ -99,6 +136,22 @@ export function decide(f, { mint = false } = {}) {
   return out;
 }
 
+/** Why the marker does not qualify this tree at HEAD, or null. The full schema, then the binding. */
+function markerProblem(f) {
+  const m = f.marker;
+  if (m === null) return "no release marker: create the tree with `node scripts/publish-gate.mjs --mint` before npm ci";
+  if (m === "unreadable" || typeof m !== "object") return "the release marker could not be read";
+  if (m.v !== 1) return `the release marker has an unknown version (${JSON.stringify(m.v)})`;
+  if (typeof m.sha !== "string" || !/^[0-9a-f]{40}$/.test(m.sha)) return "the release marker's sha is not a full commit id";
+  if (typeof m.minted_at !== "string" || Number.isNaN(Date.parse(m.minted_at)) || new Date(m.minted_at).toISOString() !== m.minted_at) {
+    return "the release marker's minted_at is not an ISO time";
+  }
+  if (typeof m.tree !== "string" || m.tree !== f.top) return `the release marker was minted for another tree (${typeof m.tree === "string" ? m.tree : "none"}), not this one (${f.top})`;
+  if (typeof m.git_dir !== "string" || m.git_dir !== f.gitDir) return "the release marker names another git dir: it was copied, not minted here";
+  if (m.sha !== f.head) return `the release marker was minted for ${short(m.sha)}, not HEAD ${short(f.head)}`;
+  return null;
+}
+
 const short = (s) => (typeof s === "string" ? s.slice(0, 7) : String(s));
 
 function within(child, parent) {
@@ -106,8 +159,8 @@ function within(child, parent) {
   return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
-function nodeModulesState(top, rel) {
-  const p = path.join(top, rel, "node_modules");
+/** "absent" | "link" | "real" (a real directory inside the tree) | "outside" | "error". */
+function dirState(top, p) {
   let st;
   try {
     st = fs.lstatSync(p);
@@ -117,14 +170,51 @@ function nodeModulesState(top, rel) {
   if (st.isSymbolicLink()) return "link";
   if (!st.isDirectory()) return "error";
   try {
-    return within(fs.realpathSync(p), fs.realpathSync(top)) ? "real" : "outside";
+    return within(fs.realpathSync(p), top) ? "real" : "outside";
   } catch {
     return "error";
   }
 }
 
-/** Gather the facts for decide(). `git` runs a git command in `cwd` and returns its trimmed stdout (throws on failure). */
-export function gather({ cwd, env = process.env, git = defaultGit(cwd) }) {
+/** Every top-level node_modules entry (and @scope/<name>) that is a link resolving outside the tree. Throws when unreadable. */
+function linksOut(top, nm) {
+  const out = [];
+  const check = (dir, name) => {
+    const p = path.join(dir, name);
+    let target;
+    try {
+      target = fs.realpathSync(p);
+    } catch {
+      out.push(`${path.relative(top, p)} (a dangling link)`);
+      return;
+    }
+    if (!within(target, top)) out.push(`${path.relative(top, p)} → ${target}`);
+  };
+  for (const e of fs.readdirSync(nm, { withFileTypes: true })) {
+    if (e.isSymbolicLink()) check(nm, e.name);
+    else if (e.isDirectory() && e.name.startsWith("@")) {
+      const scope = path.join(nm, e.name);
+      for (const s of fs.readdirSync(scope, { withFileTypes: true })) if (s.isSymbolicLink()) check(scope, s.name);
+    }
+  }
+  return out;
+}
+
+/** true (an entry exists, of any kind), false (ENOENT only), or the inspection error's text. */
+function entryState(p) {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch (e) {
+    return e && e.code === "ENOENT" ? false : String((e && e.code) || e);
+  }
+}
+
+/**
+ * Gather the facts for decide(). `git` runs a git command in `cwd` with `env` and returns its trimmed stdout
+ * (throws on failure); `env` is also where a workspace publish is read from.
+ */
+export function gather({ cwd, env = process.env, git = defaultGit(cwd, env) }) {
   const f = { nodeModules: {} };
   let top;
   try {
@@ -136,10 +226,19 @@ export function gather({ cwd, env = process.env, git = defaultGit(cwd) }) {
     f.gitError = firstLine(e);
     return f;
   }
+  f.top = top;
   f.sanctionedRoot = path.join(path.dirname(path.dirname(f.commonDir)), ".worktrees");
   f.underSanctionedRoot = within(top, f.sanctionedRoot);
-  f.prodMarker = fs.existsSync(path.join(top, ".relay-prod-tree"));
-  f.nodeModules = { root: nodeModulesState(top, "."), "extensions/vscode": nodeModulesState(top, "extensions/vscode") };
+  f.prodMarker = entryState(path.join(top, ".relay-prod-tree"));
+  const nmDirs = { root: path.join(top, "node_modules"), "extensions/vscode": path.join(top, "extensions", "vscode", "node_modules") };
+  for (const [where, p] of Object.entries(nmDirs)) f.nodeModules[where] = dirState(top, p);
+  f.nmLinksOut = [];
+  try {
+    for (const [where, p] of Object.entries(nmDirs)) if (f.nodeModules[where] === "real") f.nmLinksOut.push(...linksOut(top, p));
+  } catch (e) {
+    f.nmScanError = firstLine(e);
+  }
+  f.dist = dirState(top, path.join(top, "dist"));
   try {
     f.dirty = git(["status", "--porcelain", "--untracked-files=all"]).split("\n").filter(Boolean);
   } catch (e) {
@@ -147,8 +246,7 @@ export function gather({ cwd, env = process.env, git = defaultGit(cwd) }) {
     f.statusError = firstLine(e);
   }
   try {
-    const raw = fs.readFileSync(path.join(top, "package.json"), "utf8");
-    const p = JSON.parse(raw);
+    const p = JSON.parse(fs.readFileSync(path.join(top, "package.json"), "utf8"));
     f.pkg = { name: String(p.name ?? ""), version: String(p.version ?? ""), publishConfigRegistry: (p.publishConfig && p.publishConfig.registry) || null };
   } catch {
     f.pkg = null;
@@ -164,11 +262,12 @@ export function gather({ cwd, env = process.env, git = defaultGit(cwd) }) {
     f.remoteError = firstLine(e);
   }
   const markerPath = path.join(f.gitDir, MARKER_NAME);
-  if (!fs.existsSync(markerPath)) f.marker = null;
+  const markerEntry = entryState(markerPath);
+  if (markerEntry === false) f.marker = null;
   else {
     try {
       const m = JSON.parse(fs.readFileSync(markerPath, "utf8"));
-      f.marker = m && m.v === 1 && typeof m.sha === "string" ? { sha: m.sha } : "unreadable";
+      f.marker = m && typeof m === "object" ? m : "unreadable";
     } catch {
       f.marker = "unreadable";
     }
@@ -183,8 +282,8 @@ function firstLine(e) {
   return s.split("\n").find((l) => l.trim()) ?? "unknown error";
 }
 
-function defaultGit(cwd) {
-  return (args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 }).trim();
+function defaultGit(cwd, env) {
+  return (args) => execFileSync("git", args, { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 }).trim();
 }
 
 function main() {
@@ -204,7 +303,13 @@ function main() {
     process.exit(1);
   }
   if (mint) {
-    fs.writeFileSync(path.join(f.gitDir, MARKER_NAME), JSON.stringify({ v: 1, sha: f.head, minted_at: new Date().toISOString() }) + "\n", { flag: "w" });
+    const marker = { v: 1, sha: f.head, minted_at: new Date().toISOString(), tree: f.top, git_dir: f.gitDir };
+    try {
+      fs.writeFileSync(path.join(f.gitDir, MARKER_NAME), JSON.stringify(marker) + "\n", { flag: "wx" }); // never over an existing one
+    } catch (e) {
+      process.stderr.write(`\n✖ NOT minting a release marker: ${firstLine(e)}\n\n`);
+      process.exit(1);
+    }
     process.stderr.write(`release marker minted for ${f.head}\n`);
   }
   process.exit(0);

@@ -40,12 +40,14 @@
 #   1. create a linked worktree at origin/main under the workspace's .worktrees/;
 #   2. `node scripts/publish-gate.mjs --mint` in it, BEFORE npm ci (the marker is for this SHA);
 #   3. remove any node_modules link, then `npm ci` (root and extensions/vscode);
-#   4. `node scripts/publish-gate.mjs --check` (the qualification on demand);
+#   4. `node scripts/publish-gate.mjs --check` (the qualification on demand; not the whole gate);
 #   5. `npm publish` (it runs this whole gate, the qualification first).
 # KNOWN LIMIT: `npm publish --ignore-scripts` skips prepublishOnly, and with it this WHOLE gate,
-# the qualification included. Use it only to retry the upload right after a fully gated run on
-# the SAME tree at the SAME SHA (e.g. one that failed only on the login), and only after
-# `--check` passes there again.
+# the qualification included. It is allowed ONLY to retry the UPLOAD after a run that completed
+# EVERY step of this gate and then failed at the upload itself (npm's own publish request), on the
+# SAME tree at the SAME SHA. A login failure is NOT that: it stops this gate BEFORE the build and the
+# tests, so fix the login and run a plain `npm publish` again (the whole gate runs). `--check`
+# proves the tree's QUALIFICATION only, never that this gate passed.
 #
 # You do NOT need a manual `npm run build` first — the gate builds
 # dist/ itself (step 2) before any test. Both stumbles that hit the 2.25.0 publish
