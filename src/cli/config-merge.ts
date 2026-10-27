@@ -25,6 +25,7 @@ import path from "path";
 import os from "os";
 import crypto from "crypto";
 import { flatConfigPath, configPathForInstance } from "../instance.js"; // the relay config layout: one place
+import { walkPath, comparePaths, isProtected } from "../path-walk.js"; // THE path walk, and its sanctioned reader
 
 /**
  * SHIPPING-DEFECT guard (2026-07-23): under a test harness, UNCONDITIONALLY
@@ -72,61 +73,72 @@ function accountHome(): string {
 }
 
 /**
- * Canonicalize a path that may not exist yet: realpath the deepest EXISTING
- * ancestor (following symlinks), then re-append the non-existent tail.
- * codex #125 blocker 2: lexical path.resolve equality is symlink-bypassable —
- * `alias -> home` makes `alias/.claude.json` land in `home/.claude.json`
- * while resolving unequal. Canonicalizing BOTH sides closes that.
+ * The instance configs a destination could name: one per path component of its walk (its own spelling, where the
+ * walk landed, and every entry the walk passed through, link hops included) that is a valid instance id, under the
+ * ACCOUNT home's instances dir. A superset on purpose: each is then judged by comparePaths, so a name that is not an
+ * instance under the account home simply compares "different". Nothing of the operator's tree is read to work out
+ * which instances exist (the operator tripwire would refuse those reads, and an env-selected instance has no marker).
  */
-function canonicalize(p: string): string {
-  let base = path.resolve(p);
-  const tail: string[] = [];
-  for (;;) {
+function instanceConfigCandidates(dest: string, accountEnv: { HOME: string; USERPROFILE: string }): string[] {
+  const names = new Set<string>();
+  const add = (p: string) => {
+    for (const c of p.split(/[\\/]+/)) if (c) names.add(c);
+  };
+  add(dest);
+  const w = walkPath(dest, { allowMissing: true });
+  add(w.real);
+  for (const e of w.entries) add(e.path);
+  const out: string[] = [];
+  for (const n of names) {
     try {
-      const real = fs.realpathSync(base);
-      return tail.length ? path.join(real, ...tail.slice().reverse()) : real;
+      out.push(configPathForInstance(n, accountEnv));
     } catch {
-      const parent = path.dirname(base);
-      if (parent === base) return path.resolve(p); // nothing on the path exists
-      tail.push(path.basename(base));
-      base = parent;
+      // not a valid instance id: no instance config to protect for it
     }
   }
+  return out;
 }
 
 /**
- * The relay configs this guard protects: the account home's FLAT config AND every per-instance config under it (on
- * an instance-mode machine the LIVE config is a per-instance one). Decided STRUCTURALLY, by pure path comparison
- * through instance.ts's layout (flatConfigPath / configPathForInstance with the ACCOUNT home as the env): nothing of
- * the operator's tree is read to work out what to protect (the operator tripwire would refuse those reads inside the
- * harness, and an env-selected instance has no marker to find). Any valid instance id counts: active or not.
+ * Refuse, inside a test harness, a write that lands on the ACCOUNT's real config: ~/.claude.json,
+ * ~/.claude/settings.json, the account home's flat relay config, and every per-instance relay config under it (any
+ * valid id, active or not, symlink- or env-selected). The destination is judged on THE path walk (src/path-walk.ts),
+ * against each protected path, through isProtected: a link anywhere on either side, a physical `..`, or a case or
+ * normalization variant cannot slip past it (Codex #343 R1 #1, #2), and "inconclusive" is refused.
+ * THE STATED OVER-BLOCK: with a protected config MISSING, any guarded write that shares its nearest existing
+ * directory is refused too (a sibling, a nested look-alike, another name), because two missing names are never
+ * judged equal or different. Accepted: every guarded writer today writes a protected name, and
+ * tests/config-guard-callers.test.ts pins them. A destination the walk cannot judge (a loop, an unsupported form) is
+ * refused. INACTIVE outside a test harness (no VITEST, no NODE_ENV=test): a production write is never judged here.
  * THE RESIDUAL (named once, as the tripwire names it): the root is the account home's .bot-relay, the same root
  * discoverOperator uses. An operator whose live relay lives under a custom RELAY_HOME is outside this guard.
  */
-function isAccountRelayConfig(resolved: string, home: string): boolean {
-  const accountEnv = { HOME: home, USERPROFILE: home }; // no RELAY_HOME: the account home's own .bot-relay
-  if (canonicalize(flatConfigPath(accountEnv)) === resolved) return true;
-  let instanceConfig: string;
-  try {
-    instanceConfig = configPathForInstance(path.basename(path.dirname(resolved)), accountEnv);
-  } catch {
-    return false; // not an instance id: not an instance's config
-  }
-  return canonicalize(instanceConfig) === resolved;
-}
-
 export function assertNotRealUserConfigWrite(filePath: string): void {
   if (!process.env.VITEST && process.env.NODE_ENV !== "test") return;
-  const resolved = canonicalize(filePath);
   const home = accountHome();
-  const guarded = [path.join(home, ".claude.json"), path.join(home, ".claude", "settings.json")];
-  if (guarded.some((real) => canonicalize(real) === resolved) || isAccountRelayConfig(resolved, home)) {
+  const accountEnv = { HOME: home, USERPROFILE: home }; // no RELAY_HOME: the account home's own .bot-relay
+  const refuse = (what: string): never => {
     throw new Error(
-      `[config-guard] refusing to write the REAL user config ${resolved} from inside a test harness. ` +
+      `[config-guard] refusing to write the REAL user config ${filePath} (${what}) from inside a test harness. ` +
         `This is the account's actual config (os.userInfo().homedir) — no environment variable makes ` +
         `writing it safe in a test. Sandbox user-scope writes: point RELAY_CLAUDE_HOME / RELAY_CONFIG_PATH ` +
         `(or the subprocess HOME) at a temp dir.`,
     );
+  };
+  let protectedPaths: string[];
+  try {
+    protectedPaths = [path.join(home, ".claude.json"), path.join(home, ".claude", "settings.json"), flatConfigPath(accountEnv), ...instanceConfigCandidates(filePath, accountEnv)];
+  } catch (err) {
+    return refuse(`its destination could not be judged: ${(err as Error)?.message ?? String(err)}`);
+  }
+  for (const c of protectedPaths) {
+    let hit: boolean;
+    try {
+      hit = isProtected(comparePaths(filePath, c));
+    } catch (err) {
+      return refuse(`it could not be compared with ${c}: ${(err as Error)?.message ?? String(err)}`);
+    }
+    if (hit) refuse(`it may land on ${c}`);
   }
 }
 
