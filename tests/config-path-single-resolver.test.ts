@@ -31,6 +31,10 @@ const ALLOWLIST: Record<string, Allowed> = {
   // The backup ARCHIVE MEMBER: the file inside the staging dir and the tar entry, not where the relay's config lives.
   'src/backup.ts::exportRelayState::file-name:path.join(stagingDir, "config.json")': { count: 2, why: "the staging dir's archive member (copy target, then its existence check)" },
   'src/backup.ts::exportRelayState::file-name:entries.push("config.json")': { count: 1, why: "the tar entry list's member name" },
+  // The restore reader's archive MEMBER names (SEC-22, src/backup-archive.ts): which members a backup may hold, and
+  // each one's size cap. Names inside an archive, not a path to the live config.
+  'src/backup-archive.ts::<module>::file-name:"config.json"': { count: 1, why: "an archive member name (the expected-member set), not a path to the live config" },
+  'src/backup-archive.ts::<module>::file-name:"config.json": 1024 ** 2': { count: 1, why: "an archive member name (its size cap), not a path to the live config" },
   // doctor's report ROW LABEL (the path itself comes from run()'s one resolution).
   'src/cli/doctor.ts::checkConfig::file-name:name: "config.json"': { count: 5, why: "the report row's label, one per outcome" },
   // Save / restore of the env AROUND one resolution (the value is put back unchanged; nothing is resolved from it).
