@@ -9,6 +9,7 @@
 # install on an empty directory, and the 4.0.0 publish then failed on a missing esbuild.
 relay_ext_deps_missing() {
   local d="$1/node_modules/.bin"
-  [ -x "$d/esbuild" ] && [ -x "$d/tsc" ] && return 1
+  # Windows installs .cmd shims next to (or instead of) the POSIX scripts.
+  { [ -x "$d/esbuild" ] || [ -f "$d/esbuild.cmd" ]; } && { [ -x "$d/tsc" ] || [ -f "$d/tsc.cmd" ]; } && return 1
   return 0
 }

@@ -46,6 +46,14 @@ describe("relay_ext_deps_missing (scripts/lib/ext-deps.sh): install when a tool 
     expect(spawnSync("bash", ["-c", 'cd "$1" && [ ! -d node_modules ]', "_", emptyDir]).status, "the defect: the old test skips the install on an EMPTY node_modules").toBe(1);
   });
   it("only esbuild present → missing (tsc is needed too)", () => expect(missing((d) => tool(d, "esbuild"))).toBe(true));
+  it("Windows: .cmd shims for both tools count as present; a .cmd for only one is still missing", () => {
+    const cmd = (dir: string, name: string) => {
+      fs.mkdirSync(path.join(dir, "node_modules", ".bin"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "node_modules", ".bin", `${name}.cmd`), "@echo off\r\n");
+    };
+    expect(missing((d) => { cmd(d, "esbuild"); cmd(d, "tsc"); })).toBe(false);
+    expect(missing((d) => cmd(d, "esbuild"))).toBe(true);
+  });
   it("TWIN: esbuild and tsc present → not missing (no reinstall)", () => {
     expect(missing((d) => { tool(d, "esbuild"); tool(d, "tsc"); })).toBe(false);
   });
@@ -59,15 +67,21 @@ describe("relay_ext_deps_missing (scripts/lib/ext-deps.sh): install when a tool 
 
 describe("pre-publish-check.sh preflight: refused or stopped BEFORE any step", () => {
   /** A copy of scripts/ under a fresh root, plus PATH stubs for npm/npx that log every call. */
-  const sandbox = (tag: string, opts: { marker?: boolean; whoami: "ok" | "fail" }) => {
+  const DEFAULT_REG = "https://reg.default.test/";
+  const sandbox = (tag: string, opts: { marker?: boolean; whoami: "ok" | "fail"; publishRegistry?: string }) => {
     const root = path.join(TMP, tag);
     fs.mkdirSync(root, { recursive: true });
     fs.cpSync(path.join(REPO, "scripts"), path.join(root, "scripts"), { recursive: true });
     if (opts.marker) fs.writeFileSync(path.join(root, ".relay-prod-tree"), "");
+    fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "bot-relay-mcp", version: "0.0.0", ...(opts.publishRegistry ? { publishConfig: { registry: opts.publishRegistry } } : {}) }));
     const bin = path.join(root, ".stub-bin");
     fs.mkdirSync(bin);
     const log = path.join(root, "calls.log");
-    fs.writeFileSync(path.join(bin, "npm"), `#!/bin/sh\necho "npm $*" >> "${log}"\n[ "$1" = whoami ] && exit ${opts.whoami === "ok" ? 0 : 1}\nexit 1\n`, { mode: 0o755 });
+    fs.writeFileSync(
+      path.join(bin, "npm"),
+      `#!/bin/sh\necho "npm $*" >> "${log}"\n[ "$1 $2 $3" = "config get registry" ] && { echo "${DEFAULT_REG}"; exit 0; }\n[ "$1" = whoami ] && exit ${opts.whoami === "ok" ? 0 : 1}\nexit 1\n`,
+      { mode: 0o755 },
+    );
     fs.writeFileSync(path.join(bin, "npx"), `#!/bin/sh\necho "npx $*" >> "${log}"\nexit 1\n`, { mode: 0o755 });
     const home = path.join(root, ".home");
     fs.mkdirSync(home);
@@ -96,17 +110,24 @@ describe("pre-publish-check.sh preflight: refused or stopped BEFORE any step", (
     const s = sandbox("nologin", { whoami: "fail" });
     const r = run(s, { npm_lifecycle_event: "prepublishOnly" });
     expect(r.status).toBe(1);
-    expect(r.out).toMatch(/npm whoami failed: not logged in/);
-    expect(r.calls).toEqual(["npm whoami"]);
+    expect(r.out).toMatch(/npm whoami --registry https:\/\/reg\.default\.test\/ failed: not logged in/);
+    expect(r.calls, "the configured registry is asked, then the login is checked THERE").toEqual(["npm config get registry", `npm whoami --registry ${DEFAULT_REG}`]);
     expect(r.out).not.toMatch(/=== pre-publish:/);
   });
 
   it("TWIN: a publish WITH a login passes the preflight and reaches step 1 (the stubbed npx fails it there)", () => {
     const s = sandbox("login", { whoami: "ok" });
     const r = run(s, { npm_lifecycle_event: "prepublishOnly" });
-    expect(r.calls[0]).toBe("npm whoami");
+    expect(r.calls.slice(0, 2)).toEqual(["npm config get registry", `npm whoami --registry ${DEFAULT_REG}`]);
     expect(r.out).toMatch(/=== pre-publish: tsc --noEmit ===/);
     expect(r.calls).toContain("npx tsc --noEmit");
+  });
+
+  it("publishConfig.registry wins: the login is checked against the registry npm publish will upload to", () => {
+    const s = sandbox("pubreg", { whoami: "fail", publishRegistry: "https://reg.publish.test/" });
+    const r = run(s, { npm_lifecycle_event: "prepublishOnly" });
+    expect(r.status).toBe(1);
+    expect(r.calls, "no fallback to the configured registry when publishConfig names one").toEqual(["npm whoami --registry https://reg.publish.test/"]);
   });
 
   it("TWIN: outside a publish (the gate run standalone, or CI's smoke) the login is never checked", () => {

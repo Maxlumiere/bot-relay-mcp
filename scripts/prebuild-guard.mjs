@@ -49,12 +49,28 @@ import path from "path";
 import os from "os";
 import { isDirectRun } from "./lib/entrypoint.mjs";
 
+/** Every `…/dist/index.js` path a consumer body names (a plist <string> or a JSON string value), URI-decoded. */
+export function consumerEntrypoints(text) {
+  if (!text) return [];
+  const out = new Set();
+  for (const m of text.matchAll(/[^"<>\r\n]*\/dist\/index\.js/g)) {
+    let p = m[0].trim();
+    try { p = decodeURI(p); } catch { /* keep the raw spelling */ }
+    out.add(p);
+  }
+  return [...out];
+}
+
 /** Does `text` (a plist / claude.json body) reference THIS tree's dist entrypoint?
- *  Tolerant of the `%20` percent-encoded fossil form a spaced path can take. */
-export function treePointsHere(text, cwd) {
+ *  Tolerant of the `%20` percent-encoded fossil form a spaced path can take, and of a SYMLINKED alias: each named
+ *  entrypoint's tree is resolved to its real path and compared with the tree's own real path (canonical to
+ *  canonical), so a consumer that reaches this tree through a link still counts. */
+export function treePointsHere(text, cwd, realpath = safeRealpath) {
   if (!text || !cwd) return false;
   const entry = path.join(cwd.replace(/\/+$/, ""), "dist", "index.js");
-  return text.includes(entry) || text.includes(encodeURI(entry));
+  if (text.includes(entry) || text.includes(encodeURI(entry))) return true;
+  const tree = realpath(cwd);
+  return consumerEntrypoints(text).some((p) => realpath(path.dirname(path.dirname(p))) === tree);
 }
 
 /**
