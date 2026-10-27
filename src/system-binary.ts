@@ -133,11 +133,17 @@ export function assertTrustedSystemFile(p: string, fsApi: TrustFs = nodeFs): str
     throw new SystemBinaryError(`${p}: ${why}`);
   };
   if (!path.posix.isAbsolute(p)) fail("not an absolute path");
+  // The candidate ITSELF first, so the refusal names it: "missing", or its own owner / mode, before any hop above it
+  // (MEASURED on Linux, 9313c9e: walking first named the sticky /tmp above a user-owned candidate instead).
+  let own: ReturnType<TrustFs["lstatSync"]> | undefined;
   try {
-    fsApi.lstatSync(p); // the candidate itself, first: "missing" names the candidate
+    own = fsApi.lstatSync(p);
   } catch (err) {
     fail(statFailure(err));
   }
+  const self = own as ReturnType<TrustFs["lstatSync"]>;
+  if (self.uid !== 0) fail(`not owned by root (${p} is owned by uid ${self.uid})`);
+  if (!self.isSymbolicLink() && self.mode & 0o022) fail(`writable by group or other at ${p} (mode 0${(self.mode & 0o7777).toString(8)})`);
   let w: WalkResult | undefined;
   try {
     w = walkPath(p, { fs: walkFsOf(fsApi), platform: "linux" }); // POSIX semantics, on macOS too
