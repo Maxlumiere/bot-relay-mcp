@@ -376,6 +376,15 @@ function reportDbPrivacy(dbPath: string): void {
   }
 }
 
+/**
+ * The live connection if one is open, else null: a READ that never opens, initializes or creates anything (unlike
+ * getDb). For a caller that must know the live driver, or that a connection exists, without mutating state (restore
+ * validates an archive before it touches the live DB).
+ */
+export function peekDb(): CompatDatabase | null {
+  return _db;
+}
+
 export function getDb(): CompatDatabase {
   if (_db) return _db;
 

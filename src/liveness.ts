@@ -40,8 +40,8 @@
  * Pure parse functions are separated from the impure command runner so
  * extraction is unit-testable.
  */
-import { execFileSync } from "node:child_process";
-import { systemBinary, type SystemBinaryName } from "./system-binary.js";
+import fs from "node:fs";
+import { execSystem, type SystemBinaryName } from "./system-binary.js";
 import { log } from "./logger.js";
 import { profileProcessPatternSource } from "./agent-cli-profiles.js";
 
@@ -123,34 +123,29 @@ export function startTokenEnv(base: NodeJS.ProcessEnv, form: StartTokenForm = "u
 export type CommandRunner = (cmd: string, args: string[], opts?: { startTokenForm?: StartTokenForm }) => string;
 
 /**
- * The POSIX tools this module runs BY NAME today (SEC-22's named POSIX follow-up: /bin/ps, /usr/sbin/ioreg, /bin/cat).
- * A CLOSED set, checked at run time: any other command, or any command on Windows, is refused (""), so a Windows tool
- * can never run through this path by name (Codex #336 R1 P1: `reg` did, hidden under a POSIX allowlist entry).
+ * The tools this module runs: a CLOSED set, each by its trusted ABSOLUTE path (SEC-22, src/system-binary.ts), never
+ * through PATH. Any other command is refused (""), so nothing can run through this runner by name (Codex #336 R1 P1:
+ * `reg` once hid under a POSIX allowlist entry). The Linux machine id is READ (/etc/machine-id), not a subprocess.
  */
-const POSIX_BY_NAME = new Set(["ps", "ioreg", "cat"]);
-/** Windows tools, run ONLY by their trusted absolute System32 path (SEC-22, src/system-binary.ts). */
-const WINDOWS_TOOLS = new Set<SystemBinaryName>(["reg"]);
+const RUNNER_TOOLS = new Set<SystemBinaryName>(["ps", "ioreg", "reg"]);
 
-const runPosixByName = (cmd: string, args: string[], opts?: { startTokenForm?: StartTokenForm }): string => {
-  if (process.platform === "win32" || !POSIX_BY_NAME.has(cmd)) return "";
+const runSystemTool = (cmd: SystemBinaryName, args: string[], opts?: { startTokenForm?: StartTokenForm }): string =>
   // Every command runs under the start-token environment, so `ps -o lstart=` (here and in the process table) is the
-  // ONE spelling above. ioreg and cat read neither the locale nor the clock.
-  return execFileSync(cmd, args, {
-    encoding: "utf8",
+  // ONE spelling above. ioreg and reg read neither the locale nor the clock.
+  execSystem(cmd, args, {
     timeout: 2000,
     stdio: ["ignore", "pipe", "ignore"],
-    env: startTokenEnv(process.env, opts?.startTokenForm ?? "utc"),
-    shell: false,
+    // The start-token variables ON the clean base (SEC-22 (ii)): never the caller's env, whose TZ the legacy form
+    // must not see anyway.
+    named: startTokenEnv({}, opts?.startTokenForm ?? "utc") as Record<string, string>,
+    windowsHide: true,
   });
-};
-
-const runWindowsTool = (cmd: SystemBinaryName, args: string[]): string =>
-  execFileSync(systemBinary(cmd), args, { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true, shell: false });
 
 const defaultRunner: CommandRunner = (cmd, args, opts) => {
   try {
-    // A Windows tool by its trusted path (a SystemBinaryError, like any failure, reads as "": the callers' safe default).
-    return WINDOWS_TOOLS.has(cmd as SystemBinaryName) ? runWindowsTool(cmd as SystemBinaryName, args) : runPosixByName(cmd, args, opts);
+    // A tool of the closed set by its trusted path (a SystemBinaryError, like any failure, reads as "": the callers'
+    // safe default); anything else is refused.
+    return RUNNER_TOOLS.has(cmd as SystemBinaryName) ? runSystemTool(cmd as SystemBinaryName, args, opts) : "";
   } catch {
     return "";
   }
@@ -161,6 +156,15 @@ const defaultRunner: CommandRunner = (cmd, args, opts) => {
  * platforms or extraction failure (caller then treats every agent as
  * cross-host → no PID probe → age-based fallback, the safe default).
  */
+/** /etc/machine-id's text, or "" when it cannot be read (the parser then answers null: the safe default). */
+function readMachineIdFile(): string {
+  try {
+    return fs.readFileSync("/etc/machine-id", "utf-8");
+  } catch {
+    return "";
+  }
+}
+
 export function machineGuid(
   platform: HostPlatform = process.platform,
   run: CommandRunner = defaultRunner,
@@ -170,7 +174,8 @@ export function machineGuid(
       return parseDarwinMachineGuid(run("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]));
     }
     if (platform === "linux") {
-      return parseLinuxMachineId(run("cat", ["/etc/machine-id"]));
+      // READ, never a subprocess (SEC-22: a planted `cat` first on PATH once decided this host's id).
+      return parseLinuxMachineId(readMachineIdFile());
     }
     if (platform === "win32") {
       return parseWindowsMachineGuid(

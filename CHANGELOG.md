@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### `relay backup` / `relay restore`, and the relay's system tools (SEC-22)
+
+- **The relay runs its system tools by an absolute, trust-checked path on macOS and Linux too, never through `PATH`**, with a clean environment. The tools are `ps`, `lsof`, `sysctl`, `ioreg`, `launchctl`, `plutil` and `tar`. A tool runs with only the system `PATH` and `LC_ALL=C`; nothing else from your environment (e.g. `TAR_OPTIONS`, `GZIP`, `LD_PRELOAD`, your locale) reaches it. On Windows, `relay backup` now runs `%SystemRoot%\System32\tar.exe`, never the `tar` first on `PATH` (Git Bash's).
+  - **A Linux host without them in the standard system directories** (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`; e.g. NixOS, Guix) is refused with a named error, never a `PATH` fallback.
+- **Restore reads the archive itself, before it touches anything.** No `tar` extracts the archive (the safety backup that restore writes before the swap still uses `tar`). Only `relay.db`, `manifest.json` and `config.json` are ever extracted. Restore checks the archive COMPLETELY (the reader, the required members, the manifest, the schema, the staged DB's integrity) BEFORE the safety backup is made and before the live DB is closed, so a refused archive, an empty one included, costs nothing. Refused: links, directories, other names, duplicates, malformed or truncated archives.
+  - **Older backups still restore.** A macOS backup's `._*` and `PaxHeader` metadata members are skipped, and the restore reports them (`skipped_members`).
+- **Backups are now a plain ustar archive, gzipped by the relay itself.** `relay restore` reads backups made before this change as well.
+- **A size limit, enforced by BOTH commands.** `relay backup` refuses to write an archive larger than **4 GiB uncompressed**, or one whose `manifest.json` or `config.json` is over 1 MiB, and says so. `relay restore` refuses the same archives.
+  - Why: restore must bound what it decompresses (a gzip bomb), so backup must never write an archive that restore would refuse, or it would only fail when you need it.
+  - The value is `MAX_DECOMPRESSED_BYTES` in `src/backup-archive.ts`.
+  - If your relay DB is larger: stop the daemon and back up `relay.db` (and its `config.json`) directly.
+
 ## v4.0.0 — 2026-10-25 — BREAKING: a new agent name over HTTP needs the registration secret; stricter instance and path rules; the pending queue is never windowed
 
 Everything since v3.0.1 (13 Aug). The relay's tool contract gains features and changes some behaviour, so this is a major version. Read **Upgrading from 3.x** before you upgrade a running fleet. The full entries follow it, unchanged.
