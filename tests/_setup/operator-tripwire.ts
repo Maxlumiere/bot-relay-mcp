@@ -107,6 +107,7 @@ if (!state()) {
     RELAY_TEST_OPERATOR_HOME: process.env.RELAY_TEST_OPERATOR_HOME ?? "",
     RELAY_TEST_OPERATOR_ROOTS: process.env.RELAY_TEST_OPERATOR_ROOTS ?? "",
     RELAY_TEST_OPERATOR_PORTS: process.env.RELAY_TEST_OPERATOR_PORTS ?? "",
+    RELAY_TEST_OPERATOR_INSTANCE_CONFIGS: process.env.RELAY_TEST_OPERATOR_INSTANCE_CONFIGS ?? "",
     RELAY_TEST_TRIPWIRE_DIR: recordDir,
   });
   (globalThis as Record<symbol, TripwireState>)[STATE_KEY] = { runDir, home, recordDir, seen: { spawn: new Set(), afterEach: new Set() }, childVars };

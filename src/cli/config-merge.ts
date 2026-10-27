@@ -54,11 +54,35 @@ import { walkPath, comparePaths, isProtected } from "../path-walk.js"; // THE pa
  * let a test certify an install that never happened.
  */
 let accountHomeOverride: string | null = null;
+let accountInventoryOverride: readonly string[] | null = null;
 /** Test-only (pattern: db.ts _resetAuditPurgeCounterForTests): lets the guard's
  *  own negative controls exercise the FULL chokepoint against a temp "account
- *  home" — a broken guard then writes a temp file, never the real config. */
-export function _setAccountHomeForTests(p: string | null): void {
+ *  home" — a broken guard then writes a temp file, never the real config. A test
+ *  that points the account home names ITS protected instance inventory too (the
+ *  tripwire's snapshot describes the real account, not the temp one); none given
+ *  is an empty inventory. */
+export function _setAccountHomeForTests(p: string | null, inventory: readonly string[] = []): void {
   accountHomeOverride = p;
+  accountInventoryOverride = p === null ? null : inventory;
+}
+
+/**
+ * The protected instance inventory (SEC-11, ruled on #343 R2): every config.json of the account's instances, as
+ * spelled, as resolved and as its own link target, read ONCE by the operator tripwire's sanctioned snapshot
+ * (tests/_setup/vitest-tripwire-base.mjs instanceInventory) and published as RELAY_TEST_OPERATOR_INSTANCE_CONFIGS.
+ * Never enumerated here: a src readdir of the operator's tree from a test worker would trip the tripwire. null when it
+ * is not established (no snapshot, or a malformed one): the guard then refuses.
+ */
+function protectedInstanceInventory(): readonly string[] | null {
+  if (accountHomeOverride) return accountInventoryOverride;
+  const raw = process.env.RELAY_TEST_OPERATOR_INSTANCE_CONFIGS;
+  if (raw === undefined || raw === "") return null;
+  try {
+    const v: unknown = JSON.parse(raw);
+    return Array.isArray(v) && v.every((x) => typeof x === "string" && path.isAbsolute(x)) ? (v as string[]) : null;
+  } catch {
+    return null;
+  }
 }
 
 function accountHome(): string {
@@ -102,8 +126,9 @@ function instanceConfigCandidates(dest: string, accountEnv: { HOME: string; USER
 /**
  * Refuse, inside a test harness, a write that lands on the ACCOUNT's real config: ~/.claude.json,
  * ~/.claude/settings.json, the account home's flat relay config, and every per-instance relay config under it (any
- * valid id, active or not, symlink- or env-selected). The destination is judged on THE path walk (src/path-walk.ts),
- * against each protected path, through isProtected: a link anywhere on either side, a physical `..`, or a case or
+ * valid id, active or not, symlink- or env-selected, and each instance's config as reached through its link TARGET:
+ * the inventory, protectedInstanceInventory; no inventory means refuse). The destination is judged on THE path walk
+ * (src/path-walk.ts), against each protected path, through isProtected: a link anywhere on either side, a physical `..`, or a case or
  * normalization variant cannot slip past it (Codex #343 R1 #1, #2), and "inconclusive" is refused.
  * THE STATED OVER-BLOCK, in comparePaths' own terms: two paths whose deepest EXISTING entries are the same (dev, ino)
  * and whose missing tails DIFFER (in any way) compare "inconclusive", which is refused. So with a protected config
@@ -130,9 +155,13 @@ export function assertNotRealUserConfigWrite(filePath: string): void {
         `(or the subprocess HOME) at a temp dir.`,
     );
   };
+  const inventory = protectedInstanceInventory();
+  if (inventory === null) return refuse("the protected instance inventory is not established (no RELAY_TEST_OPERATOR_INSTANCE_CONFIGS from the operator tripwire)");
   let protectedPaths: string[];
   try {
-    protectedPaths = [path.join(home, ".claude.json"), path.join(home, ".claude", "settings.json"), flatConfigPath(accountEnv), ...instanceConfigCandidates(filePath, accountEnv)];
+    // The inventory covers instances reached through their TARGETS; the destination-derived candidates cover a
+    // valid-id instance config that does not exist yet. Both are kept (ruled).
+    protectedPaths = [path.join(home, ".claude.json"), path.join(home, ".claude", "settings.json"), flatConfigPath(accountEnv), ...inventory, ...instanceConfigCandidates(filePath, accountEnv)];
   } catch (err) {
     return refuse(`its destination could not be judged: ${(err as Error)?.message ?? String(err)}`);
   }
