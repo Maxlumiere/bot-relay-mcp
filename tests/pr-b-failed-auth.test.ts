@@ -21,7 +21,8 @@ import path from "path";
 import type { Server as HttpServer } from "http";
 import { monitorEventLoopDelay, PerformanceObserver } from "perf_hooks";
 import { Worker } from "worker_threads";
-import { spawn } from "child_process";
+import childProcess, { spawn } from "child_process";
+import { installSyncRecorder, type SyncRecorder } from "./_helpers/sync-call-recorder.js";
 import { LAPSE_MAX_BUSY, OCCUPANCY_FLOOR, lapseReport, lapsedPool, occupancy, type PoolOccupancy, type PoolWork } from "./_helpers/pool-occupancy.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-b-")));
@@ -346,6 +347,48 @@ const STOP_MEASURE_SRC = `(function stopAndMeasure(kill, floorMs, maxWaitMs, clo
 })`;
 const stopAndMeasure = new Function(`return ${STOP_MEASURE_SRC}`)() as (kill: () => void, floorMs: number, maxWaitMs: number, clock?: () => number) => number;
 const absNow = () => performance.timeOrigin + performance.now();
+
+/**
+ * DIAGNOSTICS (RELAY_TIMING_DIAG=1 only; REPORT ONLY, never a verdict input): who froze the main thread in a breach?
+ * The daemon runs in this process, so a main-thread freeze is the daemon's synchronous work or the harness's. The
+ * recorder (tests/_helpers/sync-call-recorder.ts) times every sync SQLite call, transaction, fs *Sync and sync child
+ * process at or over DIAG_THRESHOLD_MS, on this clock; each breach line is followed by the recorded calls it overlaps.
+ */
+const DIAG_THRESHOLD_MS = 100;
+/**
+ * The recorder for ONE bar, or null: installed ONLY when RELAY_TIMING_DIAG=1, and runBar uninstalls it when the bar
+ * ends (finally), so outside a DIAG bar nothing is patched and a normal run behaves exactly as without this code.
+ */
+export function diagInstall(env: NodeJS.ProcessEnv = process.env): SyncRecorder | null {
+  if (env.RELAY_TIMING_DIAG !== "1") return null;
+  const handle = db.getDb() as unknown as { prepare(sql: string): object };
+  return installSyncRecorder({
+    now: absNow,
+    thresholdMs: DIAG_THRESHOLD_MS,
+    databaseProto: Object.getPrototypeOf(handle) as Record<string, unknown>,
+    statementProto: Object.getPrototypeOf(handle.prepare("SELECT 1")) as Record<string, unknown>,
+  });
+}
+/** One DIAG line per located breach (every arm), naming the recorded sync calls that overlap it, or saying none did. */
+export function diagLines(label: string, b: Pick<BarStats, "auth" | "control" | "control2">, rec: Pick<SyncRecorder, "overlapping" | "count">): string[] {
+  const out: string[] = [];
+  for (const [arm, rs] of [["auth", b.auth], ["control", b.control], ["control'", b.control2]] as const) {
+    rs.forEach((r, i) => {
+      for (const x of r.breaches.filter((g) => g.to - g.from >= CEILING_MS)) {
+        const calls = rec.overlapping(x.from, x.to);
+        out.push(
+          `DIAG ${label} | arm ${arm} round ${i + 1} | ${x.kind} ${(x.to - x.from).toFixed(1)} ms | ` +
+            (calls.length
+              ? `${calls.length} sync call(s) >= ${DIAG_THRESHOLD_MS} ms overlap it`
+              : `NO recorded sync call >= ${DIAG_THRESHOLD_MS} ms overlaps it (the block is not a recorded SQLite/fs/child-process call: widen the instrument)`),
+        );
+        for (const c of calls) out.push(`DIAG   - ${c.what} ${(c.to - c.from).toFixed(1)} ms [${c.detail}] at ${c.stack}`);
+      }
+    });
+  }
+  out.push(`DIAG ${label} | recorder: ${rec.count()} sync call(s) >= ${DIAG_THRESHOLD_MS} ms recorded during this bar`);
+  return out;
+}
 
 /** What LOOP reads for one window, from the MAIN ticker (8). */
 interface LoopReading {
@@ -1173,12 +1216,16 @@ function announce(bare: string): void {
  * (architect b72c3ac4): BOTH controls also run the pool work the design INTENDS for this load, so the bar compares
  * the auth PATH against the bcrypt work itself. `authPool`: the auth arm runs pool work too (a pool-loaded A/A).
  */
-async function runBar(
-  label: string,
-  port: number,
-  load: Load,
-  opts: { onLoop?: () => void; onOpen?: () => void; poolControl?: PoolWork; authPool?: PoolWork; controlOnLoop?: () => void; measureImpl?: typeof measure } = {},
-): Promise<BarStats> {
+type BarOpts = { onLoop?: () => void; onOpen?: () => void; poolControl?: PoolWork; authPool?: PoolWork; controlOnLoop?: () => void; measureImpl?: typeof measure };
+async function runBar(label: string, port: number, load: Load, opts: BarOpts = {}): Promise<BarStats> {
+  const rec = diagInstall(); // null unless RELAY_TIMING_DIAG=1
+  try {
+    return await runBarMeasured(label, port, load, opts, rec);
+  } finally {
+    rec?.uninstall();
+  }
+}
+async function runBarMeasured(label: string, port: number, load: Load, opts: BarOpts, rec: SyncRecorder | null): Promise<BarStats> {
   // `measureImpl`: a seam for the WIRING MUTANT only (a measure that drops the occupancy reading).
   const measure = opts.measureImpl ?? measureWindow;
   _resetAuthThrottleForTests();
@@ -1217,6 +1264,7 @@ async function runBar(
       exactTail({ auth, control, control2, health, eld }),
   );
   for (const line of breachDiagnostics(label, { auth, control, control2 })) announce(line); // T-A, report only
+  if (rec) for (const line of diagLines(label, { auth, control, control2 }, rec)) announce(line); // RELAY_TIMING_DIAG, report only
   return { label, control, control2, auth, compares: count, perRound, health, eld, pooled: opts.poolControl !== undefined };
 }
 
@@ -1478,6 +1526,42 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
       "BREACH t | arm control round 1 | /health 560.0 ms, the sentinel covers 0.0 ms, uncovered 560.0 ms (no sentinel overlap) | process-wide counters: voluntary cs 3, involuntary cs 33, CPU 333.0 ms of 700.0 ms wall",
     ]);
     expect(breachDiagnostics("t", { auth: [r()], control: [r()], control2: [r()] }), "no breach: no line").toEqual([]);
+  });
+  it("DIAG is INERT unless asked: without RELAY_TIMING_DIAG=1 nothing is patched; with it the wrappers exist only until uninstall, which restores every function (fs, child_process, the SQLite prototypes)", () => {
+    const handle = db.getDb() as unknown as { prepare(sql: string): object };
+    const dbProto = Object.getPrototypeOf(handle) as Record<string, unknown>;
+    const stProto = Object.getPrototypeOf(handle.prepare("SELECT 1")) as Record<string, unknown>;
+    const snapshot = () => [fs.readFileSync, fs.writeFileSync, childProcess.spawnSync, dbProto.prepare, dbProto.transaction, stProto.run, stProto.get];
+    const before = snapshot();
+    expect(diagInstall({}), "not asked: no recorder").toBeNull();
+    expect(snapshot(), "not asked: nothing patched").toEqual(before);
+    const rec = diagInstall({ RELAY_TIMING_DIAG: "1" })!;
+    try {
+      const during = snapshot();
+      during.forEach((f, i) => expect(f, `function ${i} is wrapped while a DIAG bar runs`).not.toBe(before[i]));
+    } finally {
+      rec.uninstall();
+    }
+    expect(snapshot(), "after the bar: every function restored, identical").toEqual(before);
+  });
+  it("DIAG (RELAY_TIMING_DIAG, report only): each located breach of every arm is matched to the recorded sync calls that OVERLAP it, or says none did; a call outside it is not listed", () => {
+    const r = (o: Partial<Reading> = {}): Reading => ({ healthMax: 30, eldMax: 20, eldHist: 20, mainGapCount: 0, tickerBusy: 0, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0, ...o });
+    const calls = [
+      { what: "sqlite Statement#run", detail: "INSERT INTO audit_log …", from: 1100, to: 1650, stack: "run <- handler" },
+      { what: "fs.writeFileSync", detail: "/tmp/x", from: 7000, to: 7200, stack: "writer" },
+    ];
+    const rec = { overlapping: (from: number, to: number) => calls.filter((c) => c.from < to && c.to > from), count: () => calls.length };
+    const lines = diagLines("t", {
+      auth: [r({ eldMax: 600, breaches: [{ from: 1000, to: 1600, kind: "loop-delay" }] })],
+      control: [r({ healthMax: 560, breaches: [{ from: 9000, to: 9560, kind: "/health" }] })],
+      control2: [],
+    }, rec);
+    expect(lines).toEqual([
+      "DIAG t | arm auth round 1 | loop-delay 600.0 ms | 1 sync call(s) >= 100 ms overlap it",
+      "DIAG   - sqlite Statement#run 550.0 ms [INSERT INTO audit_log …] at run <- handler",
+      "DIAG t | arm control round 1 | /health 560.0 ms | NO recorded sync call >= 100 ms overlaps it (the block is not a recorded SQLite/fs/child-process call: widen the instrument)",
+      "DIAG t | recorder: 2 sync call(s) >= 100 ms recorded during this bar",
+    ]);
   });
   it("T-A (report only, verdict parked): a breach with NO sentinel overlap FAILS with the T-A wording and the window's PROCESS-WIDE counters; a covered breach carries the counters too; no verdict reads them", () => {
     const proc: ProcCounters = { volCs: 12, invCs: 340, cpuMs: 1234.5, wallMs: 700.2 };

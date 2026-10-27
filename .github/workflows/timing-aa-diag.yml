@@ -1,0 +1,62 @@
+name: Timing A/A stall diagnostics (manual)
+
+# REPORT ONLY, MANUAL ONLY: never a required check, never on a push or a pull request.
+# The timing bars' A/A control (tests/pr-b-failed-auth.test.ts) has breached the 500 ms ceiling on a Linux runner with
+# the main thread blocked off-CPU and the idle sentinel worker unaffected: a main-thread freeze inside the test process,
+# where the daemon runs. This repeats the A/A bar with RELAY_TIMING_DIAG=1, which records every synchronous SQLite
+# call, transaction, fs *Sync and sync child process of 100 ms or more (tests/_helpers/sync-call-recorder.ts) and prints,
+# after each BREACH line, the recorded calls that overlap it, or that none did. The DIAG lines are the measurement;
+# a run's pass/fail is not (a breach FAILs the A/A by design; this job keeps going and collects every run).
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "How many A/A runs (each ~1 min)"
+        required: false
+        default: "5"
+
+jobs:
+  aa-diag:
+    name: A/A stall diagnostics (ubuntu, report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: A/A with diagnostics, repeated (every run's BREACH and DIAG lines go to the summary)
+        env:
+          RELAY_TIMING_BARS: '1'
+          RELAY_TIMING_DIAG: '1'
+          RUNS: ${{ inputs.runs }}
+        run: |
+          case "$RUNS" in ''|*[!0-9]*) echo "runs must be a number, got '$RUNS'"; exit 1 ;; esac
+          [ "$RUNS" -ge 1 ] && [ "$RUNS" -le 20 ] || { echo "runs must be 1..20, got $RUNS"; exit 1; }
+          {
+            echo "## A/A stall diagnostics ($RUNS runs, $(node --version), $(uname -sr))"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for i in $(seq 1 "$RUNS"); do
+            echo "::group::A/A run $i of $RUNS"
+            # --silent=false: a passing test's console output (the BAR/BREACH/DIAG lines) is hidden without it (measured).
+            # `|| rc=$?`: Actions runs bash with -e, and a breach FAILS the A/A by design; the loop must go on.
+            rc=0; npx vitest run tests/pr-b-failed-auth.test.ts -t "A/A CONTROL" --silent=false > "aa-$i.log" 2>&1 || rc=$?
+            cat "aa-$i.log"
+            echo "::endgroup::"
+            lines=$(sed -E 's/\x1b\[[0-9;]*m//g' "aa-$i.log" | grep -E '(BREACH|DIAG) ' || true)
+            {
+              echo "### run $i (vitest exit $rc)"
+              if [ -n "$lines" ]; then echo '```'; echo "$lines"; echo '```'; else echo "no breach"; fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
