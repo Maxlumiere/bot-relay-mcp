@@ -5,11 +5,11 @@
 ### `relay backup` / `relay restore`: what an archive carries, and a keyring check on restore (SEC-23)
 
 - **No backup contains an encryption key, a raw token or the mint secret.**
-  - **The archived `config.json` is no longer a copy of the file.** Its credentials (`http_secret`, `http_secrets_previous`, `dashboard_secret`, `dashboard_push_secret`) are set to `null`, and a key the relay does not know is left out. Both are named, never valued, in the manifest and in the result (`config`). Restore never read the archived config, so nothing is lost on restore.
+  - **The archived `config.json` is no longer a copy of the file.** Its credentials (`http_secret`, `http_secrets_previous`, `dashboard_secret`, `dashboard_push_secret`) are set to `null`, and a key the relay does not know is left out. A known, non-secret field is copied as it is: its value is not validated or inspected (e.g. a nested object under it is copied whole). Both are named, never valued, in the manifest and in the result (`config`). Restore never read the archived config, so nothing is lost on restore.
   - **The manifest names the encryption keys the archive needs** (`encryption.keys`: key id, row count and a fingerprint, never the key), and `relay backup` says so on stderr. Keep your keyring: an archive with encrypted rows cannot be restored without it.
-- **No-key mode, stated loudly.** Without an encryption keyring, webhook secrets are stored in plaintext, so the archive carries them. `relay backup` now states how many, on stderr, in the result (`plaintext_secrets`, `warnings`) and in the manifest, and names the remedy.
+- **No-key mode, stated loudly.** Without an encryption keyring, webhook secrets are stored in plaintext, so the archive carries them. `relay backup` now states how many, on stderr, in the result (`plaintext_secrets`, `warnings`) and in the manifest, and names the remedy. Only a well-formed ciphertext counts as encrypted: a secret that merely starts with `enc:` is counted as plaintext. If the count cannot be read, it is `null` and the warning says it could not be verified.
 - **Restore refuses an archive this keyring cannot read**, before the safety backup or any live change: a key id the keyring does not hold, a key whose fingerprint is not the manifest's, or a staged row that does not decrypt. Each refusal is named. Archives made before this change are checked by the decrypt test alone.
-- **On Windows, the archive is now restricted to its owner** (its ACL), as the live DB and the mint secret already were. Before, it inherited its directory's ACL.
+- **On Windows, the archive is now restricted to its owner** (its ACL), as the live DB and the mint secret already were. Before, it inherited its directory's ACL. If the restriction cannot be applied, the archive is still written, keeps its inherited ACL, and the warning says so.
 
 ### `relay backup` / `relay restore`, and the relay's system tools (SEC-22)
 

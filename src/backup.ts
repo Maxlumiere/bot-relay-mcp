@@ -135,8 +135,8 @@ function runTar(args: string[], cwd: string): void {
 export interface BackupSecretsStatement {
   /** Per key id the DB's ciphertext needs: its row count and fingerprint (never the key; the key is NOT archived). */
   encryption: { keys: ManifestKey[] };
-  /** Secrets the DB holds in PLAINTEXT (no-key mode), carried in the archive: a count per column. */
-  plaintext_secrets: { "webhook_subscriptions.secret": number };
+  /** Secrets the DB holds in PLAINTEXT (no-key mode), carried in the archive: a count per column; null = it could not be read (UNVERIFIABLE). */
+  plaintext_secrets: { "webhook_subscriptions.secret": number | null };
   /** The archived config.json: the secrets redacted and the unknown keys dropped. Absent when there is no config file. */
   config?: ArchivedConfig;
 }
@@ -232,7 +232,12 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
 
     const warnings: string[] = [];
     const nPlain = plaintext_secrets["webhook_subscriptions.secret"];
-    if (nPlain > 0) {
+    if (nPlain === null) {
+      warnings.push(
+        "how many webhook secrets are stored in PLAINTEXT could NOT be verified (the webhook table could not be read); treat this archive as possibly carrying them. " +
+          "Configure an encryption keyring (RELAY_ENCRYPTION_KEYRING or RELAY_ENCRYPTION_KEYRING_PATH) so secrets are encrypted at rest."
+      );
+    } else if (nPlain > 0) {
       warnings.push(
         `${nPlain} webhook secret${nPlain === 1 ? " is" : "s are"} stored in PLAINTEXT (no encryption keyring) and ${nPlain === 1 ? "is" : "are"} IN this archive. ` +
           `Configure an encryption keyring (RELAY_ENCRYPTION_KEYRING or RELAY_ENCRYPTION_KEYRING_PATH) and re-register the webhooks, so their secrets are encrypted at rest.`

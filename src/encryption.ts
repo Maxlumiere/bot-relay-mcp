@@ -330,6 +330,23 @@ export function backupKeyFingerprint(keyId: string): string | null {
   return crypto.createHmac("sha256", kr.keys[keyId]).update(BACKUP_KEY_FINGERPRINT_LABEL).digest().subarray(0, 16).toString("hex");
 }
 
+const B64 = "[A-Za-z0-9+/]+={0,2}";
+const V2_SHAPE = new RegExp(`^enc:([a-zA-Z0-9_.-]+):(${B64}):(${B64})$`);
+const V1_SHAPE = new RegExp(`^enc1:(${B64}):(${B64})$`);
+
+/**
+ * SEC-23: whether `stored` is a WELL-FORMED ciphertext envelope: a v2 `enc:<key_id>:<iv>:<payload>` with a valid
+ * key id, or a legacy `enc1:<iv>:<payload>`; strict base64; a 12-byte iv and a payload longer than the GCM tag
+ * (what decryptWithKeyId requires). A value that only starts with a prefix is NOT one: in no-key mode
+ * encryptContent stores its input unchanged, so such a value is plaintext.
+ */
+export function isWellFormedCiphertext(stored: string): boolean {
+  const m = V2_SHAPE.exec(stored);
+  const parts = m ? [m[2], m[3]] : V1_SHAPE.exec(stored)?.slice(1, 3);
+  if (!parts) return false;
+  return Buffer.from(parts[0], "base64").length === IV_LEN && Buffer.from(parts[1], "base64").length > TAG_LEN;
+}
+
 /** Whether `id` is a well-formed key id (the keyring's own rule). */
 export function isValidKeyId(id: string): boolean {
   return KEY_ID_RE.test(id);

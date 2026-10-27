@@ -17,7 +17,7 @@
  */
 import type { RelayConfig } from "./config.js";
 import type { CompatDatabase } from "./sqlite-compat.js";
-import { backupKeyFingerprint, decryptContent, getKeyringInfo, isValidKeyId } from "./encryption.js";
+import { backupKeyFingerprint, decryptContent, getKeyringInfo, isValidKeyId, isWellFormedCiphertext } from "./encryption.js";
 
 export type ConfigArchiveClass = "secret" | "copy";
 
@@ -75,28 +75,31 @@ export function serializeConfigForArchive(raw: string): { json: string | null; i
 
 const quoteIdent = (name: string): string => `"${name.replace(/"/g, '""')}"`;
 
+export type NeededKeys = Map<string, { rows: number; sample: string }>;
+
 /**
  * Per key id, the rows of `db` encrypted under it and one sample ciphertext, found by scanning EVERY column of every
  * table for the ciphertext prefixes (src/encryption.ts): `enc:<key_id>:` and the legacy `enc1:` (its key id is
- * `legacyKeyId`). Every column, not a list of the encrypted ones, so a column encrypted later is not missed. A value
- * that only looks like ciphertext (its id is not a well-formed key id) is not counted.
+ * `legacyKeyId`). Every column, generated and hidden ones included (table_xinfo), not a list of the encrypted ones,
+ * so a column encrypted later is not missed. A Map, so a key id that is an Object.prototype name (`constructor`,
+ * `__proto__`) is a key like any other. A value whose id is not a well-formed key id is not counted.
  */
-export function scanCiphertextKeyIds(db: CompatDatabase, legacyKeyId: string): Record<string, { rows: number; sample: string }> {
-  const out: Record<string, { rows: number; sample: string }> = {};
+export function scanCiphertextKeyIds(db: CompatDatabase, legacyKeyId: string): NeededKeys {
+  const out: NeededKeys = new Map();
   const add = (id: string, n: number, sample: string): void => {
-    const cur = out[id];
+    const cur = out.get(id);
     if (cur) cur.rows += n;
-    else out[id] = { rows: n, sample };
+    else out.set(id, { rows: n, sample });
   };
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>;
   for (const { name: t } of tables) {
-    const cols = db.prepare(`PRAGMA table_info(${quoteIdent(t)})`).all() as Array<{ name: string }>;
+    const cols = db.prepare(`PRAGMA table_xinfo(${quoteIdent(t)})`).all() as Array<{ name: string }>;
     for (const { name: c } of cols) {
       const col = quoteIdent(c);
       const v2 = db
         .prepare(
           `SELECT substr(${col}, 5, instr(substr(${col}, 5), ':') - 1) AS id, COUNT(*) AS n, MIN(${col}) AS sample ` +
-            `FROM ${quoteIdent(t)} WHERE typeof(${col}) = 'text' AND substr(${col}, 1, 4) = 'enc:' GROUP BY id`
+            `FROM ${quoteIdent(t)} WHERE typeof(${col}) = 'text' AND substr(${col}, 1, 4) = 'enc:' GROUP BY 1`
         )
         .all() as Array<{ id: string; n: number; sample: string }>;
       for (const r of v2) if (isValidKeyId(r.id)) add(r.id, r.n, r.sample);
@@ -109,18 +112,19 @@ export function scanCiphertextKeyIds(db: CompatDatabase, legacyKeyId: string): R
   return out;
 }
 
-/** The webhook secrets `db` holds in PLAINTEXT (no-key mode); 0 when the table does not exist (an older schema). */
-export function countPlaintextWebhookSecrets(db: CompatDatabase): number {
+/**
+ * The webhook secrets `db` holds in PLAINTEXT: every non-empty secret that is not a WELL-FORMED ciphertext envelope
+ * (isWellFormedCiphertext), since in no-key mode a secret that merely starts with `enc:` is stored as given. 0 when
+ * the table does not exist (an older schema); null, UNVERIFIABLE, when the table exists but cannot be read.
+ */
+export function countPlaintextWebhookSecrets(db: CompatDatabase): number | null {
+  const exists = db.prepare("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'webhook_subscriptions'").get();
+  if (!exists) return 0;
   try {
-    const r = db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM webhook_subscriptions WHERE secret IS NOT NULL AND secret <> '' " +
-          "AND substr(secret, 1, 4) <> 'enc:' AND substr(secret, 1, 5) <> 'enc1:'"
-      )
-      .get() as { n: number } | undefined;
-    return r?.n ?? 0;
+    const rows = db.prepare("SELECT secret FROM webhook_subscriptions WHERE secret IS NOT NULL AND secret <> ''").all() as Array<{ secret: unknown }>;
+    return rows.filter((r) => typeof r.secret !== "string" || !isWellFormedCiphertext(r.secret)).length;
   } catch {
-    return 0;
+    return null;
   }
 }
 
@@ -132,10 +136,8 @@ export interface ManifestKey {
 }
 
 /** The manifest's `encryption` block for the key ids `db` needs. */
-export function manifestKeysOf(needed: Record<string, { rows: number }>): ManifestKey[] {
-  return Object.keys(needed)
-    .sort()
-    .map((key_id) => ({ key_id, rows: needed[key_id].rows, fingerprint: backupKeyFingerprint(key_id) }));
+export function manifestKeysOf(needed: NeededKeys): ManifestKey[] {
+  return [...needed.keys()].sort().map((key_id) => ({ key_id, rows: needed.get(key_id)!.rows, fingerprint: backupKeyFingerprint(key_id) }));
 }
 
 /**
@@ -144,8 +146,8 @@ export function manifestKeysOf(needed: Record<string, { rows: number }>): Manife
  * recorded one); a staged row that does not decrypt (the AEAD tag is the ground truth, and an old archive has no
  * fingerprints). `manifestEncryption` is the manifest's `encryption` value, undefined for an old archive.
  */
-export function assertKeyringCanRead(needed: Record<string, { rows: number; sample: string }>, manifestEncryption: unknown): void {
-  const ids = Object.keys(needed).sort();
+export function assertKeyringCanRead(needed: NeededKeys, manifestEncryption: unknown): void {
+  const ids = [...needed.keys()].sort();
   const recorded = new Map<string, string | null>();
   if (manifestEncryption !== undefined) {
     const keys = (manifestEncryption as { keys?: unknown } | null)?.keys;
@@ -162,7 +164,7 @@ export function assertKeyringCanRead(needed: Record<string, { rows: number; samp
   const missing = ids.filter((id) => !held.has(id));
   if (missing.length) {
     throw new Error(
-      `backup restore refused: the archive has rows encrypted under key id(s) ${missing.map((id) => `${id} (${needed[id].rows} rows)`).join(", ")}, ` +
+      `backup restore refused: the archive has rows encrypted under key id(s) ${missing.map((id) => `${id} (${needed.get(id)!.rows} rows)`).join(", ")}, ` +
         `which are not held by this relay's keyring. Configure a keyring that holds ${missing.length === 1 ? "that key" : "those keys"} ` +
         `(RELAY_ENCRYPTION_KEYRING or RELAY_ENCRYPTION_KEYRING_PATH), then restore again. Nothing was changed.`
     );
@@ -179,7 +181,7 @@ export function assertKeyringCanRead(needed: Record<string, { rows: number; samp
   }
   const undecryptable = ids.filter((id) => {
     try {
-      decryptContent(needed[id].sample);
+      decryptContent(needed.get(id)!.sample);
       return false;
     } catch {
       return true;
