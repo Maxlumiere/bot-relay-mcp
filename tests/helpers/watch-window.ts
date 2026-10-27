@@ -105,7 +105,7 @@ export interface WindowOpts {
    * What is still in the group, for the not-empty error (default: one ASYNC `ps`, parseGroupMembers). REPORT ONLY:
    * started near the deadline and NEVER awaited past it (an unsettled reading is reported as unavailable).
    */
-  groupMembers?: (pgid: number) => Promise<string>;
+  groupMembers?: (pgid: number, settled: AbortSignal) => Promise<string>;
   /** The leader's start token now (default: liveness.processStartedAt). */
   leaderStart?: (pid: number) => string | null;
   /** The supervisor's shell (default `sh`): the close test runs it under dash, Linux's /bin/sh. */
@@ -154,13 +154,43 @@ export function parseGroupMembers(stdout: string, pgid: number): string {
   return "unparseable: the ps output had no valid row";
 }
 
-/** The members, read by an ASYNC ps (never blocks the event loop; bounded). */
-const realGroupMembers = (pgid: number): Promise<string> =>
+/**
+ * The members, read by an ASYNC ps (never blocks the event loop). When `settled` aborts (close() is done, either way),
+ * the ps child is DISPOSED: SIGKILL to that one child ONLY while its handle shows it alive (exitCode and signalCode both
+ * null: the ChildProcess handle guards against pid reuse; never a pid number, never a pattern), its stdio destroyed,
+ * its timer cleared, the handle unref()ed, and its exit never awaited. So a reading that outlives close() cannot keep
+ * the process alive. A 2 s timer ends a reading that never returns ("unreadable: ps timed out"). `psCmd`/`psArgs` are
+ * test seams.
+ */
+const PS_MEMBER_ARGS = ["-A", "-o", "pid=,pgid=,ppid=,stat=,etime=,comm="];
+export const readGroupMembers = (pgid: number, settled?: AbortSignal, psCmd = "ps", psArgs: readonly string[] = PS_MEMBER_ARGS): Promise<string> =>
   new Promise((resolve) => {
-    execFile("ps", ["-A", "-o", "pid=,pgid=,ppid=,stat=,etime=,comm="], { encoding: "utf-8", timeout: 2_000 }, (err, stdout) => {
+    const child = execFile(psCmd, [...psArgs], { encoding: "utf-8" }, (err, stdout) => {
+      clearTimeout(timer);
       if (err) resolve(`unreadable: ps failed (${err.message.split("\n")[0]})`);
       else resolve(parseGroupMembers(stdout, pgid));
     });
+    const dispose = () => {
+      clearTimeout(timer);
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+    };
+    const timer = setTimeout(() => {
+      dispose();
+      resolve("unreadable: ps timed out after 2000 ms");
+    }, 2_000);
+    if (settled) {
+      if (settled.aborted) dispose();
+      else settled.addEventListener("abort", dispose, { once: true });
+    }
   });
 
 /** How long before the close deadline the members reading starts (it needs one ps; a longer close starts it then). */
@@ -269,7 +299,7 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
   if (delay !== undefined && !(Number.isFinite(delay) && delay >= 0)) throw new Error(`codeWriteDelayS must be a number >= 0, got ${delay}`);
   const closeWaitMs = opts.closeWaitMs ?? 5_000;
   const groupAlive = opts.groupAlive ?? realGroupAlive;
-  const groupMembers = opts.groupMembers ?? realGroupMembers;
+  const groupMembers = opts.groupMembers ?? ((pgid: number, settled: AbortSignal) => readGroupMembers(pgid, settled));
   const startOf = opts.leaderStart ?? ((pid: number) => startOrNull(processStartedAt(pid)));
   const windowId = crypto.randomBytes(16).toString("hex");
   const readyFile = path.join(dir, `.window-${windowId}.ready`);
@@ -382,10 +412,11 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
     // reading is reported as unavailable, so a stuck ps can neither delay nor prevent the rejection.
     let members: string | null = null;
     let reading = false;
+    const settled = new AbortController(); // aborted when close() settles, either way: the reading's child is disposed
     const startMembers = () => {
       reading = true;
       try {
-        groupMembers(lp).then(
+        groupMembers(lp, settled.signal).then(
           (m) => (members = m),
           (e: unknown) => (members = `unavailable (${e instanceof Error ? e.message : String(e)})`),
         );
@@ -393,14 +424,18 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
         members = `unavailable (${e instanceof Error ? e.message : String(e)})`;
       }
     };
-    while (groupAlive(lp) && Date.now() < deadline) {
-      if (!reading && deadline - Date.now() <= MEMBERS_LEAD_MS) startMembers();
-      await sleep(25);
-    }
-    if (groupAlive(lp)) {
-      if (!reading) startMembers();
-      const what = members ?? "unavailable (diagnostic still running)";
-      throw new Error(`window close (${dir}): process group ${lp} is not empty after ${closeWaitMs} ms: something it started may still write into this dir; members: ${what}`);
+    try {
+      while (groupAlive(lp) && Date.now() < deadline) {
+        if (!reading && deadline - Date.now() <= MEMBERS_LEAD_MS) startMembers();
+        await sleep(25);
+      }
+      if (groupAlive(lp)) {
+        if (!reading) startMembers();
+        const what = members ?? "unavailable (diagnostic still running)";
+        throw new Error(`window close (${dir}): process group ${lp} is not empty after ${closeWaitMs} ms: something it started may still write into this dir; members: ${what}`);
+      }
+    } finally {
+      settled.abort(); // never awaited: the reading is disposed, not waited for
     }
     // ESCAPES: list first, then kill ONLY the listed pids, and fail naming them.
     const table = processTable();
