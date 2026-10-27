@@ -160,8 +160,14 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     expect(fs.existsSync(path.join(inst, "config.json"))).toBe(false);
   });
 
-  it("(G7d) TWIN: only an instance's config.json is refused, not its siblings, not a nested look-alike, not another root", () => {
+  it("(G7d) TWIN: with the protected configs PRESENT, only an instance's config.json is refused, not its siblings, not a nested look-alike, not another root", () => {
     _setAccountHomeForTests(SANDBOX);
+    // The protected files EXIST (as on a configured machine): the siblings below are then other files by identity.
+    // With a protected file MISSING the guard refuses them too (inconclusive is protected): (G8f) pins that.
+    for (const f of [path.join(SANDBOX, ".claude.json"), path.join(SANDBOX, ".claude", "settings.json"), path.join(SANDBOX, ".bot-relay", "config.json"), path.join(SANDBOX, ".bot-relay", "instances", "work", "config.json")]) {
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f, "{}");
+    }
     const allowed = [
       path.join(SANDBOX, ".bot-relay", "instances", "work", "other.json"), // a sibling file
       path.join(SANDBOX, ".bot-relay", "instances", "work", "sub", "config.json"), // not an instance's own config
@@ -170,6 +176,96 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     for (const target of allowed) {
       atomicWriteJson(target, { ok: true });
       expect(JSON.parse(fs.readFileSync(target, "utf-8")), target).toEqual({ ok: true });
+    }
+  });
+
+  // ---- #343 R1 rework: the guard decides on THE path walk (src/path-walk.ts) and reads its verdict through isProtected
+  // (same | inconclusive), so a link anywhere in the destination, a physical `..`, a case variant, or a walk that throws
+  // cannot slip past it (Codex #343 R1 #1 and #2).
+  const posixOnly = process.platform === "win32";
+  it.skipIf(posixOnly)("(G8a) Codex R1 #1: an instance DIR that is itself a symlink (instances/work -> elsewhere) is refused, nothing written", () => {
+    const home = path.join(SANDBOX, "acct-8a");
+    const elsewhere = path.join(SANDBOX, "relocated-prod");
+    fs.mkdirSync(path.join(home, ".bot-relay", "instances"), { recursive: true });
+    fs.mkdirSync(elsewhere, { recursive: true });
+    fs.symlinkSync(elsewhere, path.join(home, ".bot-relay", "instances", "work"));
+    _setAccountHomeForTests(home);
+    const target = path.join(home, ".bot-relay", "instances", "work", "config.json");
+    expect(() => atomicWriteJson(target, { clobbered: true })).toThrow(/config-guard/);
+    expect(fs.existsSync(path.join(elsewhere, "config.json")), "nothing landed through the link").toBe(false);
+  });
+  it.skipIf(posixOnly)("(G8b) Codex R1 #1: an instance config.json that is itself a symlink to another file is refused (the rename would replace the protected entry)", () => {
+    const home = path.join(SANDBOX, "acct-8b");
+    const inst = path.join(home, ".bot-relay", "instances", "work");
+    fs.mkdirSync(inst, { recursive: true });
+    const other = path.join(SANDBOX, "other.json");
+    fs.writeFileSync(other, "{}");
+    fs.symlinkSync(other, path.join(inst, "config.json"));
+    _setAccountHomeForTests(home);
+    expect(() => atomicWriteJson(path.join(inst, "config.json"), { clobbered: true })).toThrow(/config-guard/);
+    expect(fs.lstatSync(path.join(inst, "config.json")).isSymbolicLink(), "the protected entry is untouched").toBe(true);
+  });
+  it.skipIf(posixOnly)("(G8c) Codex R1 #2: alias/../config.json, with alias -> an instance's sub dir, lands on the instance config: refused", () => {
+    const home = path.join(SANDBOX, "acct-8c");
+    const inst = path.join(home, ".bot-relay", "instances", "work");
+    fs.mkdirSync(path.join(inst, "sub"), { recursive: true });
+    const alias = path.join(SANDBOX, "alias-8c");
+    fs.symlinkSync(path.join(inst, "sub"), alias);
+    _setAccountHomeForTests(home);
+    expect(() => atomicWriteJson(`${alias}${path.sep}..${path.sep}config.json`, { clobbered: true })).toThrow(/config-guard/);
+    expect(fs.existsSync(path.join(inst, "config.json"))).toBe(false);
+  });
+  it("(G8d) a case variant of an EXISTING protected config is refused where the kernel opens the same file, and allowed where it does not", () => {
+    const home = path.join(SANDBOX, "acct-8d");
+    const inst = path.join(home, ".bot-relay", "instances", "work");
+    fs.mkdirSync(inst, { recursive: true });
+    fs.writeFileSync(path.join(inst, "config.json"), "{}");
+    _setAccountHomeForTests(home);
+    const variant = path.join(inst, "Config.json");
+    const sameFile = fs.existsSync(variant); // the kernel's own answer (a case-insensitive volume opens it)
+    if (sameFile) expect(() => assertNotRealUserConfigWrite(variant)).toThrow(/config-guard/);
+    else expect(() => assertNotRealUserConfigWrite(variant)).not.toThrow();
+  });
+  it("(G8e) a case variant of a MISSING protected config is refused (inconclusive is protected), on every volume", () => {
+    const home = path.join(SANDBOX, "acct-8e");
+    fs.mkdirSync(path.join(home, ".bot-relay", "instances", "work"), { recursive: true });
+    _setAccountHomeForTests(home);
+    expect(() => assertNotRealUserConfigWrite(path.join(home, ".bot-relay", "instances", "work", "Config.json"))).toThrow(/config-guard/);
+  });
+  it("(G8f) with a protected config MISSING, a write sharing its nearest existing directory is refused: a sibling, a nested look-alike, another name (the stated over-block)", () => {
+    const home = path.join(SANDBOX, "acct-8f");
+    fs.mkdirSync(path.join(home, ".bot-relay", "instances", "work"), { recursive: true });
+    _setAccountHomeForTests(home);
+    for (const t of [
+      path.join(home, ".bot-relay", "instances", "work", "other.json"),
+      path.join(home, ".bot-relay", "instances", "work", "sub", "config.json"),
+      path.join(home, ".bot-relay", "notes.json"),
+    ]) {
+      expect(() => atomicWriteJson(t, { x: 1 }), t).toThrow(/config-guard/);
+      expect(fs.existsSync(t), t).toBe(false);
+    }
+  });
+  it.skipIf(posixOnly)("(G8g) a destination the walk cannot judge (a link loop) is REFUSED, never let through", () => {
+    const home = path.join(SANDBOX, "acct-8g");
+    fs.mkdirSync(path.join(home, ".bot-relay"), { recursive: true });
+    fs.symlinkSync(path.join(SANDBOX, "loop-b"), path.join(SANDBOX, "loop-a"));
+    fs.symlinkSync(path.join(SANDBOX, "loop-a"), path.join(SANDBOX, "loop-b"));
+    _setAccountHomeForTests(home);
+    expect(() => assertNotRealUserConfigWrite(path.join(SANDBOX, "loop-a", "config.json"))).toThrow(/config-guard/);
+  });
+  it("(G8h) PRODUCTION: with VITEST and NODE_ENV unset the guard is inactive, so a first-time write on a FRESH account home lands", () => {
+    const home = path.join(SANDBOX, "acct-8h-fresh");
+    _setAccountHomeForTests(home); // nothing exists under it: a fresh install
+    const saved = { vitest: process.env.VITEST, nodeEnv: process.env.NODE_ENV };
+    delete process.env.VITEST;
+    delete process.env.NODE_ENV;
+    try {
+      const target = path.join(home, ".bot-relay", "config.json");
+      atomicWriteJson(target, { fresh: true });
+      expect(JSON.parse(fs.readFileSync(target, "utf-8"))).toEqual({ fresh: true });
+    } finally {
+      if (saved.vitest !== undefined) process.env.VITEST = saved.vitest;
+      if (saved.nodeEnv !== undefined) process.env.NODE_ENV = saved.nodeEnv;
     }
   });
 
