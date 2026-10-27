@@ -42,6 +42,7 @@ const ENV_KEYS = [
   "RELAY_ENCRYPTION_LEGACY_KEY_ID",
 ] as const;
 const FP_LABEL = "bot-relay backup key fingerprint v1";
+const ZERO_REASONS = { no_keyring: 0, key_not_held: 0, auth_failed: 0 };
 
 const newKey = (): Buffer => crypto.randomBytes(32);
 const fingerprintOf = (key: Buffer): string => crypto.createHmac("sha256", key).update(FP_LABEL).digest().subarray(0, 16).toString("hex");
@@ -164,10 +165,10 @@ describe("SEC-23: what a backup carries, and what it states", () => {
     const stated = writes.join("");
     expect(stated, "stderr states the count").toMatch(/2 webhook secrets? .*PLAINTEXT/i);
     expect(stated, "stderr names the remedy").toMatch(/keyring/i);
-    expect(exp.plaintext_secrets, "the export result states the count").toEqual({ "webhook_subscriptions.secret": 2 });
+    expect(exp.webhook_secrets, "the export result states the count").toEqual({ plaintext: 2, encrypted: 0, unverifiable: 0, unverifiable_reasons: ZERO_REASONS });
     expect((exp.warnings as string[] | undefined)?.join(" ") ?? "", "the export result carries the warning").toMatch(/2 webhook secrets? .*PLAINTEXT.*keyring/i);
     const manifest = manifestOf(archiveBytes(String(exp.archive_path)).plain);
-    expect(manifest.plaintext_secrets, "the manifest states the count").toEqual({ "webhook_subscriptions.secret": 2 });
+    expect(manifest.webhook_secrets, "the manifest states the count").toEqual({ plaintext: 2, encrypted: 0, unverifiable: 0, unverifiable_reasons: ZERO_REASONS });
   });
 
   it("known-good twin: with a keyring, the webhook secrets are encrypted, so NONE is stated as plaintext, and no secret value is in the archive", async () => {
@@ -175,7 +176,8 @@ describe("SEC-23: what a backup carries, and what it states", () => {
     await seed("whsec-encrypted-value");
     const { exportRelayState } = await import("../src/backup.js");
     const exp = (await exportRelayState({ destinationPath: path.join(ROOT, "keyed.tar.gz") })) as unknown as Record<string, unknown>;
-    expect(exp.plaintext_secrets).toEqual({ "webhook_subscriptions.secret": 0 });
+    expect(exp.webhook_secrets, "a real encrypted secret with its key: encrypted 1").toEqual({ plaintext: 0, encrypted: 1, unverifiable: 0, unverifiable_reasons: ZERO_REASONS });
+    expect(exp.warnings, "no warning").toEqual([]);
     expect(holds(archiveBytes(String(exp.archive_path)), "whsec-encrypted-value")).toBe(false);
   });
 
@@ -415,23 +417,55 @@ describe("SEC-23 R1: the plaintext count counts only what is not a well-formed c
     db.registerWebhook("https://example.com/hook3", "task.posted", undefined, "enc1:abc");
     const { exportRelayState } = await import("../src/backup.js");
     const exp = (await exportRelayState({ destinationPath: path.join(ROOT, "lookalike.tar.gz") })) as unknown as Record<string, unknown>;
-    expect(exp.plaintext_secrets).toEqual({ "webhook_subscriptions.secret": 2 });
+    expect(exp.webhook_secrets).toEqual({ plaintext: 2, encrypted: 0, unverifiable: 0, unverifiable_reasons: ZERO_REASONS });
+  });
+
+  it("THREE states (ruled): a forged envelope `enc:k1:…` in no-key mode is UNVERIFIABLE (no keyring), never plaintext-0 or encrypted, and is warned about in stderr, the result and the manifest", async () => {
+    await seed(fakeCiphertext("k1"));
+    const writes: string[] = [];
+    const orig = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: (c: unknown, ...a: unknown[]) => boolean }).write = (c: unknown, ...a: unknown[]) => {
+      writes.push(String(c));
+      return orig(c as string, ...(a as []));
+    };
+    let exp: Record<string, unknown>;
+    try {
+      const { exportRelayState } = await import("../src/backup.js");
+      exp = (await exportRelayState({ destinationPath: path.join(ROOT, "forged.tar.gz") })) as unknown as Record<string, unknown>;
+    } finally {
+      (process.stderr as unknown as { write: typeof orig }).write = orig;
+    }
+    const want = { plaintext: 0, encrypted: 0, unverifiable: 1, unverifiable_reasons: { no_keyring: 1, key_not_held: 0, auth_failed: 0 } };
+    expect(exp.webhook_secrets, "the export result").toEqual(want);
+    expect(manifestOf(archiveBytes(String(exp.archive_path)).plain).webhook_secrets, "the manifest").toEqual(want);
+    expect((exp.warnings as string[]).join(" "), "the result's warning").toMatch(/could NOT be verified.*no keyring/);
+    expect(writes.join(""), "stderr").toMatch(/could NOT be verified.*no keyring/);
+  });
+
+  it("THREE states: a secret under a HELD key id but a DIFFERENT key is UNVERIFIABLE (authentication failed: corruption or the wrong key)", async () => {
+    await useKeyring({ k1: newKey() });
+    await seed("whsec-under-the-first-key");
+    await useKeyring({ k1: newKey() }); // the same id, another key
+    const { exportRelayState } = await import("../src/backup.js");
+    const exp = (await exportRelayState({ destinationPath: path.join(ROOT, "wrongkey.tar.gz") })) as unknown as Record<string, unknown>;
+    expect(exp.webhook_secrets).toEqual({ plaintext: 0, encrypted: 0, unverifiable: 1, unverifiable_reasons: { no_keyring: 0, key_not_held: 0, auth_failed: 1 } });
+    expect((exp.warnings as string[]).join(" ")).toMatch(/authentication FAILED.*corruption, or the wrong key/);
   });
 
   it("the webhook table is found as SQLite resolves identifiers (case-insensitively): a `Webhook_Subscriptions` table is counted, not read as absent", async () => {
     const Database = (await import("better-sqlite3")).default;
-    const { countPlaintextWebhookSecrets } = await import("../src/backup-secrets.js");
+    const { classifyWebhookSecrets } = await import("../src/backup-secrets.js");
     const mixed = new Database(":memory:");
     mixed.exec("CREATE TABLE Webhook_Subscriptions (id TEXT, secret TEXT)");
     mixed.prepare("INSERT INTO Webhook_Subscriptions (id, secret) VALUES ('w1', 'plain-secret')").run();
-    expect(countPlaintextWebhookSecrets(mixed as never)).toBe(1);
+    expect(classifyWebhookSecrets(mixed as never)).toEqual({ plaintext: 1, encrypted: 0, unverifiable: 0, unverifiable_reasons: ZERO_REASONS });
     mixed.close();
   });
 
   it("a failure while DISCOVERING the webhook table is UNVERIFIABLE (null), never 0 and never a throw", async () => {
-    const { countPlaintextWebhookSecrets } = await import("../src/backup-secrets.js");
+    const { classifyWebhookSecrets } = await import("../src/backup-secrets.js");
     const broken = { prepare: () => { throw new Error("discovery failed"); } };
-    expect(countPlaintextWebhookSecrets(broken as never)).toBeNull();
+    expect(classifyWebhookSecrets(broken as never)).toBeNull();
   });
 
   it("coverage: an UNVERIFIABLE count is stated on ALL THREE surfaces (stderr, the export result, the manifest)", async () => {
@@ -452,20 +486,20 @@ describe("SEC-23 R1: the plaintext count counts only what is not a well-formed c
       (process.stderr as unknown as { write: typeof orig }).write = orig;
     }
     expect(writes.join(""), "stderr").toMatch(/could NOT be verified/);
-    expect(exp.plaintext_secrets, "the export result").toEqual({ "webhook_subscriptions.secret": null });
+    expect(exp.webhook_secrets, "the export result").toBeNull();
     expect((exp.warnings as string[]).join(" "), "the export result's warnings").toMatch(/could NOT be verified/);
-    expect(manifestOf(archiveBytes(String(exp.archive_path)).plain).plaintext_secrets, "the manifest").toEqual({ "webhook_subscriptions.secret": null });
+    expect(manifestOf(archiveBytes(String(exp.archive_path)).plain).webhook_secrets, "the manifest").toBeNull();
   });
 
   it("a webhook_subscriptions table the count cannot read is reported as UNVERIFIABLE (null), never 0; an absent table is 0", async () => {
     const Database = (await import("better-sqlite3")).default;
-    const { countPlaintextWebhookSecrets } = await import("../src/backup-secrets.js");
+    const { classifyWebhookSecrets } = await import("../src/backup-secrets.js");
     const odd = new Database(":memory:");
     odd.exec("CREATE TABLE webhook_subscriptions (id TEXT)"); // no `secret` column: the query fails
-    expect(countPlaintextWebhookSecrets(odd as never)).toBeNull();
+    expect(classifyWebhookSecrets(odd as never)).toBeNull();
     odd.close();
     const none = new Database(":memory:");
-    expect(countPlaintextWebhookSecrets(none as never)).toBe(0);
+    expect(classifyWebhookSecrets(none as never)).toEqual({ plaintext: 0, encrypted: 0, unverifiable: 0, unverifiable_reasons: ZERO_REASONS });
     none.close();
   });
 });
