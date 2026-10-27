@@ -26,19 +26,20 @@
  * catches that — which is the same silence-as-failure lesson the feature exists
  * to enforce, turned on the feature itself.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { execFileSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
 import { fileURLToPath, pathToFileURL } from "url";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
-const HOOK = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "hooks",
-  "check-relay.sh",
-);
+const REPO = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "hmd-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO, "hooks"), path.join(REPO, "bin")), "check-relay.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 
 let home: string;
 
@@ -67,7 +68,7 @@ function runHook(env: Record<string, string> = {}): string {
       // ADR-0036 S1: pin the daemon port to an unreachable one. Unpinned, the hook fell back
       // to 127.0.0.1:3777 — the LIVE daemon on a developer machine — and could register
       // "probe" there. These tests judge config diagnostics, never a live relay.
-      env: { ...inherited, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_HTTP_PORT: "1", ...env },
+      env: { ...inherited, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_HTTP_PORT: "1", RELAY_TEST_CLOCK: "0", ...env },
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });

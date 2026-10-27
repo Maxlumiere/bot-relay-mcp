@@ -462,6 +462,26 @@ describe("the test seam's FIXED budget clock does not tick (Codex R1 on the seam
     expect(copy.split(BUDGET_CLOCK_SEAMED).length - 1, "both functions' reads are seamed in the copy").toBe(2);
     expect(copy.split(BUDGET_CLOCK_SEAMED).join("").split(BUDGET_CLOCK_READ).length - 1, "no unseamed read is left in the copy").toBe(0);
   });
+  it("CRLF hooks (the Windows CI job's refusal reproduces with them) are seamed exactly as LF: no read refused, both functions' reads rewritten", () => {
+    const crlf = path.join(ROOT, "crlf-src");
+    fs.rmSync(crlf, { recursive: true, force: true });
+    fs.cpSync(HOOKS, crlf, { recursive: true });
+    for (const f of fs.readdirSync(crlf).filter((n) => n.endsWith(".sh"))) {
+      const p = path.join(crlf, f);
+      fs.writeFileSync(p, fs.readFileSync(p, "utf-8").replace(/\r?\n/g, "\r\n"));
+    }
+    expect(fs.readFileSync(path.join(crlf, "_vault-helpers.sh"), "utf-8"), "precondition: the copy really is CRLF").toMatch(/\r\n/);
+    expect(budgetGuardFindings(crlf), "the budget functions' own reads are found inside them, not refused").toEqual([]);
+    const copy = fs.readFileSync(path.join(budgetTree(path.join(ROOT, "crlf-dest"), crlf, path.join(REPO_ROOT, "bin")), "_vault-helpers.sh"), "utf-8");
+    expect(copy.split(BUDGET_CLOCK_SEAMED).length - 1, "both functions' reads are seamed").toBe(2);
+    expect(copy.split(BUDGET_CLOCK_SEAMED).join("").split(BUDGET_CLOCK_READ).length - 1, "no unseamed read is left").toBe(0);
+  });
+  it("the copy links dist/ (the one beside the repo's bin/): check-relay.sh's wake-coverage module resolves through it, as in the real hooks", () => {
+    const copy = starvedTree("dist-link");
+    const linked = path.join(copy, "..", "dist");
+    expect(fs.realpathSync(linked), "the copy's dist is the repo's dist").toBe(fs.realpathSync(path.join(REPO_ROOT, "dist")));
+    expect(fs.existsSync(path.join(linked, "wake-coverage-status.js")), "check-relay.sh's $HOOKS_DIR/../dist/wake-coverage-status.js resolves in the copy").toBe(true);
+  });
   it("HARM: a new SECONDS read on a budget path is REFUSED (the seam would look applied while it ticks), and the half-built copy is removed; TWIN: diagnostic text is allowed", () => {
     const planted = (tag: string, line: string) => {
       const d = path.join(ROOT, `guard-src-${tag}`);

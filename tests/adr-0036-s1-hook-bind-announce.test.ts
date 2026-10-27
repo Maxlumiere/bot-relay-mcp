@@ -43,6 +43,7 @@ import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REAL_HOOKS = path.join(REPO_ROOT, "hooks");
@@ -104,6 +105,7 @@ function runHook(o: RunOpts): { stdout: string; stderr: string; status: number }
       RELAY_HTTP_HOST: "127.0.0.1",
       RELAY_HTTP_PORT: String(o.port),
       CLAUDE_PID: String(ANCHOR_PID),
+      RELAY_TEST_CLOCK: "0",
     },
   });
   return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", status: r.status ?? -1 };
@@ -132,14 +134,13 @@ async function downgradeToV24(): Promise<void> {
 }
 
 beforeEach(async () => {
-  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
-  fs.mkdirSync(TEST_ROOT, { recursive: true, mode: 0o700 });
-  fs.cpSync(REAL_HOOKS, HOOK_COPY_DIR, { recursive: true });
-  // The hook resolves the CLI as $HOOKS_DIR/../bin/relay. Without these the copied
-  // tree has no sibling bin/dist and the hook would fall back to a `relay` on PATH
-  // that does not exist — failing for a reason this file is not testing.
-  fs.symlinkSync(path.join(REPO_ROOT, "bin"), path.join(FAKE_REPO, "bin"), "dir");
-  fs.symlinkSync(path.join(REPO_ROOT, "dist"), path.join(FAKE_REPO, "dist"), "dir");
+  // budgetTree replaces TEST_ROOT with FAKE_REPO = TEST_ROOT/bot-relay-mcp holding the hooks copy and the
+  // repo's bin/ and dist/ linked beside it (the hook resolves the CLI as $HOOKS_DIR/../bin/relay; without them
+  // it would fall back to a `relay` on PATH that does not exist, failing for a reason this file is not
+  // testing). The copy's budget arithmetic reads RELAY_TEST_CLOCK when set (tests/_helpers/hook-budget-tree.ts):
+  // runHook fixes it at 0; the open-stdin row leaves it unset and runs on the real clock.
+  budgetTree(TEST_ROOT, REAL_HOOKS, path.join(REPO_ROOT, "bin"));
+  fs.chmodSync(TEST_ROOT, 0o700);
   // A valid config keeps the hook on its success path; a dead one can exit before
   // the bind block and the test would then pass or fail for the wrong reason.
   fs.writeFileSync(

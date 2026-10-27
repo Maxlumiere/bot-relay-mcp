@@ -45,6 +45,7 @@ import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REAL_HOOKS = path.join(REPO_ROOT, "hooks");
@@ -112,6 +113,7 @@ function runHook(o: RunOpts): { stdout: string; stderr: string; status: number }
       RELAY_AGENT_TOKEN: o.token ?? "",
       RELAY_HTTP_HOST: "127.0.0.1",
       RELAY_HTTP_PORT: String(o.port),
+      RELAY_TEST_CLOCK: "0",
     },
   });
   return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", status: r.status ?? -1 };
@@ -184,13 +186,12 @@ async function registerLive(port: number, name: string, dbPath: string): Promise
 }
 
 beforeEach(async () => {
-  if (fs.existsSync(TEST_ROOT)) fs.rmSync(TEST_ROOT, { recursive: true, force: true });
-  fs.mkdirSync(TEST_ROOT, { recursive: true, mode: 0o700 });
-  fs.cpSync(REAL_HOOKS, HOOK_COPY_DIR, { recursive: true });
-  // A real install has bin/ beside hooks/: the hooks run `bin/relay` (bind, and
-  // `relay pending` for the mail delivery). A symlink keeps the copy byte-identical
-  // while bin/relay still resolves dist/ through its real path.
-  fs.symlinkSync(path.join(REPO_ROOT, "bin"), path.join(TEST_ROOT, "bot-relay-mcp", "bin"));
+  // A real install has bin/ and dist/ beside hooks/: the hooks run `bin/relay` (bind, and `relay pending` for
+  // the mail delivery) and check-relay.sh loads dist/wake-coverage-status.js. budgetTree replaces TEST_ROOT with
+  // that layout (both linked; bin/relay still resolves dist/ through its real path). Its budget arithmetic
+  // reads RELAY_TEST_CLOCK, fixed at 0 by runHook (tests/_helpers/hook-budget-tree.ts).
+  budgetTree(TEST_ROOT, REAL_HOOKS, path.join(REPO_ROOT, "bin"));
+  fs.chmodSync(TEST_ROOT, 0o700);
   const { closeDb } = await import("../src/db.js");
   closeDb();
   // A sibling file sharing this worker may have moved RELAY_DB_PATH; re-assert ours.

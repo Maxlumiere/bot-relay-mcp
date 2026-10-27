@@ -24,6 +24,7 @@ import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOKS = path.join(REPO_ROOT, "hooks");
@@ -38,6 +39,11 @@ const HEALTH_OK = path.join(ROOT, "health-ok");
 const AGENT = "c-agent";
 const TASK_TITLE = "TASK-FROM-THE-WRONG-DB";
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
+// runHook, the relay_where_load rows and hookTree run a seamed copy of the hooks (tests/_helpers/hook-budget-tree.ts)
+// whose budgeted steps read RELAY_TEST_CLOCK, fixed at 0: bash SECONDS ticks on whole wall-clock seconds, so on a slow
+// runner a step could be skipped for budget and the row read the skip. The budget rows (#291 R1 #1) measure the
+// budget itself: they run the live hooks on the real clock.
+const SEAMED_HOOKS = budgetTree(path.join(ROOT, "seamed"), HOOKS, path.join(REPO_ROOT, "bin"));
 
 fs.mkdirSync(STUBS, { recursive: true });
 // Every call is logged, and so is a config read from STDIN (`-K -`), each of its lines prefixed `cfg: `;
@@ -70,7 +76,7 @@ function seedDb(dbPath: string, withTask: boolean): void {
 function runHook(hook: string, env: Record<string, string> = {}, stdin = "") {
   fs.rmSync(CURL_LOG, { force: true });
   fs.rmSync(NODE_LOG, { force: true });
-  const r = spawnSync("bash", [path.join(HOOKS, hook)], {
+  const r = spawnSync("bash", [path.join(SEAMED_HOOKS, hook)], {
     encoding: "utf-8",
     timeout: 30_000,
     input: stdin,
@@ -80,6 +86,7 @@ function runHook(hook: string, env: Record<string, string> = {}, stdin = "") {
       RELAY_AGENT_NAME: AGENT,
       RELAY_HTTP_PORT: "1",
       RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json"),
+      RELAY_TEST_CLOCK: "0",
       ...env,
     },
   });
@@ -274,9 +281,9 @@ describe("Codex #291 R1 #3 — relay_where_load exposes a path ONLY from a succe
     return f;
   }
   const load = (cli: string) =>
-    spawnSync("bash", ["-c", `. "${path.join(HOOKS, "_vault-helpers.sh")}"; relay_where_load "$1"; echo "rc=$? kind=$RELAY_RES_KIND db=$RELAY_RES_DB_PATH"; resolve_relay_db_path; echo "shim=$?"`, "bash", cli], {
+    spawnSync("bash", ["-c", `. "${path.join(SEAMED_HOOKS, "_vault-helpers.sh")}"; relay_where_load "$1"; echo "rc=$? kind=$RELAY_RES_KIND db=$RELAY_RES_DB_PATH"; resolve_relay_db_path; echo "shim=$?"`, "bash", cli], {
       encoding: "utf-8",
-      env: { PATH: process.env.PATH ?? "", HOME },
+      env: { PATH: process.env.PATH ?? "", HOME, RELAY_TEST_CLOCK: "0" },
     });
   const cases: Array<[string, string, number]> = [
     ["partial output from a FAILED command (Codex's case)", "flat\n/tmp/partial.db\n", 1],
@@ -311,11 +318,11 @@ describe("Codex #291 R1 #3 — relay_where_load exposes a path ONLY from a succe
 
 describe("Codex #291 R1 #2 — PostToolUse / Stop trust a pending answer only with a VALID embedded resolution", () => {
   const SQLITE_LOG = path.join(ROOT, "sqlite.log");
-  /** A copy of the hooks whose bin/relay prints `envelope` (exit 0); sqlite3 logs every DB it is handed. */
+  /** A seamed copy of the hooks whose bin/relay prints `envelope` (exit 0); sqlite3 logs every DB it is handed. */
   function hookTree(tag: string, envelope: unknown): string {
-    const base = path.join(ROOT, `tree-${tag}`, "bot-relay-mcp");
-    fs.rmSync(path.dirname(base), { recursive: true, force: true });
-    fs.cpSync(HOOKS, path.join(base, "hooks"), { recursive: true });
+    const hooksCopy = budgetTree(path.join(ROOT, `tree-${tag}`), HOOKS, path.join(REPO_ROOT, "bin"));
+    const base = path.dirname(hooksCopy);
+    fs.unlinkSync(path.join(base, "bin")); // the linked bin/ is replaced by the stub (unlink removes the link, never its target)
     fs.mkdirSync(path.join(base, "bin"), { recursive: true });
     fs.writeFileSync(path.join(base, "bin", "relay"), `process.stdout.write(${JSON.stringify(JSON.stringify(envelope) + "\n")}); process.exit(0);\n`);
     fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SQLITE_LOG}"\nexit 1\n`, { mode: 0o755 });
@@ -328,7 +335,7 @@ describe("Codex #291 R1 #2 — PostToolUse / Stop trust a pending answer only wi
       encoding: "utf-8",
       timeout: 30_000,
       input: JSON.stringify({ session_id: "s1" }),
-      env: { PATH: `${STUBS}:${process.env.PATH ?? ""}`, HOME, RELAY_AGENT_NAME: AGENT, RELAY_AGENT_TOKEN: "tok_" + "y".repeat(20), RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json") },
+      env: { PATH: `${STUBS}:${process.env.PATH ?? ""}`, HOME, RELAY_AGENT_NAME: AGENT, RELAY_AGENT_TOKEN: "tok_" + "y".repeat(20), RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json"), RELAY_TEST_CLOCK: "0" },
     });
     const out = `${r.stdout ?? ""}\n${r.stderr ?? ""}`;
     return { out, verdict: (/VERDICT=([A-Z-]+)/.exec(out) ?? [])[1], sqlite: fs.existsSync(SQLITE_LOG) ? fs.readFileSync(SQLITE_LOG, "utf-8") : "" };

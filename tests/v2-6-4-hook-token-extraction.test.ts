@@ -28,7 +28,7 @@
  * real `node dist/index.js` HTTP daemon, real curl-style fetch from
  * inside the bash hook — the test exercises the real shipped path.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterAll } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -36,11 +36,16 @@ import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, "..");
-const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "v264-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
 
 async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
@@ -102,6 +107,7 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
         encoding: "utf-8",
         timeout: 8000,
         env: {
+          RELAY_TEST_CLOCK: "0",
           HOME: ROOT,
           PATH: process.env.PATH || "/usr/bin:/bin",
           RELAY_HOME: ROOT,
@@ -200,6 +206,7 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
         encoding: "utf-8",
         timeout: 8000,
         env: {
+          RELAY_TEST_CLOCK: "0",
           HOME: ROOT,
           PATH: process.env.PATH || "/usr/bin:/bin",
           RELAY_HOME: ROOT,
@@ -324,6 +331,7 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
         encoding: "utf-8",
         timeout: 10_000,
         env: {
+          RELAY_TEST_CLOCK: "0",
           HOME: ROOT,
           PATH: process.env.PATH || "/usr/bin:/bin",
           RELAY_HOME: ROOT,

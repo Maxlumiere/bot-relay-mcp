@@ -17,15 +17,20 @@
  *   I5  honest truncation: "showing K of N", N the canonical pending total;
  *   I6  recipient-scoped: another agent's mail never appears.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "f1ss-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 const RELAY_BIN = path.join(REPO_ROOT, "bin", "relay");
 const ROOT = path.join(os.tmpdir(), `bot-relay-f1-sessionstart-${process.pid}`);
 const DB = path.join(ROOT, "relay.db");
@@ -58,6 +63,7 @@ function sessionStart(env: Record<string, string> = {}): { status: number; stdou
       RELAY_AGENT_NAME: R,
       RELAY_DB_PATH: DB,
       RELAY_HTTP_PORT: "1", // no daemon: delivery is DB-direct
+      RELAY_TEST_CLOCK: "0",
       ...env,
     },
   });

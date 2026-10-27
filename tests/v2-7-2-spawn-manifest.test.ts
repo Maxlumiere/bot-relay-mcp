@@ -21,12 +21,13 @@
  * the observed effect (fallback name appears in hook output) not on a
  * proxy of the effect.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -236,7 +237,12 @@ describe("v2.7.2 — delete_relay_spawn_manifest", () => {
 // What we assert is the stderr breadcrumb from the fallback path.
 
 describe("v2.7.2 — hook fallback integration (check-relay.sh)", () => {
-  const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
+  // A seamed hooks copy (tests/_helpers/hook-budget-tree.ts): its budgeted steps read RELAY_TEST_CLOCK, fixed at 0
+  // by runHook. bash SECONDS ticks on whole wall-clock seconds, so on a slow runner the step that recovers (and
+  // consumes) the manifest could be skipped for budget and the row read the skip.
+  const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "v272-seamed-"));
+  const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
+  afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 
   function runHook(extraEnv: Record<string, string> = {}): BashResult {
     // Start from process.env minus any leaked RELAY_* state, THEN apply
@@ -255,6 +261,7 @@ describe("v2.7.2 — hook fallback integration (check-relay.sh)", () => {
     // a live :3777 from a parallel session. Point to a closed loopback port.
     env.RELAY_HTTP_HOST = "127.0.0.1";
     env.RELAY_HTTP_PORT = "1";
+    env.RELAY_TEST_CLOCK = "0";
     Object.assign(env, extraEnv);
     const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 10_000, env });
     return { status: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
