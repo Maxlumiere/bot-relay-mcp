@@ -319,11 +319,17 @@ describe("SEC-23: restore refuses, before any mutation, an archive this keyring 
   it("known-good twin: the RIGHT key proceeds (fingerprint and probe pass), and the restored rows decrypt", async () => {
     const k1 = newKey();
     await useKeyring({ k1 });
-    await seed();
+    await seed("whsec-restored-secret");
     const { exportRelayState, importRelayState } = await import("../src/backup.js");
     const exp = await exportRelayState({ destinationPath: path.join(ROOT, "d.tar.gz") });
     const imp = await importRelayState(exp.archive_path, { force: true });
     expect(imp.restored).toBe(true);
+    // Reopen the RESTORED DB and read the seeded rows through the relay's own decrypting paths.
+    const db = await import("../src/db.js");
+    db.closeDb();
+    await db.initializeDb();
+    expect(db.getMessages("beta", "all", 10, true).map((m: { content: string }) => m.content)).toEqual(["a private message body"]);
+    expect(db.listWebhooks().map((w: { secret: string | null }) => w.secret)).toEqual(["whsec-restored-secret"]);
   });
 
   it("known-good twin: an OLD archive under the RIGHT key proceeds (the probe is the ground truth)", async () => {
@@ -336,6 +342,87 @@ describe("SEC-23: restore refuses, before any mutation, an archive this keyring 
     stripManifestEncryption(exp.archive_path, old);
     const imp = await importRelayState(old, { force: true });
     expect(imp.restored).toBe(true);
+  });
+});
+
+/** A well-formed v2 ciphertext under `keyId` (the structure decryptContent accepts), but encrypted under no real key. */
+const fakeCiphertext = (keyId: string): string => `enc:${keyId}:${crypto.randomBytes(12).toString("base64")}:${crypto.randomBytes(32).toString("base64")}`;
+async function insertMessageRow(content: string): Promise<void> {
+  const db = await import("../src/db.js");
+  db.getDb()
+    .prepare("INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, 'alpha', 'beta', ?, 'normal', 'read', ?)")
+    .run("m-" + crypto.randomBytes(6).toString("hex"), content, new Date().toISOString());
+}
+type Keys = Array<{ key_id: string; rows: number; fingerprint: string | null }>;
+async function exportedKeys(name: string): Promise<{ keys: Keys; archive: string }> {
+  const { exportRelayState } = await import("../src/backup.js");
+  const exp = await exportRelayState({ destinationPath: path.join(ROOT, name) });
+  const m = manifestOf(archiveBytes(exp.archive_path).plain) as { encryption?: { keys?: Keys } };
+  return { keys: m.encryption?.keys ?? [], archive: exp.archive_path };
+}
+const reEscape = (x: string): string => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+describe("SEC-23 R1: the needed-key scan sees every key id, in every column, counted right", () => {
+  it.each(["constructor", "toString", "__proto__"])("a key id that is an Object.prototype name (%s) is NEEDED: exported with its count, and restore refuses it before any mutation", async (id) => {
+    await seed();
+    await insertMessageRow(fakeCiphertext(id));
+    const { keys, archive } = await exportedKeys(`proto-${id.replace(/_/g, "u")}.tar.gz`);
+    expect(keys.filter((k) => k.key_id === id), `${id} is in the manifest`).toEqual([{ key_id: id, rows: 1, fingerprint: null }]);
+    await useKeyring({ k1: newKey() });
+    await expectRefusedBeforeAnyMutation(archive, new RegExp(`key id.*${reEscape(id)}.*not held`, "i"));
+  });
+
+  it("two rows under DIFFERENT key ids in a table whose own column is named `id`, sharing that id: both key ids, one row each", async () => {
+    await seed();
+    const db = await import("../src/db.js");
+    db.getDb().exec("CREATE TABLE zz_dup (id TEXT, v TEXT)");
+    db.getDb().prepare("INSERT INTO zz_dup (id, v) VALUES ('same', ?), ('same', ?)").run(fakeCiphertext("ka"), fakeCiphertext("kz"));
+    const { keys } = await exportedKeys("dup.tar.gz");
+    expect(keys.filter((k) => k.key_id === "ka" || k.key_id === "kz").map((k) => [k.key_id, k.rows])).toEqual([["ka", 1], ["kz", 1]]);
+  });
+
+  it("known-good twin: the same, with UNIQUE ids in that column", async () => {
+    await seed();
+    const db = await import("../src/db.js");
+    db.getDb().exec("CREATE TABLE zz_uniq (id TEXT, v TEXT)");
+    db.getDb().prepare("INSERT INTO zz_uniq (id, v) VALUES ('u1', ?), ('u2', ?)").run(fakeCiphertext("ka"), fakeCiphertext("kz"));
+    const { keys } = await exportedKeys("uniq.tar.gz");
+    expect(keys.filter((k) => k.key_id === "ka" || k.key_id === "kz").map((k) => [k.key_id, k.rows])).toEqual([["ka", 1], ["kz", 1]]);
+  });
+
+  it("a GENERATED column holding ciphertext is scanned too: its key id is needed, and restore refuses it before any mutation", async () => {
+    await seed();
+    const db = await import("../src/db.js");
+    db.getDb().exec("CREATE TABLE zz_gen (raw TEXT, gen TEXT GENERATED ALWAYS AS ('enc:kgen:' || raw) STORED)");
+    const body = fakeCiphertext("x").split(":").slice(2).join(":");
+    db.getDb().prepare("INSERT INTO zz_gen (raw) VALUES (?)").run(body);
+    const { keys, archive } = await exportedKeys("gen.tar.gz");
+    expect(keys.filter((k) => k.key_id === "kgen").map((k) => k.rows)).toEqual([1]);
+    await useKeyring({ k1: newKey() });
+    await expectRefusedBeforeAnyMutation(archive, /key id.*kgen.*not held/i);
+  });
+});
+
+describe("SEC-23 R1: the plaintext count counts only what is not a well-formed ciphertext", () => {
+  it("no-key mode: a webhook secret that only LOOKS like ciphertext (`enc:…`, `enc1:…`) is carried as PLAINTEXT and counted", async () => {
+    await seed("enc:not-ciphertext");
+    const db = await import("../src/db.js");
+    db.registerWebhook("https://example.com/hook3", "task.posted", undefined, "enc1:abc");
+    const { exportRelayState } = await import("../src/backup.js");
+    const exp = (await exportRelayState({ destinationPath: path.join(ROOT, "lookalike.tar.gz") })) as unknown as Record<string, unknown>;
+    expect(exp.plaintext_secrets).toEqual({ "webhook_subscriptions.secret": 2 });
+  });
+
+  it("a webhook_subscriptions table the count cannot read is reported as UNVERIFIABLE (null), never 0; an absent table is 0", async () => {
+    const Database = (await import("better-sqlite3")).default;
+    const { countPlaintextWebhookSecrets } = await import("../src/backup-secrets.js");
+    const odd = new Database(":memory:");
+    odd.exec("CREATE TABLE webhook_subscriptions (id TEXT)"); // no `secret` column: the query fails
+    expect(countPlaintextWebhookSecrets(odd as never)).toBeNull();
+    odd.close();
+    const none = new Database(":memory:");
+    expect(countPlaintextWebhookSecrets(none as never)).toBe(0);
+    none.close();
   });
 });
 
