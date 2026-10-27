@@ -322,14 +322,19 @@ describe("SEC-23: restore refuses, before any mutation, an archive this keyring 
     await seed("whsec-restored-secret");
     const { exportRelayState, importRelayState } = await import("../src/backup.js");
     const exp = await exportRelayState({ destinationPath: path.join(ROOT, "d.tar.gz") });
+    // Change the live data AFTER the export, so a restore that did nothing cannot pass.
+    const db = await import("../src/db.js");
+    db.registerAgent("after-export", "r", []);
+    db.sendMessage("alpha", "beta", "written after the export", "normal");
+    db.registerWebhook("https://example.com/after", "task.posted", undefined, "whsec-after-export");
     const imp = await importRelayState(exp.archive_path, { force: true });
     expect(imp.restored).toBe(true);
     // Reopen the RESTORED DB and read the seeded rows through the relay's own decrypting paths.
-    const db = await import("../src/db.js");
     db.closeDb();
     await db.initializeDb();
     expect(db.getMessages("beta", "all", 10, true).map((m: { content: string }) => m.content)).toEqual(["a private message body"]);
     expect(db.listWebhooks().map((w: { secret: string | null }) => w.secret)).toEqual(["whsec-restored-secret"]);
+    expect(db.getAgents().map((a: { name: string }) => a.name), "the post-export agent is gone").not.toContain("after-export");
   });
 
   it("known-good twin: an OLD archive under the RIGHT key proceeds (the probe is the ground truth)", async () => {
@@ -411,6 +416,45 @@ describe("SEC-23 R1: the plaintext count counts only what is not a well-formed c
     const { exportRelayState } = await import("../src/backup.js");
     const exp = (await exportRelayState({ destinationPath: path.join(ROOT, "lookalike.tar.gz") })) as unknown as Record<string, unknown>;
     expect(exp.plaintext_secrets).toEqual({ "webhook_subscriptions.secret": 2 });
+  });
+
+  it("the webhook table is found as SQLite resolves identifiers (case-insensitively): a `Webhook_Subscriptions` table is counted, not read as absent", async () => {
+    const Database = (await import("better-sqlite3")).default;
+    const { countPlaintextWebhookSecrets } = await import("../src/backup-secrets.js");
+    const mixed = new Database(":memory:");
+    mixed.exec("CREATE TABLE Webhook_Subscriptions (id TEXT, secret TEXT)");
+    mixed.prepare("INSERT INTO Webhook_Subscriptions (id, secret) VALUES ('w1', 'plain-secret')").run();
+    expect(countPlaintextWebhookSecrets(mixed as never)).toBe(1);
+    mixed.close();
+  });
+
+  it("a failure while DISCOVERING the webhook table is UNVERIFIABLE (null), never 0 and never a throw", async () => {
+    const { countPlaintextWebhookSecrets } = await import("../src/backup-secrets.js");
+    const broken = { prepare: () => { throw new Error("discovery failed"); } };
+    expect(countPlaintextWebhookSecrets(broken as never)).toBeNull();
+  });
+
+  it("coverage: an UNVERIFIABLE count is stated on ALL THREE surfaces (stderr, the export result, the manifest)", async () => {
+    await seed();
+    const db = await import("../src/db.js");
+    db.getDb().exec("DROP TABLE webhook_subscriptions; CREATE TABLE webhook_subscriptions (id TEXT)"); // no `secret` column
+    const writes: string[] = [];
+    const orig = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: (c: unknown, ...a: unknown[]) => boolean }).write = (c: unknown, ...a: unknown[]) => {
+      writes.push(String(c));
+      return orig(c as string, ...(a as []));
+    };
+    let exp: Record<string, unknown>;
+    try {
+      const { exportRelayState } = await import("../src/backup.js");
+      exp = (await exportRelayState({ destinationPath: path.join(ROOT, "unverifiable.tar.gz") })) as unknown as Record<string, unknown>;
+    } finally {
+      (process.stderr as unknown as { write: typeof orig }).write = orig;
+    }
+    expect(writes.join(""), "stderr").toMatch(/could NOT be verified/);
+    expect(exp.plaintext_secrets, "the export result").toEqual({ "webhook_subscriptions.secret": null });
+    expect((exp.warnings as string[]).join(" "), "the export result's warnings").toMatch(/could NOT be verified/);
+    expect(manifestOf(archiveBytes(String(exp.archive_path)).plain).plaintext_secrets, "the manifest").toEqual({ "webhook_subscriptions.secret": null });
   });
 
   it("a webhook_subscriptions table the count cannot read is reported as UNVERIFIABLE (null), never 0; an absent table is 0", async () => {
