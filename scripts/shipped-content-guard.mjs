@@ -22,7 +22,10 @@
  * and a guard built to the shape of the last incident (tokens) never covered it.
  *
  * Pattern list: scripts/forbidden-shipped-strings.txt — one regex per line,
- * adding a future persona is one line, not a code change.
+ * adding a future persona is one line, not a code change. Every pattern matches
+ * CASE-INSENSITIVELY: a capitalised or uppercase spelling is the same name (a
+ * case-sensitive guard let an uppercase name and a capitalised role ship in the
+ * CHANGELOG, in every tarball from 2.22/2.24 to 4.0.0).
  *
  * Exports scanDir / scanPackedTarball / loadPatterns for the both-ways control
  * test (tests/shipped-surface-persona-free.test.ts).
@@ -45,7 +48,7 @@ export function loadPatterns(file = PATTERN_FILE) {
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith("#"))
-    .map((src) => ({ src, re: new RegExp(src) }));
+    .map((src) => ({ src, re: new RegExp(src, "i") }));
 }
 
 /** Scan an extracted package directory. Returns [{file,line,pattern,text}]. */

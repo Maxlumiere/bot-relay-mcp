@@ -55,6 +55,7 @@ describe("SEC-22: systemBinary validates SystemRoot and fails CLOSED with a name
     expect(systemBinary("whoami")).toBe(path.win32.join(root, "System32", "whoami.exe"));
     expect(systemBinary("icacls")).toBe(path.win32.join(root, "System32", "icacls.exe"));
     expect(systemBinary("powershell")).toBe(path.win32.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
+    expect(systemBinary("tar")).toBe(path.win32.join(root, "System32", "tar.exe")); // `relay backup`: never the tar first on PATH
   });
 });
 
@@ -133,18 +134,6 @@ describe.runIf(process.platform === "win32")("SEC-22 (Windows): the host id (Mac
  * either moved to systemBinary or listed here with its reason.
  */
 const ALLOWLIST: Record<string, string> = {
-  // SEC-22 POSIX FOLLOW-UP (named, not this change): the same class, by name today.
-  // A CLOSED set checked at run time (POSIX_BY_NAME = ps, ioreg, cat; any other command, or win32, is refused), so a
-  // Windows tool cannot hide under it (Codex #336 R1 P1: reg did, under the old function-wide entry).
-  "src/liveness.ts::runPosixByName::cmd": "ps / ioreg / cat (liveness, INV-LIVE-01), a closed set: SEC-22 POSIX follow-up (-> /bin/ps ...)",
-  "src/watch-wake.ts::awakeNowMs::c": "sysctl / ioreg (the awake clock): SEC-22 POSIX follow-up",
-  "src/deploy-gate.ts::cmd::bin": "launchctl / plutil (the deploy gate): SEC-22 POSIX follow-up",
-  "src/deploy-gate.ts::defaultGateDeps::\"lsof\"": "lsof (the deploy gate): SEC-22 POSIX follow-up",
-  "src/fleet-system.ts::lsofPids::\"lsof\"": "lsof (fleet view): SEC-22 POSIX follow-up",
-  "src/fleet-system.ts::<module>::\"lsof\"": "lsof (fleet view): SEC-22 POSIX follow-up",
-  "src/cli/init.ts::realDaemonDeps::\"launchctl\"": "launchctl (relay init, the user's own service): SEC-22 POSIX follow-up",
-  "src/cli/restart.ts::run::\"launchctl\"": "launchctl (relay restart, the user's own service): SEC-22 POSIX follow-up",
-  "src/backup.ts::runTar::\"tar\"": "tar (relay backup): SEC-22 POSIX follow-up",
   // DELIBERATE: the user's own programs, found the way the user's shell finds them; not a security or liveness decision.
   "src/fleet-system.ts::<module>::\"node\"": "reports the user's own node on PATH (fleet view): deliberate",
   "src/spawn/dispatcher.ts::defaultHasBinary::probe": "a `command -v` probe: is the user's terminal app installed (asks PATH by design)",
@@ -153,17 +142,27 @@ const ALLOWLIST: Record<string, string> = {
   "src/cli/open.ts::run::driver.command": "opens the dashboard in the user's browser: deliberate",
 };
 
+/**
+ * The scan's verdict. A checked program is the real process.execPath, or systemBinary(...) INSIDE src/system-binary.ts
+ * only: everywhere else a system tool goes through spawnSystem / execSystem, which add the clean-base env and argv0
+ * (SEC-22 (ii)); a direct child_process call on systemBinary(...) elsewhere would skip both.
+ */
+function scanOffenders(sites: Array<{ program: string; api: string; key: string; why?: string }>): string[] {
+  return sites
+    .filter((s) => s.program !== "execPath" && !(s.program === "systemBinary" && s.key.startsWith("src/system-binary.ts::")) && !(s.program === "other" && s.key in ALLOWLIST))
+    .map((s) => `${s.program} ${s.api} ${s.key}${s.why ? ` [${s.why}]` : ""}`);
+}
+
 describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outside the reasoned allowlist", () => {
   const rel = (f: string) => path.relative(REPO, f).split(path.sep).join("/");
 
   it("every child_process call in src/ goes through systemBinary(...) or process.execPath, or is ALLOWLISTED; no allowlist entry is stale", () => {
     const sites = subprocessSites(srcProgram(), rel, (f) => f.startsWith("src/"));
-    expect(sites.length, "the scan found the spawn family at all").toBeGreaterThan(10);
-    const offenders = sites
-      .filter((s) => s.program !== "systemBinary" && s.program !== "execPath" && !(s.program === "other" && s.key in ALLOWLIST))
-      .map((s) => `${s.program} ${s.api} ${s.key}${s.why ? ` [${s.why}]` : ""}`);
-    expect(offenders, "started by a bare name or an unchecked expression: use systemBinary(...), or list it with a reason").toEqual([]);
-    expect(sites.filter((s) => s.program === "systemBinary").length, "the Windows tools go through systemBinary").toBeGreaterThan(0);
+    // The floor: every allowlisted site plus spawnSystem's own (the other system-tool sites now go through the
+    // wrappers, so there are few direct calls left; the stale-entry check below shows each listed one is seen).
+    expect(sites.length, "the scan found the spawn family at all").toBeGreaterThanOrEqual(Object.keys(ALLOWLIST).length + 1);
+    expect(scanOffenders(sites), "started by a bare name, an unchecked expression, or systemBinary(...) outside src/system-binary.ts: use spawnSystem / execSystem, or list it with a reason").toEqual([]);
+    expect(sites.filter((s) => s.program === "systemBinary" && s.key.startsWith("src/system-binary.ts::")).length, "the scan sees spawnSystem's own systemBinary(...) site").toBeGreaterThan(0);
     const seen = new Set(sites.map((s) => s.key));
     expect(Object.keys(ALLOWLIST).filter((k) => !seen.has(k)), "allowlist entries that match no site (remove them)").toEqual([]);
   });
@@ -178,7 +177,7 @@ describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outsi
     "child_process.d.ts": decl,
     "node_modules/@types/node/process.d.ts": "declare var process: { execPath: string };",
     "globals.d.ts": "declare function require(m: string): any; declare function createRequire(u: string): (m: string) => any; declare class Worker { constructor(s: string, o?: object); } declare const opts: object; declare function doIt(f: unknown): void; declare const someName: string;",
-    "src/system-binary.ts": "export function systemBinary(n: string): string { return n; }",
+    "src/system-binary.ts": 'import { spawnSync } from "child_process"; export function systemBinary(n: string): string { return n; } export function spawnSystem(n: string) { return spawnSync(systemBinary(n), [], { shell: false }); }',
     // the program
     "src/bad-literal.ts": 'import { spawnSync } from "child_process"; export function a() { spawnSync("whoami", ["/user"]); }',
     "src/bad-alias-import.ts": 'import { spawnSync as run } from "child_process"; export function b() { run("icacls", []); }',
@@ -262,6 +261,15 @@ describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outsi
     expect(by(sites, "good-execpath.ts")).toEqual(["execPath"]);
     expect(by(sites, "good-fork.ts")).toEqual(["execPath"]);
     expect(by(sites, "not-cp.ts")).toEqual([]);
+  });
+
+  it("CAUGHT: systemBinary(...) as a program OUTSIDE src/system-binary.ts (it would skip the clean-base env and argv0)", () => {
+    expect(scanOffenders(sitesOnce().filter((s) => s.key.startsWith("src/good-system.ts::")))).toHaveLength(1);
+  });
+  it("known-good twin: spawnSystem's own systemBinary(...) inside src/system-binary.ts", () => {
+    const own = sitesOnce().filter((s) => s.key.startsWith("src/system-binary.ts::"));
+    expect(own.map((s) => s.program)).toEqual(["systemBinary"]);
+    expect(scanOffenders(own)).toEqual([]);
   });
 
   it.each(["esc-computed-destructure.ts", "esc-namespace-passed.ts", "esc-namespace-stored.ts", "esc-nonliteral-require.ts", "esc-nonliteral-import.ts", "esc-nonliteral-created.ts", "esc-export-star.ts"])(
