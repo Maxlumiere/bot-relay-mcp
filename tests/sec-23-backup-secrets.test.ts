@@ -379,6 +379,26 @@ describe("SEC-23 R1: the needed-key scan sees every key id, in every column, cou
     await expectRefusedBeforeAnyMutation(archive, new RegExp(`key id.*${reEscape(id)}.*not held`, "i"));
   });
 
+  it("the wasm driver STREAMS the scan: its statement steps row by row (iterate), yielding exactly what all() returns, and the scan agrees with native", async () => {
+    await useKeyring({ k1: newKey() });
+    await seed();
+    const db = await import("../src/db.js");
+    db.closeDb();
+    const { openReadOnly } = await import("../src/sqlite-compat.js");
+    const { scanCiphertextKeyIds } = await import("../src/backup-secrets.js");
+    const wasm = await openReadOnly(DB_PATH, "wasm");
+    const native = await openReadOnly(DB_PATH, "native");
+    try {
+      const stmt = wasm.prepare("SELECT name FROM agents ORDER BY name") as ReturnType<typeof wasm.prepare> & { iterate?: () => Iterable<unknown> };
+      expect(typeof stmt.iterate, "the wasm statement can iterate").toBe("function");
+      expect([...stmt.iterate!()]).toEqual(stmt.all());
+      expect([...scanCiphertextKeyIds(wasm, "k1")].map(([id, v]) => [id, v.rows])).toEqual([...scanCiphertextKeyIds(native, "k1")].map(([id, v]) => [id, v.rows]));
+    } finally {
+      wasm.close();
+      native.close();
+    }
+  });
+
   it("two rows under DIFFERENT key ids in a table whose own column is named `id`, sharing that id: both key ids, one row each", async () => {
     await seed();
     const db = await import("../src/db.js");
