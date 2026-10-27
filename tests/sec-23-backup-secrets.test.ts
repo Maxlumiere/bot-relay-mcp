@@ -25,6 +25,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import zlib from "zlib";
+import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { craftTar, gzip } from "./_helpers/ustar.js";
 
@@ -254,6 +255,20 @@ describe("SEC-23: what a backup carries, and what it states", () => {
     const { exportRelayState } = await import("../src/backup.js");
     const exp = await exportRelayState({ destinationPath: path.join(ROOT, "mode.tar.gz") });
     const { privacyFaults } = await import("../src/fs-perms.js");
+    expect(privacyFaults(exp.archive_path, 0o600)).toEqual([]);
+  });
+
+  it.skipIf(process.platform !== "win32")("Windows: an archive written into a directory whose ACL grants others (an inherited BUILTIN\\Users allow ACE) is still owner-only", async () => {
+    const shared = path.join(ROOT, "shared");
+    fs.mkdirSync(shared);
+    const icacls = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "icacls.exe");
+    const grant = spawnSync(icacls, [shared, "/grant", "*S-1-5-32-545:(OI)(CI)(RX)"], { encoding: "utf-8" });
+    expect(grant.status, `icacls /grant: ${grant.stderr}`).toBe(0);
+    const { privacyFaults } = await import("../src/fs-perms.js");
+    expect(privacyFaults(shared, 0o700).join(" "), "the setup reaches the target: the dir really grants a foreign SID").toMatch(/S-1-5-32-545/);
+    await seed();
+    const { exportRelayState } = await import("../src/backup.js");
+    const exp = await exportRelayState({ destinationPath: path.join(shared, "inherited.tar.gz") });
     expect(privacyFaults(exp.archive_path, 0o600)).toEqual([]);
   });
 
