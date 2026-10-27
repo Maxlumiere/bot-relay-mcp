@@ -6,7 +6,7 @@
 /**
  * RESTORE reads a backup archive IN-PROCESS: ONE parser that both decides what the archive holds and extracts it
  * (SEC-22; ruled 26 Oct inside the 21 Oct clause "restore accepts ONLY the expected regular-file members"). No tar
- * extracts the input archive (the safety backup that restore writes first still uses tar): a check in one parser
+ * extracts the input archive (the safety backup that restore writes before the swap still uses tar): a check in one parser
  * followed by extraction in another (tar) is a parser differential
  * (a pax `path=` record renames the next member for tar; a ustar `prefix` lengthens it; GNU tar execs a filter for a
  * compressed member), and tar would obey whatever the check missed.
