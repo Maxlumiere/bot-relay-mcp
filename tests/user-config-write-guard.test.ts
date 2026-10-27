@@ -284,6 +284,69 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
     }
   });
 
+  // ---- #343 R2 DESIGN (ruled, SEC-11): the protected instance INVENTORY comes from the tripwire's own sanctioned
+  // snapshot (every instances/ entry: its config.json as spelled, as resolved, and the config's own target), so a
+  // protected config reached through its TARGET, not through instances/<id>, is still refused.
+  const inv = async (home: string): Promise<string[]> => {
+    const { instanceInventory } = (await import("./_setup/vitest-tripwire-base.mjs")) as unknown as { instanceInventory?: (root: string) => { configs: string[] } };
+    expect(typeof instanceInventory, "the tripwire base exports instanceInventory").toBe("function");
+    return instanceInventory!(path.join(home, ".bot-relay")).configs;
+  };
+  const point = _setAccountHomeForTests as unknown as (p: string | null, inventory?: string[]) => void;
+  it.skipIf(posixOnly)("(G9a) a DIRECT write to an instance's link target (instances/work -> relocated-prod; write relocated-prod/config.json) is refused", async () => {
+    const home = path.join(SANDBOX, "acct-9a");
+    const relocated = path.join(SANDBOX, "relocated-prod-9a");
+    fs.mkdirSync(path.join(home, ".bot-relay", "instances"), { recursive: true });
+    fs.mkdirSync(relocated, { recursive: true });
+    fs.writeFileSync(path.join(relocated, "config.json"), '{"live":true}');
+    fs.symlinkSync(relocated, path.join(home, ".bot-relay", "instances", "work"));
+    point(home, await inv(home));
+    expect(() => atomicWriteJson(path.join(relocated, "config.json"), { clobbered: true })).toThrow(/config-guard/);
+    expect(fs.readFileSync(path.join(relocated, "config.json"), "utf-8")).toBe('{"live":true}');
+  });
+  it.skipIf(posixOnly)("(G9b) an alias whose NAME is not an instance id, pointing at that target, is refused", async () => {
+    const home = path.join(SANDBOX, "acct-9b");
+    const relocated = path.join(SANDBOX, "relocated-prod-9b");
+    fs.mkdirSync(path.join(home, ".bot-relay", "instances"), { recursive: true });
+    fs.mkdirSync(relocated, { recursive: true });
+    fs.writeFileSync(path.join(relocated, "config.json"), '{"live":true}');
+    fs.symlinkSync(relocated, path.join(home, ".bot-relay", "instances", "work"));
+    const alias = path.join(SANDBOX, "not an id 9b");
+    fs.symlinkSync(relocated, alias);
+    point(home, await inv(home));
+    expect(() => atomicWriteJson(path.join(alias, "config.json"), { clobbered: true })).toThrow(/config-guard/);
+    expect(fs.readFileSync(path.join(relocated, "config.json"), "utf-8")).toBe('{"live":true}');
+  });
+  it.skipIf(posixOnly)("(G9c) an instance config.json that is a symlink: a direct write to ITS target is refused", async () => {
+    const home = path.join(SANDBOX, "acct-9c");
+    const inst = path.join(home, ".bot-relay", "instances", "work");
+    fs.mkdirSync(inst, { recursive: true });
+    const live = path.join(SANDBOX, "live-9c.json");
+    fs.writeFileSync(live, '{"live":true}');
+    fs.symlinkSync(live, path.join(inst, "config.json"));
+    point(home, await inv(home));
+    expect(() => atomicWriteJson(live, { clobbered: true })).toThrow(/config-guard/);
+    expect(fs.readFileSync(live, "utf-8")).toBe('{"live":true}');
+  });
+  it("(G9d) under the harness with NO inventory published (the real account, no snapshot), every guarded write is refused: the inventory is not established", () => {
+    const saved = process.env.RELAY_TEST_OPERATOR_INSTANCE_CONFIGS;
+    delete process.env.RELAY_TEST_OPERATOR_INSTANCE_CONFIGS;
+    try {
+      expect(() => assertNotRealUserConfigWrite(path.join(SANDBOX, "unrelated-9d", "config.json"))).toThrow(/inventory/);
+    } finally {
+      if (saved !== undefined) process.env.RELAY_TEST_OPERATOR_INSTANCE_CONFIGS = saved;
+    }
+  });
+  it("(G9e) TWIN: with the inventory established, an unrelated tmp config is allowed", async () => {
+    const home = path.join(SANDBOX, "acct-9e");
+    fs.mkdirSync(path.join(home, ".bot-relay", "instances", "work"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".bot-relay", "instances", "work", "config.json"), "{}");
+    point(home, await inv(home));
+    const t = path.join(SANDBOX, "unrelated-9e", "config.json");
+    atomicWriteJson(t, { ok: true });
+    expect(JSON.parse(fs.readFileSync(t, "utf-8"))).toEqual({ ok: true });
+  });
+
   it("(G6) sandboxed writes still work — the guard blocks the clobber, not the installer", () => {
     // A temp HOME / RELAY_CLAUDE_HOME resolves to different paths than the
     // account home, so the real-installer coverage in v2-3-0-profiles /
