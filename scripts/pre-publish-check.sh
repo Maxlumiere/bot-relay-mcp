@@ -25,29 +25,29 @@
 # Wired via package.json "prepublishOnly" so `npm publish` will refuse to ship
 # unless every check passes. Also runnable standalone for operator confidence.
 #
-# NEVER IN THE SERVING TREE: publish from a throwaway git worktree (or a fresh clone) at
-# origin/main, with its own node_modules. In the tree the live daemon runs from (the
-# .relay-prod-tree marker, or a launchd/claude.json entry pointing at its dist), a
-# `git pull` + `npm ci` swaps packages under the running build; this gate refuses to
-# start there (scripts/prebuild-guard.mjs --publish, first thing below, no override). That check
-# is NOT complete yet: the .relay-prod-tree marker is its reliable signal (the consumer detection
-# sees only the forms it parses); a follow-up replaces it with a positive qualification of the tree.
+# ONLY FROM A QUALIFIED RELEASE TREE. A real `npm publish` (npm sets npm_lifecycle_event=
+# prepublishOnly) runs scripts/publish-gate.mjs FIRST. It refuses, fail-closed, unless the tree
+# PROVES it is a fresh release tree: a linked worktree under the workspace's .worktrees/, no
+# .relay-prod-tree, its own real node_modules (root and extensions/vscode), clean at the remote's
+# main (or the release tag), with a release marker minted when the tree was created; and unless
+# the registry checked below is the one npm uploads to (no publishConfig.registry, an unscoped
+# name, no workspace publish). Run standalone (CI's smoke, a dev loop), this gate refuses only
+# the marked serving tree (.relay-prod-tree).
+# This gate CANNOT undo an earlier pull or `npm ci`: by the time it runs, they have happened.
+# So never run them in the serving tree at all.
 #
-# UNTIL THE POSITIVE-QUALIFICATION GATE LANDS, check these MANUALLY before publishing (this
-# gate's serving-tree check is not enough on its own):
-#   - a fresh linked worktree created for this release;
-#   - no .relay-prod-tree in it;
-#   - its OWN real node_modules (root AND extensions/vscode), never a worktree tool's symlink
-#     to the main checkout;
-#   - a clean tree at the fetched origin/main SHA;
-#   - `npm whoami` succeeds.
-# This gate CANNOT undo an earlier pull or `npm ci`: by the time it runs, they have
-# happened. So never run them in the serving tree at all; publish from a disposable
-# worktree with its own node_modules.
+# THE RELEASE PROCEDURE:
+#   1. create a linked worktree at origin/main under the workspace's .worktrees/;
+#   2. `node scripts/publish-gate.mjs --mint` in it, BEFORE npm ci (the marker is for this SHA);
+#   3. remove any node_modules link, then `npm ci` (root and extensions/vscode);
+#   4. `node scripts/publish-gate.mjs --check` (the qualification on demand);
+#   5. `npm publish` (it runs this whole gate, the qualification first).
+# KNOWN LIMIT: `npm publish --ignore-scripts` skips prepublishOnly, and with it this WHOLE gate,
+# the qualification included. Use it only to retry the upload right after a fully gated run on
+# the SAME tree at the SAME SHA (e.g. one that failed only on the login), and only after
+# `--check` passes there again.
 #
-# IN THAT DISPOSABLE WORKTREE OR FRESH CLONE (the real `npm publish` path): run
-# `npm ci` there first (its own node_modules, never one linked to another tree), then
-# `npm publish` (which invokes this gate) or the gate standalone. You do NOT need a manual `npm run build` first — the gate builds
+# You do NOT need a manual `npm run build` first — the gate builds
 # dist/ itself (step 2) before any test. Both stumbles that hit the 2.25.0 publish
 # from a fresh checkout are covered here: missing node_modules (→ `npm ci`) and
 # missing dist (→ the step-2 build-before-tests ordering).
@@ -80,17 +80,18 @@ done
 
 # PREFLIGHT, before any step. Skipped under --list-steps, which runs NO step (it only prints the
 # labels), so there is nothing to protect and nothing to publish (both checks cost no load):
-#  1. the serving tree is refused first (no override for a publish);
-#  2. a real `npm publish` (npm sets npm_lifecycle_event=prepublishOnly) checks the npm login NOW,
-#     not after the ~20-minute gate: on 26 Oct the gate passed and the upload then failed on an
-#     expired login.
-# The registry `npm publish` uploads to: package.json publishConfig.registry when set, else the
-# configured registry. The package name is unscoped, so no @scope:registry mapping applies.
-# KNOWN GAP: a CLI `npm publish --registry X` is not seen here; a follow-up closes it.
+#  1. a real `npm publish`: the release-tree qualification (scripts/publish-gate.mjs), no override;
+#     standalone: the marked serving tree is refused;
+#  2. a real `npm publish` checks the npm login NOW, not after the ~20-minute gate: on 26 Oct the
+#     gate passed and the upload then failed on an expired login.
+# The registry `npm publish` uploads to, as npm reports it INSIDE this script (`npm config get
+# registry`): measured on npm 11.6.2 to be the real target for a CLI --registry, either env
+# spelling and .npmrc. Not with publishConfig.registry set (then a CLI and an env registry look
+# the same from here), so publish-gate.mjs refuses publishConfig.registry, a scoped name and a
+# workspace publish before this runs.
 publish_registry() {
   local r
-  r=$(node -e 'const p=require(process.argv[1]); process.stdout.write((p.publishConfig && p.publishConfig.registry) || "")' "$PROJECT_ROOT/package.json" 2>/dev/null) || r=""
-  [ -n "$r" ] || r=$(npm config get registry 2>/dev/null) || r=""
+  r=$(npm config get registry 2>/dev/null) || r=""
   printf '%s' "$r"
 }
 # A registry URL may carry a credential (user:token@) or a query: print it without either, never raw.
@@ -98,11 +99,11 @@ redact_registry() {
   printf '%s' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#; s#[?#].*$##'
 }
 if [ "$LIST_STEPS_MODE" != "1" ]; then
-  node "$PROJECT_ROOT/scripts/prebuild-guard.mjs" --publish || exit 1
   if [ "${npm_lifecycle_event:-}" = "prepublishOnly" ]; then
+    node "$PROJECT_ROOT/scripts/publish-gate.mjs" || exit 1
     _reg=$(publish_registry)
     if [ -z "$_reg" ]; then
-      echo "✖ could not determine the registry npm publish would use (publishConfig.registry / npm config get registry)." >&2
+      echo "✖ could not determine the registry npm publish would use (npm config get registry)." >&2
       exit 1
     fi
     if ! npm whoami --registry "$_reg" >/dev/null 2>&1; then
@@ -111,6 +112,9 @@ if [ "$LIST_STEPS_MODE" != "1" ]; then
       echo "  Run \`npm login --registry $_shown\`, then \`npm publish\` again. Checked before the gate, so nothing ran." >&2
       exit 1
     fi
+  elif [ -e "$PROJECT_ROOT/.relay-prod-tree" ]; then
+    echo "✖ REFUSING to run the pre-publish gate in the serving tree (.relay-prod-tree): it installs, builds and packs here, under the live daemon's dist/." >&2
+    exit 1
   fi
 fi
 
