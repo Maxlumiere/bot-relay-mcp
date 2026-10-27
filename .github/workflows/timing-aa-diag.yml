@@ -7,6 +7,12 @@ name: Timing A/A stall diagnostics (manual)
 # call, transaction, fs *Sync and sync child process of 100 ms or more (tests/_helpers/sync-call-recorder.ts) and prints,
 # after each BREACH line, the recorded calls that overlap it, or that none did. The DIAG lines are the measurement;
 # a run's pass/fail is not (a breach FAILs the A/A by design; this job keeps going and collects every run).
+# NOT RECORDED (so "NO recorded sync call" is absence of evidence, never "no block"): functions captured before the
+# recorder was installed, other native addons, crypto/zlib *Sync, Atomics.wait, plain JavaScript compute (GC is
+# reported on the BAR line). Timing neutrality of the wrappers is NOT established (each call pays two clock reads).
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -23,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js 22
         uses: actions/setup-node@v7
@@ -54,9 +62,20 @@ jobs:
             rc=0; npx vitest run tests/pr-b-failed-auth.test.ts -t "A/A CONTROL" --silent=false > "aa-$i.log" 2>&1 || rc=$?
             cat "aa-$i.log"
             echo "::endgroup::"
-            lines=$(sed -E 's/\x1b\[[0-9;]*m//g' "aa-$i.log" | grep -E '(BREACH|DIAG) ' || true)
+            clean=$(sed -E 's/\x1b\[[0-9;]*m//g' "aa-$i.log")
+            lines=$(printf '%s\n' "$clean" | grep -E '(BREACH|DIAG) ' || true)
+            # "no breach" only when the bar COMPLETED: its BAR line and the recorder's per-bar total are both there.
+            completed=0
+            printf '%s\n' "$clean" | grep -q '^BAR A/A' && printf '%s\n' "$clean" | grep -q 'DIAG .* | recorder: ' && completed=1
             {
               echo "### run $i (vitest exit $rc)"
-              if [ -n "$lines" ]; then echo '```'; echo "$lines"; echo '```'; else echo "no breach"; fi
+              if [ "$completed" = 0 ]; then
+                echo "INCOMPLETE run / no diagnostic output (vitest exit $rc): no BAR line or no recorder total"
+                [ -n "$lines" ] && { echo '```'; echo "$lines"; echo '```'; }
+              elif printf '%s\n' "$lines" | grep -q '^BREACH '; then
+                echo '```'; echo "$lines"; echo '```'
+              else
+                echo "no breach (the bar completed)"
+              fi
             } >> "$GITHUB_STEP_SUMMARY"
           done

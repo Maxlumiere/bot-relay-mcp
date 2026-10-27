@@ -13,7 +13,7 @@
  *   SHAPE  : known-provenance digests decide a wrong token with no bcrypt; unknown-provenance and
  *            digest-less rows are found and healed, and their failures are bounded (throttle + pool).
  */
-import { describe, it, expect, beforeEach, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, beforeAll, afterAll, afterEach } from "vitest";
 import crypto from "crypto";
 import fs from "fs";
 import os from "os";
@@ -362,12 +362,34 @@ const DIAG_THRESHOLD_MS = 100;
 export function diagInstall(env: NodeJS.ProcessEnv = process.env): SyncRecorder | null {
   if (env.RELAY_TIMING_DIAG !== "1") return null;
   const handle = db.getDb() as unknown as { prepare(sql: string): object };
-  return installSyncRecorder({
+  const rec = installSyncRecorder({
     now: absNow,
     thresholdMs: DIAG_THRESHOLD_MS,
     databaseProto: Object.getPrototypeOf(handle) as Record<string, unknown>,
     statementProto: Object.getPrototypeOf(handle.prepare("SELECT 1")) as Record<string, unknown>,
   });
+  liveRecorders.add(rec);
+  return rec;
+}
+/** Every recorder not yet uninstalled: a bar a test TIMEOUT abandons never reaches its finally; teardown cleans up. */
+const liveRecorders = new Set<SyncRecorder>();
+/** Uninstall every live recorder (idempotent). Registered with afterEach, so no wrapper outlives its test. */
+export function diagCleanupAll(): void {
+  for (const r of liveRecorders) r.uninstall();
+  liveRecorders.clear();
+}
+afterEach(diagCleanupAll);
+/** Run `fn` with a recorder for its duration (null unless RELAY_TIMING_DIAG=1): uninstalled when it settles, either way. */
+export async function withDiag<T>(env: NodeJS.ProcessEnv, fn: (rec: SyncRecorder | null) => Promise<T>): Promise<T> {
+  const rec = diagInstall(env);
+  try {
+    return await fn(rec);
+  } finally {
+    if (rec) {
+      rec.uninstall();
+      liveRecorders.delete(rec);
+    }
+  }
 }
 /** One DIAG line per located breach (every arm), naming the recorded sync calls that overlap it, or saying none did. */
 export function diagLines(label: string, b: Pick<BarStats, "auth" | "control" | "control2">, rec: Pick<SyncRecorder, "overlapping" | "count">): string[] {
@@ -1218,12 +1240,7 @@ function announce(bare: string): void {
  */
 type BarOpts = { onLoop?: () => void; onOpen?: () => void; poolControl?: PoolWork; authPool?: PoolWork; controlOnLoop?: () => void; measureImpl?: typeof measure };
 async function runBar(label: string, port: number, load: Load, opts: BarOpts = {}): Promise<BarStats> {
-  const rec = diagInstall(); // null unless RELAY_TIMING_DIAG=1
-  try {
-    return await runBarMeasured(label, port, load, opts, rec);
-  } finally {
-    rec?.uninstall();
-  }
+  return withDiag(process.env, (rec) => runBarMeasured(label, port, load, opts, rec)); // rec is null unless RELAY_TIMING_DIAG=1
 }
 async function runBarMeasured(label: string, port: number, load: Load, opts: BarOpts, rec: SyncRecorder | null): Promise<BarStats> {
   // `measureImpl`: a seam for the WIRING MUTANT only (a measure that drops the occupancy reading).
@@ -1543,6 +1560,21 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
       rec.uninstall();
     }
     expect(snapshot(), "after the bar: every function restored, identical").toEqual(before);
+  });
+  it("DIAG cleanup: a REJECTING bar restores everything; a NEVER-SETTLING bar (a test timeout abandons it) is restored by the teardown cleanup, idempotently", async () => {
+    const snapshot = () => [fs.readFileSync, childProcess.spawnSync];
+    const before = snapshot();
+    await expect(withDiag({ RELAY_TIMING_DIAG: "1" }, async () => {
+      expect(fs.readFileSync, "wrapped during the bar").not.toBe(before[0]);
+      throw new Error("the bar failed");
+    })).rejects.toThrow("the bar failed");
+    expect(snapshot(), "a rejecting bar: restored").toEqual(before);
+    void withDiag({ RELAY_TIMING_DIAG: "1" }, () => new Promise<never>(() => {})); // never settles: its finally never runs
+    expect(fs.readFileSync, "the abandoned bar left the wrappers installed").not.toBe(before[0]);
+    diagCleanupAll(); // what afterEach runs
+    expect(snapshot(), "the teardown cleanup restored them").toEqual(before);
+    diagCleanupAll();
+    expect(snapshot(), "idempotent").toEqual(before);
   });
   it("DIAG (RELAY_TIMING_DIAG, report only): each located breach of every arm is matched to the recorded sync calls that OVERLAP it, or says none did; a call outside it is not listed", () => {
     const r = (o: Partial<Reading> = {}): Reading => ({ healthMax: 30, eldMax: 20, eldHist: 20, mainGapCount: 0, tickerBusy: 0, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0, ...o });
