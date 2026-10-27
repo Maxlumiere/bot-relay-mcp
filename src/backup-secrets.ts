@@ -77,10 +77,9 @@ export function serializeConfigForArchive(raw: string): { json: string | null; i
 
 const quoteIdent = (name: string): string => `"${name.replace(/"/g, '""')}"`;
 
-/** Rows of a statement, streamed where the driver can (better-sqlite3's iterate), else all at once (wasm: the DB is in memory already). */
+/** Rows of a statement, streamed on both drivers (CompatStatement.iterate): never all held at once. */
 function rowsOf<T>(db: CompatDatabase, sql: string): Iterable<T> {
-  const stmt = db.prepare(sql) as ReturnType<CompatDatabase["prepare"]> & { iterate?: () => Iterable<T> };
-  return typeof stmt.iterate === "function" ? stmt.iterate() : (stmt.all() as T[]);
+  return db.prepare(sql).iterate() as Iterable<T>;
 }
 
 export type NeededKeys = Map<string, { rows: number; sample: string }>;
