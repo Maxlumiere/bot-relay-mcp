@@ -17,7 +17,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
-import { openWindow, findEscapes, selfAndAncestors, snapshotProcessEnv, parseProcessTable, parseReadyAck } from "./helpers/watch-window.js";
+import { openWindow, findEscapes, selfAndAncestors, snapshotProcessEnv, parseProcessTable, parseReadyAck, parseGroupMembers } from "./helpers/watch-window.js";
 import { ownPid, parentPidOf, parsePid, signalOwnedPid, type OwnedPid } from "./_helpers/recorded-pid.js";
 import { probePid, processStartedAt as readStart, startOrNull } from "../src/liveness.js";
 
@@ -165,6 +165,29 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
       cleanup(w, leaderStart);
     }
   }, 15_000);
+
+  it("the not-empty failure NAMES what is still in the group (the reader's text), so the next CI occurrence carries its own evidence", async () => {
+    const dir = path.join(ROOT, "named");
+    const w = openWindow(dir, env, { closeWaitMs: 200, groupAlive: () => true, groupMembers: (pgid) => `pid 4242 ppid 1 stat Z etime 00:05 comm sleep (group ${pgid})` });
+    const leaderStart = processStartedAt(w.leaderPid);
+    try {
+      await expect(w.close()).rejects.toThrow(new RegExp(`process group ${w.leaderPid} is not empty after 200 ms: .*; still in it: pid 4242 ppid 1 stat Z etime 00:05 comm sleep \\(group ${w.leaderPid}\\)$`));
+    } finally {
+      cleanup(w, leaderStart);
+    }
+  }, 15_000);
+
+  it("parseGroupMembers keeps ONLY the group's rows (a zombie included) and says so when ps lists none", () => {
+    const ps = [
+      "  100   100     1 Ss   01:00 sh",
+      "  101   100   100 Z    00:01 sleep",
+      "  102   999   100 S    00:01 escaped-into-another-group",
+      "  103   100   100 U    00:02 node /x/relay watch",
+      "garbage",
+    ].join("\n");
+    expect(parseGroupMembers(ps, 100)).toBe("pid 100 ppid 1 stat Ss etime 01:00 comm sh; pid 101 ppid 100 stat Z etime 00:01 comm sleep; pid 103 ppid 100 stat U etime 00:02 comm node /x/relay watch");
+    expect(parseGroupMembers(ps, 555)).toBe("ps lists NO member (the group emptied after the last probe)");
+  });
 
   it("ONE shutdown: concurrent calls share it, and a call after a REJECTION rejects the same way (never a false success)", async () => {
     const dir = path.join(ROOT, "once");

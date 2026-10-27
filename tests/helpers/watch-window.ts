@@ -101,6 +101,8 @@ export interface WindowOpts {
   closeWaitMs?: number;
   /** Does the group still have members? (default: kill(-pgid, 0)). */
   groupAlive?: (pgid: number) => boolean;
+  /** What is still in the group, for the not-empty error (default: one `ps`, parseGroupMembers). REPORT ONLY. */
+  groupMembers?: (pgid: number) => string;
   /** The leader's start token now (default: liveness.processStartedAt). */
   leaderStart?: (pid: number) => string | null;
   /** The supervisor's shell (default `sh`): the close test runs it under dash, Linux's /bin/sh. */
@@ -120,6 +122,28 @@ const realGroupAlive = (pgid: number): boolean => {
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "EPERM";
   }
+};
+
+/**
+ * `ps -A -o pid=,pgid=,ppid=,stat=,etime=,comm=` text → the members of process group `pgid`, one readable entry each
+ * ("pid 4242 ppid 1 stat Z etime 00:05 comm sleep"), or a line saying ps listed none. REPORT ONLY: it names what kept
+ * `kill(-pgid, 0)` succeeding when close() gives up (a zombie, a process in an uninterruptible wait, a live straggler),
+ * so the next "not empty" failure carries its own evidence. Never a signal target.
+ */
+export function parseGroupMembers(stdout: string, pgid: number): string {
+  const rows: string[] = [];
+  for (const line of stdout.split("\n")) {
+    const f = line.trim().split(/\s+/);
+    if (f.length < 6 || f[1] !== String(pgid)) continue;
+    rows.push(`pid ${f[0]} ppid ${f[2]} stat ${f[3]} etime ${f[4]} comm ${f.slice(5).join(" ")}`);
+  }
+  return rows.length ? rows.join("; ").slice(0, 1000) : "ps lists NO member (the group emptied after the last probe)";
+}
+
+const realGroupMembers = (pgid: number): string => {
+  const r = spawnSync("ps", ["-A", "-o", "pid=,pgid=,ppid=,stat=,etime=,comm="], { encoding: "utf-8", timeout: 2_000 });
+  if (r.status !== 0 || !r.stdout) return `the process table could not be read (ps exit ${r.status}${r.error ? `, ${r.error.message}` : ""})`;
+  return parseGroupMembers(r.stdout, pgid);
 };
 
 /**
@@ -225,6 +249,7 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
   if (delay !== undefined && !(Number.isFinite(delay) && delay >= 0)) throw new Error(`codeWriteDelayS must be a number >= 0, got ${delay}`);
   const closeWaitMs = opts.closeWaitMs ?? 5_000;
   const groupAlive = opts.groupAlive ?? realGroupAlive;
+  const groupMembers = opts.groupMembers ?? realGroupMembers;
   const startOf = opts.leaderStart ?? ((pid: number) => startOrNull(processStartedAt(pid)));
   const windowId = crypto.randomBytes(16).toString("hex");
   const readyFile = path.join(dir, `.window-${windowId}.ready`);
@@ -334,7 +359,9 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
       /* the group is already empty */
     }
     while (groupAlive(lp) && Date.now() < deadline) await sleep(25);
-    if (groupAlive(lp)) throw new Error(`window close (${dir}): process group ${lp} is not empty after ${closeWaitMs} ms: something it started may still write into this dir`);
+    if (groupAlive(lp)) {
+      throw new Error(`window close (${dir}): process group ${lp} is not empty after ${closeWaitMs} ms: something it started may still write into this dir; still in it: ${groupMembers(lp)}`);
+    }
     // ESCAPES: list first, then kill ONLY the listed pids, and fail naming them.
     const table = processTable();
     if (table === null) throw new Error(`window close (${dir}): the process table is unreadable: cannot sweep for escaped descendants`);
