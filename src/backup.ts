@@ -42,7 +42,7 @@ import { getDbPath, getDb, peekDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
 import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDriver } from "./sqlite-compat.js";
 import { VERSION } from "./version.js";
-import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
+import { ensureSecureDir, ensureSecureFile, restrictToOwnerWindows } from "./fs-perms.js";
 import { serializeConfigForArchive, scanCiphertextKeyIds, countPlaintextWebhookSecrets, manifestKeysOf, assertKeyringCanRead, type ArchivedConfig, type ManifestKey } from "./backup-secrets.js";
 import { getKeyringInfo } from "./encryption.js";
 import { ERROR_CODES } from "./error-codes.js";
@@ -283,6 +283,8 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     // full DB snapshot + any sensitive columns (encrypted but still copyable
     // for offline analysis) + the config.json. Same protection as the live DB.
     ensureSecureFile(archivePath, 0o600);
+    // SEC-23: owner-only on Windows too (the mode above means nothing there), as the DB and the mint secret are.
+    for (const fault of restrictToOwnerWindows(archivePath, false)) warnings.push(`the archive is NOT owner-only: ${fault}.`);
 
     if (encryption.keys.length) {
       const k = encryption.keys.map((e) => `${e.key_id} (${e.rows} rows, fingerprint ${e.fingerprint ?? "unknown: this keyring does not hold it"})`).join(", ");
