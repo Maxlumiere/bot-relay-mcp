@@ -21,15 +21,20 @@
  * Outputs that ARE the observation axis (last_seq, epoch, the per-record seq/epoch
  * fields) are not decisions and are excluded from the comparison.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
 import cp from "child_process";
 import { fileURLToPath } from "url";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const HOOK = path.resolve(HERE, "..", "hooks", "post-tool-use-check.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "a46seq-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(path.resolve(HERE, ".."), "hooks"), path.join(path.resolve(HERE, ".."), "bin")), "post-tool-use-check.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 const DIR = path.join(os.tmpdir(), "bot-relay-adr0046-seq-" + process.pid);
 const DB_PATH = path.join(DIR, "relay.db");
 const HOME = path.join(DIR, "home");
@@ -127,7 +132,7 @@ function surfaces(restore: () => void) {
       input: JSON.stringify({ session_id: "44444444-4444-4444-4444-444444444444", hook_event_name: "PostToolUse" }),
       encoding: "utf-8",
       timeout: 15_000,
-      env: { PATH: process.env.PATH ?? "", HOME, RELAY_AGENT_NAME: R, RELAY_DB_PATH: DB_PATH, RELAY_HOOK_NOTICE_REMIND_SECS: "0" },
+      env: { PATH: process.env.PATH ?? "", HOME, RELAY_AGENT_NAME: R, RELAY_DB_PATH: DB_PATH, RELAY_HOOK_NOTICE_REMIND_SECS: "0", RELAY_TEST_CLOCK: "0" },
     });
     return hook.stdout ? JSON.parse(hook.stdout).hookSpecificOutput.additionalContext : "";
   });

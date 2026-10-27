@@ -26,6 +26,9 @@ import path from "path";
  * budget arithmetic). On a construction failure the destination is removed before the error is rethrown.
  *
  * `bin` is a symlink to the repo's: Node resolves a main script's symlinks, so bin/relay still finds the real dist/.
+ * `dist` is linked too (the dist/ beside the given bin/, when it exists): check-relay.sh loads
+ * `$HOOKS_DIR/../dist/wake-coverage-status.js` and silently skips the wake-coverage line without it, so a copy
+ * without dist/ (as before this) differed from the real hooks on that line.
  */
 export const BUDGET_CLOCK_READ = "${SECONDS:-0}";
 export const BUDGET_CLOCK_SEAMED = "${RELAY_TEST_CLOCK:-${SECONDS:-0}}";
@@ -77,7 +80,10 @@ export function budgetTree(dir: string, hooksDir: string, binDir: string): strin
   fs.rmSync(dir, { recursive: true, force: true });
   try {
     fs.cpSync(hooksDir, path.join(base, "hooks"), { recursive: true });
-    fs.symlinkSync(binDir, path.join(base, "bin"));
+    // "junction": a directory link Windows creates without a privilege (the Windows CI job runs hook rows); POSIX ignores it.
+    fs.symlinkSync(binDir, path.join(base, "bin"), "junction");
+    const distDir = path.join(path.dirname(binDir), "dist");
+    if (fs.existsSync(distDir)) fs.symlinkSync(distDir, path.join(base, "dist"), "junction");
     const copy = path.join(base, "hooks");
     const stray = unclassifiedSecondsReads(copy);
     if (stray.length) throw new Error(`budgetTree: SECONDS read outside the seamed budget arithmetic, unclassified: ${stray.join(" | ")}`);
