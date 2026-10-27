@@ -245,6 +245,21 @@ describe("chokepoint — test-harness writes to REAL user config are refused", (
       expect(fs.existsSync(t), t).toBe(false);
     }
   });
+  it("(G8i) a FRESH account home (nothing under it): a new file directly under it, and a path through a wholly missing subtree, are refused; a write under a directory that already exists below it is not", () => {
+    const home = path.join(SANDBOX, "acct-8i-fresh");
+    fs.mkdirSync(home, { recursive: true }); // the home exists, nothing under it
+    _setAccountHomeForTests(home);
+    for (const t of [path.join(home, "new.json"), path.join(home, "a", "b", "c.json"), path.join(home, ".bot-relay", "notes.json")]) {
+      expect(() => atomicWriteJson(t, { x: 1 }), t).toThrow(/config-guard/);
+      expect(fs.existsSync(t), t).toBe(false);
+    }
+    // TWIN: the deepest existing entry is a directory that already exists BELOW the home, not the home itself:
+    // "different" from every protected path, so the write lands.
+    fs.mkdirSync(path.join(home, "existing-dir"));
+    const ok = path.join(home, "existing-dir", "x.json");
+    atomicWriteJson(ok, { ok: true });
+    expect(JSON.parse(fs.readFileSync(ok, "utf-8"))).toEqual({ ok: true });
+  });
   it.skipIf(posixOnly)("(G8g) a destination the walk cannot judge (a link loop) is REFUSED, never let through", () => {
     const home = path.join(SANDBOX, "acct-8g");
     fs.mkdirSync(path.join(home, ".bot-relay"), { recursive: true });

@@ -105,9 +105,14 @@ function instanceConfigCandidates(dest: string, accountEnv: { HOME: string; USER
  * valid id, active or not, symlink- or env-selected). The destination is judged on THE path walk (src/path-walk.ts),
  * against each protected path, through isProtected: a link anywhere on either side, a physical `..`, or a case or
  * normalization variant cannot slip past it (Codex #343 R1 #1, #2), and "inconclusive" is refused.
- * THE STATED OVER-BLOCK: with a protected config MISSING, any guarded write that shares its nearest existing
- * directory is refused too (a sibling, a nested look-alike, another name), because two missing names are never
- * judged equal or different. Accepted: every guarded writer today writes a protected name, and
+ * THE STATED OVER-BLOCK, in comparePaths' own terms: two paths whose deepest EXISTING entries are the same (dev, ino)
+ * and whose missing tails DIFFER (in any way) compare "inconclusive", which is refused. So with a protected config
+ * MISSING, a guarded write is refused when its deepest existing entry is the same as the protected path's and its
+ * missing tail differs: a sibling, a nested look-alike, another name under that directory; and on a FRESH account
+ * home (nothing under it yet), every new file directly under the home and every path through a wholly missing
+ * subtree of it. Not refused: identical missing tails ("same" is the protected path itself), and anything whose
+ * deepest existing entry differs, e.g. a write under a directory that already exists below that ancestor
+ * ("different"). Accepted: every guarded writer today writes a protected name, and
  * tests/config-guard-callers.test.ts pins them. A destination the walk cannot judge (a loop, an unsupported form) is
  * refused. INACTIVE outside a test harness (no VITEST, no NODE_ENV=test): a production write is never judged here.
  * THE RESIDUAL (named once, as the tripwire names it): the root is the account home's .bot-relay, the same root

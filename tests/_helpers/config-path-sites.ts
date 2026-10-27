@@ -9,7 +9,9 @@
  * the NAME, not its syntactic position (Codex #343 R1: an enumerated list of "building" positions missed an assignment
  * RHS and literal / computed destructuring keys, and the next position would be missed the same way):
  *   - env-read: `x.RELAY_CONFIG_PATH` (unless it is the target of an assignment or `delete`: that SETS the override),
- *     a shorthand `{ RELAY_CONFIG_PATH }` binding, and EVERY string literal whose text is exactly RELAY_CONFIG_PATH
+ *     a shorthand `{ RELAY_CONFIG_PATH }` binding, the key of a destructuring ASSIGNMENT (`({ RELAY_CONFIG_PATH: p } =
+ *     src)`, its shorthand, nested, under a default, in an array pattern), and EVERY string literal whose text is
+ *     exactly RELAY_CONFIG_PATH
  *     (element access, literal or computed binding keys, a constant later used as a key, a list of names), except the
  *     key of an element-access write;
  *   - file-name: EVERY string literal whose text is "config.json" (or ends in /config.json or \config.json), and every
@@ -58,8 +60,51 @@ export function configPathSites(program: ts.Program, rel: (f: string) => string,
       if (ts.isBinaryExpression(p) && p.left === n && p.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && p.operatorToken.kind <= ts.SyntaxKind.LastAssignment) return true;
       return ts.isDeleteExpression(p);
     };
+    /**
+     * Is this object literal a destructuring ASSIGNMENT target (`({ … } = src)`, also nested in another pattern, in an
+     * array pattern, under a default, or a for-of / for-in target)? Its keys are then READ from the source object
+     * (Codex #343 R2 #2), unlike an object literal that BUILDS a value (e.g. a child's env), whose keys set it.
+     */
+    const isAssignmentPattern = (lit: ts.Node): boolean => {
+      let cur: ts.Node = lit;
+      for (;;) {
+        const p = cur.parent;
+        if (!p) return false;
+        if (ts.isParenthesizedExpression(p)) {
+          cur = p;
+          continue;
+        }
+        if (ts.isBinaryExpression(p) && p.left === cur && p.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+          // the pattern's own `= default` inside an enclosing pattern, or the assignment itself
+          const pp = p.parent;
+          if (ts.isPropertyAssignment(pp) && pp.initializer === p) {
+            cur = pp.parent;
+            continue;
+          }
+          if (ts.isArrayLiteralExpression(pp)) {
+            cur = pp;
+            continue;
+          }
+          return true;
+        }
+        if ((ts.isForOfStatement(p) || ts.isForInStatement(p)) && p.initializer === cur) return true;
+        if (ts.isPropertyAssignment(p) && p.initializer === cur) {
+          cur = p.parent;
+          continue;
+        }
+        if (ts.isArrayLiteralExpression(p) || ts.isSpreadElement(p) || ts.isSpreadAssignment(p)) {
+          cur = ts.isArrayLiteralExpression(p) ? p : p.parent;
+          continue;
+        }
+        return false;
+      }
+    };
     const visit = (n: ts.Node): void => {
-      if (ts.isPropertyAccessExpression(n) && n.name.text === ENV) {
+      if (ts.isPropertyAssignment(n) && ts.isIdentifier(n.name) && n.name.text === ENV && isAssignmentPattern(n.parent)) {
+        add(n, "env-read"); // `({ RELAY_CONFIG_PATH: p } = src)`
+      } else if (ts.isShorthandPropertyAssignment(n) && n.name.text === ENV && isAssignmentPattern(n.parent)) {
+        add(n, "env-read"); // `({ RELAY_CONFIG_PATH } = src)`
+      } else if (ts.isPropertyAccessExpression(n) && n.name.text === ENV) {
         if (!isWrite(n)) add(n, "env-read");
       } else if (ts.isBindingElement(n) && !n.propertyName && ts.isIdentifier(n.name) && n.name.text === ENV) {
         add(n, "env-read"); // `{ RELAY_CONFIG_PATH }`: a renamed or literal key is the string/identifier case

@@ -89,6 +89,13 @@ describe("ONE config-path resolver (src/config.ts → src/instance.ts)", () => {
     "src/read-computed-key.ts": 'export function f3() { const { ["RELAY_CONFIG_PATH"]: p } = process.env; return p; }',
     "src/read-const-key.ts": 'const K = "RELAY_CONFIG_PATH"; export function f4() { return process.env[K]; }',
     "src/read-name-list.ts": 'export const KEYS = ["RELAY_CONFIG_PATH", "RELAY_DB_PATH"];',
+    // Codex #343 R2 #2: the key of a destructuring ASSIGNMENT reads the source
+    "src/read-assign-pattern.ts": "export function q1() { let p; ({ RELAY_CONFIG_PATH: p } = process.env); return p; }",
+    "src/read-assign-shorthand.ts": "let RELAY_CONFIG_PATH: string | undefined; export function q2() { ({ RELAY_CONFIG_PATH } = process.env); return RELAY_CONFIG_PATH; }",
+    "src/read-assign-nested.ts": "export function q3() { let p; ({ env: { RELAY_CONFIG_PATH: p } } = { env: process.env }); return p; }",
+    "src/read-assign-default.ts": 'export function q4() { let p; ({ RELAY_CONFIG_PATH: p = "/x" } = process.env); return p; }',
+    "src/read-assign-nested-default.ts": "export function q5() { let p; ({ env: { RELAY_CONFIG_PATH: p } = {} } = { env: process.env }); return p; }",
+    "src/read-assign-array.ts": "export function q6() { let p; [{ RELAY_CONFIG_PATH: p }] = [process.env]; return p; }",
     // CAUGHT: the config file name, wherever it appears
     "src/name-join.ts": 'import path from "path"; export function g() { return path.join(dir, "config.json"); }',
     "src/name-named-import.ts": 'import { resolve } from "path"; export function h() { return resolve(dir, "config.json"); }',
@@ -103,6 +110,8 @@ describe("ONE config-path resolver (src/config.ts → src/instance.ts)", () => {
     // PASSED: setting the override, or a mention in prose
     "src/ok-assign.ts": "export function m() { process.env.RELAY_CONFIG_PATH = dir; }",
     "src/ok-assign-element.ts": 'export function m2() { process.env["RELAY_CONFIG_PATH"] = dir; }',
+    // the twin: an object literal that BUILDS a child's env SETS the override, it does not read it
+    "src/ok-env-object.ts": "export function m3() { return { env: { RELAY_CONFIG_PATH: dir } }; }",
     "src/ok-delete.ts": "export function n() { delete process.env.RELAY_CONFIG_PATH; }",
     "src/ok-message.ts": 'export function o() { log(`config at ${dir} (see config.json docs)`); log("set RELAY_CONFIG_PATH to move it"); }',
     // THE BOUNDARY (documented, NOT seen): a name built at run time
@@ -130,12 +139,18 @@ describe("ONE config-path resolver (src/config.ts → src/instance.ts)", () => {
     "read-computed-key.ts",
     "read-const-key.ts",
     "read-name-list.ts",
+    "read-assign-pattern.ts",
+    "read-assign-shorthand.ts",
+    "read-assign-nested.ts",
+    "read-assign-default.ts",
+    "read-assign-nested-default.ts",
+    "read-assign-array.ts",
   ])("CAUGHT a read of RELAY_CONFIG_PATH: %s", (f) => expect(forms(f)).toContain("env-read"));
   it.each(["name-join.ts", "name-named-import.ts", "name-const.ts", "name-concat.ts", "name-template.ts", "name-fallback.ts", "name-assign.ts", "name-default.ts", "name-property.ts", "name-array.ts"])(
     "CAUGHT the config file name: %s",
     (f) => expect(forms(f)).toContain("file-name"),
   );
-  it.each(["ok-assign.ts", "ok-assign-element.ts", "ok-delete.ts", "ok-message.ts"])("PASSED setting the override, or a mention in prose: %s", (f) => expect(forms(f)).toEqual([]));
+  it.each(["ok-assign.ts", "ok-assign-element.ts", "ok-delete.ts", "ok-message.ts", "ok-env-object.ts"])("PASSED setting the override, or a mention in prose: %s", (f) => expect(forms(f)).toEqual([]));
   it("BOUNDARY (documented, NOT seen): a file name built at run time", () => expect(forms("boundary-runtime-name.ts")).toEqual([]));
 
   const scoped = (file: string) => sites().filter((s) => s.key.startsWith(`src/scoped/${file}::`));
