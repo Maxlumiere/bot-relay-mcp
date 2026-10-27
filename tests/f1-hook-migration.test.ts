@@ -39,12 +39,19 @@ import http from "http";
 import cp from "child_process";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const HOOKS_DIR = path.resolve(__dirname, "..", "hooks");
 const PTU_HOOK = path.join(HOOKS_DIR, "post-tool-use-check.sh");
 const STOP_HOOK = path.join(HOOKS_DIR, "stop-check.sh");
+// Rows that need a margin-budgeted step to RUN (the liveness self-heal, the remote read) use a copy of the hooks whose
+// budgeted steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS ticks on whole
+// wall-clock seconds, so on a slow runner the 5s hooks' 2s margin can be spent first. The live hooks are unchanged.
+let seamedHooks: string | null = null;
+const seamed = (hook: string) => path.join((seamedHooks ??= budgetTree(path.join(TEST_DIR, "seamed"), HOOKS_DIR, path.resolve(__dirname, "..", "bin"))), path.basename(hook));
+const FIXED_CLOCK = { RELAY_TEST_CLOCK: "0" };
 
 const TEST_DIR = path.join(os.tmpdir(), "bot-relay-f1-hooks-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DIR, "relay.db");
@@ -289,7 +296,7 @@ describe("F1 hook migration — PostToolUse, LOCAL mode: F1 only, ZERO HTTP requ
     dbSend("f1h-sender-4", "f1h-recv-4", "local mail 4", "normal");
     takeStubRequests();
 
-    const r = await runHook(PTU_HOOK, localEnv("f1h-recv-4", t, freshHome("p4")), PTU_STDIN);
+    const r = await runHook(seamed(PTU_HOOK), { ...localEnv("f1h-recv-4", t, freshHome("p4")), ...FIXED_CLOCK }, PTU_STDIN);
     const reqs = takeStubRequests();
     expect(reqs.length, "precondition: the stub is reachable from the hook").toBeGreaterThan(0);
     for (const q of reqs) {
@@ -308,8 +315,9 @@ describe("F1 hook migration — PostToolUse, REMOTE mode twin: the labeled HTTP 
     dbSend("f1h-sender-5", "f1h-recv-5", "remote mail", "normal");
 
     const r = await runHook(
-      PTU_HOOK,
+      seamed(PTU_HOOK),
       {
+        ...FIXED_CLOCK,
         HOME: freshHome("p5"),
         RELAY_AGENT_NAME: "f1h-recv-5",
         RELAY_AGENT_TOKEN: t,
@@ -383,8 +391,9 @@ describe("F1 hook migration — Stop hook: the same mode rule", () => {
     const t = seedAgent("f1h-recv-9");
     dbSend("f1h-sender-9", "f1h-recv-9", "remote stop mail", "normal");
     const r = await runHook(
-      STOP_HOOK,
+      seamed(STOP_HOOK),
       {
+        ...FIXED_CLOCK,
         HOME: freshHome("s3"),
         RELAY_AGENT_NAME: "f1h-recv-9",
         RELAY_AGENT_TOKEN: t,
@@ -411,8 +420,9 @@ describe("#286 Codex R1 #4 — a remote TOOL ERROR is never a successful empty r
         try {
           takeStubRequests();
           const r = await runHook(
-            hook,
+            seamed(hook),
             {
+              ...FIXED_CLOCK,
               HOME: freshHome(`r4-${label}-${mode}`),
               RELAY_AGENT_NAME: "f1h-r4",
               RELAY_AGENT_TOKEN: "stubtoken-aaaaaaaaaaaa",
