@@ -9,8 +9,10 @@
 # FORMAT: one JavaScript regex per line. Blank lines and #-comments ignored.
 # Every pattern matches CASE-INSENSITIVELY (loadPatterns compiles it with the i flag).
 # Adding a future persona/codename is ONE line here — no code change.
-# `\b` word-boundaries keep `Maxime` from matching `Maxlumiere` (the public
-# GitHub handle) and `architect` from matching `architecture`.
+# `\b` word boundaries keep a name from matching INSIDE a longer word: the owner name
+# with a prefix or a suffix, the role name at the start of a longer word.
+# tests/shipped-surface-persona-free.test.ts pins both directions. (The public GitHub
+# handle never contains the owner name, so it is not a boundary case.)
 \bMaxime\b
 victra
 mustang

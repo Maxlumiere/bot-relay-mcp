@@ -63,7 +63,7 @@ describe("shipped-content guard — the npm tarball, not the source tree", () =>
     fs.rmSync(path.dirname(pkg), { recursive: true, force: true });
   });
 
-  // The names are built from fragments so this source file carries no persona literal of its own.
+  // These fixtures assemble names from fragments to avoid adding new persona literals to this file.
   const owner = ["MAX", "IME"].join("");
   const persona = ["VIC", "TRA"].join("");
   const role = ["Archi", "tect"].join("");
@@ -76,6 +76,15 @@ describe("shipped-content guard — the npm tarball, not the source tree", () =>
     expect(hits, "every case variant is caught, with file:line").toEqual(["CHANGELOG.md:2", "CHANGELOG.md:4", "dist/x.js:1"]);
     const caseSensitive = patterns.map((p: { src: string }) => ({ src: p.src, re: new RegExp(p.src) }));
     expect(scanDir(pkg, caseSensitive), "the defect: without the i flag none of these is caught").toEqual([]);
+    fs.rmSync(path.dirname(pkg), { recursive: true, force: true });
+  });
+
+  it("BOUNDARY (must pass) — a name INSIDE a longer word is not the name: the owner name with a prefix or a suffix, the role name starting a longer word", () => {
+    const pkg = fixtureDir({
+      "README.md": `${owner}LY wrote this\nPRE${owner} is a word\n${role}ural notes\n`,
+      "dist/z.js": `module.exports = { ${owner.toLowerCase()}ly: 1, pre${owner.toLowerCase()}: 2 };\n`,
+    });
+    expect(scanDir(pkg, patterns)).toEqual([]);
     fs.rmSync(path.dirname(pkg), { recursive: true, force: true });
   });
 
