@@ -29,7 +29,7 @@ const RESOLVER_FILES = new Set(["src/config.ts", "src/instance.ts"]);
 type Allowed = { count: number; why: string };
 const ALLOWLIST: Record<string, Allowed> = {
   // The backup ARCHIVE MEMBER: the file inside the staging dir and the tar entry, not where the relay's config lives.
-  'src/backup.ts::exportRelayState::file-name:path.join(stagingDir, "config.json")': { count: 2, why: "the staging dir's archive member (copy target, then its existence check)" },
+  'src/backup.ts::exportRelayState::file-name:path.join(stagingDir, "config.json")': { count: 2, why: "the staging dir's archive member (the serialized config's write target, SEC-23; then its existence check)" },
   'src/backup.ts::exportRelayState::file-name:entries.push("config.json")': { count: 1, why: "the tar entry list's member name" },
   // The restore reader's archive MEMBER names (SEC-22, src/backup-archive.ts): which members a backup may hold, and
   // each one's size cap. Names inside an archive, not a path to the live config.
