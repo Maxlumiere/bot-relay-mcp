@@ -316,6 +316,25 @@ export function deriveKeyringSubkeyFor(keyId: string, info: string): Buffer | nu
   return Buffer.from(crypto.hkdfSync("sha256", kr.keys[keyId], Buffer.alloc(0), Buffer.from(info, "utf8"), 32));
 }
 
+/** SEC-23: the domain label of a backup's key fingerprint. Changing it makes every recorded fingerprint mismatch. */
+export const BACKUP_KEY_FINGERPRINT_LABEL = "bot-relay backup key fingerprint v1";
+
+/**
+ * SEC-23: the FINGERPRINT a backup records for `keyId`: HMAC-SHA256(key, BACKUP_KEY_FINGERPRINT_LABEL), truncated to
+ * 128 bits, hex. It identifies the key without revealing it (the raw key never leaves this module). null when no
+ * keyring is configured or it does not hold `keyId`.
+ */
+export function backupKeyFingerprint(keyId: string): string | null {
+  const kr = loadKeyring();
+  if (!kr || !Object.prototype.hasOwnProperty.call(kr.keys, keyId)) return null;
+  return crypto.createHmac("sha256", kr.keys[keyId]).update(BACKUP_KEY_FINGERPRINT_LABEL).digest().subarray(0, 16).toString("hex");
+}
+
+/** Whether `id` is a well-formed key id (the keyring's own rule). */
+export function isValidKeyId(id: string): boolean {
+  return KEY_ID_RE.test(id);
+}
+
 /**
  * Whether `RELAY_ENCRYPTION_KEY` is being used — flag so callers can emit
  * the one-time deprecation warning at startup.

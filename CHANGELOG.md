@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### `relay backup` / `relay restore`: what an archive carries, and a keyring check on restore (SEC-23)
+
+- **No backup contains an encryption key, a raw token or the mint secret.**
+  - **The archived `config.json` is no longer a copy of the file.** Its credentials (`http_secret`, `http_secrets_previous`, `dashboard_secret`, `dashboard_push_secret`) are set to `null`, and a key the relay does not know is left out. Both are named, never valued, in the manifest and in the result (`config`). Restore never read the archived config, so nothing is lost on restore.
+  - **The manifest names the encryption keys the archive needs** (`encryption.keys`: key id, row count and a fingerprint, never the key), and `relay backup` says so on stderr. Keep your keyring: an archive with encrypted rows cannot be restored without it.
+- **No-key mode, stated loudly.** Without an encryption keyring, webhook secrets are stored in plaintext, so the archive carries them. `relay backup` now states how many, on stderr, in the result (`plaintext_secrets`, `warnings`) and in the manifest, and names the remedy.
+- **Restore refuses an archive this keyring cannot read**, before the safety backup or any live change: a key id the keyring does not hold, a key whose fingerprint is not the manifest's, or a staged row that does not decrypt. Each refusal is named. Archives made before this change are checked by the decrypt test alone.
+- **On Windows, the archive is now restricted to its owner** (its ACL), as the live DB and the mint secret already were. Before, it inherited its directory's ACL.
+
 ### `relay backup` / `relay restore`, and the relay's system tools (SEC-22)
 
 - **The relay runs its system tools by an absolute, trust-checked path on macOS and Linux too, never through `PATH`**, with a clean environment. The tools are `ps`, `lsof`, `sysctl`, `ioreg`, `launchctl`, `plutil` and `tar`. A tool runs with only the system `PATH` and `LC_ALL=C`; nothing else from your environment (e.g. `TAR_OPTIONS`, `GZIP`, `LD_PRELOAD`, your locale) reaches it. On Windows, `relay backup` now runs `%SystemRoot%\System32\tar.exe`, never the `tar` first on `PATH` (Git Bash's).
