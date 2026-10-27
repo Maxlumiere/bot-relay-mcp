@@ -24,7 +24,8 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawn, spawnSync } from "child_process";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
+import { budgetTree, budgetGuardFindings, BUDGET_CLOCK_READ, BUDGET_CLOCK_SEAMED } from "./_helpers/hook-budget-tree.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOKS = path.join(REPO_ROOT, "hooks");
@@ -375,17 +376,31 @@ describe("Codex #291 R2 #1 — REMOTE path: after the resolver, every HTTP call 
       const r = timed(hook, `a-${hook}`, { STUB_WHERE: "1.4", STUB_D_health: "0.9", STUB_OK_health: "1", STUB_D_mail: "8" }, JSON.stringify({ session_id: "s1" }));
       expect(r.verbs, r.out).toContain("where");
       expect(r.secs, r.out).toBeLessThan(BUDGET[hook]);
+      // Vacuous when no call started: on a slow runner the probe's share can be spent too (above), so this row
+      // cannot guarantee a call and does not assert one. (The TWIN asserts the caps an instant arrival gets, [1, 2];
+      // it does not assert this row's start + cap within the wall-clock deadline.)
       expectEveryCallInsideTheBudget(r, BUDGET[hook]);
       expect(r.curls.map((c) => c.kind), "the read that no longer fits is never started").not.toContain("mail");
       expect(r.verdict, r.out).not.toMatch(/VERDICT=HEALTHY/);
     }, 40_000);
 
-    it(`${hook}: TWIN — a fast resolver and a healthy remote: the read runs, capped by what is left`, () => {
+    // The twin must not depend on how fast the runner reaches the remote steps (CI: "no time budget left for the
+    // remote mail read (2s of 5s spent)" after 1.5s real). The budget arithmetic reads a FIXED clock of 0 (RELAY_TEST_CLOCK, which cannot tick), so
+    // the REAL caps are exactly what an instant arrival leaves: min(own, budget - margin).
+    it(`${hook}: TWIN — a fast resolver and a healthy remote: the read runs, capped by what is left (a fixed budget clock)`, () => {
       vaultToken();
-      const r = timed(hook, `b-${hook}`, { STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "8" }, JSON.stringify({ session_id: "s1" }));
+      const r = timed(hook, `b-${hook}`, { STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "8", RELAY_TEST_CLOCK: "0" }, JSON.stringify({ session_id: "s1" }), starvedTree(`feed-${hook}`));
       expect(r.curls.map((c) => c.kind), r.out).toEqual(["health", "mail"]);
-      expectEveryCallInsideTheBudget(r, BUDGET[hook]);
-      expect(r.secs, r.out).toBeLessThan(BUDGET[hook]);
+      expect(r.curls.map((c) => c.cap), "the REAL caps for an instant arrival: health min(1, 2) = 1, mail min(2, 2) = 2").toEqual([1, BUDGET[hook] - MARGIN]);
+      expect(r.out).not.toMatch(/no time budget left/);
+    }, 40_000);
+    // RED CONTROL (CI's failure, made deterministic): the same run with ONLY the remote mail read starved. The twin's
+    // own assertion would fail exactly as on CI: the read never starts, and the skip names it.
+    it(`${hook}: CONTROL — the twin with only the remote mail read starved reproduces CI's skip: no mail call, "no time budget left for the remote mail read"`, () => {
+      vaultToken();
+      const r = timed(hook, `bc-${hook}`, { STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "8", RELAY_TEST_CLOCK: "0", RELAY_TEST_STARVE: "the remote mail read" }, JSON.stringify({ session_id: "s1" }), starvedTree(`ctl-${hook}`));
+      expect(r.curls.map((c) => c.kind), r.out).toEqual(["health"]);
+      expect(r.out).toMatch(/\[bot-relay\] no time budget left for the remote mail read \(\d+s of 5s spent\): skipped\./);
     }, 40_000);
   }
 
@@ -407,29 +422,78 @@ describe("Codex #291 R2 #1 — REMOTE path: after the resolver, every HTTP call 
 });
 
 /**
- * A copy of the hooks whose relay_budget_for grants NO time to the steps matching
- * RELAY_TEST_STARVE (a case pattern), and passes every other step through
- * unchanged. The REAL relay_budget_for then takes its skip path, so the hooks'
- * own skip handling runs deterministically: no wall-clock race (bash's SECONDS
- * ticks on whole wall-clock seconds, so a timed row can never pin "no time left").
+ * A copy of the hooks with the deterministic budget seams (tests/_helpers/hook-budget-tree.ts): RELAY_TEST_STARVE
+ * grants NO time to the matching steps, so the REAL relay_budget_for takes its skip path; RELAY_TEST_CLOCK gives the
+ * budget arithmetic a FIXED clock, so a step a twin needs is never starved by a slow runner. No wall-clock
+ * race: bash's SECONDS ticks on whole wall-clock seconds, so a timed row can never pin "no time left", nor "time left".
  */
 function starvedTree(tag: string): string {
-  const base = path.join(ROOT, `starved-${tag}`, "bot-relay-mcp");
-  fs.rmSync(path.dirname(base), { recursive: true, force: true });
-  fs.cpSync(HOOKS, path.join(base, "hooks"), { recursive: true });
-  fs.symlinkSync(path.join(REPO_ROOT, "bin"), path.join(base, "bin"));
-  fs.appendFileSync(
-    path.join(base, "hooks", "_vault-helpers.sh"),
-    [
-      "",
-      "# TEST ONLY (starvedTree): starve the steps matching RELAY_TEST_STARVE.",
-      `eval "$(declare -f relay_budget_for | sed '1s/^relay_budget_for/relay_budget_for_real/')"`,
-      'relay_budget_for() { case "$1" in $RELAY_TEST_STARVE) relay_budget_for_real "$1" 0 "${3:-}" ;; *) relay_budget_for_real "$@" ;; esac; }',
-      "",
-    ].join("\n"),
-  );
-  return path.join(base, "hooks");
+  return budgetTree(path.join(ROOT, `starved-${tag}`), HOOKS, path.join(REPO_ROOT, "bin"));
 }
+
+describe("the test seam's FIXED budget clock does not tick (Codex R1 on the seam: never ASSUME bash's special-variable semantics; measured)", () => {
+  // Every bash this run can reach: /bin/bash (3.2 on macOS) and the one on PATH (CI's). For each, the budget
+  // arithmetic is read before and after a forced 2.2s wait (>= 2 wall-second boundaries): with RELAY_TEST_CLOCK=0 it
+  // must not move while the shell's own SECONDS DID tick; the CONTROL without it must move (else the probe is blind).
+  // Distinct BINARIES only: /bin/bash and the bash on PATH can be the same file, which would count one shell twice.
+  const resolved = (b: string) => {
+    const where = b.includes("/") ? b : spawnSync("bash", ["-c", "command -v bash"], { encoding: "utf-8" }).stdout.trim();
+    return where && fs.existsSync(where) ? fs.realpathSync(where) : null;
+  };
+  const byBinary = new Map<string, string>();
+  for (const b of ["/bin/bash", "bash"]) {
+    const real = resolved(b);
+    if (real && !byBinary.has(real) && spawnSync(real, ["-c", "true"]).status === 0) byBinary.set(real, b);
+  }
+  const shells = [...byBinary.keys()];
+  const probe = (bash: string, clock: string | undefined) => {
+    const tree = starvedTree(`clock-${path.basename(bash)}-${clock ?? "none"}`);
+    const r = spawnSync(bash, ["-c", `. "${path.join(tree, "_vault-helpers.sh")}"; RELAY_HOOK_BUDGET_SECS=5; a=$(relay_margin_secs); b=$(relay_pending_deadline 5); sleep 2.2; c=$(relay_margin_secs); d=$(relay_pending_deadline 5); echo "$a $b $c $d $SECONDS $BASH_VERSION"`], {
+      encoding: "utf-8",
+      timeout: 20_000,
+      env: { PATH: process.env.PATH ?? "", HOME, ...(clock === undefined ? {} : { RELAY_TEST_CLOCK: clock }) },
+    });
+    const [a, b, c, d, secs, version] = r.stdout.trim().split(" ");
+    return { before: [Number(a), Number(b)], after: [Number(c), Number(d)], secs: Number(secs), version, err: r.stderr };
+  };
+  it("the seam rewrites the ONE read in each budget function, and the live hooks hold no unclassified SECONDS read", () => {
+    expect(budgetGuardFindings(HOOKS), "every other SECONDS line is diagnostic text or the Stop stdin loop").toEqual([]);
+    const copy = fs.readFileSync(path.join(starvedTree("clock-count"), "_vault-helpers.sh"), "utf-8");
+    expect(copy.split(BUDGET_CLOCK_SEAMED).length - 1, "both functions' reads are seamed in the copy").toBe(2);
+    expect(copy.split(BUDGET_CLOCK_SEAMED).join("").split(BUDGET_CLOCK_READ).length - 1, "no unseamed read is left in the copy").toBe(0);
+  });
+  it("HARM: a new SECONDS read on a budget path is REFUSED (the seam would look applied while it ticks), and the half-built copy is removed; TWIN: diagnostic text is allowed", () => {
+    const planted = (tag: string, line: string) => {
+      const d = path.join(ROOT, `guard-src-${tag}`);
+      fs.rmSync(d, { recursive: true, force: true });
+      fs.cpSync(HOOKS, d, { recursive: true });
+      fs.appendFileSync(path.join(d, "post-tool-use-check.sh"), `\n${line}\n`);
+      return d;
+    };
+    for (const [tag, line] of [["dollar", 'left=$(( 5 - $SECONDS - 3 ))'], ["bare", "left=$(( 5 - SECONDS - 3 ))"], ["default", 'left=$(( 5 - ${SECONDS:-0} ))']] as const) {
+      const src = planted(tag, line);
+      expect(budgetGuardFindings(src), `${tag}: the planted read is found`).toEqual([`post-tool-use-check.sh: ${line}`]);
+      const dest = path.join(ROOT, `guard-dest-${tag}`);
+      expect(() => budgetTree(dest, src, path.join(REPO_ROOT, "bin")), `${tag}: refused`).toThrow(/unclassified/);
+      expect(fs.existsSync(dest), `${tag}: the destination is removed on the failure`).toBe(false);
+    }
+    const twin = planted("diag", 'echo "spent (${SECONDS}s of 5s)" >&2');
+    expect(budgetGuardFindings(twin), "diagnostic text that prints ${SECONDS}s is allowed").toEqual([]);
+  });
+  for (const bash of shells) {
+    it(`${bash}: with RELAY_TEST_CLOCK=0 the budget reads 2/2 before AND after 2.2s (SECONDS itself ticked to >= 2); the CONTROL without it drops`, () => {
+      const version = spawnSync(bash, ["--version"], { encoding: "utf-8" }).stdout.split("\n")[0];
+      console.log(`clock probe: ${byBinary.get(bash)} -> ${bash} (${version})`);
+      const fixed = probe(bash, "0");
+      expect(fixed.secs, `the shell's own SECONDS ticked (bash ${fixed.version}) ${fixed.err}`).toBeGreaterThanOrEqual(2);
+      expect([fixed.before, fixed.after], `bash ${fixed.version}: the fixed clock never moved`).toEqual([[2, 2], [2, 2]]);
+      const control = probe(bash, undefined);
+      expect(control.secs).toBeGreaterThanOrEqual(2);
+      expect(control.after[0], `CONTROL (bash ${control.version}): without the seam the margin drops`).toBe(0);
+      expect(control.after[1], `CONTROL (bash ${control.version}): without the seam the deadline drops`).toBeLessThanOrEqual(0);
+    }, 30_000);
+  }
+});
 
 describe("Codex #291 R2 #1 — a step with no time left is SKIPPED and said (the hooks' own skip handling, deterministic)", () => {
   for (const hook of ["post-tool-use-check.sh", "stop-check.sh"]) {
@@ -445,7 +509,7 @@ describe("Codex #291 R2 #1 — a step with no time left is SKIPPED and said (the
       expect(r.verdict, r.out).toMatch(/VERDICT=DEGRADED reason="no time budget left for the remote read"/);
     });
     it(`${hook}: TWIN — nothing starved: probe and read both run, never DEGRADED for time`, () => {
-      const r = timed(hook, `sn-${hook}`, { RELAY_AGENT_TOKEN: "tok_" + "n".repeat(20), RELAY_TEST_STARVE: "no-such-step", STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "0.1" }, JSON.stringify({ session_id: "s1" }), starvedTree(`n-${hook}`));
+      const r = timed(hook, `sn-${hook}`, { RELAY_AGENT_TOKEN: "tok_" + "n".repeat(20), RELAY_TEST_STARVE: "no-such-step", RELAY_TEST_CLOCK: "0", STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "0.1" }, JSON.stringify({ session_id: "s1" }), starvedTree(`n-${hook}`));
       expect(r.curls.map((c) => c.kind), r.out).toEqual(["health", "mail"]);
       expect(r.out).not.toMatch(/no time budget left/);
     });
@@ -469,7 +533,7 @@ describe("Codex #291 R2 #1 — SessionStart's sqlite3 reads run under the watchd
     fs.mkdirSync(RH, { recursive: true });
     const seed = spawnSync(process.execPath, ["--input-type=module", "-e", `
       process.env.RELAY_DB_PATH = ${JSON.stringify(dbPath)};
-      const db = await import(${JSON.stringify(path.join(REPO_ROOT, "dist", "db.js"))});
+      const db = await import(${JSON.stringify(pathToFileURL(path.join(REPO_ROOT, "dist", "db.js")).href)});
       db.registerAgent(${JSON.stringify(AGENT)}, "r", []);
       db.closeDb();`], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME } });
     expect(seed.status, seed.stderr).toBe(0);

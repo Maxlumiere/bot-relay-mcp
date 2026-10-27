@@ -27,7 +27,7 @@ import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { createHash } from "crypto";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO_ROOT, "bin", "relay");
@@ -516,7 +516,7 @@ describe("F1 — containment: the connector's approved-roots rule applies to eve
       // The connector, judged under the SAME HOME the CLI runs with (its approved
       // roots include the home directory, read when db.ts loads).
       const conn = spawnSync("node", ["--input-type=module", "-e", `
-        const db = await import(${JSON.stringify(path.join(REPO_ROOT, "dist", "db.js"))});
+        const db = await import(${JSON.stringify(pathToFileURL(path.join(REPO_ROOT, "dist", "db.js")).href)});
         try { db.getDbPath(); process.stdout.write("ACCEPTED"); } catch (e) { process.stdout.write("THREW: " + e.message); }`], {
         encoding: "utf-8",
         env: { PATH: process.env.PATH ?? "", HOME: HOME_DIR, RELAY_DB_PATH: outside },

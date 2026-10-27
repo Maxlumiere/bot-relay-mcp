@@ -17,7 +17,7 @@
  */
 import { spawnSync } from "node:child_process";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -34,8 +34,8 @@ export function listTools(): ToolDef[] {
       "-e",
       `
       (async () => {
-        const { Client } = await import('${path.join(PROJECT_ROOT, "node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js")}');
-        const { StdioClientTransport } = await import('${path.join(PROJECT_ROOT, "node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js")}');
+        const { Client } = await import(${JSON.stringify(pathToFileURL(path.join(PROJECT_ROOT, "node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js")).href)});
+        const { StdioClientTransport } = await import(${JSON.stringify(pathToFileURL(path.join(PROJECT_ROOT, "node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js")).href)});
         const fs = await import('node:fs');
         const path = await import('node:path');
         const os = await import('node:os');
