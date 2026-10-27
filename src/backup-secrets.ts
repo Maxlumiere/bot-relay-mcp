@@ -14,10 +14,12 @@
  *   archived config (src/backup.ts importRelayState), so the redaction costs a restore nothing.
  * - The key ids an archive NEEDS come from its DB's own ciphertext (scanCiphertextKeyIds), not from a manifest
  *   (stale, or absent in an old archive). Restore checks them before any mutation (assertKeyringCanRead).
+ * - Every judgment of a stored value goes through src/encryption.ts's ONE classifier: parseEnvelope (the shape) and
+ *   classifyStored (plaintext / encrypted, i.e. authenticated / unverifiable, with the reason).
  */
 import type { RelayConfig } from "./config.js";
 import type { CompatDatabase } from "./sqlite-compat.js";
-import { backupKeyFingerprint, decryptContent, getKeyringInfo, isValidKeyId, isWellFormedCiphertext } from "./encryption.js";
+import { backupKeyFingerprint, classifyStored, getKeyringInfo, parseEnvelope, type UnverifiableReason } from "./encryption.js";
 
 export type ConfigArchiveClass = "secret" | "copy";
 
@@ -75,54 +77,72 @@ export function serializeConfigForArchive(raw: string): { json: string | null; i
 
 const quoteIdent = (name: string): string => `"${name.replace(/"/g, '""')}"`;
 
+/** Rows of a statement, streamed where the driver can (better-sqlite3's iterate), else all at once (wasm: the DB is in memory already). */
+function rowsOf<T>(db: CompatDatabase, sql: string): Iterable<T> {
+  const stmt = db.prepare(sql) as ReturnType<CompatDatabase["prepare"]> & { iterate?: () => Iterable<T> };
+  return typeof stmt.iterate === "function" ? stmt.iterate() : (stmt.all() as T[]);
+}
+
 export type NeededKeys = Map<string, { rows: number; sample: string }>;
 
 /**
- * Per key id, the rows of `db` encrypted under it and one sample ciphertext, found by scanning EVERY column of every
- * table for the ciphertext prefixes (src/encryption.ts): `enc:<key_id>:` and the legacy `enc1:` (its key id is
- * `legacyKeyId`). Every column, generated and hidden ones included (table_xinfo), not a list of the encrypted ones,
- * so a column encrypted later is not missed. A Map, so a key id that is an Object.prototype name (`constructor`,
- * `__proto__`) is a key like any other. A value whose id is not a well-formed key id is not counted.
+ * Per key id, the rows of `db` encrypted under it and one sample ciphertext. EVERY column of every table, generated
+ * and hidden ones included (table_xinfo), not a list of the encrypted ones, so a column encrypted later is not
+ * missed. SQL only narrows to values starting with a ciphertext prefix; each one is then judged by the classifier's
+ * parseEnvelope (a value without an envelope's shape is not counted), and a legacy `enc1:` value's id is
+ * `legacyKeyId`. A Map, so a key id that is an Object.prototype name (`constructor`, `__proto__`) is a key like any
+ * other.
  */
 export function scanCiphertextKeyIds(db: CompatDatabase, legacyKeyId: string): NeededKeys {
   const out: NeededKeys = new Map();
-  const add = (id: string, n: number, sample: string): void => {
-    const cur = out.get(id);
-    if (cur) cur.rows += n;
-    else out.set(id, { rows: n, sample });
-  };
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>;
   for (const { name: t } of tables) {
     const cols = db.prepare(`PRAGMA table_xinfo(${quoteIdent(t)})`).all() as Array<{ name: string }>;
     for (const { name: c } of cols) {
       const col = quoteIdent(c);
-      const v2 = db
-        .prepare(
-          `SELECT substr(${col}, 5, instr(substr(${col}, 5), ':') - 1) AS id, COUNT(*) AS n, MIN(${col}) AS sample ` +
-            `FROM ${quoteIdent(t)} WHERE typeof(${col}) = 'text' AND substr(${col}, 1, 4) = 'enc:' GROUP BY 1`
-        )
-        .all() as Array<{ id: string; n: number; sample: string }>;
-      for (const r of v2) if (isValidKeyId(r.id)) add(r.id, r.n, r.sample);
-      const v1 = db
-        .prepare(`SELECT COUNT(*) AS n, MIN(${col}) AS sample FROM ${quoteIdent(t)} WHERE typeof(${col}) = 'text' AND substr(${col}, 1, 5) = 'enc1:'`)
-        .get() as { n: number; sample: string | null } | undefined;
-      if (v1 && v1.n > 0 && v1.sample !== null) add(legacyKeyId, v1.n, v1.sample);
+      const sql =
+        `SELECT ${col} AS v FROM ${quoteIdent(t)} WHERE typeof(${col}) = 'text' ` +
+        `AND (substr(${col}, 1, 4) = 'enc:' OR substr(${col}, 1, 5) = 'enc1:')`;
+      for (const { v } of rowsOf<{ v: string }>(db, sql)) {
+        const env = parseEnvelope(v);
+        if (!env) continue;
+        const id = env.keyId ?? legacyKeyId;
+        const cur = out.get(id);
+        if (cur) cur.rows += 1;
+        else out.set(id, { rows: 1, sample: v });
+      }
     }
   }
   return out;
 }
 
+/** The webhook secrets, by the classifier's verdict. `unverifiable` > 0 is never a confident count of the others. */
+export interface WebhookSecretCount {
+  plaintext: number;
+  encrypted: number;
+  unverifiable: number;
+  unverifiable_reasons: Record<UnverifiableReason, number>;
+}
+
 /**
- * The webhook secrets `db` holds in PLAINTEXT: every non-empty secret that is not a WELL-FORMED ciphertext envelope
- * (isWellFormedCiphertext), since in no-key mode a secret that merely starts with `enc:` is stored as given. 0 when
- * the table does not exist (an older schema); null, UNVERIFIABLE, when the table exists but cannot be read.
+ * The webhook secrets `db` holds, each classified by classifyStored: plaintext (carried as such), encrypted
+ * (authenticated under the keyring), or unverifiable (with its reason). All zeros when the table is ABSENT (an older
+ * schema), found as SQLite resolves identifiers (case-insensitively); null, UNVERIFIABLE as a whole, when the
+ * table cannot be discovered or read. No decrypted value is kept.
  */
-export function countPlaintextWebhookSecrets(db: CompatDatabase): number | null {
-  const exists = db.prepare("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'webhook_subscriptions'").get();
-  if (!exists) return 0;
+export function classifyWebhookSecrets(db: CompatDatabase): WebhookSecretCount | null {
+  const count: WebhookSecretCount = { plaintext: 0, encrypted: 0, unverifiable: 0, unverifiable_reasons: { no_keyring: 0, key_not_held: 0, auth_failed: 0 } };
   try {
-    const rows = db.prepare("SELECT secret FROM webhook_subscriptions WHERE secret IS NOT NULL AND secret <> ''").all() as Array<{ secret: unknown }>;
-    return rows.filter((r) => typeof r.secret !== "string" || !isWellFormedCiphertext(r.secret)).length;
+    const found = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'webhook_subscriptions' COLLATE NOCASE").get() as { name: string } | undefined;
+    if (!found) return count;
+    for (const r of rowsOf<{ secret: unknown }>(db, `SELECT secret FROM ${quoteIdent(found.name)} WHERE secret IS NOT NULL AND secret <> ''`)) {
+      const c = typeof r.secret === "string" ? classifyStored(r.secret) : ({ kind: "plaintext" } as const);
+      if (c.kind === "unverifiable") {
+        count.unverifiable += 1;
+        count.unverifiable_reasons[c.reason] += 1;
+      } else count[c.kind] += 1;
+    }
+    return count;
   } catch {
     return null;
   }
@@ -143,8 +163,9 @@ export function manifestKeysOf(needed: NeededKeys): ManifestKey[] {
 /**
  * Restore, in staging, before ANY mutation: this keyring can read every key id the STAGED DB needs. Refuses, by
  * name: an id the keyring does not hold; a key whose fingerprint is not the one the manifest recorded (when it
- * recorded one); a staged row that does not decrypt (the AEAD tag is the ground truth, and an old archive has no
- * fingerprints). `manifestEncryption` is the manifest's `encryption` value, undefined for an old archive.
+ * recorded one); a staged row that the classifier cannot AUTHENTICATE (the GCM tag is the ground truth, and an old
+ * archive has no fingerprints). `manifestEncryption` is the manifest's `encryption` value, undefined for an old
+ * archive.
  */
 export function assertKeyringCanRead(needed: NeededKeys, manifestEncryption: unknown): void {
   const ids = [...needed.keys()].sort();
@@ -179,18 +200,11 @@ export function assertKeyringCanRead(needed: NeededKeys, manifestEncryption: unk
         `(its fingerprint differs from the one manifest.json recorded). Configure the original key, then restore again. Nothing was changed.`
     );
   }
-  const undecryptable = ids.filter((id) => {
-    try {
-      decryptContent(needed.get(id)!.sample);
-      return false;
-    } catch {
-      return true;
-    }
-  });
+  const undecryptable = ids.filter((id) => classifyStored(needed.get(id)!.sample).kind !== "encrypted");
   if (undecryptable.length) {
     throw new Error(
       `backup restore refused: a staged row encrypted under key id(s) ${undecryptable.join(", ")} does not decrypt with this keyring's key ` +
-        `(the archive was made with a different key). Configure the original key, then restore again. Nothing was changed.`
+        `(authentication failed: the archive was made with a different key, or the row is corrupt). Configure the original key, then restore again. Nothing was changed.`
     );
   }
 }

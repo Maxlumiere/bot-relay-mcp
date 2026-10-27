@@ -78,7 +78,7 @@ config.json     the live config, its secrets REDACTED (present iff one existed; 
   "encryption": {
     "keys": [{ "key_id": "k1", "rows": 171, "fingerprint": "3f9c0e5a1b7d2c4e8a6f0b1d3e5c7a9b" }]
   },
-  "plaintext_secrets": { "webhook_subscriptions.secret": 0 },
+  "webhook_secrets": { "plaintext": 0, "encrypted": 2, "unverifiable": 0, "unverifiable_reasons": { "no_keyring": 0, "key_not_held": 0, "auth_failed": 0 } },
   "config": { "redacted": ["dashboard_secret", "http_secret"], "dropped": [] }
 }
 ```
@@ -86,19 +86,24 @@ config.json     the live config, its secrets REDACTED (present iff one existed; 
 - `schema_version` tracks the DB schema. The relay reads this from the `schema_info` table at export time (DB-actual, not a code constant — v2.1 Phase 4c.3). Restore refuses when the archive's schema is **higher** than the target relay (cannot downgrade) and refuses by default when it is **lower** (pass `--force` to override; migration is your responsibility). The authoritative `CURRENT_SCHEMA_VERSION` constant in `src/db.ts` is what the running code expects; `schema_info.version` is what the live DB has.
 - `archive_format_version` tracks the tar layout itself, so either can evolve independently.
 - `encryption.keys`: every key id the DB's ciphertext needs, its row count, and a **fingerprint** of the key: HMAC-SHA256(key, `"bot-relay backup key fingerprint v1"`), truncated to 128 bits. It identifies the key without revealing it. `fingerprint` is `null` when the backing-up relay's keyring did not hold that key.
-- `plaintext_secrets`: the secrets the DB holds in PLAINTEXT (see "Secrets" below).
+- `webhook_secrets`: the webhook secrets, each classified: `plaintext`, `encrypted` (it authenticates under this keyring's key) or `unverifiable` (an envelope that cannot be authenticated), with `unverifiable_reasons`: `no_keyring`, `key_not_held`, `auth_failed` (the id IS held and authentication failed: corruption, or the wrong key). `null` when the webhook table could not be read at all. See "Secrets" below.
 - `config`: what the archived `config.json` had redacted and dropped.
 - Archives made before these three fields existed still restore (see "Safety guarantees").
 
 ## Secrets: what an archive does and does not carry
 
-**No archive contains an encryption key, a raw token or the mint secret.**
+What a backup leaves out, concretely:
+
+- the keyring and its sources (`RELAY_ENCRYPTION_KEYRING`, `RELAY_ENCRYPTION_KEYRING_PATH`, `RELAY_ENCRYPTION_KEY`) and the mint-secret file are never archived;
+- the config credentials the relay recognises are redacted.
+
+What it does NOT do: inspect arbitrary copied content. A copied config value (a nested value included) and the application data in the DB (message bodies, task text, audit parameters) are archived as they are. If an agent put a secret in a message, the archive holds that message.
 
 - **Encryption keys are never archived.** Rows encrypted at rest stay encrypted in the snapshot, and the manifest names the key id(s) they need. **Keep your keyring** (`RELAY_ENCRYPTION_KEYRING` or `RELAY_ENCRYPTION_KEYRING_PATH`) somewhere other than the archive: without it, an archive with encrypted rows cannot be restored. `relay backup` says which key ids an archive needs, on stderr.
 - **The archived `config.json` is not a copy of the file.** Each known config field is either copied as it is (its value is not validated or inspected; a nested value is copied whole) or, for a credential, set to `null`: `http_secret`, `http_secrets_previous`, `dashboard_secret` and `dashboard_push_secret` (each is a shared bearer credential). A key the relay does not know is left out. Both lists are named, never valued, in the manifest and in the result. Restore does not read the archived `config.json`, so this costs a restore nothing.
 - **The mint secret** (`secrets/mint.secret`) is not one of the three archive members.
 - **Token hashes ARE in the snapshot, and are not tokens.** The DB stores bcrypt hashes of agent and recovery tokens, never the tokens. A token is 32 random bytes (256 bits, `crypto.randomBytes(32)` in `src/auth.ts`), so its hash cannot be reversed by guessing. A future token that is NOT random would change this.
-- **No-key mode: the webhook secrets ARE in the archive, in plaintext.** Without an encryption keyring, the relay stores a webhook's HMAC secret as given, so the snapshot carries it. `relay backup` then states how many, loudly: on stderr, in the result (`plaintext_secrets`, `warnings`) and in the manifest. Only a well-formed ciphertext counts as encrypted, so a secret that merely starts with `enc:` is counted as plaintext; a count that cannot be read is `null`, stated as unverifiable. The remedy: configure a keyring and re-register the webhooks, so their secrets are encrypted at rest.
+- **No-key mode: the webhook secrets ARE in the archive, in plaintext.** Without an encryption keyring, the relay stores a webhook's HMAC secret as given, so the snapshot carries it. `relay backup` then states how many, loudly: on stderr, in the result (`webhook_secrets`, `warnings`) and in the manifest. A secret counts as encrypted only if it AUTHENTICATES under this keyring's key; an envelope that cannot be authenticated is `unverifiable`, with its reason, and is warned about like plaintext. A secret that merely starts with `enc:` is plaintext. The warning fires whenever anything is plaintext or unverifiable. The remedy: configure a keyring and re-register the webhooks, so their secrets are encrypted at rest.
 
 ## File perms
 

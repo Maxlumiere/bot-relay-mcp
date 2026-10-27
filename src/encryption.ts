@@ -335,16 +335,53 @@ const V2_SHAPE = new RegExp(`^enc:([a-zA-Z0-9_.-]+):(${B64}):(${B64})$`);
 const V1_SHAPE = new RegExp(`^enc1:(${B64}):(${B64})$`);
 
 /**
- * SEC-23: whether `stored` is a WELL-FORMED ciphertext envelope: a v2 `enc:<key_id>:<iv>:<payload>` with a valid
- * key id, or a legacy `enc1:<iv>:<payload>`; strict base64; a 12-byte iv and a payload longer than the GCM tag
- * (what decryptWithKeyId requires). A value that only starts with a prefix is NOT one: in no-key mode
- * encryptContent stores its input unchanged, so such a value is plaintext.
+ * SEC-23: THE classifier of a stored value (one module: backup's secret count, restore's staged scan and its
+ * decrypt probe all use it; there is no second copy of "is this ciphertext real").
+ *
+ * parseEnvelope: whether `stored` has the SHAPE of a ciphertext envelope: a v2 `enc:<key_id>:<iv>:<payload>` with a
+ * valid key id, or a legacy `enc1:<iv>:<payload>` (keyId null: the keyring's legacy id); strict base64; a 12-byte
+ * iv and a payload longer than the GCM tag (what decryptWithKeyId requires). A shape is not proof: only
+ * classifyStored's authenticated decrypt is.
  */
-export function isWellFormedCiphertext(stored: string): boolean {
+export function parseEnvelope(stored: string): { keyId: string | null } | null {
   const m = V2_SHAPE.exec(stored);
   const parts = m ? [m[2], m[3]] : V1_SHAPE.exec(stored)?.slice(1, 3);
-  if (!parts) return false;
-  return Buffer.from(parts[0], "base64").length === IV_LEN && Buffer.from(parts[1], "base64").length > TAG_LEN;
+  if (!parts) return null;
+  if (Buffer.from(parts[0], "base64").length !== IV_LEN || Buffer.from(parts[1], "base64").length <= TAG_LEN) return null;
+  return { keyId: m ? m[1] : null };
+}
+
+export type UnverifiableReason = "no_keyring" | "key_not_held" | "auth_failed";
+export type StoredClass =
+  | { kind: "plaintext" }
+  | { kind: "encrypted"; keyId: string }
+  | { kind: "unverifiable"; keyId: string; reason: UnverifiableReason };
+
+/**
+ * plaintext: not an envelope (in no-key mode encryptContent stores its input unchanged, so a value that merely
+ * starts with `enc:` is plaintext). encrypted: it AUTHENTICATES under the keyring's key for its id (the GCM tag is
+ * the ground truth). unverifiable: an envelope that cannot be authenticated, with the reason: no keyring; the id is
+ * not held; or the id IS held and authentication FAILED (corruption, or the wrong key under that id). The decrypted
+ * value is discarded at once: never returned, logged or kept.
+ */
+export function classifyStored(stored: string): StoredClass {
+  const env = parseEnvelope(stored);
+  if (!env) return { kind: "plaintext" };
+  let kr: Keyring | null;
+  try {
+    kr = loadKeyring();
+  } catch {
+    kr = null;
+  }
+  const keyId = env.keyId ?? (kr ? kr.legacyKeyId : DEFAULT_LEGACY_KEY_ID);
+  if (!kr) return { kind: "unverifiable", keyId, reason: "no_keyring" };
+  if (!Object.prototype.hasOwnProperty.call(kr.keys, keyId)) return { kind: "unverifiable", keyId, reason: "key_not_held" };
+  try {
+    decryptContent(stored);
+  } catch {
+    return { kind: "unverifiable", keyId, reason: "auth_failed" };
+  }
+  return { kind: "encrypted", keyId };
 }
 
 /** Whether `id` is a well-formed key id (the keyring's own rule). */

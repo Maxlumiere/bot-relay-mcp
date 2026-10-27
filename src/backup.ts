@@ -45,7 +45,7 @@ import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDr
 import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
 import { ensureSecureDir, ensureSecureFile, restrictToOwnerWindows } from "./fs-perms.js";
-import { serializeConfigForArchive, scanCiphertextKeyIds, countPlaintextWebhookSecrets, manifestKeysOf, assertKeyringCanRead, type ArchivedConfig, type ManifestKey } from "./backup-secrets.js";
+import { serializeConfigForArchive, scanCiphertextKeyIds, classifyWebhookSecrets, manifestKeysOf, assertKeyringCanRead, type ArchivedConfig, type ManifestKey, type WebhookSecretCount } from "./backup-secrets.js";
 import { getKeyringInfo } from "./encryption.js";
 import { ERROR_CODES } from "./error-codes.js";
 
@@ -135,8 +135,11 @@ function runTar(args: string[], cwd: string): void {
 export interface BackupSecretsStatement {
   /** Per key id the DB's ciphertext needs: its row count and fingerprint (never the key; the key is NOT archived). */
   encryption: { keys: ManifestKey[] };
-  /** Secrets the DB holds in PLAINTEXT (no-key mode), carried in the archive: a count per column; null = it could not be read (UNVERIFIABLE). */
-  plaintext_secrets: { "webhook_subscriptions.secret": number | null };
+  /**
+   * The webhook secrets the archive carries, by the classifier's verdict: plaintext (no-key mode), encrypted
+   * (authenticated under the keyring), unverifiable (with reasons). null: the table could not be read at all.
+   */
+  webhook_secrets: WebhookSecretCount | null;
   /** The archived config.json: the secrets redacted and the unknown keys dropped. Absent when there is no config file. */
   config?: ArchivedConfig;
 }
@@ -217,7 +220,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     // it holds in plaintext (no-key mode), both read from the snapshot itself.
     const needed = scanCiphertextKeyIds(snap, getKeyringInfo().legacy_key_id);
     const encryption = { keys: manifestKeysOf(needed) };
-    const plaintext_secrets = { "webhook_subscriptions.secret": countPlaintextWebhookSecrets(snap) };
+    const webhook_secrets = classifyWebhookSecrets(snap);
     snap.close();
 
     // The config.json, SERIALIZED through the classification of every RelayConfig field (SEC-23): its secrets are
@@ -231,17 +234,30 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     }
 
     const warnings: string[] = [];
-    const nPlain = plaintext_secrets["webhook_subscriptions.secret"];
-    if (nPlain === null) {
+    const KEYRING = "Configure an encryption keyring (RELAY_ENCRYPTION_KEYRING or RELAY_ENCRYPTION_KEYRING_PATH)";
+    if (webhook_secrets === null) {
       warnings.push(
-        "how many webhook secrets are stored in PLAINTEXT could NOT be verified (the webhook table could not be read); treat this archive as possibly carrying them. " +
-          "Configure an encryption keyring (RELAY_ENCRYPTION_KEYRING or RELAY_ENCRYPTION_KEYRING_PATH) so secrets are encrypted at rest."
+        `the webhook secrets could NOT be verified (the webhook table could not be read): treat this archive as possibly carrying them in PLAINTEXT. ${KEYRING} so secrets are encrypted at rest.`
       );
-    } else if (nPlain > 0) {
-      warnings.push(
-        `${nPlain} webhook secret${nPlain === 1 ? " is" : "s are"} stored in PLAINTEXT (no encryption keyring) and ${nPlain === 1 ? "is" : "are"} IN this archive. ` +
-          `Configure an encryption keyring (RELAY_ENCRYPTION_KEYRING or RELAY_ENCRYPTION_KEYRING_PATH) and re-register the webhooks, so their secrets are encrypted at rest.`
-      );
+    } else {
+      const { plaintext: nPlain, unverifiable: nUnv, unverifiable_reasons: why } = webhook_secrets;
+      if (nPlain > 0) {
+        warnings.push(
+          `${nPlain} webhook secret${nPlain === 1 ? " is" : "s are"} stored in PLAINTEXT and ${nPlain === 1 ? "is" : "are"} IN this archive. ` +
+            `${KEYRING} and re-register the webhooks, so their secrets are encrypted at rest.`
+        );
+      }
+      if (nUnv > 0) {
+        const reasons = [
+          why.no_keyring ? `${why.no_keyring} with no keyring to check them` : "",
+          why.key_not_held ? `${why.key_not_held} under a key id this keyring does not hold` : "",
+          why.auth_failed ? `${why.auth_failed} whose authentication FAILED under the key this keyring holds for their id (corruption, or the wrong key)` : "",
+        ].filter(Boolean);
+        warnings.push(
+          `${nUnv} webhook secret${nUnv === 1 ? " looks" : "s look"} encrypted but could NOT be verified (${reasons.join("; ")}): treat ${nUnv === 1 ? "it" : "them"} as possibly PLAINTEXT, IN this archive. ` +
+            `${KEYRING} that holds the key, or re-register the webhooks.`
+        );
+      }
     }
     if (config?.omitted) warnings.push(config.omitted + ".");
 
@@ -256,7 +272,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
       relay_version: VERSION,
       row_counts,
       encryption,
-      plaintext_secrets,
+      webhook_secrets,
       ...(config ? { config } : {}),
     };
     fs.writeFileSync(path.join(stagingDir, "manifest.json"), JSON.stringify(manifest, null, 2));
@@ -302,7 +318,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
       row_counts,
       bytes,
       encryption,
-      plaintext_secrets,
+      webhook_secrets,
       ...(config ? { config } : {}),
       warnings,
     };
