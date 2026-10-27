@@ -24,6 +24,8 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import crypto from "crypto";
+import { flatConfigPath, configPathForInstance } from "../instance.js"; // the relay config layout: one place
+import { walkPath, comparePaths, isProtected } from "../path-walk.js"; // THE path walk, and its sanctioned reader
 
 /**
  * SHIPPING-DEFECT guard (2026-07-23): under a test harness, UNCONDITIONALLY
@@ -52,11 +54,42 @@ import crypto from "crypto";
  * let a test certify an install that never happened.
  */
 let accountHomeOverride: string | null = null;
+let accountInventoryOverride: readonly string[] | null = null;
 /** Test-only (pattern: db.ts _resetAuditPurgeCounterForTests): lets the guard's
  *  own negative controls exercise the FULL chokepoint against a temp "account
- *  home" — a broken guard then writes a temp file, never the real config. */
-export function _setAccountHomeForTests(p: string | null): void {
+ *  home" — a broken guard then writes a temp file, never the real config. A test
+ *  that points the account home names ITS protected instance inventory too (the
+ *  tripwire's snapshot describes the real account, not the temp one): REQUIRED,
+ *  an explicit [] for a sandbox with no instances. */
+export function _setAccountHomeForTests(p: null): void;
+export function _setAccountHomeForTests(p: string, inventory: readonly string[]): void;
+export function _setAccountHomeForTests(p: string | null, inventory?: readonly string[]): void {
+  // REQUIRED with a home: `[]` says "this sandbox has no instances" explicitly; a missing one is refused here (and a
+  // type error), never a silently empty inventory that would weaken the guard by omission.
+  if (p !== null && (!Array.isArray(inventory) || !inventory.every((x) => typeof x === "string" && path.isAbsolute(x)))) {
+    throw new Error("_setAccountHomeForTests: a test that points the account home must name its protected instance inventory (an explicit [] for none)");
+  }
   accountHomeOverride = p;
+  accountInventoryOverride = p === null ? null : (inventory as readonly string[]);
+}
+
+/**
+ * The protected instance inventory (SEC-11, ruled on #343 R2): every config.json of the account's instances, as
+ * spelled, as resolved and as its own link target, read ONCE by the operator tripwire's sanctioned snapshot
+ * (tests/_setup/vitest-tripwire-base.mjs instanceInventory) and published as RELAY_TEST_OPERATOR_INSTANCE_CONFIGS.
+ * Never enumerated here: a src readdir of the operator's tree from a test worker would trip the tripwire. null when it
+ * is not established (no snapshot, or a malformed one): the guard then refuses.
+ */
+function protectedInstanceInventory(): readonly string[] | null {
+  if (accountHomeOverride) return accountInventoryOverride;
+  const raw = process.env.RELAY_TEST_OPERATOR_INSTANCE_CONFIGS;
+  if (raw === undefined || raw === "") return null;
+  try {
+    const v: unknown = JSON.parse(raw);
+    return Array.isArray(v) && v.every((x) => typeof x === "string" && path.isAbsolute(x)) ? (v as string[]) : null;
+  } catch {
+    return null;
+  }
 }
 
 function accountHome(): string {
@@ -71,44 +104,82 @@ function accountHome(): string {
 }
 
 /**
- * Canonicalize a path that may not exist yet: realpath the deepest EXISTING
- * ancestor (following symlinks), then re-append the non-existent tail.
- * codex #125 blocker 2: lexical path.resolve equality is symlink-bypassable —
- * `alias -> home` makes `alias/.claude.json` land in `home/.claude.json`
- * while resolving unequal. Canonicalizing BOTH sides closes that.
+ * The instance configs a destination could name: one per path component of its walk (its own spelling, where the
+ * walk landed, and every entry the walk passed through, link hops included) that is a valid instance id, under the
+ * ACCOUNT home's instances dir. A superset on purpose: each is then judged by comparePaths, so a name that is not an
+ * instance under the account home simply compares "different". Nothing of the operator's tree is read to work out
+ * which instances exist (the operator tripwire would refuse those reads, and an env-selected instance has no marker).
  */
-function canonicalize(p: string): string {
-  let base = path.resolve(p);
-  const tail: string[] = [];
-  for (;;) {
+function instanceConfigCandidates(dest: string, accountEnv: { HOME: string; USERPROFILE: string }): string[] {
+  const names = new Set<string>();
+  const add = (p: string) => {
+    for (const c of p.split(/[\\/]+/)) if (c) names.add(c);
+  };
+  add(dest);
+  const w = walkPath(dest, { allowMissing: true });
+  add(w.real);
+  for (const e of w.entries) add(e.path);
+  const out: string[] = [];
+  for (const n of names) {
     try {
-      const real = fs.realpathSync(base);
-      return tail.length ? path.join(real, ...tail.slice().reverse()) : real;
+      out.push(configPathForInstance(n, accountEnv));
     } catch {
-      const parent = path.dirname(base);
-      if (parent === base) return path.resolve(p); // nothing on the path exists
-      tail.push(path.basename(base));
-      base = parent;
+      // not a valid instance id: no instance config to protect for it
     }
   }
+  return out;
 }
 
+/**
+ * Refuse, inside a test harness, a write that lands on the ACCOUNT's real config: ~/.claude.json,
+ * ~/.claude/settings.json, the account home's flat relay config, and every per-instance relay config under it (any
+ * valid id, active or not, symlink- or env-selected, and each instance's config as reached through its link TARGET:
+ * the inventory, protectedInstanceInventory; no inventory means refuse). The destination is judged on THE path walk
+ * (src/path-walk.ts), against each protected path, through isProtected: a link anywhere on either side, a physical `..`, or a case or
+ * normalization variant cannot slip past it (Codex #343 R1 #1, #2), and "inconclusive" is refused.
+ * THE STATED OVER-BLOCK, in comparePaths' own terms: two paths whose deepest EXISTING entries are the same (dev, ino)
+ * and whose missing tails DIFFER (in any way) compare "inconclusive", which is refused. So with a protected config
+ * MISSING, a guarded write is refused when its deepest existing entry is the same as the protected path's and its
+ * missing tail differs: a sibling, a nested look-alike, another name under that directory; and on a FRESH account
+ * home (nothing under it yet), every new file directly under the home and every path through a wholly missing
+ * subtree of it. Not refused: identical missing tails ("same" is the protected path itself), and anything whose
+ * deepest existing entry differs, e.g. a write under a directory that already exists below that ancestor
+ * ("different"). Accepted: every guarded writer today writes a protected name, and
+ * tests/config-guard-callers.test.ts pins them. A destination the walk cannot judge (a loop, an unsupported form) is
+ * refused. INACTIVE outside a test harness (no VITEST, no NODE_ENV=test): a production write is never judged here.
+ * THE RESIDUAL (named once, as the tripwire names it): the root is the account home's .bot-relay, the same root
+ * discoverOperator uses. An operator whose live relay lives under a custom RELAY_HOME is outside this guard.
+ */
 export function assertNotRealUserConfigWrite(filePath: string): void {
   if (!process.env.VITEST && process.env.NODE_ENV !== "test") return;
-  const resolved = canonicalize(filePath);
   const home = accountHome();
-  const guarded = [
-    path.join(home, ".claude.json"),
-    path.join(home, ".claude", "settings.json"),
-    path.join(home, ".bot-relay", "config.json"),
-  ];
-  if (guarded.some((real) => canonicalize(real) === resolved)) {
+  const accountEnv = { HOME: home, USERPROFILE: home }; // no RELAY_HOME: the account home's own .bot-relay
+  const refuse = (what: string): never => {
     throw new Error(
-      `[config-guard] refusing to write the REAL user config ${resolved} from inside a test harness. ` +
+      `[config-guard] refusing to write the REAL user config ${filePath} (${what}) from inside a test harness. ` +
         `This is the account's actual config (os.userInfo().homedir) — no environment variable makes ` +
         `writing it safe in a test. Sandbox user-scope writes: point RELAY_CLAUDE_HOME / RELAY_CONFIG_PATH ` +
         `(or the subprocess HOME) at a temp dir.`,
     );
+  };
+  const inventory = protectedInstanceInventory();
+  if (inventory === null) return refuse("the protected instance inventory is not established (no RELAY_TEST_OPERATOR_INSTANCE_CONFIGS from the operator tripwire)");
+  let protectedPaths: string[];
+  try {
+    // The inventory covers instances reached through their TARGETS; the destination-derived candidates cover a
+    // valid-id instance config that does not exist yet. Both are kept (ruled).
+    protectedPaths = [path.join(home, ".claude.json"), path.join(home, ".claude", "settings.json"), flatConfigPath(accountEnv), ...inventory, ...instanceConfigCandidates(filePath, accountEnv)];
+  } catch (err) {
+    return refuse(`its destination could not be judged: ${(err as Error)?.message ?? String(err)}`);
+  }
+  for (const c of protectedPaths) {
+    let hit: boolean;
+    try {
+      hit = isProtected(comparePaths(filePath, c));
+    } catch (err) {
+      return refuse(`it could not be compared with ${c}: ${(err as Error)?.message ?? String(err)}`);
+    }
+    if (hit) refuse(`it may land on ${c}`);
   }
 }
 

@@ -39,7 +39,50 @@ export const SAFE_PORT = "1";
 export const HOME_KEYS = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"];
 
 // Inside a test worker, fs is wrapped by the tripwire; discovery must read through the raw functions.
-const RAW = () => globalThis[Symbol.for("bot-relay.operator-tripwire.raw-fs")] ?? { readFileSync: fs.readFileSync, readdirSync: fs.readdirSync };
+const RAW = () => globalThis[Symbol.for("bot-relay.operator-tripwire.raw-fs")] ?? { readFileSync: fs.readFileSync, readdirSync: fs.readdirSync, realpathSync: fs.realpathSync.native };
+
+/**
+ * The PROTECTED INSTANCE INVENTORY under one relay root (SEC-11, ruled on #343 R2): for EVERY entry of
+ * <root>/instances (a valid id or not), its config.json as spelled, as resolved through the entry, and the config's
+ * own target when it is a link; plus each entry's resolved directory (`targets`). Read ONCE, here, by the tripwire's
+ * sanctioned raw fs: the run's only enumeration of the operator's instances (a src readdir from a test worker would
+ * trip the tripwire itself). An entry that cannot be resolved FAILS CLOSED: the run does not start without its
+ * inventory. A missing instances dir is an empty inventory. Stated residual: an instance created or relinked after
+ * this snapshot is not in it.
+ */
+export function instanceInventory(root, raw = RAW()) {
+  const configs = [];
+  const targets = [];
+  const add = (p) => {
+    if (!configs.includes(p)) configs.push(p);
+  };
+  const dir = path.join(root, "instances");
+  let ids = [];
+  try {
+    ids = raw.readdirSync(dir);
+  } catch (err) {
+    if (!err || (err.code !== "ENOENT" && err.code !== "ENOTDIR")) throw new Error(`operator tripwire: cannot list ${dir} (${err && err.code})`);
+  }
+  for (const id of ids) {
+    const entry = path.join(dir, id);
+    const cfg = path.join(entry, "config.json");
+    add(cfg);
+    let real;
+    try {
+      real = raw.realpathSync(entry);
+    } catch (err) {
+      throw new Error(`operator tripwire: cannot resolve ${entry} (${err && err.code}): the protected instance inventory cannot be established`);
+    }
+    targets.push(real);
+    add(path.join(real, "config.json"));
+    try {
+      add(raw.realpathSync(cfg)); // the config itself a link: its target is protected too
+    } catch (err) {
+      if (!err || (err.code !== "ENOENT" && err.code !== "ENOTDIR")) throw new Error(`operator tripwire: cannot resolve ${cfg} (${err && err.code}): the protected instance inventory cannot be established`);
+    }
+  }
+  return { configs, targets };
+}
 
 /**
  * The env that points the HOME of a process at `home` on every platform. Unix (and node's os.homedir()
@@ -94,16 +137,32 @@ export function discoverOperator(env = process.env, realHome = os.userInfo().hom
   if (given("RELAY_HOME")) roots.push(given("RELAY_HOME"));
   const ports = new Set([DEFAULT_OPERATOR_PORT]);
   const configs = [];
+  const instanceConfigs = [];
+  const relocated = [];
+  const realOf = (p) => {
+    try {
+      return RAW().realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
   for (const root of roots) {
     configs.push(path.join(root, "config.json"));
-    let ids = [];
-    try {
-      ids = RAW().readdirSync(path.join(root, "instances"));
-    } catch (err) {
-      if (!err || (err.code !== "ENOENT" && err.code !== "ENOTDIR")) throw new Error(`operator tripwire: cannot list ${path.join(root, "instances")} (${err && err.code})`);
+    const inv = instanceInventory(root);
+    for (const c of inv.configs) {
+      configs.push(c);
+      if (!instanceConfigs.includes(c)) instanceConfigs.push(c);
     }
-    for (const id of ids) configs.push(path.join(root, "instances", id, "config.json"));
+    // An instance that resolves OUTSIDE every root (a symlink to a directory elsewhere) is the operator's too.
+    for (const t of inv.targets) {
+      const under = roots.some((r) => {
+        const rr = realOf(r);
+        return t === rr || t.startsWith(rr + path.sep);
+      });
+      if (!under && !relocated.includes(t)) relocated.push(t);
+    }
   }
+  roots.push(...relocated);
   if (given("RELAY_CONFIG_PATH")) configs.push(given("RELAY_CONFIG_PATH"));
   for (const f of configs) {
     const p = portOf(f);
@@ -113,7 +172,7 @@ export function discoverOperator(env = process.env, realHome = os.userInfo().hom
   if (Number.isInteger(ambient) && ambient > 0 && ambient < 65536) ports.add(ambient);
   // A shell-set config or DB path is the operator's too: protect it like a root.
   for (const k of ["RELAY_CONFIG_PATH", "RELAY_DB_PATH"]) if (given(k)) roots.push(given(k));
-  return { realHome, roots, ports: [...ports] };
+  return { realHome, roots, ports: [...ports], instanceConfigs };
 }
 
 /** The per-run directory: a NAME only (the global setup creates it). */
@@ -146,6 +205,8 @@ export function withOperatorTripwire(config = {}) {
     RELAY_TEST_OPERATOR_HOME: op.realHome,
     RELAY_TEST_OPERATOR_ROOTS: JSON.stringify(op.roots),
     RELAY_TEST_OPERATOR_PORTS: op.ports.join(","),
+    // The protected instance inventory, for the test-harness write guard (src/cli/config-merge.ts).
+    RELAY_TEST_OPERATOR_INSTANCE_CONFIGS: JSON.stringify(op.instanceConfigs),
   };
   const setupFiles = [TRIPWIRE_SETUP, ...asList(test.setupFiles).filter((f) => abs(root, f) !== TRIPWIRE_SETUP)];
   const globalSetup = [TRIPWIRE_GLOBAL, ...asList(test.globalSetup).filter((f) => abs(root, f) !== TRIPWIRE_GLOBAL)];
