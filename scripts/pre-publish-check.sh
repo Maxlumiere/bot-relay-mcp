@@ -29,7 +29,18 @@
 # origin/main, with its own node_modules. In the tree the live daemon runs from (the
 # .relay-prod-tree marker, or a launchd/claude.json entry pointing at its dist), a
 # `git pull` + `npm ci` swaps packages under the running build; this gate refuses to
-# start there (scripts/prebuild-guard.mjs --publish, first thing below, no override).
+# start there (scripts/prebuild-guard.mjs --publish, first thing below, no override). That check
+# is NOT complete yet: the .relay-prod-tree marker is its reliable signal (the consumer detection
+# sees only the forms it parses); a follow-up replaces it with a positive qualification of the tree.
+#
+# UNTIL THE POSITIVE-QUALIFICATION GATE LANDS, check these MANUALLY before publishing (this
+# gate's serving-tree check is not enough on its own):
+#   - a fresh linked worktree created for this release;
+#   - no .relay-prod-tree in it;
+#   - its OWN real node_modules (root AND extensions/vscode), never a worktree tool's symlink
+#     to the main checkout;
+#   - a clean tree at the fetched origin/main SHA;
+#   - `npm whoami` succeeds.
 # This gate CANNOT undo an earlier pull or `npm ci`: by the time it runs, they have
 # happened. So never run them in the serving tree at all; publish from a disposable
 # worktree with its own node_modules.
@@ -75,11 +86,16 @@ done
 #     expired login.
 # The registry `npm publish` uploads to: package.json publishConfig.registry when set, else the
 # configured registry. The package name is unscoped, so no @scope:registry mapping applies.
+# KNOWN GAP: a CLI `npm publish --registry X` is not seen here; a follow-up closes it.
 publish_registry() {
   local r
   r=$(node -e 'const p=require(process.argv[1]); process.stdout.write((p.publishConfig && p.publishConfig.registry) || "")' "$PROJECT_ROOT/package.json" 2>/dev/null) || r=""
   [ -n "$r" ] || r=$(npm config get registry 2>/dev/null) || r=""
   printf '%s' "$r"
+}
+# A registry URL may carry a credential (user:token@) or a query: print it without either, never raw.
+redact_registry() {
+  printf '%s' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#; s#[?#].*$##'
 }
 if [ "$LIST_STEPS_MODE" != "1" ]; then
   node "$PROJECT_ROOT/scripts/prebuild-guard.mjs" --publish || exit 1
@@ -90,8 +106,9 @@ if [ "$LIST_STEPS_MODE" != "1" ]; then
       exit 1
     fi
     if ! npm whoami --registry "$_reg" >/dev/null 2>&1; then
-      echo "✖ npm whoami --registry $_reg failed: not logged in to that registry (or the login expired)." >&2
-      echo "  Run \`npm login --registry $_reg\`, then \`npm publish\` again. Checked before the gate, so nothing ran." >&2
+      _shown=$(redact_registry "$_reg")
+      echo "✖ npm whoami --registry $_shown failed: not logged in to that registry (or the login expired)." >&2
+      echo "  Run \`npm login --registry $_shown\`, then \`npm publish\` again. Checked before the gate, so nothing ran." >&2
       exit 1
     fi
   fi

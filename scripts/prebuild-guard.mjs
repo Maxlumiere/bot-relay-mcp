@@ -35,7 +35,9 @@
  *      whose path points at THIS tree's dist/index.js (covers an unmarked tree).
  *
  * PUBLISH MODE (`--publish`, run first by scripts/pre-publish-check.sh): the same detection, but
- * RELAY_ALLOW_PROD_BUILD is IGNORED and the message points at a throwaway worktree. A publish never
+ * RELAY_ALLOW_PROD_BUILD is IGNORED and the message points at a throwaway worktree. NOT a complete
+ * serving-tree gate: the marker is its reliable check; the consumer detection sees only the forms it
+ * parses (see consumerEntrypoints). A follow-up replaces it with a positive qualification of the tree. A publish never
  * belongs in the serving tree: its `git pull` + `npm ci` swap the packages under the live dist (seen
  * 26 Oct: zod 3 → 4 under the running daemon's build), before any step of the gate has run.
  *
@@ -49,7 +51,10 @@ import path from "path";
 import os from "os";
 import { isDirectRun } from "./lib/entrypoint.mjs";
 
-/** Every `…/dist/index.js` path a consumer body names (a plist <string> or a JSON string value), URI-decoded. */
+/** Every `…/dist/index.js` path a consumer body names, URI-decoded. Parses ONLY a path that sits whole between
+ *  quotes or angle brackets (a plist <string> or a JSON string value) and ends in /dist/index.js. NOT seen: a
+ *  JSON-escaped `\/`, a Windows backslash path, a path inside a shell wrapper's command string, a relative path,
+ *  or another entrypoint. A consumer written that way is missed; the marker still protects a marked tree. */
 export function consumerEntrypoints(text) {
   if (!text) return [];
   const out = new Set();

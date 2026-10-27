@@ -26,10 +26,12 @@ const TMP = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "prepub-prefli
 afterAll(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
 describe("relay_ext_deps_missing (scripts/lib/ext-deps.sh): install when a tool is missing, not only when node_modules is absent", () => {
-  const missing = (setup: (dir: string) => void) => {
+  // An explicit env (no inherited OS): the Windows case is simulated by OS=Windows_NT, the variable the helper keys on.
+  const missing = (setup: (dir: string) => void, windows = false) => {
     const dir = fs.mkdtempSync(path.join(TMP, "ext-"));
     setup(dir);
-    const r = spawnSync("bash", ["-c", `. "${path.join(REPO, "scripts", "lib", "ext-deps.sh")}"; relay_ext_deps_missing "$1"`, "_", dir]);
+    const env = { PATH: process.env.PATH ?? "", ...(windows ? { OS: "Windows_NT" } : {}) };
+    const r = spawnSync("bash", ["-c", `. "${path.join(REPO, "scripts", "lib", "ext-deps.sh")}"; relay_ext_deps_missing "$1"`, "_", dir], { env });
     return r.status === 0;
   };
   const tool = (dir: string, name: string) => {
@@ -46,13 +48,17 @@ describe("relay_ext_deps_missing (scripts/lib/ext-deps.sh): install when a tool 
     expect(spawnSync("bash", ["-c", 'cd "$1" && [ ! -d node_modules ]', "_", emptyDir]).status, "the defect: the old test skips the install on an EMPTY node_modules").toBe(1);
   });
   it("only esbuild present → missing (tsc is needed too)", () => expect(missing((d) => tool(d, "esbuild"))).toBe(true));
-  it("Windows: .cmd shims for both tools count as present; a .cmd for only one is still missing", () => {
-    const cmd = (dir: string, name: string) => {
-      fs.mkdirSync(path.join(dir, "node_modules", ".bin"), { recursive: true });
-      fs.writeFileSync(path.join(dir, "node_modules", ".bin", `${name}.cmd`), "@echo off\r\n");
-    };
-    expect(missing((d) => { cmd(d, "esbuild"); cmd(d, "tsc"); })).toBe(false);
-    expect(missing((d) => cmd(d, "esbuild"))).toBe(true);
+  const cmd = (dir: string, name: string) => {
+    fs.mkdirSync(path.join(dir, "node_modules", ".bin"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "node_modules", ".bin", `${name}.cmd`), "@echo off\r\n");
+  };
+  // On a real Windows shell `uname -s` is MINGW/MSYS/CYGWIN, which the helper also counts, so the Unix row is skipped there.
+  it.skipIf(process.platform === "win32")("Unix: a .cmd-only layout stays MISSING (a .cmd cannot run the tool there)", () => {
+    expect(missing((d) => { cmd(d, "esbuild"); cmd(d, "tsc"); })).toBe(true);
+  });
+  it("Windows (OS=Windows_NT): .cmd shims for both tools count as present; a .cmd for only one is still missing", () => {
+    expect(missing((d) => { cmd(d, "esbuild"); cmd(d, "tsc"); }, true)).toBe(false);
+    expect(missing((d) => cmd(d, "esbuild"), true)).toBe(true);
   });
   it("TWIN: esbuild and tsc present → not missing (no reinstall)", () => {
     expect(missing((d) => { tool(d, "esbuild"); tool(d, "tsc"); })).toBe(false);
@@ -68,7 +74,8 @@ describe("relay_ext_deps_missing (scripts/lib/ext-deps.sh): install when a tool 
 describe("pre-publish-check.sh preflight: refused or stopped BEFORE any step", () => {
   /** A copy of scripts/ under a fresh root, plus PATH stubs for npm/npx that log every call. */
   const DEFAULT_REG = "https://reg.default.test/";
-  const sandbox = (tag: string, opts: { marker?: boolean; whoami: "ok" | "fail"; publishRegistry?: string }) => {
+  const sandbox = (tag: string, opts: { marker?: boolean; whoami: "ok" | "fail"; publishRegistry?: string; config?: { status: number; out: string } }) => {
+    const config = opts.config ?? { status: 0, out: DEFAULT_REG };
     const root = path.join(TMP, tag);
     fs.mkdirSync(root, { recursive: true });
     fs.cpSync(path.join(REPO, "scripts"), path.join(root, "scripts"), { recursive: true });
@@ -79,7 +86,7 @@ describe("pre-publish-check.sh preflight: refused or stopped BEFORE any step", (
     const log = path.join(root, "calls.log");
     fs.writeFileSync(
       path.join(bin, "npm"),
-      `#!/bin/sh\necho "npm $*" >> "${log}"\n[ "$1 $2 $3" = "config get registry" ] && { echo "${DEFAULT_REG}"; exit 0; }\n[ "$1" = whoami ] && exit ${opts.whoami === "ok" ? 0 : 1}\nexit 1\n`,
+      `#!/bin/sh\necho "npm $*" >> "${log}"\n[ "$1 $2 $3" = "config get registry" ] && { printf '%s' '${config.out}'; exit ${config.status}; }\n[ "$1" = whoami ] && exit ${opts.whoami === "ok" ? 0 : 1}\nexit 1\n`,
       { mode: 0o755 },
     );
     fs.writeFileSync(path.join(bin, "npx"), `#!/bin/sh\necho "npx $*" >> "${log}"\nexit 1\n`, { mode: 0o755 });
@@ -128,6 +135,28 @@ describe("pre-publish-check.sh preflight: refused or stopped BEFORE any step", (
     const r = run(s, { npm_lifecycle_event: "prepublishOnly" });
     expect(r.status).toBe(1);
     expect(r.calls, "no fallback to the configured registry when publishConfig names one").toEqual(["npm whoami --registry https://reg.publish.test/"]);
+  });
+
+  for (const [label, config] of [["fails", { status: 1, out: "" }], ["prints nothing", { status: 0, out: "" }]] as const) {
+    it(`an undeterminable registry (\`npm config get registry\` ${label}) stops BEFORE the login check and before any step`, () => {
+      const s = sandbox(`noreg-${label.replace(/ /g, "-")}`, { whoami: "ok", config });
+      const r = run(s, { npm_lifecycle_event: "prepublishOnly" });
+      expect(r.status).toBe(1);
+      expect(r.out).toMatch(/could not determine the registry npm publish would use/);
+      expect(r.calls, "no login check without a registry").toEqual(["npm config get registry"]);
+      expect(r.out).not.toMatch(/=== pre-publish:/);
+    });
+  }
+
+  it("HARM: a registry URL that carries a credential is never printed raw (userinfo and query stripped)", () => {
+    const secret = ["s3c", "retTOKEN"].join("");
+    const q = ["q1", "w2"].join("");
+    const s = sandbox("credreg", { whoami: "fail", publishRegistry: `https://user:${secret}@reg.cred.test/path/?auth=${q}` });
+    const r = run(s, { npm_lifecycle_event: "prepublishOnly" });
+    expect(r.status).toBe(1);
+    expect(r.out, "the credential never reaches stdout or stderr").not.toContain(secret);
+    expect(r.out, "nor the query").not.toContain(q);
+    expect(r.out, "the registry is still named, redacted").toContain("https://reg.cred.test/path/");
   });
 
   it("TWIN: outside a publish (the gate run standalone, or CI's smoke) the login is never checked", () => {
