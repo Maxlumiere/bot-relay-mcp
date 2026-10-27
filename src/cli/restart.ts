@@ -17,7 +17,7 @@
  * shells out to launchctl once the target is decided.
  */
 import fs from "fs";
-import { execFileSync } from "child_process";
+import { execSystem } from "../system-binary.js"; // SEC-22: launchctl by its trusted path, never by name
 import { CANONICAL_LABEL, plistPathFor, parseLoadedRelayLabels, chooseRestartTarget } from "./launchd.js";
 import { VERSION } from "../version.js";
 
@@ -56,7 +56,7 @@ export async function run(argv: string[]): Promise<number> {
   let loadedRelayLabels: string[] = [];
   try {
     loadedRelayLabels = parseLoadedRelayLabels(
-      execFileSync("launchctl", ["list"], { encoding: "utf-8" }),
+      execSystem("launchctl", ["list"]),
     );
   } catch {
     /* launchctl unavailable → treat as nothing loaded */
@@ -85,7 +85,7 @@ export async function run(argv: string[]): Promise<number> {
   // If the canonical plist exists but isn't loaded yet, bootstrap before kick.
   if (target.needsBootstrap) {
     try {
-      execFileSync("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "ignore" });
+      execSystem("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "ignore" });
     } catch {
       /* may already be bootstrapped; kickstart below still applies */
     }
@@ -94,7 +94,7 @@ export async function run(argv: string[]): Promise<number> {
   try {
     // kickstart -k: kill the running instance and restart it under KeepAlive,
     // so it re-execs the (now-updated) dist the plist points at.
-    execFileSync("launchctl", ["kickstart", "-k", `gui/${uid}/${target.label}`], { stdio: "ignore" });
+    execSystem("launchctl", ["kickstart", "-k", `gui/${uid}/${target.label}`], { stdio: "ignore" });
   } catch (err) {
     process.stderr.write(
       `relay restart: launchctl kickstart failed for ${target.label}: ` +

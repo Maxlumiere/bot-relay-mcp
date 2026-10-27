@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### `relay backup` / `relay restore`, and the relay's system tools (SEC-22)
+
+- **The relay runs its system tools by an absolute, trust-checked path on macOS and Linux too, never through `PATH`**, with a clean environment. The tools are `ps`, `lsof`, `sysctl`, `ioreg`, `launchctl`, `plutil` and `tar`. A tool runs with only the system `PATH` and `LC_ALL=C`; nothing else from your environment (e.g. `TAR_OPTIONS`, `GZIP`, `LD_PRELOAD`, your locale) reaches it. On Windows, `relay backup` now runs `%SystemRoot%\System32\tar.exe`, never the `tar` first on `PATH` (Git Bash's).
+  - **A Linux host without them in the standard system directories** (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`; e.g. NixOS, Guix) is refused with a named error, never a `PATH` fallback.
+- **Restore reads the archive itself, before it touches anything.** No `tar` extracts the archive (the safety backup that restore writes before the swap still uses `tar`). Only `relay.db`, `manifest.json` and `config.json` are ever extracted. Restore checks the archive COMPLETELY (the reader, the required members, the manifest, the schema, the staged DB's integrity) BEFORE the safety backup is made and before the live DB is closed, so a refused archive, an empty one included, costs nothing. Refused: links, directories, other names, duplicates, malformed or truncated archives.
+  - **Older backups still restore.** A macOS backup's `._*` and `PaxHeader` metadata members are skipped, and the restore reports them (`skipped_members`).
+- **Backups are now a plain ustar archive, gzipped by the relay itself.** `relay restore` reads backups made before this change as well.
+- **A size limit, enforced by BOTH commands.** `relay backup` refuses to write an archive larger than **4 GiB uncompressed**, or one whose `manifest.json` or `config.json` is over 1 MiB, and says so. `relay restore` refuses the same archives.
+  - Why: restore must bound what it decompresses (a gzip bomb), so backup must never write an archive that restore would refuse, or it would only fail when you need it.
+  - The value is `MAX_DECOMPRESSED_BYTES` in `src/backup-archive.ts`.
+  - If your relay DB is larger: stop the daemon and back up `relay.db` (and its `config.json`) directly.
+
 ## v4.0.0 — 2026-10-25 — BREAKING: a new agent name over HTTP needs the registration secret; stricter instance and path rules; the pending queue is never windowed
 
 Everything since v3.0.1 (13 Aug). The relay's tool contract gains features and changes some behaviour, so this is a major version. Read **Upgrading from 3.x** before you upgrade a running fleet. The full entries follow it, unchanged.
@@ -818,7 +832,7 @@ network position plus a transport secret, not from an operator identity. ADR-000
 **verified dashboard secret regardless of network position**, and the
 `http_secret`→operator escalation is removed at every site.
 
-> **◆ FLAGGED FOR MAXIME — a possible SECOND breaking change for this release, not yet decided.**
+> **◆ FLAGGED FOR A DECISION — a possible SECOND breaking change for this release, not yet decided.**
 > Node 20 reached **end-of-life on 2026-04-30** (Node.js release schedule) and no
 > longer receives security patches; Node 22 is supported to 2027-04-30. The pending
 > better-sqlite3 major (**#81**, 11.x → 13.0.1) declares `engines: node >=22` and,
@@ -982,7 +996,7 @@ The load-bearing one is a **shipping defect that anyone who ran the test suite h
 
 Five fixes for callers driving the relay over raw HTTP (no MCP client wired in), from a real friction report. The load-bearing one is a **safe self-serve orphan cleanup**.
 
-- **Safe orphan cleanup (#4) — `abandon_registration` (caller-initiated ONLY; no auto-GC).** A caller who registered but lost the `agent_token` before ever authenticating (e.g. a truncated `curl` capture) orphaned a row it couldn't unregister (unregister needs the lost token) — and had to reach for the *destructive operator endpoint*. Now: register returns a one-time, name-scoped **`registration_recovery`** handle; `abandon_registration(name, handle)` self-cleans the orphan without a token. **Safe by construction** via the establishment keystone — an `established_at` marker (stamped at token auth, credential recovery, and spawn provisioning) means abandon can **only ever** remove a row that has NEVER become a legitimate identity, so a working agent self-excludes and can never be reached (the handle proves the caller is the registrant + covers the just-registered race). **An automatic orphan GC was designed, adversarially audited five rounds, and CUT by final ruling:** abandonment is undecidable from row state — a slow-spawned child, an idle recovered agent, and a genuinely abandoned registration are byte-identical in the data, and each audit round found a different legitimate identity being reaped. The rule that came out of it: *do not attach an irreversible action to a predicate that cannot be decided by observation.* Un-abandoned rows persist harmlessly (session-less, never established, name reclaimable via unregister or `relay recover`); `tests/v2-22-0-no-auto-gc.test.ts` proves the GC is gone, not disabled. Architect-designed (ADR-0005); the keystone invariant is adversarially tested.
+- **Safe orphan cleanup (#4) — `abandon_registration` (caller-initiated ONLY; no auto-GC).** A caller who registered but lost the `agent_token` before ever authenticating (e.g. a truncated `curl` capture) orphaned a row it couldn't unregister (unregister needs the lost token) — and had to reach for the *destructive operator endpoint*. Now: register returns a one-time, name-scoped **`registration_recovery`** handle; `abandon_registration(name, handle)` self-cleans the orphan without a token. **Safe by construction** via the establishment keystone — an `established_at` marker (stamped at token auth, credential recovery, and spawn provisioning) means abandon can **only ever** remove a row that has NEVER become a legitimate identity, so a working agent self-excludes and can never be reached (the handle proves the caller is the registrant + covers the just-registered race). **An automatic orphan GC was designed, adversarially audited five rounds, and CUT by final ruling:** abandonment is undecidable from row state — a slow-spawned child, an idle recovered agent, and a genuinely abandoned registration are byte-identical in the data, and each audit round found a different legitimate identity being reaped. The rule that came out of it: *do not attach an irreversible action to a predicate that cannot be decided by observation.* Un-abandoned rows persist harmlessly (session-less, never established, name reclaimable via unregister or `relay recover`); `tests/v2-22-0-no-auto-gc.test.ts` proves the GC is gone, not disabled. Designed in ADR-0005; the keystone invariant is adversarially tested.
 - **Reliable token capture (#2).** `agent_token` is now the **first** field of the register response, so a truncated `head -c` read still captures it (it was buried 4th).
 - **Plain JSON for one-shots (#3).** A non-streaming one-shot `POST /mcp` now returns `application/json`, not an `event: message\ndata: {…}` SSE frame — curl/script callers can `JSON.parse` the body directly. The stateful/streaming (Tether SSE) path is unchanged.
 - **`send_message` accepts `message` (#5).** The MCP tool now takes `content` **or** its alias `message` (exactly one; both-with-different-values rejected), matching the REST endpoint + the agent-team `SendMessage` — one send vocabulary across every surface.

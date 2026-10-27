@@ -50,6 +50,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
+import { spawnSystem, type SystemBinaryName } from "./system-binary.js";
 import { fileURLToPath } from "url";
 import { RESOLVER_ENV_KEYS } from "./instance.js";
 import { processStartedAt } from "./liveness.js";
@@ -129,8 +130,9 @@ const CMD_TIMEOUT_MS = 10_000;
 const RELAY_BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "relay");
 const KEYS: ReadonlySet<string> = new Set(RESOLVER_ENV_KEYS);
 
-function cmd(bin: string, args: string[]): Ok<{ stdout: string }> {
-  const r = spawnSync(bin, args, { encoding: "utf-8", timeout: CMD_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
+/** A system tool by its trusted absolute path (SEC-22: spawnSystem), never by name; one that cannot be located fails here. */
+function cmd(bin: SystemBinaryName, args: string[]): Ok<{ stdout: string }> {
+  const r = spawnSystem(bin, args, { encoding: "utf-8", timeout: CMD_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
   if (r.error) return { ok: false, error: `${bin}: ${r.error.message}` };
   if (r.status !== 0) return { ok: false, error: `${bin} exited ${r.status ?? r.signal}` };
   return { ok: true, stdout: r.stdout };
@@ -149,7 +151,7 @@ export function defaultGateDeps(): GateDeps {
       return r.ok ? { ok: true, json: r.stdout } : r;
     },
     listenerPids: (port) => {
-      const r = spawnSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], { encoding: "utf-8", timeout: CMD_TIMEOUT_MS });
+      const r = spawnSystem("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], { encoding: "utf-8", timeout: CMD_TIMEOUT_MS });
       if (r.error) return { ok: false, error: `lsof: ${r.error.message}` };
       // lsof exits 1 with no output when nothing matches: a positive "none".
       if (r.status !== 0 && r.stdout.trim() !== "") return { ok: false, error: `lsof exited ${r.status}` };

@@ -45,6 +45,7 @@ import {
   instanceIdFault as idFaultUnder,
   ACTIVE_INSTANCE_MARKER,
   type ResolvedInstance,
+  type ResolverEnv,
 } from "./resolve-instance.js";
 
 // ADR-0048 PR D: the resolver lives in src/resolve-instance.ts (a PURE module
@@ -403,10 +404,29 @@ export function resolveInstanceConfigPath(): string {
 export function configPathFor(r: ResolvedInstance): string {
   if (process.env.RELAY_CONFIG_PATH) return process.env.RELAY_CONFIG_PATH;
   if (r.kind === "error") {
-    if (r.ambiguous && process.env.RELAY_DB_PATH) return path.join(botRelayRoot(), "config.json");
+    if (r.ambiguous && process.env.RELAY_DB_PATH) return flatConfigPath();
     throw new Error(r.reason);
   }
-  return path.join(r.kind === "instance" ? path.dirname(r.dbPath) : botRelayRoot(), "config.json");
+  return r.kind === "instance" ? path.join(path.dirname(r.dbPath), CONFIG_FILE) : flatConfigPath();
+}
+
+/** The relay's config file name: the ONE place it is spelled (tests/config-path-single-resolver.test.ts). */
+const CONFIG_FILE = "config.json";
+
+/**
+ * The FLAT (no-instance) config path under `env`'s relay root: RELAY_HOME, else <home>/.bot-relay. `env` defaults to
+ * this process's; another env names another root (the test-harness write guard passes the ACCOUNT home's).
+ */
+export function flatConfigPath(env: ResolverEnv = process.env): string {
+  return path.join(relayRootFor(env), CONFIG_FILE);
+}
+
+/** The config path of instance `id` under `env`'s relay root. An invalid id throws (the same rule as instanceDir). */
+export function configPathForInstance(id: string, env: ResolverEnv = process.env): string {
+  const root = instancesRootFor(env);
+  const fault = idFaultUnder(id, root);
+  if (fault) throw new Error(`invalid instance_id "${id}": ${fault}`);
+  return path.join(root, id, CONFIG_FILE);
 }
 
 /**
