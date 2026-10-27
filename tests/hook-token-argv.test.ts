@@ -37,7 +37,7 @@ import crypto from "crypto";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
 import { mintHeaders } from "./_helpers/mint.js";
-import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { budgetTree, BUDGET_CLOCK_SEAMED } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(__filename), "..");
@@ -199,6 +199,17 @@ interface RunResult {
 }
 
 /** `fd5`: a file the child gets as descriptor 5 (where an inherited BASH_XTRACEFD=5 sends a trace). */
+/**
+ * EVERY hook run in this file uses a copy of the hooks whose budget arithmetic reads a FIXED clock
+ * (tests/_helpers/hook-budget-tree.ts, RELAY_TEST_CLOCK=0 by default below). These cases test where the token travels,
+ * not timing: on the real clock, a slow runner spent the 5s hooks' 2s margin before a budgeted step these cases need
+ * (CI: "no time budget left for the remote mail read (2s of 5s spent)", and the same for the liveness health probe), so
+ * a precondition failed for a reason unrelated to the case. A run that passes its own path keeps it (the restamp rows'
+ * own copy); anything else under hooks/ is mapped onto SEAMED_HOOKS, built in beforeAll after the sandbox reset.
+ */
+let SEAMED_HOOKS: string | null = null;
+const seamedPath = (p: string) => (SEAMED_HOOKS && p.startsWith(HOOKS_DIR + path.sep) ? path.join(SEAMED_HOOKS, path.relative(HOOKS_DIR, p)) : p);
+
 function run(args: string[], env: Record<string, string>, stdin = "", fd5?: string): Promise<RunResult> {
   fs.rmSync(ARGV_DIR, { recursive: true, force: true });
   fs.mkdirSync(ARGV_DIR);
@@ -207,7 +218,8 @@ function run(args: string[], env: Record<string, string>, stdin = "", fd5?: stri
   return new Promise<RunResult>((resolve, reject) => {
     const stdio: cp.StdioOptions = f5 === undefined ? "pipe" : ["pipe", "pipe", "pipe", "ignore", "ignore", f5];
     // TMPDIR: a hook's mktemp files land in this test's sandbox, never the machine's temp directory.
-    const child = cp.spawn(BASH, args, { env: { PATH: SHIM_DIR, TMPDIR: TEST_TMP, ...env }, stdio }) as cp.ChildProcessWithoutNullStreams;
+    const routed = args.length ? [seamedPath(args[0]), ...args.slice(1)] : args;
+    const child = cp.spawn(BASH, routed, { env: { PATH: SHIM_DIR, TMPDIR: TEST_TMP, RELAY_TEST_CLOCK: "0", ...env }, stdio }) as cp.ChildProcessWithoutNullStreams;
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d.toString()));
@@ -284,9 +296,9 @@ const STOP_STDIN = JSON.stringify({ session_id: "a1a1a1a1-0000-0000-0000-0000000
  * here, unasserted, along the same paths the cases take, until one run completes its WHOLE path inside its budget:
  * no "no time budget left" skip, and for PostToolUse the restamp actually reached report_liveness. That is what the
  * cases need, measured, not merely "the hook ran".
- * NOT REMOVED: the timing dependence. The budget is the hook's own (RELAY_HOOK_BUDGET_SECS, hard-coded in each hook,
- * not read from the environment), so a runner slow enough to exceed it on WARM shims would still trip the restamp
- * case. This warm-up removes the cold-start cost, which was the measured cause.
+ * The timing dependence itself is now REMOVED by the fixed budget clock (see run() below): every hook run here uses a
+ * seamed copy, so no budgeted step can be skipped for time. This warm-up still runs, to warm the shims; its precondition
+ * row then holds by construction.
  */
 const WARM_ATTEMPTS = 3;
 const WARMED: string[] = [];
@@ -318,6 +330,7 @@ async function warmShims(): Promise<void> {
 beforeAll(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_TMP, { recursive: true });
+  SEAMED_HOOKS = budgetTree(path.join(TEST_DIR, "seamed-hooks"), HOOKS_DIR, path.join(REPO_ROOT, "bin"));
   expect(buildShims(), "precondition: shims built").toBeGreaterThan(20);
   relay = startHttpServer(0, "127.0.0.1");
   await new Promise((r) => setTimeout(r, 100));
@@ -330,6 +343,14 @@ beforeAll(async () => {
 }, 60_000);
 
 describe("the harness sandbox", () => {
+  it("every hook run is routed to the seamed copy, whose budget arithmetic reads the fixed clock", () => {
+    for (const h of [CHECK_RELAY, STOP_HOOK, PTU_HOOK, CODEX_HOOK]) {
+      const routed = seamedPath(h);
+      expect(routed, `${path.basename(h)} is not run from the real hooks dir`).not.toBe(h);
+      expect(fs.existsSync(routed), routed).toBe(true);
+    }
+    expect(fs.readFileSync(path.join(SEAMED_HOOKS!, "_vault-helpers.sh"), "utf-8")).toContain(BUDGET_CLOCK_SEAMED);
+  });
   it("hook children get the test's own TMPDIR: TMPDIR-honouring tools put their temp files in the sandbox", async () => {
     const r = await run(["-c", 'printf "%s\\n" "$TMPDIR"; python3 -c "import tempfile; print(tempfile.gettempdir())"; mktemp'], {});
     const [seenEnv, py, mk] = r.stdout.trim().split("\n");
@@ -623,6 +644,13 @@ describe("stop-check.sh (Stop) and post-tool-use-check.sh (every tool call)", SL
       expect(reads[0].headers["x-agent-token"]).toBe(token);
       expect(reads[0].args.agent_token).toBe(token);
       expectNoArgvHolds([token]);
+    });
+    it(`${label}, CONTROL: the same run with ONLY the remote mail read starved reproduces CI's failure: no read, the skip names it`, async () => {
+      const name = `argv-${label.toLowerCase()}-remote-ctl`;
+      const token = dbRegister(name, "tester", []).plaintext_token as string;
+      const r = await run([hook], { ...remoteEnv(name, home(`${label}-remote-ctl`), token), RELAY_TEST_STARVE: "the remote mail read" }, stdin);
+      expect(toolCalls("get_messages").length, "the read never ran: CI's precondition failure, made deterministic").toBe(0);
+      expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the remote mail read \(\d+s of 5s spent\): skipped\./);
     });
   }
 
