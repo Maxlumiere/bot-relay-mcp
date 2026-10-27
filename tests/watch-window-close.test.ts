@@ -168,16 +168,45 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
 
   it("the not-empty failure NAMES what is still in the group (the reader's text), so the next CI occurrence carries its own evidence", async () => {
     const dir = path.join(ROOT, "named");
-    const w = openWindow(dir, env, { closeWaitMs: 200, groupAlive: () => true, groupMembers: (pgid) => `pid 4242 ppid 1 stat Z etime 00:05 comm sleep (group ${pgid})` });
+    const w = openWindow(dir, env, { closeWaitMs: 200, groupAlive: () => true, groupMembers: async (pgid) => `pid 4242 ppid 1 stat Z etime 00:05 comm sleep (group ${pgid})` });
     const leaderStart = processStartedAt(w.leaderPid);
     try {
-      await expect(w.close()).rejects.toThrow(new RegExp(`process group ${w.leaderPid} is not empty after 200 ms: .*; still in it: pid 4242 ppid 1 stat Z etime 00:05 comm sleep \\(group ${w.leaderPid}\\)$`));
+      await expect(w.close()).rejects.toThrow(new RegExp(`process group ${w.leaderPid} is not empty after 200 ms: .*; members: pid 4242 ppid 1 stat Z etime 00:05 comm sleep \\(group ${w.leaderPid}\\)$`));
     } finally {
       cleanup(w, leaderStart);
     }
   }, 15_000);
 
-  it("parseGroupMembers keeps ONLY the group's rows (a zombie included) and says so when ps lists none", () => {
+  it("a members reading that NEVER returns cannot delay the rejection: it lands on time, the members 'unavailable (diagnostic still running)'", async () => {
+    const dir = path.join(ROOT, "stuck-reader");
+    const w = openWindow(dir, env, { closeWaitMs: 200, groupAlive: () => true, groupMembers: () => new Promise<string>(() => {}) });
+    const leaderStart = processStartedAt(w.leaderPid);
+    try {
+      const t0 = Date.now();
+      await expect(w.close()).rejects.toThrow(/is not empty after 200 ms: .*; members: unavailable \(diagnostic still running\)$/);
+      expect(Date.now() - t0, "never waited for the reader").toBeLessThan(2_000);
+    } finally {
+      cleanup(w, leaderStart);
+    }
+  }, 15_000);
+
+  it("a members reader that THROWS or REJECTS never replaces the original error: it is appended as 'unavailable (<reason>)'", async () => {
+    for (const [tag, reader] of [
+      ["throws", () => { throw new Error("planted: reader threw"); }],
+      ["rejects", () => Promise.reject(new Error("planted: reader rejected"))],
+    ] as const) {
+      const dir = path.join(ROOT, `reader-${tag}`);
+      const w = openWindow(dir, env, { closeWaitMs: 200, groupAlive: () => true, groupMembers: reader as (pgid: number) => Promise<string> });
+      const leaderStart = processStartedAt(w.leaderPid);
+      try {
+        await expect(w.close(), tag).rejects.toThrow(new RegExp(`process group ${w.leaderPid} is not empty after 200 ms: something it started may still write into this dir; members: unavailable \\(planted: reader ${tag === "throws" ? "threw" : "rejected"}\\)$`));
+      } finally {
+        cleanup(w, leaderStart);
+      }
+    }
+  }, 20_000);
+
+  it("parseGroupMembers: members found (a zombie and a U state included), a VALID table with no match, and output with NO valid row are three different answers", () => {
     const ps = [
       "  100   100     1 Ss   01:00 sh",
       "  101   100   100 Z    00:01 sleep",
@@ -186,7 +215,10 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
       "garbage",
     ].join("\n");
     expect(parseGroupMembers(ps, 100)).toBe("pid 100 ppid 1 stat Ss etime 01:00 comm sh; pid 101 ppid 100 stat Z etime 00:01 comm sleep; pid 103 ppid 100 stat U etime 00:02 comm node /x/relay watch");
-    expect(parseGroupMembers(ps, 555)).toBe("ps lists NO member (the group emptied after the last probe)");
+    expect(parseGroupMembers(ps, 555), "a valid table, no row in this group").toBe("ps listed no matching members (4 rows read; kill(-pgid, 0) and ps are two readings at two instants)");
+    for (const [tag, out] of [["empty", ""], ["whitespace-only", "   \n  \t\n"], ["malformed-only", "garbage\nfoo bar baz\n12 x 3 S 00:01 sh"]] as const) {
+      expect(parseGroupMembers(out, 100), tag).toBe("unparseable: the ps output had no valid row");
+    }
   });
 
   it("ONE shutdown: concurrent calls share it, and a call after a REJECTION rejects the same way (never a false success)", async () => {

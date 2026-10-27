@@ -37,7 +37,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
-import { spawn, spawnSync, type ChildProcess } from "child_process";
+import { execFile, spawn, spawnSync, type ChildProcess } from "child_process";
 import { probePid, processStartedAt, startOrNull } from "../../src/liveness.js";
 import { parsePid } from "../_helpers/recorded-pid.js";
 
@@ -101,8 +101,11 @@ export interface WindowOpts {
   closeWaitMs?: number;
   /** Does the group still have members? (default: kill(-pgid, 0)). */
   groupAlive?: (pgid: number) => boolean;
-  /** What is still in the group, for the not-empty error (default: one `ps`, parseGroupMembers). REPORT ONLY. */
-  groupMembers?: (pgid: number) => string;
+  /**
+   * What is still in the group, for the not-empty error (default: one ASYNC `ps`, parseGroupMembers). REPORT ONLY:
+   * started near the deadline and NEVER awaited past it (an unsettled reading is reported as unavailable).
+   */
+  groupMembers?: (pgid: number) => Promise<string>;
   /** The leader's start token now (default: liveness.processStartedAt). */
   leaderStart?: (pid: number) => string | null;
   /** The supervisor's shell (default `sh`): the close test runs it under dash, Linux's /bin/sh. */
@@ -126,25 +129,42 @@ const realGroupAlive = (pgid: number): boolean => {
 
 /**
  * `ps -A -o pid=,pgid=,ppid=,stat=,etime=,comm=` text → the members of process group `pgid`, one readable entry each
- * ("pid 4242 ppid 1 stat Z etime 00:05 comm sleep"), or a line saying ps listed none. REPORT ONLY: it names what kept
- * `kill(-pgid, 0)` succeeding when close() gives up (a zombie, a process in an uninterruptible wait, a live straggler),
- * so the next "not empty" failure carries its own evidence. Never a signal target.
+ * ("pid 4242 ppid 1 stat Z etime 00:05 comm sleep"). REPORT ONLY: it names what kept `kill(-pgid, 0)` succeeding when
+ * close() gives up (a zombie, a process in an uninterruptible wait, a live straggler), so the next "not empty" failure
+ * carries its own evidence. Never a signal target. Four outcomes, never conflated:
+ *   - members found;
+ *   - a VALID table (at least one well-formed row) with no row in this group: "ps listed no matching members" (which
+ *     does NOT say the group is empty: kill(-pgid, 0) and ps are two readings at two instants);
+ *   - output with NO valid row (empty, whitespace, or malformed only): "unparseable";
+ *   (the fourth, an unreadable table, is the reader's: realGroupMembers.)
+ * The comm field is a FIELD FILTER (the executable name only, never argv or the environment), not a secret scrubber.
  */
 export function parseGroupMembers(stdout: string, pgid: number): string {
   const rows: string[] = [];
+  let valid = 0;
   for (const line of stdout.split("\n")) {
     const f = line.trim().split(/\s+/);
-    if (f.length < 6 || f[1] !== String(pgid)) continue;
+    if (f.length < 6 || !/^\d+$/.test(f[0]) || !/^\d+$/.test(f[1]) || !/^\d+$/.test(f[2])) continue;
+    valid++;
+    if (f[1] !== String(pgid)) continue;
     rows.push(`pid ${f[0]} ppid ${f[2]} stat ${f[3]} etime ${f[4]} comm ${f.slice(5).join(" ")}`);
   }
-  return rows.length ? rows.join("; ").slice(0, 1000) : "ps lists NO member (the group emptied after the last probe)";
+  if (rows.length) return rows.join("; ").slice(0, 1000);
+  if (valid) return `ps listed no matching members (${valid} rows read; kill(-pgid, 0) and ps are two readings at two instants)`;
+  return "unparseable: the ps output had no valid row";
 }
 
-const realGroupMembers = (pgid: number): string => {
-  const r = spawnSync("ps", ["-A", "-o", "pid=,pgid=,ppid=,stat=,etime=,comm="], { encoding: "utf-8", timeout: 2_000 });
-  if (r.status !== 0 || !r.stdout) return `the process table could not be read (ps exit ${r.status}${r.error ? `, ${r.error.message}` : ""})`;
-  return parseGroupMembers(r.stdout, pgid);
-};
+/** The members, read by an ASYNC ps (never blocks the event loop; bounded). */
+const realGroupMembers = (pgid: number): Promise<string> =>
+  new Promise((resolve) => {
+    execFile("ps", ["-A", "-o", "pid=,pgid=,ppid=,stat=,etime=,comm="], { encoding: "utf-8", timeout: 2_000 }, (err, stdout) => {
+      if (err) resolve(`unreadable: ps failed (${err.message.split("\n")[0]})`);
+      else resolve(parseGroupMembers(stdout, pgid));
+    });
+  });
+
+/** How long before the close deadline the members reading starts (it needs one ps; a longer close starts it then). */
+const MEMBERS_LEAD_MS = 1_000;
 
 /**
  * `ps -A -o pid=,ppid=` text → pid → ppid. The PID is a SIGNAL TARGET (the escape sweep kills keys of this map), so it
@@ -358,9 +378,29 @@ export function openWindow(dir: string, env: Record<string, string>, opts: Windo
     } catch {
       /* the group is already empty */
     }
-    while (groupAlive(lp) && Date.now() < deadline) await sleep(25);
+    // The members reading (report only) starts near the deadline and is NEVER awaited: at the deadline an unsettled
+    // reading is reported as unavailable, so a stuck ps can neither delay nor prevent the rejection.
+    let members: string | null = null;
+    let reading = false;
+    const startMembers = () => {
+      reading = true;
+      try {
+        groupMembers(lp).then(
+          (m) => (members = m),
+          (e: unknown) => (members = `unavailable (${e instanceof Error ? e.message : String(e)})`),
+        );
+      } catch (e) {
+        members = `unavailable (${e instanceof Error ? e.message : String(e)})`;
+      }
+    };
+    while (groupAlive(lp) && Date.now() < deadline) {
+      if (!reading && deadline - Date.now() <= MEMBERS_LEAD_MS) startMembers();
+      await sleep(25);
+    }
     if (groupAlive(lp)) {
-      throw new Error(`window close (${dir}): process group ${lp} is not empty after ${closeWaitMs} ms: something it started may still write into this dir; still in it: ${groupMembers(lp)}`);
+      if (!reading) startMembers();
+      const what = members ?? "unavailable (diagnostic still running)";
+      throw new Error(`window close (${dir}): process group ${lp} is not empty after ${closeWaitMs} ms: something it started may still write into this dir; members: ${what}`);
     }
     // ESCAPES: list first, then kill ONLY the listed pids, and fail naming them.
     const table = processTable();
