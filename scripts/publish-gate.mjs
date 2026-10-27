@@ -21,10 +21,16 @@
  *      <parent of the main checkout>/.worktrees (the main checkout is the common dir's parent);
  *   2. no .relay-prod-tree entry (the serving tree's marker; any entry counts, a dangling link included; an
  *      entry that cannot be inspected is a refusal);
- *   3. ISOLATED build inputs and outputs: node_modules (root and extensions/vscode) are real directories inside
- *      the tree, never a link (a worktree tool links them to the main checkout until `npm ci`), and none of their
- *      top-level entries (scoped ones included) is a link resolving outside the tree (what `npm link` or a hand
- *      link leaves; `npm ci` never does); dist/ is absent or a real directory inside the tree, never a link;
+ *   3. these FILESYSTEM CHECKS (exactly these; not a proof of isolation):
+ *      - node_modules (root and extensions/vscode) are real directories inside the tree, never a link (a worktree
+ *        tool links them to the main checkout until `npm ci`), and none of their top-level entries (scoped ones
+ *        included) is a link resolving outside the tree (what `npm link` or a hand link leaves; `npm ci` never does);
+ *      - the gate's BUILD OUTPUTS, every path its own build steps write (OUTPUT_ROOTS: dist/ from the root tsconfig
+ *        outDir and scripts/write-build-info.mjs; extensions/vscode/out/ from its tsconfig outDir and the esbuild
+ *        outfile), are absent or real directories inside the tree, and EVERYTHING under them, recursively, is a
+ *        real directory or a regular file with ONE link: no symlink, no other entry type, no hard-linked file (tsc
+ *        and esbuild write in place, so a shared inode is modified exactly as through a link), no entry that
+ *        cannot be inspected;
  *   4. a clean tree whose HEAD is the remote's main (`git ls-remote`, read live) or the remote's tag
  *      v<package version>;
  *   5. a release marker minted for this tree, at HEAD (below).
@@ -34,7 +40,11 @@
  *   6. no publishConfig.registry;
  *   7. an UNSCOPED name (an @scope:registry mapping could override; not measured);
  *   8. no workspace publish (npm_config_workspace / npm_config_workspaces; not measured).
- * Inside prepublishOnly this runs AFTER any `npm ci`, so the isolation in 3 is checked on the installed tree.
+ * Inside prepublishOnly this runs AFTER any `npm ci`, so 3 is checked on the installed tree.
+ *
+ * BACKSTOP, partial: the gate's release-security step packs THIS tree (`npm pack`), installs that tarball in a
+ * scratch directory and runs the security-invariant tests against it (its integrity printed). `npm publish` then
+ * packs the tree again for the upload; the two tarballs are not compared.
  *
  * THE MARKER: <the worktree's private git dir>/relay-release-tree.json, {v:1, sha, minted_at, tree, git_dir}:
  * the SHA, an ISO time, and the canonical paths of the tree and of its private git dir, all validated. It is not
@@ -44,11 +54,16 @@
  * CONTROLLED ASSERTION ("this tree was created for this release"), not provenance: anyone who can write the
  * git dir can write it. Stronger provenance would need a trusted creator outside the mutable checkout.
  *
- * NOT CAUGHT (named exclusions, each pinned by a test or stated as untestable here):
- *   - a HARD-LINKED file inside node_modules or dist/ shared with another tree (a hard link is a plain file;
- *     nothing tells it apart without comparing inodes across trees): pinned by a NOT-caught test;
+ * NOT CAUGHT (named exclusions, each pinned by an acceptance test or stated as untestable here):
+ *   - a HARD-LINKED file inside node_modules (a READ-only input: the build never writes there) shared with another
+ *     tree. A link count above 1 WOULD show the sharing (not with which other path); it is excluded because an
+ *     accident does not create hard links into another checkout. Valid for read-only inputs ONLY: the build
+ *     OUTPUTS refuse a hard-linked file (above);
  *   - a BIND MOUNT over a directory (needs privileges to make; not tested here);
- *   - links BELOW the top level of node_modules (only the entries npm itself places are inspected);
+ *   - links BELOW the top level of node_modules, an external node_modules/.bin link included (only the entries
+ *     npm itself places at the top are inspected);
+ *   - a package whose package.json "main" (or another entry point) resolves outside the tree (entry points are
+ *     not resolved);
  *   - the HEAD rule accepts a lightweight tag, a tag off main or ahead of it, and trusts whatever URL `origin`
  *     points at: the rule as written, not verified release provenance.
  *
@@ -72,6 +87,10 @@ import { execFileSync } from "child_process";
 import { isDirectRun } from "./lib/entrypoint.mjs";
 
 export const MARKER_NAME = "relay-release-tree.json";
+
+/** Every path the gate's own build steps write (see 3 above). Keep in step with tsconfig.json, scripts/write-build-info.mjs,
+ *  extensions/vscode/tsconfig.json and extensions/vscode/esbuild.config.mjs (tests/publish-gate.test.ts checks the configs). */
+export const OUTPUT_ROOTS = ["dist", "extensions/vscode/out"];
 
 const NM_WHY = {
   absent: "is missing",
@@ -107,9 +126,7 @@ export function decide(f, { mint = false } = {}) {
     if (f.nmScanError) no("node_modules", `node_modules entries could not be inspected (${f.nmScanError})`);
     else if (f.nmLinksOut && f.nmLinksOut.length) no("node_modules", `${f.nmLinksOut.length} node_modules entr${f.nmLinksOut.length === 1 ? "y is a link" : "ies are links"} out of the tree (e.g. ${f.nmLinksOut[0]}): a linked package is not this tree's`);
   }
-  if (f.dist && f.dist !== "absent" && f.dist !== "real") {
-    no("dist", `dist/ ${{ link: "is a link: the build would write through it", outside: "resolves outside the tree", error: "could not be inspected" }[f.dist] ?? f.dist}`);
-  }
+  for (const o of f.outputs ?? []) no("output", o);
   // 4
   if (f.dirty === null) no("clean", `the tree's status could not be read (${f.statusError})`);
   else if (f.dirty.length) no("clean", `the tree is not clean (${f.dirty.length} change(s), e.g. ${f.dirty[0]})`);
@@ -157,6 +174,45 @@ const short = (s) => (typeof s === "string" ? s.slice(0, 7) : String(s));
 function within(child, parent) {
   const rel = path.relative(parent, child);
   return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/**
+ * What the gate's build would write through, under one output root: the root itself (absent, or a real directory
+ * inside the tree), then EVERY entry below it, recursively: a symlink, an entry neither a file nor a directory, a
+ * regular file with more than one link, or an entry that cannot be inspected. Returns the problems (empty = clean).
+ */
+function outputProblems(top, rel) {
+  const root = path.join(top, rel);
+  const state = dirState(top, root);
+  if (state === "absent") return [];
+  if (state !== "real") return [`${rel}/ ${{ link: "is a link: the build would write through it", outside: "resolves outside the tree", error: "could not be inspected" }[state] ?? state}`];
+  const out = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      out.push(`${path.relative(top, dir)} could not be read (${(e && e.code) || e})`);
+      return;
+    }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      const rp = path.relative(top, p);
+      let st;
+      try {
+        st = fs.lstatSync(p);
+      } catch (err) {
+        out.push(`${rp} could not be inspected (${(err && err.code) || err})`);
+        continue;
+      }
+      if (st.isSymbolicLink()) out.push(`${rp} is a link: the build would write through it`);
+      else if (st.isDirectory()) walk(p);
+      else if (!st.isFile()) out.push(`${rp} is neither a file nor a directory`);
+      else if (st.nlink > 1) out.push(`${rp} is hard-linked (${st.nlink} links): the build writes in place, into the shared file`);
+    }
+  };
+  walk(root);
+  return out;
 }
 
 /** "absent" | "link" | "real" (a real directory inside the tree) | "outside" | "error". */
@@ -238,7 +294,7 @@ export function gather({ cwd, env = process.env, git = defaultGit(cwd, env) }) {
   } catch (e) {
     f.nmScanError = firstLine(e);
   }
-  f.dist = dirState(top, path.join(top, "dist"));
+  f.outputs = OUTPUT_ROOTS.flatMap((rel) => outputProblems(top, rel));
   try {
     f.dirty = git(["status", "--porcelain", "--untracked-files=all"]).split("\n").filter(Boolean);
   } catch (e) {

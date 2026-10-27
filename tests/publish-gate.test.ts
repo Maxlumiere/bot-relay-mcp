@@ -24,7 +24,7 @@ import os from "os";
 import path from "path";
 import { execFileSync, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
-import { decide, gather, MARKER_NAME } from "../scripts/publish-gate.mjs";
+import { decide, gather, MARKER_NAME, OUTPUT_ROOTS } from "../scripts/publish-gate.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const GATE = path.join(REPO, "scripts", "publish-gate.mjs");
@@ -44,7 +44,7 @@ const qualifying = (): Facts => ({
   prodMarker: false,
   nodeModules: { root: "real", "extensions/vscode": "real" },
   nmLinksOut: [],
-  dist: "real",
+  outputs: [],
   dirty: [],
   remoteMain: SHA,
   remoteTag: null,
@@ -82,9 +82,7 @@ describe("decide(): each condition alone refuses, named; the qualifying set pass
     ["a serving-tree marker that cannot be inspected", { prodMarker: "EACCES" }, "prod-marker", /could not be inspected \(EACCES\)/],
     ["a node_modules entry linked out of the tree", { nmLinksOut: ["node_modules/x → /elsewhere/x"] }, "node_modules", /1 node_modules entry is a link out of the tree \(e\.g\. node_modules\/x → \/elsewhere\/x\)/],
     ["node_modules entries that cannot be inspected", { nmScanError: "EACCES" }, "node_modules", /entries could not be inspected \(EACCES\)/],
-    ["a linked dist/", { dist: "link" }, "dist", /dist\/ is a link: the build would write through it/],
-    ["a dist/ resolving outside the tree", { dist: "outside" }, "dist", /resolves outside the tree/],
-    ["a dist/ that cannot be inspected", { dist: "error" }, "dist", /could not be inspected/],
+    ["a build-output problem (named as found)", { outputs: ["dist/index.js is a link: the build would write through it"] }, "output", /^dist\/index\.js is a link: the build would write through it$/],
     ["publishConfig.registry", { pkg: { name: "bot-relay-mcp", version: "9.9.9", publishConfigRegistry: "https://r.test/" } }, "registry", /publishConfig\.registry: not supported/],
     ["a scoped name", { pkg: { name: "@x/bot-relay-mcp", version: "9.9.9", publishConfigRegistry: null } }, "registry", /is scoped/],
     ["a workspace publish", { workspaceEnv: "npm_config_workspace=a" }, "workspace", /workspace publish \(npm_config_workspace=a\)/],
@@ -102,7 +100,7 @@ describe("decide(): each condition alone refuses, named; the qualifying set pass
     expect(checks({ ...qualifying(), remoteMain: "b".repeat(40), remoteTag: "d".repeat(40) }).map((x) => x.check)).toEqual(["head"]);
   });
   it("--mint: only an ABSENT or LINKED node_modules (before npm ci); installed, outside or uninspectable are refused; no marker may exist", () => {
-    const fresh = { ...qualifying(), marker: null, dist: "absent", nodeModules: { root: "link", "extensions/vscode": "absent" } };
+    const fresh = { ...qualifying(), marker: null, outputs: [], nodeModules: { root: "link", "extensions/vscode": "absent" } };
     expect(checks(fresh, true)).toEqual([]);
     const r = checks({ ...fresh, nodeModules: { root: "real", "extensions/vscode": "outside" } }, true);
     expect(r.map((x) => x.check)).toEqual(["node_modules", "node_modules"]);
@@ -112,6 +110,21 @@ describe("decide(): each condition alone refuses, named; the qualifying set pass
     const again = checks({ ...fresh, marker: { ...MARKER } }, true);
     expect(again.map((x) => x.check)).toEqual(["marker"]);
     expect(again[0].reason).toMatch(/already exists for this tree: a tree is minted once/);
+  });
+});
+
+describe("OUTPUT_ROOTS is every path the gate's own build steps write (read from the build configs)", () => {
+  it("the root tsconfig outDir, write-build-info's dist/, the extension's tsconfig outDir and its esbuild outfile are each under a root", () => {
+    const under = (p: string) => OUTPUT_ROOTS.some((r: string) => p === r || p.startsWith(`${r}/`));
+    const outDir = (f: string) => JSON.parse(fs.readFileSync(path.join(REPO, f), "utf8")).compilerOptions.outDir as string;
+    expect(under(outDir("tsconfig.json"))).toBe(true);
+    expect(under(path.posix.join("extensions/vscode", outDir("extensions/vscode/tsconfig.json")))).toBe(true);
+    const esb = fs.readFileSync(path.join(REPO, "extensions", "vscode", "esbuild.config.mjs"), "utf8");
+    const outs = [...esb.matchAll(/resolve\(__dirname, "([^"]+)"\)/g)].map((m) => m[1]).filter((p) => /^out\//.test(p));
+    expect(outs.length, "esbuild writes under out/").toBeGreaterThan(0);
+    for (const o of outs) expect(under(`extensions/vscode/${o}`), o).toBe(true);
+    expect(fs.readFileSync(path.join(REPO, "scripts", "write-build-info.mjs"), "utf8")).toMatch(/const dist = path\.join\(install, "dist"\)/);
+    expect(under("dist")).toBe(true);
   });
 });
 
@@ -244,10 +257,60 @@ describe("the gatherer on a REAL git fixture (bare origin, main checkout, .workt
     expect(refusedChecks(tree)).toEqual(["head"]);
   });
 
-  it("HARM: a dist/ LINKED out of the tree is refused [dist] (the build would write through it)", () => {
+  it("HARM: a dist/ LINKED out of the tree is refused [output] (the build would write through it)", () => {
     const { tree } = qualifiedTree();
     fs.symlinkSync(outsideDir("dist"), path.join(tree, "dist"), "junction");
-    expect(refusedChecks(tree)).toEqual(["dist"]);
+    expect(refusedChecks(tree)).toEqual(["output"]);
+  });
+
+  /** A qualified tree with a real, clean dist/ (files the build would overwrite). */
+  const withDist = () => {
+    const w = qualifiedTree();
+    fs.mkdirSync(path.join(w.tree, "dist", "cli"), { recursive: true });
+    fs.writeFileSync(path.join(w.tree, "dist", "cli", "bind.js"), "// built\n");
+    return w;
+  };
+  it("TWIN: a real, clean dist/ (regular files, one link each) passes", () => {
+    const { tree } = withDist();
+    fs.writeFileSync(path.join(tree, "dist", "index.js"), "// built\n");
+    expect(refusedChecks(tree)).toEqual([]);
+  });
+  it("HARM: dist/index.js LINKED into a fake serving tree is refused [output] (tsc would write the serving file)", () => {
+    const { tree } = withDist();
+    const serving = path.join(outsideDir("serving"), "dist");
+    fs.mkdirSync(serving, { recursive: true });
+    fs.writeFileSync(path.join(serving, "index.js"), "// the serving tree's live build\n");
+    fs.symlinkSync(path.join(serving, "index.js"), path.join(tree, "dist", "index.js"));
+    const r = refusals(tree);
+    expect(r.map((x) => x.check)).toEqual(["output"]);
+    expect(r[0].reason).toBe("dist/index.js is a link: the build would write through it");
+  });
+  it("HARM: a HARD-LINKED dist file is refused [output] (the build writes in place, into the shared inode)", () => {
+    const { tree } = withDist();
+    const shared = path.join(outsideDir("hard-out"), "index.js");
+    fs.writeFileSync(shared, "// the serving tree's live build\n");
+    fs.linkSync(shared, path.join(tree, "dist", "index.js"));
+    const r = refusals(tree);
+    expect(r.map((x) => x.check)).toEqual(["output"]);
+    expect(r[0].reason).toMatch(/^dist\/index\.js is hard-linked \(2 links\)/);
+  });
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("HARM: an UNREADABLE dist/ entry is refused [output], never passed", () => {
+    const { tree } = withDist();
+    const locked = path.join(tree, "dist", "cli");
+    fs.chmodSync(locked, 0o000);
+    try {
+      const r = refusals(tree);
+      expect(r.map((x) => x.check)).toEqual(["output"]);
+      expect(r[0].reason).toMatch(/^dist\/cli could not be read \(EACCES\)/);
+    } finally {
+      fs.chmodSync(locked, 0o755);
+    }
+  });
+  it("HARM: the EXTENSION's build output (extensions/vscode/out) is scanned too: a link there is refused [output]", () => {
+    const { tree } = qualifiedTree();
+    fs.mkdirSync(path.join(tree, "extensions", "vscode", "out"), { recursive: true });
+    fs.symlinkSync(path.join(outsideDir("ext-out"), "extension.js"), path.join(tree, "extensions", "vscode", "out", "extension.js"));
+    expect(refusals(tree)[0]?.reason).toBe("extensions/vscode/out/extension.js is a link: the build would write through it");
   });
 
   it("HARM: a top-level node_modules entry, or a SCOPED one, LINKED out of the tree is refused [node_modules] (npm link's shape); TWIN: a link inside the tree passes", () => {
@@ -266,14 +329,89 @@ describe("the gatherer on a REAL git fixture (bare origin, main checkout, .workt
     expect(refusedChecks(c.tree), "a link that stays inside the tree is not refused").toEqual([]);
   });
 
-  it("NOT CAUGHT (a named exclusion of the accident gate): a HARD-LINKED file shared with another tree passes", () => {
+  it("NOT CAUGHT (a named exclusion, valid for READ-only inputs ONLY: node_modules; build outputs refuse it): a HARD-LINKED node_modules file passes", () => {
     const { tree } = qualifiedTree();
     const shared = path.join(outsideDir("hard"), "index.js");
     fs.writeFileSync(shared, "module.exports = 1;\n");
     fs.mkdirSync(path.join(tree, "node_modules", "hard-pkg"));
     fs.linkSync(shared, path.join(tree, "node_modules", "hard-pkg", "index.js"));
     expect(fs.statSync(shared).nlink, "precondition: the file really is shared").toBe(2);
-    expect(refusedChecks(tree), "pinned: a hard link is a plain file, not compared across trees").toEqual([]);
+    expect(refusedChecks(tree), "pinned: nlink > 1 would show the sharing, but the gate does not refuse it (an accident does not hard-link into another checkout)").toEqual([]);
+  });
+
+  // ACCEPTANCE of every other declared exclusion: each row passes the gate with ZERO refusals, so the exclusion is
+  // pinned as behaviour, not only stated.
+  it("NOT CAUGHT (named exclusion): a link BELOW the top level of node_modules passes, even resolving outside the tree", () => {
+    const { tree } = qualifiedTree();
+    fs.mkdirSync(path.join(tree, "node_modules", "pkg"));
+    fs.symlinkSync(outsideDir("nested"), path.join(tree, "node_modules", "pkg", "linked-sub"), "junction");
+    expect(fs.realpathSync(path.join(tree, "node_modules", "pkg", "linked-sub")).startsWith(tree), "precondition: it resolves outside").toBe(false);
+    expect(refusedChecks(tree)).toEqual([]);
+  });
+
+  it("NOT CAUGHT (named exclusion): a package whose package.json \"main\" resolves OUTSIDE the tree passes (entry points are not resolved)", () => {
+    const { tree } = qualifiedTree();
+    const elsewhere = outsideDir("main");
+    fs.writeFileSync(path.join(elsewhere, "index.js"), "module.exports = 1;\n");
+    fs.mkdirSync(path.join(tree, "node_modules", "escaping-pkg"));
+    fs.writeFileSync(path.join(tree, "node_modules", "escaping-pkg", "package.json"), JSON.stringify({ name: "escaping-pkg", main: path.relative(path.join(tree, "node_modules", "escaping-pkg"), path.join(elsewhere, "index.js")) }));
+    expect(refusedChecks(tree)).toEqual([]);
+  });
+  it("NOT CAUGHT (named exclusion): an external node_modules/.bin link passes (below the top level)", () => {
+    const { tree } = qualifiedTree();
+    const tool = path.join(outsideDir("bin"), "tool");
+    fs.writeFileSync(tool, "#!/bin/sh\n", { mode: 0o755 });
+    fs.symlinkSync(tool, path.join(tree, "node_modules", ".bin", "tool"));
+    expect(refusedChecks(tree)).toEqual([]);
+  });
+
+  /** A worktree created at the remote's tag v9.9.9 (not at main), minted and installed. */
+  const atTag = (tagIt: (main: string) => void) => {
+    const w = workspace();
+    tagIt(w.main);
+    git(w.main, "push", "-q", "origin", "refs/tags/v9.9.9");
+    const tree = path.join(path.dirname(w.tree), "rel-tag");
+    git(w.main, "worktree", "add", "-q", "--detach", tree, "v9.9.9^{commit}");
+    expect(runGate(tree, ["--mint"]).status).toBe(0);
+    install(tree);
+    expect(git(tree, "rev-parse", "HEAD"), "precondition: HEAD is the tag, not the remote's main").not.toBe(git(tree, "ls-remote", "origin", "refs/heads/main").split("\t")[0]);
+    return { ...w, tree };
+  };
+  it("ACCEPTED as written (the HEAD rule): a LIGHTWEIGHT tag AHEAD of main qualifies the tree", () => {
+    const { tree } = atTag((main) => {
+      fs.writeFileSync(path.join(main, "ahead.txt"), "ahead");
+      git(main, "add", "-A");
+      git(main, "commit", "-q", "-m", "ahead of main, not pushed to main");
+      git(main, "tag", "v9.9.9"); // lightweight
+    });
+    expect(git(tree, "cat-file", "-t", "v9.9.9"), "precondition: lightweight (the tag names the commit itself)").toBe("commit");
+    expect(refusedChecks(tree)).toEqual([]);
+  });
+  it("ACCEPTED as written (the HEAD rule): an annotated tag OFF main (a commit main never had) qualifies the tree", () => {
+    const { tree, main } = atTag((m) => {
+      const base = git(m, "rev-parse", "HEAD");
+      fs.writeFileSync(path.join(m, "main-moves.txt"), "main moves on");
+      git(m, "add", "-A");
+      git(m, "commit", "-q", "-m", "main moves on");
+      git(m, "push", "-q", "origin", "HEAD:main");
+      git(m, "checkout", "-q", "--detach", base);
+      fs.writeFileSync(path.join(m, "side.txt"), "a side line");
+      git(m, "add", "-A");
+      git(m, "commit", "-q", "-m", "off main");
+      git(m, "tag", "-a", "-m", "release", "v9.9.9");
+    });
+    expect(spawnSync("git", ["merge-base", "--is-ancestor", "HEAD", "origin/main"], { cwd: tree, env: ISO_ENV }).status, "precondition: not on main").not.toBe(0);
+    expect(git(main, "cat-file", "-t", "v9.9.9"), "precondition: annotated").toBe("tag");
+    expect(refusedChecks(tree)).toEqual([]);
+  });
+  it("ACCEPTED as written (trusted): a NON-DEFAULT origin URL that serves the same main qualifies the tree", () => {
+    const { ws, main, tree } = qualifiedTree();
+    const mirror = path.join(ws, "elsewhere", "mirror.git");
+    fs.mkdirSync(path.dirname(mirror), { recursive: true });
+    git(ws, "clone", "-q", "--bare", path.join(ws, "origin.git"), mirror);
+    git(main, "remote", "set-url", "origin", mirror);
+    expect(git(tree, "remote", "get-url", "origin"), "precondition: origin points elsewhere").toBe(mirror);
+    expect(refusedChecks(tree)).toEqual([]);
   });
 
   it("HARM: --mint refuses a node_modules that a LINKED ANCESTOR routes outside the tree (state 'outside', not only 'real')", () => {
