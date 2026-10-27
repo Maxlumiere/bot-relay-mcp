@@ -82,25 +82,39 @@ describe("sync-call-recorder (the RELAY_TIMING_DIAG instrument)", () => {
     const plain = handle.transaction(() => 1) as unknown as Record<string, unknown>;
     rec = installSyncRecorder({ now, thresholdMs: THRESHOLD, ...protosOf(handle) });
     const tx = handle.transaction(() => (handle.prepare(SLOW_SQL).get(n) as { n: number }).n) as unknown as ((...a: unknown[]) => number) & Record<string, unknown>;
-    expect(Object.keys(tx).sort(), "the same own keys as an unwrapped transaction").toEqual(Object.keys(plain).sort());
-    expect(tx.database, ".database kept").toBe(handle);
-    // better-sqlite3 (lib/methods/transaction.js) RETURNS the `default` variant itself: tx.default === tx.
+    // better-sqlite3 (lib/methods/transaction.js) RETURNS the `default` variant itself (tx.default === tx), and gives all
+    // four variants the same non-configurable links plus `.database`. The wrapped graph must have the SAME shape.
+    const VARIANTS = ["default", "deferred", "immediate", "exclusive"] as const;
+    const keysOf = (o: object) => Reflect.ownKeys(o).map(String).filter((k) => k !== "length" && k !== "name" && k !== "prototype").sort();
+    const attrs = (o: object, k: string) => { const d = Object.getOwnPropertyDescriptor(o, k)!; return { enumerable: d.enumerable, configurable: d.configurable, writable: d.writable }; };
+    for (const v of VARIANTS) {
+      const w = tx[v] as Record<string, unknown>;
+      const p = plain[v] as Record<string, unknown>;
+      expect(keysOf(w), `${v}: the same own keys (Reflect.ownKeys)`).toEqual(keysOf(p));
+      for (const k of keysOf(p)) expect(attrs(w, k), `${v}.${k}: the same descriptor attributes`).toEqual(attrs(p, k));
+      for (const link of VARIANTS) expect(w[link], `${v}.${link} links to the wrapped ${link}`).toBe(tx[link]);
+      expect(w.database, `${v}.database is the handle`).toBe(handle);
+    }
     expect(tx.default, "the self-link kept: tx.default is the (timed) transaction itself").toBe(tx);
     expect(plain.default, "as in the library").toBe(plain);
-    for (const v of ["deferred", "immediate", "exclusive"]) {
-      expect(Object.keys(tx[v] as object).sort(), `${v}'s own keys kept (its links to the other variants)`).toEqual(Object.keys(plain[v] as object).sort());
-      expect((tx[v] as Record<string, unknown>).default, `${v}.default links to the timed default`).toBe(tx.default);
-    }
     for (const v of ["default", "deferred", "immediate", "exclusive"]) {
       const from = now();
       expect((tx[v] as () => number)(), `${v} runs the body`).toBe(n);
       const label = v === "default" ? "sqlite transaction (body + COMMIT)" : `sqlite transaction.${v} (body + COMMIT)`;
       expect(rec.overlapping(from, now()).map((c) => c.what), `${v} is timed`).toContain(label);
     }
+    // Retained wrappers of every kind (a transaction, a statement method, an iterator) work and stay SILENT after uninstall.
+    const st = handle.prepare(SLOW_SQL);
+    const retainedGet = st.get; // the wrapped prototype method, captured while installed
+    const iter = handle.prepare(SLOW_SQL).iterate(n) as Iterator<{ n: number }>; // next() wrapped while installed
     const counted = rec.count();
     rec.uninstall();
+    // An open iterator makes the whole CONNECTION busy (better-sqlite3), so it is stepped and closed first.
+    expect(iter.next().value?.n, "a retained iterator's next() still works").toBe(n);
+    iter.return?.();
     expect(tx(), "the retained transaction still works after uninstall").toBe(n);
-    expect(rec.count(), "and records nothing any more").toBe(counted);
+    expect((retainedGet.call(st, n) as { n: number }).n, "a retained statement method still works").toBe(n);
+    expect(rec.count(), "and none of them records anything any more").toBe(counted);
     handle.close();
   });
 
@@ -141,6 +155,16 @@ describe("sync-call-recorder (the RELAY_TIMING_DIAG instrument)", () => {
     expect(stProto.iterate).toBe(originals.it);
     expect(dbProto.transaction).toBe(originals.tx);
     handle.close();
+  });
+
+  it("ONE recorder per process: a second install while one is active THROWS (overlapping installs can never restore out of order); after uninstall, install works again", () => {
+    rec = installSyncRecorder({ now, thresholdMs: THRESHOLD });
+    const wrapped = fs.readFileSync;
+    expect(() => installSyncRecorder({ now, thresholdMs: THRESHOLD })).toThrow(/a recorder is already active in this process/);
+    expect(fs.readFileSync, "the refused install changed nothing").toBe(wrapped);
+    rec.uninstall();
+    rec = installSyncRecorder({ now, thresholdMs: THRESHOLD });
+    expect(fs.readFileSync).not.toBe(wrapped);
   });
 
   it("install is ALL-OR-NOTHING: a failure part-way restores what was already patched and rethrows", () => {

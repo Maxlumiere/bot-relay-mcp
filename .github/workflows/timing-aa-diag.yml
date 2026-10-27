@@ -64,13 +64,14 @@ jobs:
             echo "::endgroup::"
             clean=$(sed -E 's/\x1b\[[0-9;]*m//g' "aa-$i.log")
             lines=$(printf '%s\n' "$clean" | grep -E '(BREACH|DIAG) ' || true)
-            # "no breach" only when the bar COMPLETED: its BAR line and the recorder's per-bar total are both there.
+            # "no breach" only when the WHOLE A/A attempt sequence completed: the test prints the TERMINAL marker after its
+            # last attempt (a completed NOT_EVALUATED attempt followed by a stalled retry has a BAR line but no marker).
             completed=0
-            printf '%s\n' "$clean" | grep -q '^BAR A/A' && printf '%s\n' "$clean" | grep -q 'DIAG .* | recorder: ' && completed=1
+            printf '%s\n' "$clean" | grep -q '^DIAG A/A TERMINAL' && completed=1
             {
               echo "### run $i (vitest exit $rc)"
               if [ "$completed" = 0 ]; then
-                echo "INCOMPLETE run / no diagnostic output (vitest exit $rc): no BAR line or no recorder total"
+                echo "INCOMPLETE run / no diagnostic output (vitest exit $rc): no DIAG A/A TERMINAL marker"
                 [ -n "$lines" ] && { echo '```'; echo "$lines"; echo '```'; }
               elif printf '%s\n' "$lines" | grep -q '^BREACH '; then
                 echo '```'; echo "$lines"; echo '```'

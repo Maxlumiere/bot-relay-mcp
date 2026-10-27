@@ -22,9 +22,10 @@
  *   - other native addons; crypto and zlib *Sync; Atomics.wait; plain JavaScript compute; GC (reported separately).
  * TIMING NEUTRALITY IS NOT ESTABLISHED: every wrapped call, fast ones too, pays two clock reads and a closure call.
  *
- * SAFETY: installation is all-or-nothing (a failure part-way restores every change and re-syncs the ESM exports, then
- * rethrows); uninstall is idempotent; after it, any wrapper a caller still holds (a transaction function made while
- * installed, a captured fs function) passes straight through without recording.
+ * SAFETY: ONE recorder per process (a second install while one is active throws, so overlapping installs can never
+ * restore out of order); installation is all-or-nothing (a failure part-way restores every change and re-syncs the
+ * ESM exports, then rethrows); uninstall is idempotent; after it, any wrapper a caller still holds (a transaction
+ * function made while installed, a captured fs function) passes straight through without recording.
  */
 import fs from "fs";
 import childProcess from "child_process";
@@ -52,6 +53,8 @@ export interface SyncRecorder {
 }
 
 const MAX_KEPT = 1000;
+/** The process's one active recorder (or null). */
+let activeRecorder: SyncRecorder | null = null;
 const TX_VARIANTS = ["default", "deferred", "immediate", "exclusive"];
 
 function short(v: unknown): string {
@@ -77,6 +80,7 @@ export function installSyncRecorder(opts: {
   databaseProto?: Record<string, unknown>;
   statementProto?: Record<string, unknown>;
 }): SyncRecorder {
+  if (activeRecorder) throw new Error("sync-call-recorder: a recorder is already active in this process (one at a time; uninstall it first)");
   const { now, thresholdMs } = opts;
   const kept: SlowCall[] = [];
   let total = 0;
@@ -120,7 +124,9 @@ export function installSyncRecorder(opts: {
     active = false;
     while (restores.length) restores.pop()!();
     syncBuiltinESMExports();
+    if (activeRecorder === self) activeRecorder = null;
   };
+  let self: SyncRecorder | null = null;
 
   try {
     if (opts.databaseProto) {
@@ -176,7 +182,7 @@ export function installSyncRecorder(opts: {
     throw err;
   }
 
-  return {
+  self = {
     overlapping: (from, to) => kept.filter((c) => c.from < to && c.to > from),
     count: () => total,
     uninstall: () => {
@@ -184,4 +190,6 @@ export function installSyncRecorder(opts: {
       rollback();
     },
   };
+  activeRecorder = self;
+  return self;
 }
