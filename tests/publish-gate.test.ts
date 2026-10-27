@@ -245,5 +245,8 @@ describe.skipIf(process.platform === "win32")("the PROPERTY the registry check r
       expect(r.target, msg).toBe(want);
       expect(r.inScript, `the in-script registry is the target (${msg})`).toBe(r.target);
     }
+    // On record (the ruling: log the npm version): which npm this property was verified with, on this runner. A direct
+    // write: a passing test's console.log is not shown in every run (measured: hidden locally), this line always is.
+    process.stdout.write(`real-npm property: npm ${npmVersion} on ${process.platform}, in-script registry == ENEEDAUTH target for CLI, both env spellings and .npmrc\n`);
   }, 120_000);
 });
