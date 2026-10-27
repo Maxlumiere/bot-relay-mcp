@@ -25,9 +25,29 @@
 # Wired via package.json "prepublishOnly" so `npm publish` will refuse to ship
 # unless every check passes. Also runnable standalone for operator confidence.
 #
-# RUNNING FROM A FRESH CLONE (the real `npm publish` path): run `npm ci` FIRST to
-# install dependencies, then `npm publish` (which invokes this gate) or the gate
-# standalone. You do NOT need a manual `npm run build` first — the gate builds
+# NEVER IN THE SERVING TREE: publish from a throwaway git worktree (or a fresh clone) at
+# origin/main, with its own node_modules. In the tree the live daemon runs from (the
+# .relay-prod-tree marker, or a launchd/claude.json entry pointing at its dist), a
+# `git pull` + `npm ci` swaps packages under the running build; this gate refuses to
+# start there (scripts/prebuild-guard.mjs --publish, first thing below, no override). That check
+# is NOT complete yet: the .relay-prod-tree marker is its reliable signal (the consumer detection
+# sees only the forms it parses); a follow-up replaces it with a positive qualification of the tree.
+#
+# UNTIL THE POSITIVE-QUALIFICATION GATE LANDS, check these MANUALLY before publishing (this
+# gate's serving-tree check is not enough on its own):
+#   - a fresh linked worktree created for this release;
+#   - no .relay-prod-tree in it;
+#   - its OWN real node_modules (root AND extensions/vscode), never a worktree tool's symlink
+#     to the main checkout;
+#   - a clean tree at the fetched origin/main SHA;
+#   - `npm whoami` succeeds.
+# This gate CANNOT undo an earlier pull or `npm ci`: by the time it runs, they have
+# happened. So never run them in the serving tree at all; publish from a disposable
+# worktree with its own node_modules.
+#
+# IN THAT DISPOSABLE WORKTREE OR FRESH CLONE (the real `npm publish` path): run
+# `npm ci` there first (its own node_modules, never one linked to another tree), then
+# `npm publish` (which invokes this gate) or the gate standalone. You do NOT need a manual `npm run build` first — the gate builds
 # dist/ itself (step 2) before any test. Both stumbles that hit the 2.25.0 publish
 # from a fresh checkout are covered here: missing node_modules (→ `npm ci`) and
 # missing dist (→ the step-2 build-before-tests ordering).
@@ -57,6 +77,46 @@ for arg in "$@"; do
   if [ "$arg" = "--full" ]; then FULL_MODE=1; fi
   if [ "$arg" = "--list-steps" ]; then LIST_STEPS_MODE=1; fi
 done
+
+# PREFLIGHT, before any step. Skipped under --list-steps, which runs NO step (it only prints the
+# labels), so there is nothing to protect and nothing to publish (both checks cost no load):
+#  1. the serving tree is refused first (no override for a publish);
+#  2. a real `npm publish` (npm sets npm_lifecycle_event=prepublishOnly) checks the npm login NOW,
+#     not after the ~20-minute gate: on 26 Oct the gate passed and the upload then failed on an
+#     expired login.
+# The registry `npm publish` uploads to: package.json publishConfig.registry when set, else the
+# configured registry. The package name is unscoped, so no @scope:registry mapping applies.
+# KNOWN GAP: a CLI `npm publish --registry X` is not seen here; a follow-up closes it.
+publish_registry() {
+  local r
+  r=$(node -e 'const p=require(process.argv[1]); process.stdout.write((p.publishConfig && p.publishConfig.registry) || "")' "$PROJECT_ROOT/package.json" 2>/dev/null) || r=""
+  [ -n "$r" ] || r=$(npm config get registry 2>/dev/null) || r=""
+  printf '%s' "$r"
+}
+# A registry URL may carry a credential (user:token@) or a query: print it without either, never raw.
+redact_registry() {
+  printf '%s' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#; s#[?#].*$##'
+}
+if [ "$LIST_STEPS_MODE" != "1" ]; then
+  node "$PROJECT_ROOT/scripts/prebuild-guard.mjs" --publish || exit 1
+  if [ "${npm_lifecycle_event:-}" = "prepublishOnly" ]; then
+    _reg=$(publish_registry)
+    if [ -z "$_reg" ]; then
+      echo "✖ could not determine the registry npm publish would use (publishConfig.registry / npm config get registry)." >&2
+      exit 1
+    fi
+    if ! npm whoami --registry "$_reg" >/dev/null 2>&1; then
+      _shown=$(redact_registry "$_reg")
+      echo "✖ npm whoami --registry $_shown failed: not logged in to that registry (or the login expired)." >&2
+      echo "  Run \`npm login --registry $_shown\`, then \`npm publish\` again. Checked before the gate, so nothing ran." >&2
+      exit 1
+    fi
+  fi
+fi
+
+# Extension deps: install when a tool the extension steps run is missing, not only when
+# node_modules is absent (an EMPTY node_modules skipped the install; see the helper).
+. "$PROJECT_ROOT/scripts/lib/ext-deps.sh"
 
 FAIL=0
 STEPS=()
@@ -144,8 +204,8 @@ extension_bundle() {
     return 0
   fi
   ( cd "$ext_dir" && \
-    if [ ! -d node_modules ]; then
-      echo "  Installing extensions/vscode dependencies (one-time)..."
+    if relay_ext_deps_missing "$ext_dir"; then
+      echo "  Installing extensions/vscode dependencies (node_modules missing or incomplete)..."
       npm install --no-audit --no-fund --silent || return 1
     fi
     npm run bundle
@@ -247,9 +307,9 @@ step "npm audit (high+)" bash "$PROJECT_ROOT/scripts/audit-with-retry.sh" high |
 # permissive + tsc --noEmit only sees src/. Add an explicit compile step
 # for the extension subdir so future R0s catch this class of breakage.
 #
-# `npm install` is gated on the lockfile being absent — once the operator
-# has installed once, repeated runs are no-ops. The first install is
-# slowest but the lockfile sticks around in the working tree.
+# `npm install` runs when a tool the step needs is missing (relay_ext_deps_missing:
+# esbuild or tsc, POSIX or .cmd), including an EMPTY node_modules; once installed,
+# repeated runs are no-ops.
 extension_compile() {
   local ext_dir="$PROJECT_ROOT/extensions/vscode"
   if [ ! -d "$ext_dir" ]; then
@@ -261,8 +321,8 @@ extension_compile() {
     return 0
   fi
   ( cd "$ext_dir" && \
-    if [ ! -d node_modules ]; then
-      echo "  Installing extensions/vscode dependencies (one-time)..."
+    if relay_ext_deps_missing "$ext_dir"; then
+      echo "  Installing extensions/vscode dependencies (node_modules missing or incomplete)..."
       npm install --no-audit --no-fund --silent || return 1
     fi
     npx tsc -p . --noEmit
