@@ -23,9 +23,14 @@ import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { openWindow, within, type TestWindow } from "./helpers/watch-window.js";
 import { startToken } from "./helpers/start-token.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const HOOK = path.join(REPO, "hooks", "stop-check.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "dbpr7-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO, "hooks"), path.join(REPO, "bin")), "stop-check.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 const RELAY_BIN = path.join(REPO, "bin", "relay");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "doorbell-pr7-heal-")));
 const DB = path.join(ROOT, "inst", "relay.db");
@@ -44,7 +49,7 @@ afterAll(async () => {
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
 
-const env = (over: Record<string, string> = {}): Record<string, string> => ({ PATH: process.env.PATH ?? "", HOME, RELAY_DB_PATH: DB, RELAY_AGENT_NAME: "h-bob", RELAY_STOP_WAKE_DAMPER_SECS: "0", RELAY_FILESYSTEM_MARKERS: "0", ...over });
+const env = (over: Record<string, string> = {}): Record<string, string> => ({ PATH: process.env.PATH ?? "", HOME, RELAY_DB_PATH: DB, RELAY_AGENT_NAME: "h-bob", RELAY_STOP_WAKE_DAMPER_SECS: "0", RELAY_FILESYSTEM_MARKERS: "0", RELAY_TEST_CLOCK: "0", ...over });
 function stop(payload: Record<string, unknown> | null): { out: string; block: { decision: string; reason: string } | null } {
   const r = spawnSync("bash", [HOOK], { env: env(), input: payload ? JSON.stringify(payload) : "", encoding: "utf-8", timeout: 30_000 });
   const out = r.stdout ?? "";

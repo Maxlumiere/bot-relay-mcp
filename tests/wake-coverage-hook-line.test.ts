@@ -28,15 +28,23 @@
  * HOME — this test never touches the real ~/.bot-relay/wake-coverage-status.json. It also
  * pins RELAY_WAKE_COVERAGE_STATUS_PATH explicitly as the unambiguous env seam.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { spawnSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import Database from "better-sqlite3";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
-const HOOK = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "hooks", "check-relay.sh");
+const REPO = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+// A seamed hooks copy (tests/_helpers/hook-budget-tree.ts) with the repo's bin/ and dist/ linked: check-relay.sh
+// loads $HOOKS_DIR/../dist/wake-coverage-status.js, so a copy without dist/ would never print the line. Its budgeted
+// steps read a FIXED clock of 0 (RELAY_TEST_CLOCK): bash SECONDS ticks on whole wall-clock seconds, so on a slow
+// runner a step before the line could be skipped for budget.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "wchl-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO, "hooks"), path.join(REPO, "bin")), "check-relay.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 
 let home: string;
 let dbPath: string;
@@ -59,6 +67,7 @@ function runHook(env: Record<string, string> = {}): RunResult {
       RELAY_DB_PATH: dbPath,
       RELAY_HTTP_PORT: "1", // privileged port → ECONNREFUSED instantly; no live-daemon dependency
       RELAY_WAKE_COVERAGE_STATUS_PATH: statusPath,
+      RELAY_TEST_CLOCK: "0",
       ...env,
     },
     encoding: "utf8",

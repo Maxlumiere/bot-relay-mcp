@@ -316,6 +316,79 @@ export function deriveKeyringSubkeyFor(keyId: string, info: string): Buffer | nu
   return Buffer.from(crypto.hkdfSync("sha256", kr.keys[keyId], Buffer.alloc(0), Buffer.from(info, "utf8"), 32));
 }
 
+/** SEC-23: the domain label of a backup's key fingerprint. Changing it makes every recorded fingerprint mismatch. */
+export const BACKUP_KEY_FINGERPRINT_LABEL = "bot-relay backup key fingerprint v1";
+
+/**
+ * SEC-23: the FINGERPRINT a backup records for `keyId`: HMAC-SHA256(key, BACKUP_KEY_FINGERPRINT_LABEL), truncated to
+ * 128 bits, hex. It identifies the key without revealing it (the raw key never leaves this module). null when no
+ * keyring is configured or it does not hold `keyId`.
+ */
+export function backupKeyFingerprint(keyId: string): string | null {
+  const kr = loadKeyring();
+  if (!kr || !Object.prototype.hasOwnProperty.call(kr.keys, keyId)) return null;
+  return crypto.createHmac("sha256", kr.keys[keyId]).update(BACKUP_KEY_FINGERPRINT_LABEL).digest().subarray(0, 16).toString("hex");
+}
+
+const B64 = "[A-Za-z0-9+/]+={0,2}";
+const V2_SHAPE = new RegExp(`^enc:([a-zA-Z0-9_.-]+):(${B64}):(${B64})$`);
+const V1_SHAPE = new RegExp(`^enc1:(${B64}):(${B64})$`);
+
+/**
+ * SEC-23: THE classifier of a stored value (one module: backup's secret count, restore's staged scan and its
+ * decrypt probe all use it; there is no second copy of "is this ciphertext real").
+ *
+ * parseEnvelope: whether `stored` has the SHAPE of a ciphertext envelope: a v2 `enc:<key_id>:<iv>:<payload>` with a
+ * valid key id, or a legacy `enc1:<iv>:<payload>` (keyId null: the keyring's legacy id); strict base64; a 12-byte
+ * iv and a payload longer than the GCM tag (what decryptWithKeyId requires). A shape is not proof: only
+ * classifyStored's authenticated decrypt is.
+ */
+export function parseEnvelope(stored: string): { keyId: string | null } | null {
+  const m = V2_SHAPE.exec(stored);
+  const parts = m ? [m[2], m[3]] : V1_SHAPE.exec(stored)?.slice(1, 3);
+  if (!parts) return null;
+  if (Buffer.from(parts[0], "base64").length !== IV_LEN || Buffer.from(parts[1], "base64").length <= TAG_LEN) return null;
+  return { keyId: m ? m[1] : null };
+}
+
+export type UnverifiableReason = "no_keyring" | "key_not_held" | "auth_failed";
+export type StoredClass =
+  | { kind: "plaintext" }
+  | { kind: "encrypted"; keyId: string }
+  | { kind: "unverifiable"; keyId: string; reason: UnverifiableReason };
+
+/**
+ * plaintext: not an envelope (in no-key mode encryptContent stores its input unchanged, so a value that merely
+ * starts with `enc:` is plaintext). encrypted: it AUTHENTICATES under the keyring's key for its id (the GCM tag is
+ * the ground truth). unverifiable: an envelope that cannot be authenticated, with the reason: no keyring; the id is
+ * not held; or the id IS held and authentication FAILED (corruption, or the wrong key under that id). The decrypted
+ * value is discarded at once: never returned, logged or kept.
+ */
+export function classifyStored(stored: string): StoredClass {
+  const env = parseEnvelope(stored);
+  if (!env) return { kind: "plaintext" };
+  let kr: Keyring | null;
+  try {
+    kr = loadKeyring();
+  } catch {
+    kr = null;
+  }
+  const keyId = env.keyId ?? (kr ? kr.legacyKeyId : DEFAULT_LEGACY_KEY_ID);
+  if (!kr) return { kind: "unverifiable", keyId, reason: "no_keyring" };
+  if (!Object.prototype.hasOwnProperty.call(kr.keys, keyId)) return { kind: "unverifiable", keyId, reason: "key_not_held" };
+  try {
+    decryptContent(stored);
+  } catch {
+    return { kind: "unverifiable", keyId, reason: "auth_failed" };
+  }
+  return { kind: "encrypted", keyId };
+}
+
+/** Whether `id` is a well-formed key id (the keyring's own rule). */
+export function isValidKeyId(id: string): boolean {
+  return KEY_ID_RE.test(id);
+}
+
 /**
  * Whether `RELAY_ENCRYPTION_KEY` is being used — flag so callers can emit
  * the one-time deprecation warning at startup.

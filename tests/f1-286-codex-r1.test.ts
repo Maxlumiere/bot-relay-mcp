@@ -26,6 +26,7 @@ import { fileURLToPath, pathToFileURL } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders, mintSecretFor } from "./_helpers/mint.js";
 import { ownRecordedPid, signalOwnedPid, type OwnedPid } from "./_helpers/recorded-pid.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
@@ -36,6 +37,15 @@ const REAL_NODE = execFileSync("sh", ["-c", "command -v node"], { encoding: "utf
 const OK_ENTRY = { "bot-relay": { type: "stdio", command: "node", args: [DIST_INDEX] } };
 const PTU_HOOK = path.join(REPO_ROOT, "hooks", "post-tool-use-check.sh");
 const STOP_HOOK = path.join(REPO_ROOT, "hooks", "stop-check.sh");
+// Rows that need a budgeted step to RUN (registration, the mail read) run SEAMED_HOOK, a copy whose budgeted steps
+// read RELAY_TEST_CLOCK (tests/_helpers/hook-budget-tree.ts), which baseEnv fixes at 0: bash SECONDS ticks on whole
+// wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip (or, where a
+// skip prints the same "relay unreadable", pass without the read it claims). Rows that measure the deadline or the
+// budget run the live hooks, which never read RELAY_TEST_CLOCK: they stay on the real clock.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "f1286-seamed-"));
+const SEAMED_HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
+const SEAMED_DIR = path.dirname(SEAMED_HOOK);
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 
 delete process.env.RELAY_AGENT_TOKEN;
 delete process.env.RELAY_AGENT_NAME;
@@ -98,6 +108,7 @@ function baseEnv(home: string, over: Record<string, string>): Record<string, str
     RELAY_AGENT_TOKEN: "",
     RELAY_HTTP_HOST: "127.0.0.1",
     SHIM_MODE: "pass",
+    RELAY_TEST_CLOCK: "0", // read only by the seamed copy; the live hooks ignore it
     ...over,
   };
 }
@@ -128,7 +139,7 @@ describe("#286 R1 #1 — SessionStart is HEALTHY only after the mail read comple
     const home = path.join(ROOT, "home-a");
     fs.mkdirSync(home, { recursive: true });
     fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ mcpServers: OK_ENTRY }));
-    const r = spawnSync("bash", [HOOK], {
+    const r = spawnSync("bash", [SEAMED_HOOK], {
       encoding: "utf-8",
       timeout: 20_000,
       input: "",
@@ -167,7 +178,7 @@ describe("#286 R1 #1 — SessionStart is HEALTHY only after the mail read comple
     const marker = path.join(ROOT, "stall-b.pid");
     try {
       await waitForHealth(port, 8000);
-      const child = spawn("bash", [HOOK], {
+      const child = spawn("bash", [SEAMED_HOOK], {
         env: baseEnv(home, {
           RELAY_AGENT_NAME: "r1b-unique",
           RELAY_DB_PATH: dbPath,
@@ -229,7 +240,7 @@ describe("#286 R1 #6 and the task renderer — nothing contradictory or unrender
     fs.mkdirSync(home, { recursive: true });
     const dbPath = path.join(home, "relay.db");
     seedDb(dbPath, "r6");
-    const r = spawnSync("bash", [HOOK], {
+    const r = spawnSync("bash", [SEAMED_HOOK], {
       encoding: "utf-8",
       timeout: 20_000,
       input: "",
@@ -245,7 +256,7 @@ describe("#286 R1 #6 and the task renderer — nothing contradictory or unrender
     fs.mkdirSync(home, { recursive: true });
     const dbPath = path.join(home, "relay.db");
     seedDb(dbPath, "rt", true);
-    const r = spawnSync("bash", [HOOK], {
+    const r = spawnSync("bash", [SEAMED_HOOK], {
       encoding: "utf-8",
       timeout: 20_000,
       input: "",
@@ -260,7 +271,7 @@ describe("#286 R1 #6 and the task renderer — nothing contradictory or unrender
     fs.mkdirSync(home, { recursive: true });
     const dbPath = path.join(home, "relay.db");
     seedDb(dbPath, "rt2", true);
-    const r = spawnSync("bash", [HOOK], {
+    const r = spawnSync("bash", [SEAMED_HOOK], {
       encoding: "utf-8",
       timeout: 20_000,
       input: "",
@@ -306,7 +317,7 @@ async function tool(port: number, name: string, args: Record<string, unknown>, e
 }
 function runHookAsync(env: Record<string, string>): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const c = spawn("bash", [HOOK], { env });
+    const c = spawn("bash", [SEAMED_HOOK], { env });
     let stdout = "";
     let stderr = "";
     c.stdout.on("data", (d) => (stdout += d.toString()));
@@ -407,7 +418,7 @@ describe("#286 R1 #7 (ruling) — the verdict words are ONE closed set, document
  */
 describe("#286 R2 — one total order of verdicts on the SessionStart mail path", () => {
   function sessionStart(home: string, env: Record<string, string>) {
-    return spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, { RELAY_HTTP_PORT: "1", ...env }) });
+    return spawnSync("bash", [SEAMED_HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, { RELAY_HTTP_PORT: "1", ...env }) });
   }
 
   it("(C) an earlier DEGRADED (daemon unreachable) + a failed local read → BOTH reasons, joined, the mail-read one first", () => {
@@ -470,7 +481,7 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
       const db = await import(${JSON.stringify(pathToFileURL(path.join(REPO_ROOT, "dist", "db.js")).href)});
       db.sendMessage("s", "d1a", "hello without perl", "normal"); db.closeDb();`], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", HOME: ROOT, RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json") } });
     expect(send.status, send.stderr).toBe(0);
-    const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, { RELAY_AGENT_NAME: "d1a", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1" }) });
+    const r = spawnSync("bash", [SEAMED_HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, { RELAY_AGENT_NAME: "d1a", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1" }) });
     expect(r.stdout, r.stderr).toContain("[RELAY] Pending messages for d1a (showing 1 of 1):");
     expect(r.stdout).toContain("hello without perl");
   });
@@ -512,20 +523,33 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
     ["PostToolUse", PTU_HOOK, JSON.stringify({ session_id: "d1-ptu", hook_event_name: "PostToolUse", tool_name: "Read" })],
     ["Stop", STOP_HOOK, JSON.stringify({ session_id: "d1-stop", stop_hook_active: false })],
   ] as const) {
-    it(`${label}: a stalled read ends INSIDE the installed 5s budget, LOUD (DEGRADED timed out), with NO override`, () => {
-      const home = path.join(ROOT, `home-d1-${label}`);
+    // One run cannot pin both halves on a slow runner: the real clock can spend the 2s before the read (then the
+    // read is skipped, loudly), and a fixed clock keeps the read's deadline at 2s however late it starts. So each
+    // half is its own row, and NEITHER overrides the deadline (RELAY_PENDING_TIMEOUT_SECS stays unset).
+    const stalledRun = (tag: string, script: string) => {
+      const home = path.join(ROOT, `home-d1-${label}-${tag}`);
       fs.mkdirSync(home, { recursive: true });
       const dbPath = path.join(home, "relay.db");
       seedDb(dbPath, `d1${label.toLowerCase()}`);
+      const marker = path.join(ROOT, `stall-d1-${label}-${tag}.pid`);
       const t0 = Date.now();
-      const r = spawnSync("bash", [hook], { encoding: "utf-8", timeout: 40_000, input: stdin, env: baseEnv(home, {
+      const r = spawnSync("bash", [script], { encoding: "utf-8", timeout: 40_000, input: stdin, env: baseEnv(home, {
         RELAY_AGENT_NAME: `d1${label.toLowerCase()}`, RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1",
-        SHIM_MODE: "stall", SHIM_MARKER: path.join(ROOT, `stall-d1-${label}.pid`),
+        SHIM_MODE: "stall", SHIM_MARKER: marker,
         RELAY_HOOK_NOTICE_REMIND_SECS: "0", RELAY_STOP_WAKE_DAMPER_SECS: "0",
       }) });
-      const took = Date.now() - t0;
-      expect(took, `${label} must finish inside its 5s installed budget`).toBeLessThan(5_000);
+      return { r, took: Date.now() - t0, readStarted: fs.existsSync(marker) };
+    };
+    it(`${label}: a stalled read is ENDED by its deadline, LOUD (DEGRADED timed out), with NO override (fixed clock: the read always starts)`, () => {
+      const { r, took, readStarted } = stalledRun("seamed", path.join(SEAMED_DIR, path.basename(hook)));
+      expect(readStarted, "precondition: the read started (the stall shim recorded its pid)").toBe(true);
+      expect(took, "the deadline, not the 20s stalled child, ends the read").toBeLessThan(9_000);
       expect(r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*timed out/);
+    }, 45_000);
+    it(`${label}: on the REAL clock the hook ends INSIDE its installed 5s budget, LOUD either way (the read timed out, or no budget was left for it)`, () => {
+      const { r, took } = stalledRun("real", hook);
+      expect(took, `${label} must finish inside its 5s installed budget`).toBeLessThan(5_000);
+      expect(r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*(timed out|no time budget left)/);
     }, 45_000);
   }
 
@@ -578,7 +602,7 @@ describe("#286 D2 — SessionStart: a remote-only fresh install, and a path guar
   it("a configured DB whose PARENT DIRECTORY is absent → relay pending exit 1 → DEGRADED, never a mute '/relay.db' exit", () => {
     const home = path.join(ROOT, "home-d2b");
     fs.mkdirSync(home, { recursive: true });
-    const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, {
+    const r = spawnSync("bash", [SEAMED_HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, {
       RELAY_AGENT_NAME: "d2b", RELAY_DB_PATH: path.join(home, "no-such-dir", "relay.db"), RELAY_HTTP_PORT: "1",
     }) });
     expect(r.stderr).not.toMatch(/Got: '\/relay\.db'/);
@@ -599,7 +623,7 @@ describe("#286 D2 — SessionStart: a remote-only fresh install, and a path guar
       fs.copyFileSync(staged, dbPath);
       const home = path.join(ROOT, "home-d2c");
       fs.mkdirSync(home, { recursive: true });
-      const r = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, {
+      const r = spawnSync("bash", [SEAMED_HOOK], { encoding: "utf-8", timeout: 30_000, input: "", env: baseEnv(home, {
         RELAY_AGENT_NAME: "d2c", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1",
       }) });
       // The verdict carries the resolver's refusal (each reason is capped at 200

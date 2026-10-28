@@ -46,9 +46,9 @@ const __dirname = path.dirname(__filename);
 const HOOKS_DIR = path.resolve(__dirname, "..", "hooks");
 const PTU_HOOK = path.join(HOOKS_DIR, "post-tool-use-check.sh");
 const STOP_HOOK = path.join(HOOKS_DIR, "stop-check.sh");
-// Rows that need a margin-budgeted step to RUN (the liveness self-heal, the remote read) use a copy of the hooks whose
-// budgeted steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS ticks on whole
-// wall-clock seconds, so on a slow runner the 5s hooks' 2s margin can be spent first. The live hooks are unchanged.
+// Every hook row runs a copy of the hooks whose budgeted steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, set by
+// localEnv and FIXED_CLOCK; tests/_helpers/hook-budget-tree.ts): bash SECONDS ticks on whole wall-clock seconds, so on a
+// slow runner the 5s hooks' 2s margin can be spent first and a row read a skipped step. The live hooks are unchanged.
 let seamedHooks: string | null = null;
 const seamed = (hook: string) => path.join((seamedHooks ??= budgetTree(path.join(TEST_DIR, "seamed"), HOOKS_DIR, path.resolve(__dirname, "..", "bin"))), path.basename(hook));
 const FIXED_CLOCK = { RELAY_TEST_CLOCK: "0" };
@@ -216,6 +216,7 @@ function localEnv(name: string, token: string, home: string, dbPath = TEST_DB_PA
     RELAY_DB_PATH: dbPath,
     RELAY_HOOK_NOTICE_REMIND_SECS: "0",
     RELAY_STOP_WAKE_DAMPER_SECS: "0",
+    ...FIXED_CLOCK,
   };
 }
 
@@ -250,7 +251,7 @@ describe("F1 hook migration — PostToolUse, LOCAL mode: F1 only, ZERO HTTP requ
     dbSend("f1h-sender-1", "f1h-recv-1", "local mail", "normal");
     takeStubRequests();
 
-    const r = await runHook(PTU_HOOK, localEnv("f1h-recv-1", t, freshHome("p1")), PTU_STDIN);
+    const r = await runHook(seamed(PTU_HOOK), localEnv("f1h-recv-1", t, freshHome("p1")), PTU_STDIN);
     const ctx = ptuContext(r);
     expect(ctx).toMatch(/^relay: 1 unread for f1h-recv-1/);
     expect(ctx).toContain("f1h-sender-1");
@@ -271,7 +272,7 @@ describe("F1 hook migration — PostToolUse, LOCAL mode: F1 only, ZERO HTTP requ
       fs.writeFileSync(corrupt, "this is not a sqlite database, it is a trap\n".repeat(200));
       takeStubRequests();
 
-      const r = await runHook(PTU_HOOK, localEnv(name, t, freshHome("p2" + anchor), corrupt), PTU_STDIN);
+      const r = await runHook(seamed(PTU_HOOK), localEnv(name, t, freshHome("p2" + anchor), corrupt), PTU_STDIN);
       expect(takeStubRequests(), "an unreadable local DB must NEVER lead to an HTTP request").toEqual([]);
       const ctx = ptuContext(r);
       expect(ctx).toMatch(/relay unreadable/);
@@ -284,7 +285,7 @@ describe("F1 hook migration — PostToolUse, LOCAL mode: F1 only, ZERO HTTP requ
     const t = seedAgent("f1h-recv-3");
     takeStubRequests();
 
-    const r = await runHook(PTU_HOOK, localEnv("f1h-recv-3", t, freshHome("p3"), path.join(TEST_DIR, "absent.db")), PTU_STDIN);
+    const r = await runHook(seamed(PTU_HOOK), localEnv("f1h-recv-3", t, freshHome("p3"), path.join(TEST_DIR, "absent.db")), PTU_STDIN);
     expect(takeStubRequests(), "a missing configured DB must NEVER switch to HTTP").toEqual([]);
     expect(ptuContext(r)).toMatch(/relay unreadable/);
     expect(r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
@@ -339,8 +340,9 @@ describe("F1 hook migration — PostToolUse, REMOTE mode twin: the labeled HTTP 
     const t = seedAgent("f1h-recv-6");
     takeStubRequests();
     const r = await runHook(
-      PTU_HOOK,
+      seamed(PTU_HOOK),
       {
+        ...FIXED_CLOCK,
         HOME: freshHome("p6"),
         RELAY_AGENT_NAME: "f1h-recv-6",
         RELAY_AGENT_TOKEN: t,
@@ -362,7 +364,7 @@ describe("F1 hook migration — Stop hook: the same mode rule", () => {
     for (let i = 0; i < 23; i++) dbSend("f1h-sender-7", "f1h-recv-7", `stop mail ${i}`, "normal");
     takeStubRequests();
 
-    const r = await runHook(STOP_HOOK, localEnv("f1h-recv-7", t, freshHome("s1")), STOP_STDIN);
+    const r = await runHook(seamed(STOP_HOOK), localEnv("f1h-recv-7", t, freshHome("s1")), STOP_STDIN);
     expect(takeStubRequests(), "local mode must make ZERO HTTP requests").toEqual([]);
     const out = JSON.parse(r.stdout);
     expect(out.decision).toBe("block");
@@ -379,7 +381,7 @@ describe("F1 hook migration — Stop hook: the same mode rule", () => {
     fs.writeFileSync(corrupt, "not sqlite either\n".repeat(200));
     takeStubRequests();
 
-    const r = await runHook(STOP_HOOK, localEnv("f1h-recv-8", t, freshHome("s2"), corrupt), STOP_STDIN);
+    const r = await runHook(seamed(STOP_HOOK), localEnv("f1h-recv-8", t, freshHome("s2"), corrupt), STOP_STDIN);
     expect(takeStubRequests(), "an unreadable local DB must NEVER switch to HTTP").toEqual([]);
     expect(r.stdout).toBe("");
     expect(r.stderr).toMatch(/relay unreadable/);
@@ -450,7 +452,7 @@ describe("the unresolved name `default` is never an identity: no mail read, no j
   for (const [label, hook, stdin] of [["PostToolUse", PTU_HOOK, PTU_STDIN], ["Stop", STOP_HOOK, STOP_STDIN]] as const) {
     it(`${label}: RELAY_AGENT_NAME=default → no notice, no request, CANNOT-JUDGE (never "relay unreadable")`, async () => {
       takeStubRequests();
-      const r = await runHook(hook, { ...localEnv("default", "stubtoken-aaaaaaaaaaaa", freshHome(`dflt-${label}`)) }, stdin);
+      const r = await runHook(seamed(hook), { ...localEnv("default", "stubtoken-aaaaaaaaaaaa", freshHome(`dflt-${label}`)) }, stdin);
       expect(r.stdout).toBe("");
       expect(takeStubRequests()).toEqual([]);
       expect(r.stderr).toMatch(/VERDICT=CANNOT-JUDGE reason="agent name unresolved \(default\)/);

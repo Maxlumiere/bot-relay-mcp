@@ -42,7 +42,9 @@ afterEach(async () => {
   }
 });
 
-const marker = (m: string) => JSON.stringify({ marker: m });
+// The marker rides in a COPIED RelayConfig field: the archive's config is serialized through the field classification
+// (SEC-23), so a key the relay does not know would be dropped, and its JSON is re-serialized (compared parsed).
+const marker = (m: string) => JSON.stringify({ http_host: m });
 /** Export with the relay's own backup, then read the archived config.json (or null when the archive has none). */
 async function archivedConfig(): Promise<string | null> {
   const db = await import("../src/db.js");
@@ -53,7 +55,7 @@ async function archivedConfig(): Promise<string | null> {
   const x = spawnSync("tar", ["-xzf", r.archive_path, "-C", out], { encoding: "utf-8" });
   expect(x.status, x.stderr).toBe(0);
   const f = path.join(out, "config.json");
-  return fs.existsSync(f) ? fs.readFileSync(f, "utf-8") : null;
+  return fs.existsSync(f) ? JSON.stringify(JSON.parse(fs.readFileSync(f, "utf-8"))) : null;
 }
 
 describe("relay backup archives the config the relay READS (one resolver)", () => {

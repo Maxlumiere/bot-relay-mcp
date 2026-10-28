@@ -34,10 +34,17 @@ import cp from "child_process";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
 import { mintHeaders } from "./_helpers/mint.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const HOOK_SCRIPT = path.resolve(__dirname, "..", "hooks", "stop-check.sh");
+const REAL_HOOK_SCRIPT = path.resolve(__dirname, "..", "hooks", "stop-check.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+// Row (6) is an anti-hang ceiling that needs no step to run: it runs the shipped hook on the real clock.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "hstop-seamed-"));
+const HOOK_SCRIPT = path.join(budgetTree(SEAMED_ROOT, path.dirname(REAL_HOOK_SCRIPT), path.resolve(__dirname, "..", "bin")), "stop-check.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-stop-hook-test-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -134,6 +141,7 @@ function runHook(
       // Default the damper OFF so each test opts in explicitly; a hidden
       // 120s damper would make unrelated tests order-dependent.
       RELAY_STOP_WAKE_DAMPER_SECS: "0",
+      RELAY_TEST_CLOCK: "0",
     };
     for (const [k, v] of Object.entries(env)) {
       if (v !== undefined) finalEnv[k] = v;
@@ -473,7 +481,7 @@ describe("Stop hook — graceful degradation", () => {
       RELAY_HTTP_HOST: "127.0.0.1",
       RELAY_HTTP_PORT: "1",
       RELAY_DB_PATH: "/tmp/bot-relay-stop-hook-test-does-not-exist-" + process.pid + "/relay.db",
-    });
+    }, { script: REAL_HOOK_SCRIPT });
     expect(r.code).toBe(0);
     expect(r.stdout).toBe("");
     expect(r.durationMs).toBeLessThan(7000); // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe, do NOT tighten
@@ -598,7 +606,7 @@ describe("Stop hook — behavioral invariants", () => {
     // is WAL by default — -readonly silently degraded the whole fallback to
     // no-wake on affected machines. The read-only guarantee is therefore
     // structural: no mutating SQL exists in the file at all.
-    const src = fs.readFileSync(HOOK_SCRIPT, "utf8");
+    const src = fs.readFileSync(REAL_HOOK_SCRIPT, "utf8");
     expect(src).not.toMatch(/UPDATE\s+\w+\s+SET/i);
     expect(src).not.toMatch(/INSERT\s+INTO/i);
     expect(src).not.toMatch(/DELETE\s+FROM/i);
