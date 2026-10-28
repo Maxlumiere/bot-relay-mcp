@@ -260,6 +260,13 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
         );
       }
     }
+    const unloadable = encryption.keys.filter((k) => k.fingerprint_reason === "keyring_unreadable").map((k) => k.key_id);
+    if (unloadable.length) {
+      warnings.push(
+        `the configured encryption keyring could not be LOADED (fix its configuration): key id(s) ${unloadable.join(", ")} have NO fingerprint in this archive, ` +
+          `and the encrypted contents could not be checked. The archive was still written; restore checks each row against the keyring it is given.`
+      );
+    }
     if (config?.omitted) warnings.push(config.omitted + ".");
 
     // v2.1 Phase 4c.3: read from schema_info table (DB-actual), not the
@@ -307,7 +314,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     for (const fault of restrictToOwnerWindows(archivePath, false)) warnings.push(`the archive is NOT owner-only: ${fault}.`);
 
     if (encryption.keys.length) {
-      const k = encryption.keys.map((e) => `${e.key_id} (${e.rows} rows, fingerprint ${e.fingerprint ?? "unknown: this keyring does not hold it"})`).join(", ");
+      const k = encryption.keys.map((e) => `${e.key_id} (${e.rows} rows, fingerprint ${e.fingerprint ?? `none: ${e.fingerprint_reason}`})`).join(", ");
       process.stderr.write(`relay backup: rows encrypted under key id(s) ${k}. The key is NOT in this archive: keep it, or the archive cannot be restored.\n`);
     }
     for (const w of warnings) process.stderr.write(`relay backup: WARNING: ${w}\n`);

@@ -36,7 +36,6 @@
 
 import crypto from "crypto";
 import fs from "fs";
-import { log } from "./logger.js";
 
 const ALGO = "aes-256-gcm";
 const IV_LEN = 12;            // 96 bits, GCM recommended
@@ -142,10 +141,12 @@ function validateKeyring(kr: { current?: string; keys?: Record<string, unknown> 
 function warnReservedLookingIds(source: string, current: string, keys: Map<string, Buffer>): void {
   const used = RESERVED_LOOKING_KEY_IDS.filter((id) => keys.has(id) || id === current);
   for (const id of used) {
-    log.warn(
-      `[encryption] WARNING: the keyring from ${source} uses the key id "${id}", an Object.prototype name. It works, ` +
-        `but move its rows to an ordinary id: add a new key, make it current, then run ` +
-        `\`relay re-encrypt --from ${id} --to <new id>\`. See docs/key-rotation.md.`
+    // Written to stderr DIRECTLY, never through the logger: RELAY_LOG_LEVEL=error must not hide it (Codex #368 R1).
+    // Once per load (the keyring is cached per source). It names the id, never a key byte.
+    process.stderr.write(
+      `${new Date().toISOString()} [bot-relay] [warn] [encryption] WARNING: the keyring from ${source} uses the key id "${id}", ` +
+        `an Object.prototype name. It works, but move its rows to an ordinary id: add a new key, make it current, then run ` +
+        `\`relay re-encrypt --from ${id} --to <new id>\`. See docs/key-rotation.md.\n`
     );
   }
 }
@@ -348,6 +349,27 @@ export const BACKUP_KEY_FINGERPRINT_LABEL = "bot-relay backup key fingerprint v1
  * 128 bits, hex. It identifies the key without revealing it (the raw key never leaves this module). null when no
  * keyring is configured or it does not hold `keyId`.
  */
+export type FingerprintStatus =
+  | { fingerprint: string; reason: null }
+  | { fingerprint: null; reason: "no_keyring" | "key_not_held" | "keyring_unreadable" };
+
+/**
+ * backupKeyFingerprint, or why there is none. It NEVER throws: a backup is most needed when the keyring config is
+ * broken, so a keyring that cannot be loaded is a stated reason (keyring_unreadable), not an aborted export.
+ */
+export function backupKeyFingerprintStatus(keyId: string): FingerprintStatus {
+  let kr: Keyring | null;
+  try {
+    kr = loadKeyring();
+  } catch {
+    return { fingerprint: null, reason: "keyring_unreadable" };
+  }
+  if (!kr) return { fingerprint: null, reason: "no_keyring" };
+  const key = kr.keys.get(keyId);
+  if (!key) return { fingerprint: null, reason: "key_not_held" };
+  return { fingerprint: crypto.createHmac("sha256", key).update(BACKUP_KEY_FINGERPRINT_LABEL).digest().subarray(0, 16).toString("hex"), reason: null };
+}
+
 export function backupKeyFingerprint(keyId: string): string | null {
   const kr = loadKeyring();
   const key = kr?.keys.get(keyId);
