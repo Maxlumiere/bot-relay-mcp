@@ -42,7 +42,7 @@ const ENV_KEYS = [
   "RELAY_ENCRYPTION_LEGACY_KEY_ID",
 ] as const;
 const FP_LABEL = "bot-relay backup key fingerprint v1";
-const ZERO_REASONS = { no_keyring: 0, key_not_held: 0, auth_failed: 0 };
+const ZERO_REASONS = { no_keyring: 0, key_not_held: 0, auth_failed: 0, keyring_unreadable: 0 };
 
 const newKey = (): Buffer => crypto.randomBytes(32);
 const fingerprintOf = (key: Buffer): string => crypto.createHmac("sha256", key).update(FP_LABEL).digest().subarray(0, 16).toString("hex");
@@ -455,7 +455,7 @@ describe("SEC-23 R1: the plaintext count counts only what is not a well-formed c
     } finally {
       (process.stderr as unknown as { write: typeof orig }).write = orig;
     }
-    const want = { plaintext: 0, encrypted: 0, unverifiable: 1, unverifiable_reasons: { no_keyring: 1, key_not_held: 0, auth_failed: 0 } };
+    const want = { plaintext: 0, encrypted: 0, unverifiable: 1, unverifiable_reasons: { no_keyring: 1, key_not_held: 0, auth_failed: 0, keyring_unreadable: 0 } };
     expect(exp.webhook_secrets, "the export result").toEqual(want);
     expect(manifestOf(archiveBytes(String(exp.archive_path)).plain).webhook_secrets, "the manifest").toEqual(want);
     expect((exp.warnings as string[]).join(" "), "the result's warning").toMatch(/could NOT be verified.*no keyring/);
@@ -468,7 +468,7 @@ describe("SEC-23 R1: the plaintext count counts only what is not a well-formed c
     await useKeyring({ k1: newKey() }); // the same id, another key
     const { exportRelayState } = await import("../src/backup.js");
     const exp = (await exportRelayState({ destinationPath: path.join(ROOT, "wrongkey.tar.gz") })) as unknown as Record<string, unknown>;
-    expect(exp.webhook_secrets).toEqual({ plaintext: 0, encrypted: 0, unverifiable: 1, unverifiable_reasons: { no_keyring: 0, key_not_held: 0, auth_failed: 1 } });
+    expect(exp.webhook_secrets).toEqual({ plaintext: 0, encrypted: 0, unverifiable: 1, unverifiable_reasons: { no_keyring: 0, key_not_held: 0, auth_failed: 1, keyring_unreadable: 0 } });
     expect((exp.warnings as string[]).join(" ")).toMatch(/authentication FAILED.*corruption, or the wrong key/);
   });
 
