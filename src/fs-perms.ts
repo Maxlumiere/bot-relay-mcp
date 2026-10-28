@@ -19,11 +19,10 @@
  */
 
 import fs from "fs";
-import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "child_process";
 import { tmpdir as osTmpdir } from "os";
 import { join as pathJoin } from "path";
 import { log } from "./logger.js";
-import { systemBinary, SystemBinaryError, type SystemBinaryName } from "./system-binary.js";
+import { spawnSystem, SystemBinaryError } from "./system-binary.js";
 
 /** Chmod an existing file to the requested mode. Best-effort; log.warn on failure. */
 export function ensureSecureFile(path: string, mode: number): void {
@@ -116,19 +115,8 @@ export function windowsOwnerInfo(path: string): string | null {
   }
 }
 
-/**
- * Run a Windows system tool by its TRUSTED ABSOLUTE PATH (SEC-22, src/system-binary.ts), never by name: under Git Bash
- * a name finds GNU coreutils first. A tool that cannot be located is a FAILED run carrying the named reason (status
- * null, the reason as stderr), never a fallback to PATH.
- */
-function runSystem(name: SystemBinaryName, args: string[], opts: SpawnSyncOptionsWithStringEncoding): SpawnSyncReturns<string> {
-  try {
-    return spawnSync(systemBinary(name), args, { ...opts, shell: false }); // never a shell: it would find programs by name
-  } catch (err) {
-    if (!(err instanceof SystemBinaryError)) throw err;
-    return { pid: 0, output: [], stdout: "", stderr: err.message, status: null, signal: null, error: err };
-  }
-}
+/** A Windows system tool by its TRUSTED ABSOLUTE PATH (SEC-22): src/system-binary.ts spawnSystem. */
+const runSystem = spawnSystem;
 
 let currentUserSid: string | null | undefined;
 let currentUserSidFailure: string | null = null;
@@ -298,7 +286,7 @@ export function windowsOwner(path: string): string {
   const r = runSystem("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
     encoding: "utf-8",
     windowsHide: true,
-    env: { ...process.env, RELAY_OWNER_PATH: path },
+    named: { RELAY_OWNER_PATH: path }, // the clean base + the one variable the script reads (SEC-22 (ii))
   });
   const owner = r.status === 0 ? sddlOwner(r.stdout ?? "") : null;
   if (!owner) throw new Error(`the owner of "${path}" could not be read (powershell exit ${r.status}): ${(r.stderr || r.stdout || "").trim().slice(0, 200)}`);

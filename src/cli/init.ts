@@ -37,11 +37,11 @@ import os from "os";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { withDeadline } from "../http-deadline.js";
-import { execFileSync } from "child_process";
+import { execSystem } from "../system-binary.js"; // SEC-22: launchctl by its trusted path, never by name
 import readline from "readline/promises";
 import { ensureSecureDir, ensureSecureFile } from "../fs-perms.js";
-import { createInstance, generateInstanceId, resolveActiveInstanceId, instanceDir, instanceDirNames } from "../instance.js";
-import { getConfigPath } from "../config.js";
+import { createInstance, generateInstanceId, resolveActiveInstanceId, instanceDir, instanceDirNames, configPathForInstance, flatConfigPath } from "../instance.js";
+import { getConfigPath, configPathOverride } from "../config.js";
 import {
   readJsonSafe,
   atomicWriteJson,
@@ -60,9 +60,6 @@ function defaultBotRelayDir(): string {
   return path.join(os.homedir(), ".bot-relay");
 }
 
-function defaultConfigPath(): string {
-  return process.env.RELAY_CONFIG_PATH || path.join(defaultBotRelayDir(), "config.json");
-}
 
 /** v2.16.0 — Claude Code config locations. RELAY_CLAUDE_HOME overrides the
  *  home root (test harnesses) so init never touches a developer's real files. */
@@ -345,7 +342,7 @@ function realDaemonDeps(log: (l: string) => void): InstallDeps {
     fetchHealth: probeHealth,
     launchctlList: () => {
       try {
-        return execFileSync("launchctl", ["list"], { encoding: "utf-8" });
+        return execSystem("launchctl", ["list"]);
       } catch {
         return "";
       }
@@ -353,12 +350,12 @@ function realDaemonDeps(log: (l: string) => void): InstallDeps {
     bootstrap: (plistPath, label) => {
       const uid = process.getuid?.() ?? 0;
       try {
-        execFileSync("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "ignore" });
+        execSystem("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "ignore" });
       } catch {
         /* may already be bootstrapped (we only reach here on action=install) */
       }
       try {
-        execFileSync("launchctl", ["kickstart", "-k", `gui/${uid}/${label}`], { stdio: "ignore" });
+        execSystem("launchctl", ["kickstart", "-k", `gui/${uid}/${label}`], { stdio: "ignore" });
       } catch {
         /* best-effort start */
       }
@@ -428,7 +425,7 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     // instance dir below (createInstance) and owns its config path.
     effectiveInstanceId = args.instanceId ?? generateInstanceId();
     perInstanceDir = instanceDir(effectiveInstanceId) as string;
-    configPath = path.join(perInstanceDir, "config.json");
+    configPath = configPathForInstance(effectiveInstanceId);
   } else {
     // No explicit flag: reconcile the ACTIVE install exactly as the daemon sees
     // it. getConfigPath() honours the active-instance symlink, so init lands in
@@ -628,8 +625,8 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
   // already resolved to the instance above — this only fires on the env-only gap.
   if (
     !explicitInstance &&
-    !process.env.RELAY_CONFIG_PATH &&
-    path.resolve(configPath) === path.resolve(defaultConfigPath())
+    !configPathOverride() &&
+    path.resolve(configPath) === path.resolve(flatConfigPath())
   ) {
     // Reachable only under an explicit RELAY_DB_PATH (the resolver tolerates the
     // ambiguous state there); a warning, so an unreadable listing is just none.

@@ -19,6 +19,7 @@ import path from "path";
 import { spawn, spawnSync } from "child_process";
 import { pathToFileURL } from "url";
 import type { Server as HttpServer } from "http";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-d-")));
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
@@ -536,19 +537,20 @@ describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", 
    * (which also proves the hook sends the secret end to end), or the unnamed arm's silence would prove nothing.
    */
   const OBSERVED = path.join(ROOT, "observed-repo");
+  const OBSERVED_HOOKS = path.join(OBSERVED, "bot-relay-mcp", "hooks");
   const observedHook = (): string => {
     if (!fs.existsSync(OBSERVED)) {
-      fs.mkdirSync(OBSERVED);
-      fs.cpSync(path.resolve("hooks"), path.join(OBSERVED, "hooks"), { recursive: true });
-      // The hook reaches ../bin/relay and ../dist: the copy keeps the repo's shape.
-      for (const d of ["bin", "dist"]) fs.symlinkSync(path.resolve(d), path.join(OBSERVED, d), "junction");
+      // budgetTree: the hooks copied, the repo's bin/ and dist/ linked beside them (the hook reaches ../bin/relay and
+      // ../dist), and the budget arithmetic reading RELAY_TEST_CLOCK, fixed at 0 below (tests/_helpers/hook-budget-tree.ts):
+      // bash SECONDS ticks on whole wall-clock seconds, so on a slow runner registration could be skipped for budget.
+      budgetTree(OBSERVED, path.resolve("hooks"), path.resolve("bin"));
       fs.appendFileSync(
-        path.join(OBSERVED, "hooks", "_vault-helpers.sh"),
+        path.join(OBSERVED_HOOKS, "_vault-helpers.sh"),
         `\neval "relay_test__mint_cfg_real() $(declare -f relay_mint_secret_curl_config | sed 1d)"\n` +
           `relay_mint_secret_curl_config() { printf 'read\\n' >> "$RELAY_TEST_SECRET_READ_LOG"; relay_test__mint_cfg_real "$@"; }\n`,
       );
     }
-    return path.join(OBSERVED, "hooks", "check-relay.sh");
+    return path.join(OBSERVED_HOOKS, "check-relay.sh");
   };
   const runHookTraced = (port: number, name: string | undefined) =>
     new Promise<{ stdout: string; trace: string; status: number | null; secretReads: number }>((resolve) => {
@@ -563,6 +565,7 @@ describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", 
           RELAY_HTTP_HOST: "127.0.0.1",
           RELAY_HTTP_PORT: String(port),
           RELAY_AGENT_ROLE: "builder",
+          RELAY_TEST_CLOCK: "0",
           ...(name ? { RELAY_AGENT_NAME: name } : {}),
         },
         stdio: ["pipe", "pipe", "pipe"],

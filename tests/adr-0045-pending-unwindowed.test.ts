@@ -153,8 +153,11 @@ describe("ADR-0045 R3 — total_pending is unwindowed; a hiding window says hidd
 
 describe("ADR-0045 — release note", () => {
   it("the CHANGELOG tells existing callers that received-but-never-acked mail resurfaces until acked, and one ack clears it", () => {
-    const top = fs.readFileSync(path.join(REPO, "CHANGELOG.md"), "utf-8").split(/\n## /)[1] ?? "";
-    expect(top).toMatch(/resurface/i);
-    expect(top).toMatch(/one ack/i);
+    // The release that SHIPPED it (v4.0.0), found by its heading, never "the top section": an "## Unreleased"
+    // section above it is normal and must not hide the note.
+    const release = fs.readFileSync(path.join(REPO, "CHANGELOG.md"), "utf-8").split(/\n## /).find((s) => /^v4\.0\.0\b/.test(s));
+    expect(release, "the v4.0.0 section exists").toBeTruthy();
+    expect(release).toMatch(/resurface/i);
+    expect(release).toMatch(/one ack/i);
   });
 });

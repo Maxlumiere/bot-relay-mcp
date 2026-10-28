@@ -35,11 +35,15 @@ import path from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
 import { spawnNestedRun } from "./_setup/operator-tripwire.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const HOOK = path.join(REPO, "hooks", "check-relay.sh");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "guard-contain-")));
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner the registration could be skipped for budget and the
+// claim (or its twin) read a run that never reached register_agent.
+const HOOK = path.join(budgetTree(path.join(ROOT, "seamed"), path.join(REPO, "hooks"), path.join(REPO, "bin")), "check-relay.sh");
 const NODE_DIR = path.dirname(process.execPath);
 const DIST_DB = path.join(REPO, "dist", "db.js");
 /** A sandbox HOME holding a relay instance (the flat layout), created by the product itself. */
@@ -136,7 +140,7 @@ describe.skipIf(process.platform === "win32")("CONTAINMENT (black-box): an env-{
   it("THE CLAIM: under the tripwire, the hook's register_agent reaches curl at the repaired port 1 (/mcp, tool register_agent), and NOTHING targets :3777", () => {
     const ins = instrument("claim");
     const home = homeWithInstance("claim");
-    spawnSync("bash", [HOOK], { input: STDIN, encoding: "utf-8", timeout: 60_000, env: { PATH: `${ins.bin}:${NODE_DIR}:/usr/bin:/bin`, RELAY_AGENT_NAME: "fx-contain", HOME: home, NODE_OPTIONS: `--require ${ins.blocker}` } });
+    spawnSync("bash", [HOOK], { input: STDIN, encoding: "utf-8", timeout: 60_000, env: { PATH: `${ins.bin}:${NODE_DIR}:/usr/bin:/bin`, RELAY_AGENT_NAME: "fx-contain", HOME: home, NODE_OPTIONS: `--require ${ins.blocker}`, RELAY_TEST_CLOCK: "0" } });
     assertContainedRegistration(ins.records());
   }, 90_000);
 
@@ -144,7 +148,7 @@ describe.skipIf(process.platform === "win32")("CONTAINMENT (black-box): an env-{
     const ins = instrument("twin");
     const home = homeWithInstance("twin");
     await new Promise<number | null>((resolve) => {
-      const c = spawnNestedRun("bash", [HOOK], { env: { PATH: `${ins.bin}:${NODE_DIR}:/usr/bin:/bin`, RELAY_AGENT_NAME: "fx-contain", HOME: home, NODE_OPTIONS: `--require ${ins.blocker}` }, stdio: ["pipe", "ignore", "ignore"] });
+      const c = spawnNestedRun("bash", [HOOK], { env: { PATH: `${ins.bin}:${NODE_DIR}:/usr/bin:/bin`, RELAY_AGENT_NAME: "fx-contain", HOME: home, NODE_OPTIONS: `--require ${ins.blocker}`, RELAY_TEST_CLOCK: "0" }, stdio: ["pipe", "ignore", "ignore"] });
       c.stdin!.end(STDIN);
       c.on("close", resolve);
     });

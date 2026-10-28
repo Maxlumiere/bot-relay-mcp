@@ -26,7 +26,7 @@
  * Test path matches shipped path (so the test exercises the real seam):
  * the seam under test is the bash hook itself, not a TS/SQL surrogate.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterAll } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -34,11 +34,16 @@ import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, "..");
-const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "v2110-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
 
 const SEED_SESSION = "SEED-SESSION-DO-NOT-ROTATE";
@@ -178,6 +183,7 @@ function runHook(h: Harness, name: string, token: string): ReturnType<typeof spa
       RELAY_HTTP_HOST: "127.0.0.1",
       RELAY_HTTP_PORT: String(h.port),
       RELAY_AGENT_TOKEN: token,
+      RELAY_TEST_CLOCK: "0",
     },
     input: "",
   });

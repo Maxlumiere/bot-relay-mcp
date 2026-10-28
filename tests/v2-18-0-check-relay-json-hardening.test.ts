@@ -29,9 +29,14 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const CLAUDE_HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "v2180-seamed-"));
+const CLAUDE_HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
 
 function getFreePort(): Promise<number> {
@@ -124,6 +129,7 @@ function runHook(name: string, opts: { caps?: string; title?: string } = {}): vo
     RELAY_DB_PATH: h.dbPath,
     RELAY_HTTP_HOST: "127.0.0.1",
     RELAY_HTTP_PORT: String(h.port),
+    RELAY_TEST_CLOCK: "0",
   };
   if (opts.title !== undefined) env.RELAY_TERMINAL_TITLE = opts.title;
   spawnSync("bash", [CLAUDE_HOOK], { encoding: "utf-8", timeout: 12_000, env, input: "" });

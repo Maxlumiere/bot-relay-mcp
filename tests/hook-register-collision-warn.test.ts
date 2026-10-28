@@ -21,7 +21,7 @@
  * assertion proves the collision really happened (isError in the debug body) so a
  * missing warning can only mean "swallowed", never "no collision".
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterAll } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -29,9 +29,14 @@ import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "hrcw-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
 
 async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
@@ -93,6 +98,7 @@ function runHookNoToken(h: Harness, name: string, extraEnv: Record<string, strin
       RELAY_AGENT_NAME: name, RELAY_AGENT_ROLE: "builder", RELAY_AGENT_CAPABILITIES: "",
       RELAY_DB_PATH: h.dbPath, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(h.port),
       RELAY_AGENT_TOKEN: "", // FIRST SPAWN — no token
+      RELAY_TEST_CLOCK: "0",
       ...extraEnv,
     },
   });

@@ -20,6 +20,7 @@ import { fileURLToPath } from "url";
 import { openWindow, within, type TestWindow } from "./helpers/watch-window.js";
 import { startToken } from "./helpers/start-token.js";
 import { parentPidOf } from "./_helpers/recorded-pid.js";
+import { systemBinarySeamPath } from "./_helpers/system-binary-seam-env.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO, "bin", "relay");
@@ -206,7 +207,11 @@ describe("ownership (pure; ruling ffcaf608 D1): the window a watch descends from
 // The REAL CLI, inside real bound windows. THE INVARIANT (ruling 9becb599): a watch exits only to
 // deliver a wake, or (silently) because its window is gone; every other terminal state is DORMANT.
 
-const env = (): Record<string, string> => ({ PATH: process.env.PATH ?? "", HOME: path.join(ROOT, "home"), RELAY_DB_PATH: DB, RELAY_FILESYSTEM_MARKERS: "0" });
+// Every relay CLI this file runs loads the test-only system-tool seam (tests/_helpers/system-binary-seam.cjs): with no
+// RELAY_TEST_SYSTEM_BINARY_SEAM map it changes nothing; a run that names one maps the TRUSTED ps path to a test script.
+// SEC-22: the relay runs ps by its absolute trusted path with a clean env, so neither a PATH shim nor an env-reading
+// one reaches it. (The operator tripwire appends its own preload to this NODE_OPTIONS.)
+const env = (): Record<string, string> => ({ PATH: process.env.PATH ?? "", HOME: path.join(ROOT, "home"), RELAY_DB_PATH: DB, RELAY_FILESYSTEM_MARKERS: "0", NODE_OPTIONS: `--require ${systemBinarySeamPath()}` });
 const WATCH = (agent = "w-bob") => [agent, "--until-wake", "--interval", "1", "--dormant-check-s", "1"];
 const ARM_CHECK = (agent = "w-bob") => [agent, "--arm-check"];
 const lockStatus = (agent = "w-bob") => spawnSync("node", [RELAY_BIN, "watch", agent, "--lock-status"], { env: env(), encoding: "utf-8" }).stdout.trim();
@@ -297,44 +302,62 @@ describe("the harness's own dormant reader (flake B): one bad entry never blanks
 });
 const awakeReadable = W.awakeNowMs() !== null;
 /**
- * INV-LIVE-01: a PATH seam for `ps`, scoped to THE WATCH's own command (the test's probes read the real
+ * INV-LIVE-01: a seam for `ps`, scoped to THE WATCH's own command (the test's probes read the real
  * ps). Every read takes > 1 s (still under the runner's 2 s timeout, so arming works), and while the
  * STALL flag exists a read sleeps 3 s more: it TIMES OUT and reads empty, deterministically, even for a
  * read already in flight (the flag is checked after the first sleep). Unreadable, while the process lives.
+ * It replaces the relay's TRUSTED ps path (systemBinary) through the system-tool seam. The relay runs it with a clean
+ * env (SEC-22), so every value a seam script needs is WRITTEN INTO the script, never read from the env.
  */
 /** POSIX single-quoting, for the shell text of the ps SEAMS this file writes (never for a window command: those are typed). */
 const sq = (x: string) => `'${x.replace(/'/g, `'\\''`)}'`;
-const REAL_PS = spawnSync("sh", ["-c", "command -v ps"], { encoding: "utf-8" }).stdout.trim();
+const { systemBinary } = await import("../src/system-binary.js");
+/** The path the relay runs ps by (the seam's key), and the one a seam script hands the real work to. */
+const REAL_PS = process.platform === "win32" ? "" : systemBinary("ps");
+const seamOf = (script: string): Record<string, string> => ({ RELAY_TEST_SYSTEM_BINARY_SEAM: JSON.stringify({ [REAL_PS]: script }) });
 const SLOW_PS_DIR = path.join(ROOT, "slow-ps");
 const PS_STALL = path.join(SLOW_PS_DIR, "stall");
+/** One line per read the seam STALLED (written before the stall, so a read killed by its timeout still counts). */
+const PS_STALLED = path.join(SLOW_PS_DIR, "stalled");
 fs.mkdirSync(SLOW_PS_DIR, { recursive: true });
-fs.writeFileSync(path.join(SLOW_PS_DIR, "ps"), `#!/bin/sh\nsleep 1\n[ -e ${sq(PS_STALL)} ] && sleep 3\nexec ${sq(REAL_PS)} "$@"\n`, { mode: 0o755 });
+fs.writeFileSync(path.join(SLOW_PS_DIR, "ps"), `#!/bin/sh\nsleep 1\nif [ -e ${sq(PS_STALL)} ]; then echo x >> ${sq(PS_STALLED)}; sleep 3; fi\nexec ${sq(REAL_PS)} "$@"\n`, { mode: 0o755 });
 const stallPs = (on: boolean) => (on ? fs.writeFileSync(PS_STALL, "") : fs.rmSync(PS_STALL, { force: true }));
-/** The env that puts the slow seam first on the watch's PATH (the window's own PATH is this process's). */
-const SLOW_ENV = { PATH: `${SLOW_PS_DIR}:${process.env.PATH ?? ""}` };
+/**
+ * How many reads the slow seam has stalled. The POSITIVE marker that a slow-seam test's outage was real: without it,
+ * a test whose seam never reached the relay passes vacuously (MEASURED 26 Oct, the PIN below with the seam disabled:
+ * green). Each slow-seam test asserts its own watch's reads stalled.
+ */
+const stalledReads = (): number => (fs.existsSync(PS_STALLED) ? fs.readFileSync(PS_STALLED, "utf-8").split("\n").filter(Boolean).length : 0);
+/** The env that maps the watch's ps to the slow seam. */
+const SLOW_ENV = seamOf(path.join(SLOW_PS_DIR, "ps"));
 /**
  * INV-LIVE-01 R2: a FAST-failing seam for the bound tests. A `ps -o lstart= -p <the window's pid>` exits 1
  * with no output at once (no 2 s timeouts, so timing is deterministic) while the FLAG file exists, or
  * after AFTER such reads. Every other ps (other pids, the process table) is the real one. It COUNTS every
- * read of the window (PS_COUNT) and, separately, every one it let through to the real ps (PS_COUNT.ok), so a
+ * read of the window (its count file) and, separately, every one it let through to the real ps (count.ok), so a
  * test can show the seam really intercepted the watch: failed reads = all - ok.
  */
 const FAIL_PS_DIR = path.join(ROOT, "fail-ps");
 fs.mkdirSync(FAIL_PS_DIR, { recursive: true });
-fs.writeFileSync(
-  path.join(FAIL_PS_DIR, "ps"),
-  `#!/bin/sh\ncase " $* " in\n  *" -p $PS_TARGET "*)\n    n=$(cat "$PS_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$PS_COUNT.$$" && mv -f "$PS_COUNT.$$" "$PS_COUNT"\n    if [ -e "$PS_FLAG" ] || [ "$n" -gt "$PS_AFTER" ]; then exit 1; fi\n    k=$(cat "$PS_COUNT.ok" 2>/dev/null || echo 0); k=$((k+1)); echo "$k" > "$PS_COUNT.ok.$$" && mv -f "$PS_COUNT.ok.$$" "$PS_COUNT.ok" ;;\nesac\nexec ${sq(REAL_PS)} "$@"\n`,
-  { mode: 0o755 },
-);
 let failSeq = 0;
 /** A watch (bound 3 s of awake time, 1 s checks) whose reads of window `w`'s start fail while `flag` exists, or after `after` of them. */
-function failWatch(w: { pid: number }, o: { after?: number; flags?: string[]; env?: Record<string, string> } = {}): { args: string[]; env: Record<string, string>; flag: string; reads: () => number; okReads: () => number } {
+function failWatch(w: { pid: number }, o: { after?: number; flags?: string[]; env?: Record<string, string> } = {}): { args: string[]; env: Record<string, string>; flag: string; script: string; count: string; reads: () => number; okReads: () => number } {
   const n = ++failSeq;
   const flag = path.join(FAIL_PS_DIR, `flag-${n}`);
   const count = path.join(FAIL_PS_DIR, `count-${n}`);
-  const env = { PS_TARGET: String(w.pid), PS_FLAG: flag, PS_COUNT: count, PS_AFTER: String(o.after ?? 1_000_000), ...(o.env ?? {}), PATH: `${FAIL_PS_DIR}:${process.env.PATH ?? ""}` };
+  const after = o.after ?? 1_000_000;
+  // This watch's own seam script: its target, flag, count file and limit are written into it (the relay's clean env
+  // carries none of them).
+  const script = path.join(FAIL_PS_DIR, `ps-${n}`);
+  const c = sq(count);
+  fs.writeFileSync(
+    script,
+    `#!/bin/sh\ncase " $* " in\n  *" -p ${w.pid} "*)\n    n=$(cat ${c} 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > ${c}.$$ && mv -f ${c}.$$ ${c}\n    if [ -e ${sq(flag)} ] || [ "$n" -gt ${after} ]; then exit 1; fi\n    k=$(cat ${sq(`${count}.ok`)} 2>/dev/null || echo 0); k=$((k+1)); echo "$k" > ${sq(`${count}.ok`)}.$$ && mv -f ${sq(`${count}.ok`)}.$$ ${sq(`${count}.ok`)} ;;\nesac\nexec ${sq(REAL_PS)} "$@"\n`,
+    { mode: 0o755 },
+  );
+  const env = { ...(o.env ?? {}), ...seamOf(script) };
   const args = ["w-bob", "--until-wake", ...(o.flags ?? ["--interval", "1", "--dormant-check-s", "1", "--anchor-unknown-bound-s", "3"])];
-  return { args, env, flag, reads: () => readCount(count), okReads: () => readCount(`${count}.ok`) };
+  return { args, env, flag, script, count, reads: () => readCount(count), okReads: () => readCount(`${count}.ok`) };
 }
 /**
  * The fail-ps shim's count (flake g). The shim writes it to a temp file and RENAMES it into place, so a read never
@@ -364,7 +387,7 @@ describe.skipIf(process.platform === "win32")("the fail-ps shim's count (flake g
     on(f.flag);
     // The writer runs until the TEST says stop (an explicit handshake). Its 30 s deadline is checked BETWEEN commands,
     // not while one hangs, so it bounds a normal run, not a hung `ps`.
-    const writer = spawn("/bin/sh", ["-c", `end=$(( $(date +%s) + 30 )); while [ ! -e "$STOP" ] && [ $(date +%s) -lt $end ]; do ps -o lstart= -p 4242424 >/dev/null 2>&1; done`], { env: { ...process.env, ...f.env, STOP: stop }, stdio: "ignore" });
+    const writer = spawn("/bin/sh", ["-c", `end=$(( $(date +%s) + 30 )); while [ ! -e "$STOP" ] && [ $(date +%s) -lt $end ]; do ${sq(f.script)} -o lstart= -p 4242424 >/dev/null 2>&1; done`], { env: { ...process.env, STOP: stop }, stdio: "ignore" });
     // ANY exit or error before the stop handshake is a premature end: a death by signal leaves exitCode null too.
     let stopping = false;
     let premature: string | null = null;
@@ -384,7 +407,7 @@ describe.skipIf(process.platform === "win32")("the fail-ps shim's count (flake g
     try {
       // (1) READINESS, bounded: the shim has counted (its count file exists and reads > 0).
       const ready = Date.now();
-      while (Date.now() - ready < 10_000 && (fs.existsSync(f.env.PS_COUNT) ? f.reads() : 0) === 0) await new Promise((r) => setTimeout(r, 5));
+      while (Date.now() - ready < 10_000 && (fs.existsSync(f.count) ? f.reads() : 0) === 0) await new Promise((r) => setTimeout(r, 5));
       const first = f.reads();
       expect(first, "readiness: the shim counted within 10 s").toBeGreaterThan(0);
       // (2) A SEPARATE, FIXED sampling window: its own clock, started only now.
@@ -745,9 +768,11 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     await untilStatus("live");
     const pid = await r.pid();
     try {
+      const s0 = stalledReads();
       stallPs(true);
       // ~2 checks of two timed-out reads each: before the fix the FIRST read ended the watch (window_gone, silent)
       expect(await within(r.exited, 9_000), r.err()).toBe("timeout");
+      expect(stalledReads() - s0, "the watch's reads really stalled (the seam reached the relay)").toBeGreaterThan(0);
       expect(alive(pid)).toBe(true);
       expect(r.out()).toBe("");
     } finally {
@@ -768,6 +793,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     expect(hungPid).toBeGreaterThan(1);
     try {
       await new Promise((res) => setTimeout(res, 1_500)); // inside its check loop: ~all of it is synchronous ps time
+      const s0 = stalledReads();
       process.kill(hungPid, "SIGSTOP");
       stallPs(true); // the read in flight now sleeps past its 2 s timeout: it times out when the holder resumes
       ageHolder(winDir(win));
@@ -779,6 +805,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
       expect(await within(next.exited, 20_000), next.err()).toBe(0);
       process.kill(hungPid, "SIGCONT"); // only the TEST resumes it
       await expectDormantThenSilentExit(hung, win, /^superseded: /, winDir(win));
+      expect(stalledReads() - s0, "the hung holder's read really stalled (the seam reached the relay)").toBeGreaterThan(0);
     } finally {
       stallPs(false);
     }
@@ -788,7 +815,11 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     const r = win.runRelayWatch(WATCH(), { env: SLOW_ENV });
     await untilStatus("live");
     try {
+      const s0 = stalledReads();
       stallPs(true);
+      // The outage is REAL before the window closes: the watch's own read has stalled (bounded wait).
+      for (const t = Date.now(); Date.now() - t < 8_000 && stalledReads() === s0; ) await new Promise((res) => setTimeout(res, 50));
+      expect(stalledReads() - s0, "the watch's reads really stalled before the window closed (the seam reached the relay)").toBeGreaterThan(0);
       const t0 = Date.now();
       process.kill(win.pid, "SIGKILL");
       expect(await within(r.exited, 15_000), r.err()).toBe(0); // gone is the KERNEL's answer (ESRCH): no ps needed
