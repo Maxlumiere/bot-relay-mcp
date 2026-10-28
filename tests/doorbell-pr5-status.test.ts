@@ -15,16 +15,24 @@
  *   - The hook (the real check-relay.sh): silent when not-installed or all-well; otherwise the
  *     verb's lines; unreadable / no budget → DEGRADED, never silence.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi, afterAll } from "vitest";
 import { spawnSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import Database from "better-sqlite3";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const HOOK = path.join(REPO, "hooks", "check-relay.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts) in the rows that
+// need a step to RUN: bash SECONDS ticks on whole wall-clock seconds, so on a slow runner the step could be skipped
+// for budget and the row read the skip. The starved row (SECONDS=9) and the timed flood row stay on the real clock.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "dbpr5-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO, "hooks"), path.join(REPO, "bin")), "check-relay.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
+/** A seamed hooks copy of its own (budgetTree: hooks copied, the repo's bin/ and dist/ linked); returns check-relay.sh. */
+const seamedCopy = (dir: string) => path.join(budgetTree(dir, path.join(REPO, "hooks"), path.join(REPO, "bin")), "check-relay.sh");
 const S = await import("../src/cli/doorbell.js");
 const HBM = await import("../src/doorbell-heartbeat.js");
 const L = await import("../src/doorbell-log.js");
@@ -233,7 +241,7 @@ describe("Q6: the hook's lines (pure renderer)", () => {
 describe("the SessionStart hook (the real check-relay.sh)", () => {
   function runHook(env: Record<string, string> = {}) {
     const r = spawnSync("bash", [HOOK], {
-      env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json"), ...env },
+      env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json"), RELAY_TEST_CLOCK: "0", ...env },
       encoding: "utf8",
       timeout: 20_000,
     });
@@ -281,16 +289,12 @@ describe("the SessionStart hook (the real check-relay.sh)", () => {
   });
   /** A hooks COPY with `inject` placed right before the doorbell block (the step is reached as normal). */
   function hookCopyWith(inject: string) {
-    const copy = path.join(home, `inj-${Math.random().toString(36).slice(2)}`);
-    fs.cpSync(path.join(REPO, "hooks"), path.join(copy, "hooks"), { recursive: true });
-    fs.mkdirSync(path.join(copy, "bin"));
-    fs.symlinkSync(path.join(REPO, "bin", "relay"), path.join(copy, "bin", "relay"));
-    const hook = path.join(copy, "hooks", "check-relay.sh");
+    const hook = seamedCopy(path.join(home, `inj-${Math.random().toString(36).slice(2)}`));
     const marker = "# --- Doorbell (ADR-0038 Q3/V2";
     const src = fs.readFileSync(hook, "utf-8");
     expect(src.includes(marker)).toBe(true); // precondition
     fs.writeFileSync(hook, src.replace(marker, `${inject}\n${marker}`));
-    const r = spawnSync("bash", [hook], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
+    const r = spawnSync("bash", [hook], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json"), RELAY_TEST_CLOCK: "0" }, encoding: "utf8", timeout: 20_000 });
     return { stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
   }
   it("HARM (c927c81c D1): node missing AT the doorbell step → DEGRADED naming it (never a silent skip)", () => {
@@ -310,10 +314,11 @@ describe("the SessionStart hook (the real check-relay.sh)", () => {
     expect(r.stdout).toMatch(/VERDICT=DEGRADED reason="[^"]*doorbell status: could not create a private temp file/);
   });
   it("HARM (#304 R1 F8a): the hook relays ONLY [RELAY]-prefixed lines, at most 7, whatever the CLI prints (an injection boundary)", () => {
-    const copy = path.join(home, "stub");
-    fs.cpSync(path.join(REPO, "hooks"), path.join(copy, "hooks"), { recursive: true });
+    // A seamed copy whose linked bin/ is replaced by a stub bin/ (unlink removes the link, never its target).
+    const hook = seamedCopy(path.join(home, "stub"));
+    const copy = path.dirname(path.dirname(hook));
+    fs.unlinkSync(path.join(copy, "bin"));
     fs.mkdirSync(path.join(copy, "bin"));
-    fs.symlinkSync(path.join(REPO, "dist"), path.join(copy, "dist"));
     fs.writeFileSync(
       path.join(copy, "bin", "relay"),
       `if (process.argv[2] === "doorbell") {\n` +
@@ -323,7 +328,7 @@ describe("the SessionStart hook (the real check-relay.sh)", () => {
         `const r = require("child_process").spawnSync(process.execPath, [${JSON.stringify(path.join(REPO, "bin", "relay"))}, ...process.argv.slice(2)], { stdio: "inherit" });\n` +
         `process.exit(r.status ?? 1);\n`,
     );
-    const r = spawnSync("bash", [path.join(copy, "hooks", "check-relay.sh")], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json") }, encoding: "utf8", timeout: 20_000 });
+    const r = spawnSync("bash", [hook], { env: { ...process.env, HOME: home, RELAY_AGENT_NAME: "fx-probe", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(home, "wc.json"), RELAY_TEST_CLOCK: "0" }, encoding: "utf8", timeout: 20_000 });
     expect(r.stdout).not.toContain("INJECTED");
     expect(r.stdout.split("\n").filter((l) => l.startsWith("[RELAY] doorbell stub line"))).toHaveLength(7);
   });

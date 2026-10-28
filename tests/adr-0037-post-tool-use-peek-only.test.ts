@@ -44,10 +44,15 @@ import cp from "child_process";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
 import { mintHeaders } from "./_helpers/mint.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const HOOK_SCRIPT = path.resolve(__dirname, "..", "hooks", "post-tool-use-check.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "a37-seamed-"));
+const HOOK_SCRIPT = path.join(budgetTree(SEAMED_ROOT, path.join(path.resolve(__dirname, ".."), "hooks"), path.join(path.resolve(__dirname, ".."), "bin")), "post-tool-use-check.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 
 const TEST_DB_DIR = path.join(os.tmpdir(), "bot-relay-adr0037-" + process.pid);
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
@@ -173,6 +178,7 @@ function runHook(env: Record<string, string | undefined>, stdin: string = MAIN_A
       PATH: process.env.PATH ?? "",
       HOME: HOOK_HOME,
       RELAY_HOOK_NOTICE_REMIND_SECS: "0",
+      RELAY_TEST_CLOCK: "0",
     };
     for (const [k, v] of Object.entries(env)) {
       if (v === undefined) delete finalEnv[k];
