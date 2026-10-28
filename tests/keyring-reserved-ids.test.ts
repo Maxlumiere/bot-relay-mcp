@@ -24,7 +24,7 @@ import { fileURLToPath } from "url";
 import ts from "typescript-legacy";
 import { srcProgram, virtualProgram } from "./_helpers/ts-binding.js";
 
-const ENV = ["RELAY_ENCRYPTION_KEYRING", "RELAY_ENCRYPTION_KEYRING_PATH", "RELAY_ENCRYPTION_KEY", "RELAY_ENCRYPTION_LEGACY_KEY_ID", "RELAY_DB_PATH", "RELAY_HTTP_PORT"] as const;
+const ENV = ["RELAY_ENCRYPTION_KEYRING", "RELAY_ENCRYPTION_KEYRING_PATH", "RELAY_ENCRYPTION_KEY", "RELAY_ENCRYPTION_LEGACY_KEY_ID", "RELAY_DB_PATH", "RELAY_HTTP_PORT", "RELAY_CONFIG_PATH", "RELAY_LOG_LEVEL"] as const;
 const b64 = (b: Buffer): string => b.toString("base64");
 const newKey = (): Buffer => crypto.randomBytes(32);
 /** A real v2 ciphertext of `text` under `key`, labelled `id` (what encryptContent writes). */
@@ -167,6 +167,105 @@ describe("an Object.prototype name is an ordinary key id", () => {
   it("known-good twin: with NO keyring configured at all, the reason is no_keyring", async () => {
     const enc = await useRing(null);
     expect(enc.classifyStored(seal(newKey(), "k1", "x"))).toEqual({ kind: "unverifiable", keyId: "k1", reason: "no_keyring" });
+  });
+});
+
+/** stderr captured while `fn` runs. */
+async function stderrOf(fn: () => unknown | Promise<unknown>): Promise<string> {
+  const writes: string[] = [];
+  const orig = process.stderr.write.bind(process.stderr);
+  (process.stderr as unknown as { write: (c: unknown, ...a: unknown[]) => boolean }).write = (c: unknown, ...a: unknown[]) => {
+    writes.push(String(c));
+    return orig(c as string, ...(a as []));
+  };
+  try {
+    await fn();
+  } finally {
+    (process.stderr as unknown as { write: typeof orig }).write = orig;
+  }
+  return writes.join("");
+}
+
+describe("Codex R1: the reserved-id warning does not depend on the log level", () => {
+  it.each([
+    ["the keyring", (K: Buffer) => { process.env.RELAY_ENCRYPTION_KEYRING = ringJson("k1", [["k1", newKey()], ["__proto__", K]]); }, "__proto__"],
+    ["the legacy single key", (K: Buffer) => { process.env.RELAY_ENCRYPTION_KEY = b64(K); process.env.RELAY_ENCRYPTION_LEGACY_KEY_ID = "constructor"; }, "constructor"],
+  ] as Array<[string, (K: Buffer) => void, string]>)("under RELAY_LOG_LEVEL=error, a reserved id in %s is still warned about: ONCE per load, with no key bytes", async (_label, set, id) => {
+    process.env.RELAY_LOG_LEVEL = "error";
+    const K = newKey();
+    set(K);
+    const enc = await import("../src/encryption.js");
+    enc._resetKeyringCacheForTests();
+    const out = await stderrOf(() => {
+      enc.validateKeyringStrict();
+      enc.validateKeyringStrict(); // the cached keyring: no second warning
+    });
+    const hits = out.split("\n").filter((l) => l.includes(`relay re-encrypt --from ${id} --to <new id>`));
+    expect(hits.length, `one warning per load:\n${out}`).toBe(1);
+    expect(out.includes(b64(K)), "no key bytes").toBe(false);
+    expect(out.includes(K.toString("hex")), "no key bytes (hex)").toBe(false);
+    enc._resetKeyringCacheForTests();
+    expect((await stderrOf(() => enc.validateKeyringStrict())).includes(`--from ${id}`), "a new load warns again").toBe(true);
+  });
+});
+
+describe("Codex R1 (ruled): a keyring that cannot be LOADED does not stop a backup", () => {
+  async function seedUnderKey(K: Buffer) {
+    process.env.RELAY_DB_PATH = path.join(root, "relay.db");
+    process.env.RELAY_CONFIG_PATH = path.join(root, "config.json");
+    process.env.RELAY_HTTP_PORT = "1";
+    await useRing(ringJson("k1", [["k1", K]]));
+    const db = await import("../src/db.js");
+    await db.initializeDb();
+    db.registerAgent("alpha", "r", []);
+    db.registerAgent("beta", "r", []);
+    db.sendMessage("alpha", "beta", "a private body", "normal");
+    db.registerWebhook("https://example.com/hook", "message.sent", undefined, "whsec-under-k1");
+    return db;
+  }
+  const backupsOf = () => {
+    const d = path.join(root, "backups");
+    return fs.existsSync(d) ? fs.readdirSync(d).filter((f) => f.startsWith("pre-restore-")) : [];
+  };
+
+  it("the export COMPLETES: each needed key id has fingerprint null with the reason, the webhook secret is unverifiable (keyring_unreadable), and the warning is in stderr and the result", async () => {
+    await seedUnderKey(newKey());
+    await useRing("{ not json");
+    const { exportRelayState } = await import("../src/backup.js");
+    let exp: Record<string, unknown> = {};
+    const out = await stderrOf(async () => {
+      exp = (await exportRelayState({ destinationPath: path.join(root, "broken-ring.tar.gz") })) as unknown as Record<string, unknown>;
+    });
+    expect(fs.existsSync(String(exp.archive_path)), "the archive was written").toBe(true);
+    const keys = (exp.encryption as { keys: Array<Record<string, unknown>> }).keys;
+    expect(keys.map((k) => [k.key_id, k.fingerprint, k.fingerprint_reason])).toEqual([["k1", null, "keyring_unreadable"]]);
+    expect(exp.webhook_secrets).toEqual({ plaintext: 0, encrypted: 0, unverifiable: 1, unverifiable_reasons: { no_keyring: 0, key_not_held: 0, auth_failed: 0, keyring_unreadable: 1 } });
+    expect((exp.warnings as string[]).join(" ")).toMatch(/keyring could not be LOADED/);
+    expect(out).toMatch(/keyring could not be LOADED/);
+  });
+
+  it("restore of that archive under the WRONG key is refused before any mutation (a null fingerprint lets nothing through: the decrypt probe refuses)", async () => {
+    const db = await seedUnderKey(newKey());
+    await useRing("{ not json");
+    const { exportRelayState, importRelayState } = await import("../src/backup.js");
+    const exp = await exportRelayState({ destinationPath: path.join(root, "broken-ring.tar.gz") });
+    await useRing(ringJson("k1", [["k1", newKey()]])); // the same id, another key
+    db.closeDb();
+    await db.initializeDb();
+    db.registerAgent("live-only", "r", []);
+    await expect(importRelayState(exp.archive_path, { force: true })).rejects.toThrow(/does not decrypt/);
+    expect(backupsOf(), "no safety backup").toEqual([]);
+    expect(db.getAgents().map((a: { name: string }) => a.name)).toContain("live-only");
+  });
+
+  it("known-good twin: restore of that archive under the RIGHT key proceeds", async () => {
+    const K = newKey();
+    await seedUnderKey(K);
+    await useRing("{ not json");
+    const { exportRelayState, importRelayState } = await import("../src/backup.js");
+    const exp = await exportRelayState({ destinationPath: path.join(root, "broken-ring.tar.gz") });
+    await useRing(ringJson("k1", [["k1", K]]));
+    expect((await importRelayState(exp.archive_path, { force: true })).restored).toBe(true);
   });
 });
 

@@ -374,7 +374,7 @@ describe("SEC-23 R1: the needed-key scan sees every key id, in every column, cou
     await seed();
     await insertMessageRow(fakeCiphertext(id));
     const { keys, archive } = await exportedKeys(`proto-${id.replace(/_/g, "u")}.tar.gz`);
-    expect(keys.filter((k) => k.key_id === id), `${id} is in the manifest`).toEqual([{ key_id: id, rows: 1, fingerprint: null }]);
+    expect(keys.filter((k) => k.key_id === id), `${id} is in the manifest`).toEqual([{ key_id: id, rows: 1, fingerprint: null, fingerprint_reason: "no_keyring" }]);
     await useKeyring({ k1: newKey() });
     await expectRefusedBeforeAnyMutation(archive, new RegExp(`key id.*${reEscape(id)}.*not held`, "i"));
   });
