@@ -36,6 +36,7 @@
 
 import crypto from "crypto";
 import fs from "fs";
+import { log } from "./logger.js";
 
 const ALGO = "aes-256-gcm";
 const IV_LEN = 12;            // 96 bits, GCM recommended
@@ -45,9 +46,17 @@ const V1_PREFIX = "enc1:";    // legacy v1 (Phase 4p), read-only
 const KEY_ID_RE = /^[a-zA-Z0-9_.-]+$/;
 const DEFAULT_LEGACY_KEY_ID = "k1";
 
+/**
+ * Key ids that are Object.prototype names. They are ORDINARY key ids (the keys map is a Map, every lookup is by own
+ * key), but a keyring using one is warned about at load, since any plain-object handling of key ids elsewhere would
+ * mishandle it. docs/key-rotation.md says not to choose them.
+ */
+export const RESERVED_LOOKING_KEY_IDS: readonly string[] = ["__proto__", "constructor", "prototype"];
+
 export interface Keyring {
   current: string;
-  keys: Record<string, Buffer>;
+  /** A Map, never a plain object: a key id like `__proto__` is a key, not a prototype (an object would SET it). */
+  keys: Map<string, Buffer>;
   /**
    * Which `enc1:` ciphertext rows are assumed to belong to. Defaults to
    * `RELAY_ENCRYPTION_LEGACY_KEY_ID` or "k1" if unset.
@@ -72,8 +81,8 @@ function sourceSignature(): string {
   ].join("\x00");
 }
 
-function parseKeysMap(source: string, raw: Record<string, string>): Record<string, Buffer> {
-  const out: Record<string, Buffer> = {};
+function parseKeysMap(source: string, raw: Record<string, string>): Map<string, Buffer> {
+  const out = new Map<string, Buffer>();
   for (const [keyId, b64] of Object.entries(raw)) {
     if (!KEY_ID_RE.test(keyId)) {
       throw new Error(
@@ -95,7 +104,7 @@ function parseKeysMap(source: string, raw: Record<string, string>): Record<strin
           `Generate with: openssl rand -base64 32`
       );
     }
-    out[keyId] = buf;
+    out.set(keyId, buf);
   }
   return out;
 }
@@ -116,16 +125,29 @@ function validateKeyring(kr: { current?: string; keys?: Record<string, unknown> 
     throw new Error(`Keyring from ${source} missing "keys" object`);
   }
   const keys = parseKeysMap(source, kr.keys as Record<string, string>);
-  if (!keys[kr.current]) {
+  if (!keys.has(kr.current)) {
     throw new Error(
       `Keyring from ${source}: "current" = "${kr.current}" does not appear in keys map`
     );
   }
+  warnReservedLookingIds(source, kr.current, keys);
   return {
     current: kr.current,
     keys,
     legacyKeyId: process.env.RELAY_ENCRYPTION_LEGACY_KEY_ID || DEFAULT_LEGACY_KEY_ID,
   };
+}
+
+/** The LOUD warning at load for a keyring that uses an Object.prototype name as a key id, naming the remedy. */
+function warnReservedLookingIds(source: string, current: string, keys: Map<string, Buffer>): void {
+  const used = RESERVED_LOOKING_KEY_IDS.filter((id) => keys.has(id) || id === current);
+  for (const id of used) {
+    log.warn(
+      `[encryption] WARNING: the keyring from ${source} uses the key id "${id}", an Object.prototype name. It works, ` +
+        `but move its rows to an ordinary id: add a new key, make it current, then run ` +
+        `\`relay re-encrypt --from ${id} --to <new id>\`. See docs/key-rotation.md.`
+    );
+  }
 }
 
 function loadKeyring(): Keyring | null {
@@ -222,9 +244,10 @@ function loadKeyring(): Keyring | null {
     }
     const kr: Keyring = {
       current: legacyId,
-      keys: { [legacyId]: buf },
+      keys: new Map([[legacyId, buf]]),
       legacyKeyId: legacyId,
     };
+    warnReservedLookingIds("RELAY_ENCRYPTION_KEY", legacyId, kr.keys);
     state.keyring = kr;
     state.sourceSignature = sig;
     return kr;
@@ -273,7 +296,7 @@ export function getKeyringInfo(): { current: string | null; known_key_ids: strin
     if (!kr) return { current: null, known_key_ids: [], legacy_key_id: DEFAULT_LEGACY_KEY_ID };
     return {
       current: kr.current,
-      known_key_ids: Object.keys(kr.keys).sort(),
+      known_key_ids: [...kr.keys.keys()].sort(),
       legacy_key_id: kr.legacyKeyId,
     };
   } catch {
@@ -299,7 +322,7 @@ export function getKeyringInfo(): { current: string | null; known_key_ids: strin
 export function deriveKeyringSubkey(info: string): Buffer | null {
   const kr = loadKeyring();
   if (!kr) return null;
-  const ikm = kr.keys[kr.current];
+  const ikm = kr.keys.get(kr.current)!;
   // hkdfSync returns an ArrayBuffer; wrap for a Buffer API. Empty salt is fine
   // for HKDF when the ikm is already a high-entropy 32-byte key (RFC 5869 §3.1).
   return Buffer.from(crypto.hkdfSync("sha256", ikm, Buffer.alloc(0), Buffer.from(info, "utf8"), 32));
@@ -312,8 +335,9 @@ export function deriveKeyringSubkey(info: string): Buffer | null {
  */
 export function deriveKeyringSubkeyFor(keyId: string, info: string): Buffer | null {
   const kr = loadKeyring();
-  if (!kr || !Object.prototype.hasOwnProperty.call(kr.keys, keyId)) return null;
-  return Buffer.from(crypto.hkdfSync("sha256", kr.keys[keyId], Buffer.alloc(0), Buffer.from(info, "utf8"), 32));
+  const key = kr?.keys.get(keyId);
+  if (!key) return null;
+  return Buffer.from(crypto.hkdfSync("sha256", key, Buffer.alloc(0), Buffer.from(info, "utf8"), 32));
 }
 
 /** SEC-23: the domain label of a backup's key fingerprint. Changing it makes every recorded fingerprint mismatch. */
@@ -326,8 +350,9 @@ export const BACKUP_KEY_FINGERPRINT_LABEL = "bot-relay backup key fingerprint v1
  */
 export function backupKeyFingerprint(keyId: string): string | null {
   const kr = loadKeyring();
-  if (!kr || !Object.prototype.hasOwnProperty.call(kr.keys, keyId)) return null;
-  return crypto.createHmac("sha256", kr.keys[keyId]).update(BACKUP_KEY_FINGERPRINT_LABEL).digest().subarray(0, 16).toString("hex");
+  const key = kr?.keys.get(keyId);
+  if (!key) return null;
+  return crypto.createHmac("sha256", key).update(BACKUP_KEY_FINGERPRINT_LABEL).digest().subarray(0, 16).toString("hex");
 }
 
 const B64 = "[A-Za-z0-9+/]+={0,2}";
@@ -351,7 +376,7 @@ export function parseEnvelope(stored: string): { keyId: string | null } | null {
   return { keyId: m ? m[1] : null };
 }
 
-export type UnverifiableReason = "no_keyring" | "key_not_held" | "auth_failed";
+export type UnverifiableReason = "no_keyring" | "key_not_held" | "auth_failed" | "keyring_unreadable";
 export type StoredClass =
   | { kind: "plaintext" }
   | { kind: "encrypted"; keyId: string }
@@ -371,11 +396,12 @@ export function classifyStored(stored: string): StoredClass {
   try {
     kr = loadKeyring();
   } catch {
-    kr = null;
+    // A keyring IS configured but cannot be loaded (e.g. malformed JSON): its own reason, never "no keyring".
+    return { kind: "unverifiable", keyId: env.keyId ?? (process.env.RELAY_ENCRYPTION_LEGACY_KEY_ID || DEFAULT_LEGACY_KEY_ID), reason: "keyring_unreadable" };
   }
   const keyId = env.keyId ?? (kr ? kr.legacyKeyId : DEFAULT_LEGACY_KEY_ID);
   if (!kr) return { kind: "unverifiable", keyId, reason: "no_keyring" };
-  if (!Object.prototype.hasOwnProperty.call(kr.keys, keyId)) return { kind: "unverifiable", keyId, reason: "key_not_held" };
+  if (!kr.keys.has(keyId)) return { kind: "unverifiable", keyId, reason: "key_not_held" };
   try {
     decryptContent(stored);
   } catch {
@@ -414,7 +440,7 @@ export function isLazyReencryptEnabled(): boolean {
 export function encryptContent(plaintext: string): string {
   const kr = loadKeyring();
   if (!kr) return plaintext;
-  const key = kr.keys[kr.current];
+  const key = kr.keys.get(kr.current)!;
   const iv = crypto.randomBytes(IV_LEN);
   const cipher = crypto.createCipheriv(ALGO, key, iv);
   const enc = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
@@ -465,7 +491,7 @@ function decryptWithKeyId(keyId: string, ivB64: string, payloadB64: string): str
         `Set RELAY_ENCRYPTION_KEYRING or RELAY_ENCRYPTION_KEYRING_PATH.`
     );
   }
-  const key = kr.keys[keyId];
+  const key = kr.keys.get(keyId);
   if (!key) {
     throw new Error(
       `Row is encrypted with key_id="${keyId}" but that key is not in the keyring. ` +
@@ -499,7 +525,7 @@ export function reencryptRow(stored: string, toKeyId: string): string {
   if (!kr) {
     throw new Error(`reencryptRow requires a keyring. None is configured.`);
   }
-  if (!kr.keys[toKeyId]) {
+  if (!kr.keys.has(toKeyId)) {
     throw new Error(
       `reencryptRow target key_id="${toKeyId}" is not in the keyring.`
     );

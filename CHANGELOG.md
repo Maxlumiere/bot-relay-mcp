@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Encryption: a key id that is an Object.prototype name (`__proto__`, `constructor`, `prototype`) is an ordinary key id
+
+- **Fixed:** the keyring kept its keys in a plain object, so a key id named `__proto__` replaced the object's prototype instead of being stored as a key. That key was missing from the keyring's key list (`known_key_ids`), yet its rows still decrypted. A keyring whose `current` was `__proto__` encrypted every new row under a key it reported it did not have, which `relay re-encrypt` and restore's keyring check then could not see. A row under a missing `constructor` id failed with a `TypeError` instead of the named "not in the keyring" error.
+- **Now** the keys are kept in a Map and every lookup is by own key: such an id is listed, decrypts its own rows, works as `current`, and can be re-encrypted away from with `relay re-encrypt --from <id> --to <new id>`. Loading a keyring that uses one logs a loud warning naming that command. No keyring that loaded before is refused now.
+- **Backup:** a webhook secret under a keyring that is configured but cannot be loaded (e.g. malformed JSON) is now unverifiable for its own reason, `keyring_unreadable`, not "no keyring".
+
 ### `relay backup` / `relay restore`: what an archive carries, and a keyring check on restore (SEC-23)
 
 - **What a backup leaves out, concretely:** the keyring and its sources and the mint-secret file are never archived, and the config credentials the relay recognises are redacted. Arbitrary copied content is NOT inspected: a copied config value (a nested one included) and the application data in the DB (message bodies, task text) are archived as they are.

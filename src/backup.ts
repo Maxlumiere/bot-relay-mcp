@@ -252,6 +252,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
           why.no_keyring ? `${why.no_keyring} with no keyring to check them` : "",
           why.key_not_held ? `${why.key_not_held} under a key id this keyring does not hold` : "",
           why.auth_failed ? `${why.auth_failed} whose authentication FAILED under the key this keyring holds for their id (corruption, or the wrong key)` : "",
+          why.keyring_unreadable ? `${why.keyring_unreadable} because the configured keyring could not be LOADED (fix its configuration)` : "",
         ].filter(Boolean);
         warnings.push(
           `${nUnv} webhook secret${nUnv === 1 ? " looks" : "s look"} encrypted but could NOT be verified (${reasons.join("; ")}): treat ${nUnv === 1 ? "it" : "them"} as possibly PLAINTEXT, IN this archive. ` +

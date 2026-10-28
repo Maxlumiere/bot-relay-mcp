@@ -130,7 +130,7 @@ export interface WebhookSecretCount {
  * table cannot be discovered or read. No decrypted value is kept.
  */
 export function classifyWebhookSecrets(db: CompatDatabase): WebhookSecretCount | null {
-  const count: WebhookSecretCount = { plaintext: 0, encrypted: 0, unverifiable: 0, unverifiable_reasons: { no_keyring: 0, key_not_held: 0, auth_failed: 0 } };
+  const count: WebhookSecretCount = { plaintext: 0, encrypted: 0, unverifiable: 0, unverifiable_reasons: { no_keyring: 0, key_not_held: 0, auth_failed: 0, keyring_unreadable: 0 } };
   try {
     const found = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'webhook_subscriptions' COLLATE NOCASE").get() as { name: string } | undefined;
     if (!found) return count;
