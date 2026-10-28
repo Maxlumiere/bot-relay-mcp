@@ -60,7 +60,7 @@ const { closeDb, getDb } = await import("../src/db.js");
 let server: HttpServer;
 let baseUrl: string;
 
-async function rpc(tool: string, args: any, token?: string): Promise<any> {
+async function rpc(tool: string, args: any, token?: string, expectError = false): Promise<any> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
@@ -73,7 +73,7 @@ async function rpc(tool: string, args: any, token?: string): Promise<any> {
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
   });
-  return toolCallResult(res);
+  return toolCallResult(res, { tool, expectError });
 }
 
 async function register(name: string, caps: string[] = []): Promise<string> {
@@ -172,7 +172,7 @@ describe("v2.1 Phase 5b — load smoke", () => {
   it("cap check still enforced under concurrent load — unauthed broadcast refused", async () => {
     // Fire 20 concurrent unauthed broadcasts (cap-gated). ALL must refuse.
     const attempts = Array.from({ length: 20 }, (_, i) =>
-      rpc("broadcast", { from: `ghost-${i}`, content: "x" })
+      rpc("broadcast", { from: `ghost-${i}`, content: "x" }, undefined, true)
     );
     const results = await Promise.all(attempts);
     const refused = results.filter((r) => r.success === false).length;

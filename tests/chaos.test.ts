@@ -86,7 +86,7 @@ async function killDaemon(signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
   daemon = null;
 }
 
-async function rpc(tool: string, args: any, token?: string): Promise<any> {
+async function rpc(tool: string, args: any, token?: string, expectError = false): Promise<any> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
@@ -99,7 +99,7 @@ async function rpc(tool: string, args: any, token?: string): Promise<any> {
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
   });
-  return toolCallResult(res);
+  return toolCallResult(res, { tool, expectError });
 }
 
 function integrityCheck(): string {
@@ -203,16 +203,17 @@ describe("v2.1 Phase 5b — chaos injection", { concurrent: false }, () => {
     }
     // Restart — SQLite should recover from the main DB file alone.
     await startDaemon();
-    const msgs = await rpc("get_messages", { agent_name: "c4-peer", status: "pending", limit: 10 });
-    // Depending on WAL checkpoint state at kill time, the pre-chaos message
-    // may or may not have made it to the main DB. Key invariant: integrity
-    // still ok + server accepts new writes.
+    // Depending on WAL checkpoint state at kill time, the pre-chaos rows (c4-peer's registration, the message) may
+    // or may not have made it to the main DB, so nothing here reads them. Key invariant: integrity still ok + the
+    // server accepts new writes AND serves reads.
     expect(integrityCheck()).toBe("ok");
     // Post-restart write round-trip works.
     const tok2 = (await rpc("register_agent", { name: "c4-post", role: "r", capabilities: [] })).agent_token;
     const r = await rpc("send_message", { from: "c4-post", to: "c4-peer", content: "post-wal-chaos" }, tok2);
     expect(r.success).toBe(true);
-    void msgs;
+    // And an authenticated post-restart read of an agent created after the restart (the helper rejects a tool error).
+    const msgs = await rpc("get_messages", { agent_name: "c4-post", status: "pending", limit: 10 }, tok2);
+    expect(Array.isArray(msgs.messages)).toBe(true);
   }, 30_000);
 
   it("(C.5) DB file downgrade — older-schema DB in place is detected + migrated or errored cleanly", async () => {
