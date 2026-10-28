@@ -60,9 +60,12 @@ function scratch(tag: string, scripts?: Record<string, string>): { pkg: string; 
   return { pkg, env };
 }
 
-/** Run `body` after the gate's functions, with PROJECT_ROOT = the scratch package and this run's record reset. */
-function gate(pkg: string, env: NodeJS.ProcessEnv, body: string): { status: number | null; out: string } {
-  const script = `set -u\nset -o pipefail\n${FUNCTIONS}\nPROJECT_ROOT=${JSON.stringify(pkg)}\ntested_pack_reset\n${body}\n`;
+/**
+ * Run `body` after the gate's functions, with PROJECT_ROOT = the scratch package and this run's record reset (as the
+ * gate resets it at top level). `beforeReset` runs before that reset.
+ */
+function gate(pkg: string, env: NodeJS.ProcessEnv, body: string, beforeReset = ""): { status: number | null; out: string } {
+  const script = `set -u\nset -o pipefail\n${FUNCTIONS}\nPROJECT_ROOT=${JSON.stringify(pkg)}\n${beforeReset}\ntested_pack_reset\n${body}\n`;
   const r = spawnSync("bash", ["-c", script], { cwd: pkg, env, encoding: "utf8", timeout: 60_000 });
   return { status: r.status, out: `${r.stdout}${r.stderr}` };
 }
@@ -123,20 +126,40 @@ describe.skipIf(process.platform === "win32")("re-pack identity: the uploaded ta
     fs.mkdirSync(plantedDir);
     execFileSync("npm", ["pack", "--pack-destination", plantedDir], { cwd: pkg, env, encoding: "utf8" });
     const planted = { ...env, tested_pack_integrity: dry.integrity, tested_pack_file: path.join(plantedDir, dry.filename), tested_pack_dir: plantedDir };
-    const r = gate(pkg, planted, `printf 'CHILD-SEES [%s]\\n' "$(bash -c 'printf %s "\${tested_pack_integrity:-}"')"\nrepack_identity_gate`);
+    const r = gate(pkg, planted, "repack_identity_gate");
     expect(r.status, r.out).toBe(1);
     expect(r.out).toContain("no record of a tested pack in this run");
     expect(r.out).toMatch(REMEDY);
-    expect(r.out, "the reset also stops the planted value reaching child processes (never exported)").toContain("CHILD-SEES []");
   });
 
-  it("RED: a failed tested pack (no dist/) leaves NO record, so the last step refuses", () => {
+  it("the record is NEVER EXPORTED: with its names planted in the environment, a child process has none of them after the reset, nor after a successful pack fills the record", () => {
+    const { pkg, env } = scratch("never-exported");
+    const planted = { ...env, tested_pack_integrity: "sha512-planted", tested_pack_file: "/planted.tgz", tested_pack_dir: "/planted" };
+    // EXISTENCE in the child's environment (`env` lists a variable even when it is exported EMPTY), not its value.
+    const childCount = `$(bash -c 'env | grep -c "^tested_pack_"')`;
+    const r = gate(
+      pkg,
+      planted,
+      `printf 'AFTER-RESET %s\\n' "${childCount}"\npack_tested_tarball || exit 7\nprintf 'AFTER-PACK %s [%s]\\n' "${childCount}" "$tested_pack_integrity"`,
+      `printf 'BEFORE-RESET %s\\n' "${childCount}"`,
+    );
+    expect(r.status, r.out).toBe(0);
+    expect(r.out, "precondition: a child sees all 3 planted names before the reset").toMatch(/^BEFORE-RESET 3$/m);
+    expect(r.out).toMatch(/^AFTER-RESET 0$/m);
+    expect(r.out, "after a successful pack the record is set, and still not exported").toMatch(/^AFTER-PACK 0 \[sha512-\S+\]$/m);
+  });
+
+  it("RED: a failed tested pack CLEARS the record an earlier pack left (no dist/ the second time), so the last step refuses as no record", () => {
     const { pkg, env } = scratch("no-dist");
-    fs.rmSync(path.join(pkg, "dist"), { recursive: true });
-    const r = gate(pkg, env, `pack_tested_tarball && exit 7\nprintf 'RECORD [%s]\\n' "$tested_pack_integrity"\nrepack_identity_gate`);
+    const r = gate(
+      pkg,
+      env,
+      `pack_tested_tarball || exit 7\nprintf 'RECORD-1 [%s]\\n' "$tested_pack_integrity"\nrm -rf -- "$PROJECT_ROOT/dist"\npack_tested_tarball && exit 8\nprintf 'RECORD-2 [%s]\\n' "$tested_pack_integrity"\nrepack_identity_gate`,
+    );
     expect(r.status, r.out).toBe(1);
+    expect(r.out, "precondition: the first pack filled the record").toMatch(/^RECORD-1 \[sha512-\S+\]$/m);
     expect(r.out).toContain("no dist/: build first");
-    expect(r.out).toContain("RECORD []");
+    expect(r.out, "the failed pack cleared the earlier record").toMatch(/^RECORD-2 \[\]$/m);
     expect(r.out).toContain("no record of a tested pack in this run");
   });
 
