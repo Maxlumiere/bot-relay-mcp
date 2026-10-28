@@ -20,6 +20,8 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+import { toolCallResult } from "./_helpers/mcp-tool-call.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const N_PRODUCERS = parseInt(process.env.RELAY_LOAD_PRODUCERS || "5", 10);
 const M_MESSAGES = parseInt(process.env.RELAY_LOAD_MESSAGES || "100", 10);
@@ -64,14 +66,14 @@ async function rpc(tool: string, args: any, token?: string): Promise<any> {
     Accept: "application/json, text/event-stream",
   };
   if (token) headers["X-Agent-Token"] = token;
+  // PR-D: a NEW name over HTTP needs this daemon's registration secret (created beside RELAY_DB_PATH at start).
+  if (tool === "register_agent") Object.assign(headers, mintHeaders());
   const res = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
   });
-  const text = await res.text();
-  const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-  return JSON.parse(JSON.parse(dataLine!.slice(5).trim()).result.content[0].text);
+  return toolCallResult(res);
 }
 
 async function register(name: string, caps: string[] = []): Promise<string> {

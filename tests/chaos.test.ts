@@ -13,8 +13,8 @@
  *   - No half-written state (CAS either committed or rolled back, no torn rows)
  *   - Rotation state coherent (never rotation_grace w/ missing previous_token_hash)
  *
- * Runs SEQUENTIALLY (`describe.sequential`) — each test needs a clean
- * subprocess lifecycle.
+ * Runs SEQUENTIALLY (`{ concurrent: false }`, vitest 5's spelling: `describe.sequential` is gone) — each
+ * test needs a clean subprocess lifecycle.
  *
  * Gated behind --full in pre-publish-check.sh; NOT part of the default
  * vitest run (each test takes 2-10s).
@@ -26,6 +26,8 @@ import os from "os";
 import { spawn, type ChildProcess } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { toolCallResult } from "./_helpers/mcp-tool-call.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -90,14 +92,14 @@ async function rpc(tool: string, args: any, token?: string): Promise<any> {
     Accept: "application/json, text/event-stream",
   };
   if (token) headers["X-Agent-Token"] = token;
+  // PR-D: a NEW name over HTTP needs the daemon's registration secret (created beside TEST_DB_PATH at start).
+  if (tool === "register_agent") Object.assign(headers, mintHeaders(TEST_DB_PATH));
   const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
   });
-  const text = await res.text();
-  const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-  return JSON.parse(JSON.parse(dataLine!.slice(5).trim()).result.content[0].text);
+  return toolCallResult(res);
 }
 
 function integrityCheck(): string {
@@ -118,7 +120,7 @@ afterEach(async () => {
   if (fs.existsSync(TEST_ROOT)) fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
-describe.sequential("v2.1 Phase 5b — chaos injection", () => {
+describe("v2.1 Phase 5b — chaos injection", { concurrent: false }, () => {
   it("(C.1) SIGTERM during concurrent writes — integrity_check ok after restart, no torn rows", async () => {
     await startDaemon();
     const tokA = (await rpc("register_agent", { name: "c1-a", role: "r", capabilities: [] })).agent_token;
