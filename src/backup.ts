@@ -264,7 +264,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     if (unloadable.length) {
       warnings.push(
         `the configured encryption keyring could not be LOADED (fix its configuration): key id(s) ${unloadable.join(", ")} have NO fingerprint in this archive, ` +
-          `and the encrypted contents could not be checked. The archive was still written; restore checks each row against the keyring it is given.`
+          `and the encrypted contents could not be checked. The archive was still written; on restore, the keyring it is given must hold each key id the archive needs and authenticate one sample row under each.`
       );
     }
     if (config?.omitted) warnings.push(config.omitted + ".");
