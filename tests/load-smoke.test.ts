@@ -20,7 +20,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
-import { toolCallResult } from "./_helpers/mcp-tool-call.js";
+import { toolCallResult, type ToolRefusal } from "./_helpers/mcp-tool-call.js";
 import { mintHeaders } from "./_helpers/mint.js";
 
 const N_PRODUCERS = parseInt(process.env.RELAY_LOAD_PRODUCERS || "5", 10);
@@ -60,7 +60,7 @@ const { closeDb, getDb } = await import("../src/db.js");
 let server: HttpServer;
 let baseUrl: string;
 
-async function rpc(tool: string, args: any, token?: string, expectError = false): Promise<any> {
+async function rpc(tool: string, args: any, token?: string, refusal?: ToolRefusal): Promise<any> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
@@ -73,7 +73,7 @@ async function rpc(tool: string, args: any, token?: string, expectError = false)
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
   });
-  return toolCallResult(res, { tool, expectError });
+  return toolCallResult(res, { tool, expect: refusal });
 }
 
 async function register(name: string, caps: string[] = []): Promise<string> {
@@ -172,7 +172,8 @@ describe("v2.1 Phase 5b — load smoke", () => {
   it("cap check still enforced under concurrent load — unauthed broadcast refused", async () => {
     // Fire 20 concurrent unauthed broadcasts (cap-gated). ALL must refuse.
     const attempts = Array.from({ length: 20 }, (_, i) =>
-      rpc("broadcast", { from: `ghost-${i}`, content: "x" }, undefined, true)
+      // The relay's refusal, MEASURED: HTTP 200 with the tool error AUTH_FAILED (see tests/_helpers/mcp-tool-call.ts).
+      rpc("broadcast", { from: `ghost-${i}`, content: "x" }, undefined, { status: 200, toolErrorCode: "AUTH_FAILED" })
     );
     const results = await Promise.all(attempts);
     const refused = results.filter((r) => r.success === false).length;
