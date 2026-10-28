@@ -17,6 +17,7 @@ import { describe, it, expect, beforeEach, beforeAll, afterAll, afterEach } from
 import crypto from "crypto";
 import fs from "fs";
 import os from "os";
+import net from "net";
 import path from "path";
 import type { Server as HttpServer } from "http";
 import { monitorEventLoopDelay, PerformanceObserver } from "perf_hooks";
@@ -202,15 +203,35 @@ describe("BOUNDED: where bcrypt must decide, failures are throttled per (source,
 
 // ---------------------------------------------------------------------------------------------------
 // A real daemon: the bars, and the bounded audit, through the HTTP dispatcher.
+/**
+ * Every daemon withDaemon started and has not closed yet. A bar parked past its test's end (refuseLate, as ruled)
+ * never reaches withDaemon's finally, so teardown (barTeardown) closes what is left here. Whoever REMOVES a server
+ * from this set closes it: exactly one close, never a double close.
+ */
+const liveServers = new Set<HttpServer>();
+const SERVER_CLOSE_BOUND_MS = 2_000;
+/** Close a daemon, BOUNDED: drop its open connections, then close; give up waiting after the bound (never a hang). */
+function closeServerBounded(server: HttpServer): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, SERVER_CLOSE_BOUND_MS);
+    timer.unref();
+    server.closeAllConnections();
+    server.close(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
 async function withDaemon(fn: (port: number) => Promise<void>): Promise<void> {
   const { startHttpServer } = await import("../src/transport/http.js");
   const server: HttpServer = startHttpServer(0, "127.0.0.1");
+  liveServers.add(server);
   await new Promise((r) => setTimeout(r, 80));
   const port = (server.address() as { port: number }).port;
   try {
     await fn(port);
   } finally {
-    await new Promise<void>((r) => server.close(() => r()));
+    if (liveServers.delete(server)) await closeServerBounded(server);
   }
 }
 const rpc = (port: number, tool: string, args: Record<string, unknown>, token?: string) =>
@@ -411,11 +432,20 @@ export function diagCleanupAll(): void {
   for (const r of liveRecorders) r.uninstall();
   liveRecorders.clear();
 }
-afterEach(() => {
+/**
+ * The bars' teardown (afterEach), in this order: (1) abort this test's bars (the lifetime flag: a parked bar takes no
+ * further reading and installs nothing); (2) restore the recorder, so nothing patched is on the path of what follows;
+ * (3) close every daemon a parked bar left listening (bounded, once each; see withDaemon).
+ */
+export async function barTeardown(): Promise<void> {
   for (const c of liveBarControllers) c.abort(); // the lifetime flag: this test's bars are over
   liveBarControllers.clear();
   diagCleanupAll();
-});
+  const servers = [...liveServers];
+  liveServers.clear();
+  await Promise.all(servers.map(closeServerBounded));
+}
+afterEach(barTeardown);
 /** Run `fn` with a recorder for its duration (null unless RELAY_TIMING_DIAG=1): uninstalled when it settles, either way. */
 export async function withDiag<T>(env: NodeJS.ProcessEnv, fn: (rec: SyncRecorder | null) => Promise<T>, signal: AbortSignal = NEVER_ABORTED, label = "bar"): Promise<T> {
   if (signal.aborted) return refuseLate(label, "an install after its test ended (refused; nothing installed)");
@@ -1659,6 +1689,48 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
       if (prevEnv === undefined) delete process.env.RELAY_TIMING_DIAG;
       else process.env.RELAY_TIMING_DIAG = prevEnv;
     }
+  });
+  it("LIFETIME: a bar suspended past its test's end inside withDaemon does NOT leave the daemon listening: teardown closes it (bounded, once)", async () => {
+    const test = new AbortController(); // stands for the test's own signal
+    let port = 0;
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const stub = (async () => {
+      calls++;
+      if (calls === 1) await gate; // suspended inside its first reading
+      return stubReading();
+    }) as unknown as typeof measureWindow;
+    void barScope(test.signal, () => withDaemon(async (p) => {
+      port = p;
+      await runBar("daemon-bar", p, controlLoad(1), { measureImpl: stub });
+    }));
+    await until(() => calls === 1);
+    const accepts = () => new Promise<boolean>((resolve) => {
+      const sock = net.connect({ port, host: "127.0.0.1" });
+      sock.once("connect", () => { sock.destroy(); resolve(true); });
+      sock.once("error", () => resolve(false));
+    });
+    expect(await accepts(), "precondition: the daemon listens while the bar runs").toBe(true);
+    test.abort(); // the test timed out
+    await barTeardown(); // what afterEach runs
+    release(); // the suspended reading returns, after the test ended: the bar refuses and parks (as ruled)
+    await new Promise((r) => setTimeout(r, 50));
+    expect(calls, "no further reading after the abort").toBe(1);
+    expect(await accepts(), "the daemon no longer accepts connections after teardown").toBe(false);
+  });
+  it("TWIN: a withDaemon that finishes normally closes its server ONCE; a teardown after it finds nothing to close (no double-close error)", async () => {
+    let port = 0;
+    await withDaemon(async (p) => {
+      port = p;
+    });
+    await expect(barTeardown(), "teardown after a normal close: nothing to close, no error").resolves.toBeUndefined();
+    const refused = await new Promise<boolean>((resolve) => {
+      const sock = net.connect({ port, host: "127.0.0.1" });
+      sock.once("connect", () => { sock.destroy(); resolve(false); });
+      sock.once("error", () => resolve(true));
+    });
+    expect(refused, "closed by withDaemon itself").toBe(true);
   });
   it("LIFETIME: an attempt whose signal is ABORTED mid-bar STOPS: no reading after the abort", async () => {
     const test = new AbortController();
