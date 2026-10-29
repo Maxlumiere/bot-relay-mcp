@@ -79,7 +79,7 @@ async function logicalDump(file: string): Promise<string> {
       if (row[0] !== "table") continue;
       const t = String(row[1]).replace(/"/g, '""');
       const r = db.exec(`SELECT * FROM "${t}"`);
-      const rows = (r[0]?.values ?? []).map((v) => JSON.stringify(v)).sort();
+      const rows = (r[0]?.values ?? []).map((v: unknown) => JSON.stringify(v)).sort();
       out.push(`${row[1]}: ${rows.join("|")}`);
     }
     return out.join("\n");
@@ -199,27 +199,111 @@ describe("INV-BACKUP-01: an export never mutates its source DB", () => {
 });
 
 describe("INV-BACKUP-01: the wasm export refuses what it cannot read completely, and never writes the source", () => {
-  it("a WAL-mode DB (header bytes 18-19 = 2) is REFUSED by name, before any read; the source is untouched", async () => {
-    await makeSourceDb();
-    expect(headerMode(dbPath), "precondition: the relay made a WAL DB").toBe("wal");
-    for (const s of ["-wal", "-shm"]) expect(fs.existsSync(dbPath + s), `precondition: no ${s}`).toBe(false);
-    const before = statOf(dbPath);
-    process.env.RELAY_SQLITE_DRIVER = "wasm";
-    const { exportRelayState } = await import("../src/backup.js");
-    await expect(exportRelayState({ destinationPath: path.join(root, "w.tar.gz") })).rejects.toThrow(/WAL mode/);
-    expect(statOf(dbPath)).toEqual(before);
+  afterEach(async () => {
+    // Optional: before the hook existed (the RED baseline), its absence must not fail every row here.
+    (await import("../src/backup.js") as { _setExportReadHookForTests?: (f: null) => void })._setExportReadHookForTests?.(null);
   });
 
-  it.each(["-wal", "-shm"])("a rollback-journal DB with a %s file beside it (even empty) is REFUSED by name; the source is untouched", async (side) => {
+  it("a cleanly CLOSED native DB (a WAL header, no side files) exports under wasm: the main file holds every commit (ruled: the header alone is no refusal)", async () => {
+    await makeSourceDb({ webhookSecret: "plain-secret-6" });
+    expect(headerMode(dbPath), "precondition: a WAL header").toBe("wal");
+    for (const s of ["-wal", "-shm"]) expect(fs.existsSync(dbPath + s), `precondition: no ${s}`).toBe(false);
+    const before = statOf(dbPath);
+    const dump = await logicalDump(dbPath);
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const { exportRelayState } = await import("../src/backup.js");
+    const exp = await exportRelayState({ destinationPath: path.join(root, "clean-wal.tar.gz") });
+    expect(fs.existsSync(exp.archive_path)).toBe(true);
+    expect(statOf(dbPath), "bytes and mtime unchanged").toEqual(before);
+    expect(await logicalDump(dbPath)).toBe(dump);
+  });
+
+  it.each([
+    ["-wal", "a WAL header"],
+    ["-shm", "a WAL header"],
+    ["-wal", "a rollback-journal header"],
+    ["-shm", "a rollback-journal header"],
+  ])("a %s file beside the DB (even empty; %s) is REFUSED by name before any read; the source is untouched", async (side, mode) => {
     await makeSourceDb();
-    await toRollbackJournal();
-    expect(headerMode(dbPath), "precondition: a rollback-journal header").toBe("rollback");
+    if (mode === "a rollback-journal header") await toRollbackJournal();
     fs.writeFileSync(dbPath + side, "");
     const before = statOf(dbPath);
     process.env.RELAY_SQLITE_DRIVER = "wasm";
     const { exportRelayState } = await import("../src/backup.js");
-    await expect(exportRelayState({ destinationPath: path.join(root, "s.tar.gz") })).rejects.toThrow(new RegExp(`${side}`));
+    await expect(exportRelayState({ destinationPath: path.join(root, "s.tar.gz") })).rejects.toThrow(new RegExp(`a ${side} file is beside the DB`));
     expect(statOf(dbPath)).toEqual(before);
+  });
+
+  it("a NATIVE open during the snapshot (it creates -shm) is caught by the AFTER-check: refused, and no archive is written", async () => {
+    await makeSourceDb();
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const { exportRelayState, _setExportReadHookForTests } = await import("../src/backup.js");
+    const Database = (await import("better-sqlite3")).default;
+    let opener: { close(): void } | null = null;
+    _setExportReadHookForTests(() => {
+      opener = new Database(dbPath);
+      (opener as unknown as { prepare(s: string): { get(): unknown } }).prepare("SELECT 1 FROM sqlite_master LIMIT 1").get();
+    });
+    const dest = path.join(root, "during.tar.gz");
+    try {
+      await expect(exportRelayState({ destinationPath: dest })).rejects.toThrow(/a -(wal|shm) file is beside the DB/);
+    } finally {
+      (opener as { close(): void } | null)?.close();
+    }
+    expect(fs.existsSync(dest), "no archive").toBe(false);
+  });
+
+  it("the MAIN file changed during the read (its identity: size + mtime ns) is refused after ONE retry; no archive is written", async () => {
+    await makeSourceDb();
+    await toRollbackJournal();
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const { exportRelayState, _setExportReadHookForTests } = await import("../src/backup.js");
+    let calls = 0;
+    _setExportReadHookForTests(() => {
+      calls++;
+      const t = new Date(Date.now() + calls * 5000);
+      fs.utimesSync(dbPath, t, t);
+    });
+    const dest = path.join(root, "torn.tar.gz");
+    await expect(exportRelayState({ destinationPath: dest })).rejects.toThrow(/changed while it was being read/);
+    expect(calls, "read twice: the first read and ONE retry").toBe(2);
+    expect(fs.existsSync(dest), "no archive").toBe(false);
+  });
+
+  it("known-good twin: the main file changed during the FIRST read only → the retry reads it whole and the export succeeds", async () => {
+    await makeSourceDb();
+    await toRollbackJournal();
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const { exportRelayState, _setExportReadHookForTests } = await import("../src/backup.js");
+    let calls = 0;
+    _setExportReadHookForTests(() => {
+      calls++;
+      if (calls === 1) {
+        const t = new Date(Date.now() + 5000);
+        fs.utimesSync(dbPath, t, t);
+      }
+    });
+    const exp = await exportRelayState({ destinationPath: path.join(root, "retry.tar.gz") });
+    expect(fs.existsSync(exp.archive_path)).toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  it("the loaded image FAILS integrity_check → refused before archiving; no archive is written", async () => {
+    await makeSourceDb();
+    await toRollbackJournal();
+    // Corrupt pages 2-6 at their b-tree page-type byte (page 1, the header and the schema root, stays valid, so the file
+    // still opens): an invalid page type that integrity_check must report.
+    const pageSize = (() => { const h = fs.readFileSync(dbPath).subarray(16, 18); const v = h.readUInt16BE(0); return v === 1 ? 65536 : v; })();
+    const pages = Math.floor(fs.statSync(dbPath).size / pageSize);
+    expect(pages, "precondition: pages to corrupt").toBeGreaterThan(2);
+    const fd = fs.openSync(dbPath, "r+");
+    for (let p = 2; p <= Math.min(6, pages); p++) fs.writeSync(fd, Buffer.from([0x5a]), 0, 1, (p - 1) * pageSize);
+    fs.closeSync(fd);
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const { exportRelayState } = await import("../src/backup.js");
+    const dest = path.join(root, "corrupt.tar.gz");
+    await expect(exportRelayState({ destinationPath: dest })).rejects.toThrow(/fails PRAGMA integrity_check/);
+    expect(fs.existsSync(dest), "no archive").toBe(false);
   });
 
   it("known-good twin: a rollback-journal DB with no side file exports under wasm, and the source's bytes AND mtime are unchanged (no write-back)", async () => {
