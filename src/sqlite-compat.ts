@@ -17,6 +17,7 @@
  * sharing the same DB file will overwrite each other's changes. Use native
  * for multi-terminal stdio setups. See docs/sqlite-wasm-driver.md.
  */
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
@@ -402,22 +403,104 @@ async function openReadOnlyUnchecked(dbPath: string, driver: SqliteDriver): Prom
   if (!fs.existsSync(dbPath)) {
     throw new Error(`openReadOnly: file not found at '${dbPath}'`);
   }
-  if (driver === "wasm") {
-    let initSqlJs: any;
-    try {
-      const mod = await import("sql.js");
-      initSqlJs = mod.default;
-    } catch {
-      throw new Error(
-        "sql.js is not installed. RELAY_SQLITE_DRIVER=wasm requires sql.js. " +
-        "Install it with: npm install sql.js",
-      );
-    }
-    const SQL = await initSqlJs();
-    return new WasmDatabase(new SQL.Database(fs.readFileSync(dbPath)), dbPath);
-  }
+  if (driver === "wasm") return openWasmFromBytes(fs.readFileSync(dbPath), dbPath);
   const { default: Database } = await import("better-sqlite3");
   return new Database(dbPath, { readonly: true }) as unknown as CompatDatabase;
+}
+
+/**
+ * INV-BACKUP-01: open an export's SOURCE DB read-only, WITHOUT initializeDb(): no migration, backfill or permission
+ * change runs on it. `release()` closes it without ever writing it back (wasm: discard(), never close(), which would
+ * rewrite the file). Refusals are named:
+ * - native: a read-only open of a WAL DB must create -shm when there is none, so in a read-only directory it fails;
+ *   that is refused as "a read-only directory" (MEASURED, SQLITE_READONLY_DIRECTORY).
+ * - wasm reads only the main file, so the caller must first refuse a WAL DB or side files (assertWasmSourceReadable).
+ */
+export async function openExportSource(
+  dbPath: string,
+  driver: SqliteDriver
+): Promise<{ db: CompatDatabase; release: () => void; loadedSha256: string | null }> {
+  if (driver === "wasm") assertWasmSourceReadable(dbPath);
+  let db: CompatDatabase | null = null;
+  let loadedSha256: string | null = null;
+  try {
+    if (driver === "wasm") {
+      // The EXACT bytes the image is built from, hashed, so the caller can tell a read that raced a writer.
+      const bytes = fs.readFileSync(dbPath);
+      loadedSha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+      db = await openWasmFromBytes(bytes, dbPath);
+    } else {
+      db = await openReadOnlyUnchecked(dbPath, driver);
+    }
+    db.prepare("SELECT 1 FROM sqlite_master LIMIT 1").get(); // a native read-only open fails here, not at open
+  } catch (err) {
+    // Never leak the handle a failed probe opened (Codex #372 R1 P3); the error is kept.
+    if (db) {
+      try {
+        if (db instanceof WasmDatabase) db.discard();
+        else db.close();
+      } catch {
+        /* best-effort */
+      }
+    }
+    const code = (err as { code?: string }).code ?? "";
+    if (code === "SQLITE_READONLY_DIRECTORY" || /readonly database|read-only/i.test(String((err as Error).message))) {
+      throw new Error(
+        `backup refused: the DB at '${dbPath}' is in a read-only directory and has no -shm file, which a read-only open ` +
+          `must create. Make the directory writable, or back up while the relay has the DB open.`
+      );
+    }
+    throw err;
+  }
+  const opened = db as CompatDatabase;
+  const release = () => {
+    try {
+      if (opened instanceof WasmDatabase) opened.discard();
+      else opened.close();
+    } catch {
+      /* releasing a read-only handle is best-effort */
+    }
+  };
+  return { db: opened, release, loadedSha256 };
+}
+
+/** The SHA-256 of a file's current bytes (the torn-read guard's after-read). */
+export function fileSha256(p: string): string {
+  return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+}
+
+/**
+ * The wasm driver reads ONLY a DB's main file (sql.js loads its bytes). A -wal or -shm beside it (even empty) means
+ * another process may have it open or commits may sit outside the main file (MEASURED: the wasm read silently missed
+ * them); a -journal means a rollback may be pending. Each is refused by name. The WAL header alone is NOT (ruled): a
+ * native DB whose last connection closed cleanly holds every commit in its main file (MEASURED).
+ */
+export function assertWasmSourceReadable(dbPath: string): void {
+  for (const side of ["-wal", "-shm", "-journal"]) {
+    if (fs.existsSync(dbPath + side)) {
+      throw new Error(
+        `backup refused (wasm driver): a ${side} file is beside the DB at '${dbPath}', so another process may have it open ` +
+          `or its last transaction is not in the main file, and the wasm driver reads only the main file. Back up with ` +
+          `the native driver, or once no other process has the DB open.`
+      );
+    }
+  }
+}
+
+/** A wasm (sql.js) database over the given bytes, tied to `dbPath` (whose write-back a caller must never trigger on a source). */
+async function openWasmFromBytes(bytes: Buffer, dbPath: string): Promise<CompatDatabase> {
+  let initSqlJs: any;
+  try {
+    const mod = await import("sql.js");
+    initSqlJs = mod.default;
+  } catch {
+    throw new Error(
+      "sql.js is not installed. RELAY_SQLITE_DRIVER=wasm requires sql.js. " +
+      "Install it with: npm install sql.js",
+    );
+  }
+  const SQL = await initSqlJs();
+  return new WasmDatabase(new SQL.Database(bytes), dbPath);
 }
 
 // --- Public API ---

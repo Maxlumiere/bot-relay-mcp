@@ -38,9 +38,10 @@ import zlib from "zlib";
 import { pipeline } from "stream/promises";
 import { withDeadline } from "./http-deadline.js";
 
-import { getDbPath, getDb, peekDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
+import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
+import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
-import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDriver } from "./sqlite-compat.js";
+import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
@@ -171,12 +172,178 @@ interface ExportOptions {
  * `destinationPath` (tar.gz). Opens its own read-only connection to the source
  * DB so it is safe to call while the relay daemon is running.
  */
+function destinationExists(archivePath: string): Error {
+  return new Error(`backup refused: ${archivePath} already exists. A backup never overwrites a file: choose another --output.`);
+}
+
+/**
+ * The ONE loose fold, used ONLY to WIDEN a refusal, never to allow: NFKC, then an upper/lower round trip (so "ß", "ς",
+ * "İ" and compatibility forms meet their plain spellings). It is no claim that two names ARE the same file (path-walk
+ * makes no such claim either); it only adds names to refuse.
+ */
+function foldForRefusal(name: string): string {
+  return name.normalize("NFKC").toUpperCase().toLowerCase().normalize("NFKC");
+}
+
+/**
+ * Whether `destName`, a NEW file beside the DB, is a name SQLite could take as one of the DB's own files: the DB's
+ * basename as a prefix covers -wal, -shm, -journal, the super-journal -mj*, and any future one. Refused on the RAW
+ * spelling OR the folded one, so the fold can only add refusals: NFKC can compose a combining mark into the DB name's
+ * last letter, so a fold-only test could LOSE a raw match.
+ */
+function namesASideFile(destName: string, dbName: string): boolean {
+  return destName.startsWith(dbName) || foldForRefusal(destName).startsWith(foldForRefusal(dbName));
+}
+/** Test-only: the rule above, for its property test. */
+export const _namesASideFileForTests = namesASideFile;
+
+/** Test-only: the fold, for the property tests. */
+export const _foldForRefusalForTests = foldForRefusal;
+
+/** The source DB's names a destination must not start with: as configured, and resolved through the shared walk. */
+function sourceNames(srcDbPath: string): string[] {
+  let resolved: string;
+  try {
+    resolved = walkPath(srcDbPath).real;
+  } catch (err) {
+    throw new Error(`backup refused: the database path ${srcDbPath} cannot be resolved (${(err as Error).message}).`);
+  }
+  return [...new Set([path.basename(srcDbPath), path.basename(resolved)])];
+}
+
+/**
+ * INV-BACKUP-01 (ruled; Codex #372 R1 and R2): the archive's destination is refused when it exists, or when it has a name SQLite could
+ * take as one of the source DB's own files.
+ * - An EXISTING destination is refused, whatever it is (the DB, a symlink or hardlink to it, any file): never truncated
+ *   (and the archive is created "wx", so a file appearing in between is refused too).
+ * - A NEW destination is refused, in ANY directory, when its name starts with the DB's CONFIGURED basename or its
+ *   RESOLVED one (raw or under the widen-only fold). Why: a new file at an absent side-file name (-wal, -shm, -journal,
+ *   the super-journal -mj*) is a file SQLite would later take as its own, through hot-journal or WAL recovery, and
+ *   corrupt the DB. Directory-independent, because a parent directory compared now can be swapped for a link to the
+ *   DB's directory before the archive is opened (Codex R2), and a source that is itself a symlink has a second name.
+ * - The stated cost: a destination named like the DB is refused anywhere (e.g. "RELAY.DB-backup.tgz", or "data-x.tgz"
+ *   for a DB named "data"). The default relay-backup-<iso>.tar.gz does not start with the default relay.db.
+ * Returns the names judged, so the caller re-derives and compares them right before the archive is opened.
+ */
+function assertDestinationIsNotSource(archivePath: string, srcDbPath: string): string[] {
+  let exists = false;
+  try {
+    fs.lstatSync(archivePath);
+    exists = true;
+  } catch {
+    exists = false;
+  }
+  if (exists) throw destinationExists(archivePath);
+  const names = sourceNames(srcDbPath);
+  for (const dbName of names) {
+    if (namesASideFile(path.basename(archivePath), dbName)) {
+      throw new Error(
+        `backup refused: the destination ${archivePath} has a name SQLite would treat as one of the database's own files: ` +
+          `it starts with the database's name (${dbName}). Choose another name for the archive.`
+      );
+    }
+  }
+  return names;
+}
+
+/** Right before the archive is opened: the source's names must be the ones judged (a source re-pointed meanwhile). */
+function assertSourceNamesUnchanged(srcDbPath: string, judged: string[]): void {
+  const now = sourceNames(srcDbPath);
+  if (now.length !== judged.length || now.some((n, i) => n !== judged[i])) {
+    throw new Error(
+      `backup refused: the source changed while it was being backed up (${srcDbPath} now resolves to ${now.join(" / ")}, ` +
+        `not ${judged.join(" / ")}). Run the backup again.`
+    );
+  }
+}
+
+/** Test-only: runs between a snapshot and its after-checks, so a test can act "during" the read. */
+let exportReadHook: (() => void) | null = null;
+export function _setExportReadHookForTests(fn: (() => void) | null): void {
+  exportReadHook = fn;
+}
+
+/**
+ * INV-BACKUP-01: snapshot the source DB to `snapshotDbPath` WITHOUT mutating it; returns the driver that read it.
+ * - Warm (a connection already open in this process): through that connection, as it is.
+ * - Cold: a READ-ONLY open with no initializeDb() (openExportSource): no migration, backfill or permission change.
+ * - Wasm reads only the main file, so: no -wal/-shm/-journal beside it, BEFORE and AFTER the snapshot; on a cold read,
+ *   the bytes the image was loaded from must hash the same as the file re-read after the snapshot (a torn read),
+ *   retried ONCE; and the image, warm or cold, passes PRAGMA integrity_check before anything is archived. This is
+ *   BEST-EFFORT DETECTION, not a guarantee: a wasm read takes no lock, so a writer in another process can still race it
+ *   (e.g. change the file and restore it between the two reads). INV-DB-01's lock makes it a guarantee.
+ */
+async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<SqliteDriver> {
+  const live = peekDb();
+  if (live) {
+    const d = driverOf(live);
+    if (d === "wasm") assertWasmSourceReadable(srcDbPath);
+    snapshotToFile(live, snapshotDbPath);
+    exportReadHook?.();
+    if (d === "wasm") {
+      assertWasmSourceReadable(srcDbPath);
+      assertImageIntact(live, srcDbPath);
+    }
+    return d;
+  }
+  const d = configuredDriver();
+  for (let attempt = 1; ; attempt++) {
+    const source = await openExportSource(srcDbPath, d);
+    try {
+      snapshotToFile(source.db, snapshotDbPath);
+      exportReadHook?.();
+      if (d !== "wasm") return d;
+      assertWasmSourceReadable(srcDbPath);
+      if (fileSha256(srcDbPath) === source.loadedSha256) {
+        assertImageIntact(source.db, srcDbPath);
+        return d;
+      }
+    } finally {
+      source.release(); // never written back
+    }
+    fs.rmSync(snapshotDbPath, { force: true });
+    if (attempt >= 2) {
+      throw new Error(
+        `backup refused (wasm driver): the DB at '${srcDbPath}' changed while it was being read, on the first read and ` +
+          `on the retry, so the copy could be torn. Back up when no other process is writing it, or with the native driver.`
+      );
+    }
+  }
+}
+
+/** The loaded wasm image is checked before it is archived: a corrupt one is refused, never backed up. */
+function assertImageIntact(db: CompatDatabase, srcDbPath: string): void {
+  let result: string;
+  try {
+    const row = db.prepare("PRAGMA integrity_check").get() as { integrity_check?: string } | undefined;
+    result = row?.integrity_check ?? "null";
+  } catch (err) {
+    result = (err as Error).message;
+  }
+  if (result !== "ok") {
+    throw new Error(`backup refused (wasm driver): the DB at '${srcDbPath}' fails PRAGMA integrity_check (${result}); a corrupt DB is not backed up.`);
+  }
+}
+
+/** The SOURCE's schema_info version, read from its snapshot (never a migration's); 0 when it predates schema_info. */
+async function snapshotSchemaVersion(snapshotDbPath: string, driver: SqliteDriver): Promise<number> {
+  const db = await openReadOnly(snapshotDbPath, driver);
+  try {
+    const row = db.prepare("SELECT version FROM schema_info WHERE id = 1").get() as { version: number } | undefined;
+    return typeof row?.version === "number" ? row.version : 0;
+  } catch {
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
 export async function exportRelayState(options: ExportOptions = {}): Promise<ExportResult> {
   assertTarLocatable(); // before anything is opened, created or written
-  await initializeDb();
   const srcDbPath = getDbPath();
   if (!fs.existsSync(srcDbPath)) {
-    throw new Error(`Source DB not found at '${srcDbPath}'. Nothing to back up.`);
+    // INV-BACKUP-01: an export never creates its source either.
+    throw new Error(`no relay database at ${srcDbPath}; nothing to back up. Start the relay once, or set RELAY_DB_PATH to the database's location.`);
   }
 
   const backupsDir = getBackupsDir();
@@ -188,6 +355,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
   const archivePath = options.destinationPath
     ? assertSafePath(options.destinationPath, "destinationPath")
     : path.join(backupsDir, `relay-backup-${isoTimestamp()}.tar.gz`);
+  const judgedNames = assertDestinationIsNotSource(archivePath, srcDbPath);
 
   // Stage the snapshot + manifest + optional config under a unique temp dir
   // (keyed off a random suffix so parallel exports can't collide).
@@ -202,10 +370,12 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     // sqlite-compat.snapshotToFile. Works on BOTH drivers.
     // #171/#190: snapshotToFile branches on the ACTUAL db object; openReadOnly
     // takes the driver EXPLICITLY — driverOf reads it from the live connection.
-    snapshotToFile(getDb(), snapshotDbPath);
+    // INV-BACKUP-01: the snapshot never mutates the source (takeSnapshot: warm through the open connection, cold through
+    // a read-only open with no initializeDb(); the wasm checks before and after the read).
+    const srcDriver = await takeSnapshot(srcDbPath, snapshotDbPath);
 
     // Row counts from the snapshot (not the live DB) so they match the archive.
-    const snap = await openReadOnly(snapshotDbPath, driverOf(getDb()));
+    const snap = await openReadOnly(snapshotDbPath, srcDriver);
     const row_counts: Record<string, number> = {};
     const tables = ["agents", "messages", "tasks", "channels", "channel_members", "channel_messages", "webhook_subscriptions", "webhook_delivery_log", "agent_capabilities", "audit_log"];
     for (const t of tables) {
@@ -272,7 +442,9 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     // v2.1 Phase 4c.3: read from schema_info table (DB-actual), not the
     // CURRENT_SCHEMA_VERSION constant. If the DB is older than the code
     // thinks it should be, the manifest reflects the truth.
-    const dbSchemaVersion = getSchemaVersion();
+    // The SOURCE's schema version, read from the snapshot (INV-BACKUP-01: never a migration's). 0 when the source
+    // predates schema_info.
+    const dbSchemaVersion = await snapshotSchemaVersion(snapshotDbPath, srcDriver);
     const manifest: ManifestFile = {
       schema_version: dbSchemaVersion,
       archive_format_version: ARCHIVE_FORMAT_VERSION,
@@ -304,7 +476,16 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     if (plainSize > MAX_DECOMPRESSED_BYTES) {
       throw new Error(`backup refused: the archive is ${plainSize} bytes uncompressed, over the ${MAX_DECOMPRESSED_BYTES}-byte cap; restore would refuse it.`);
     }
-    await pipeline(fs.createReadStream(plainTar), zlib.createGzip(), fs.createWriteStream(archivePath, { mode: 0o600 }));
+    // Created EXCLUSIVELY ("wx"): an existing file is never truncated (Codex #372 R1), whoever made it. Right before it,
+    // the destination is judged again against the source's names as they are NOW (Codex R2).
+    assertSourceNamesUnchanged(srcDbPath, judgedNames);
+    assertDestinationIsNotSource(archivePath, srcDbPath);
+    try {
+      await pipeline(fs.createReadStream(plainTar), zlib.createGzip(), fs.createWriteStream(archivePath, { mode: 0o600, flags: "wx" }));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw destinationExists(archivePath);
+      throw err;
+    }
 
     // v2.1 Phase 4c.4: narrow the archive to 0600 — the tarball contains a
     // full DB snapshot + any sensitive columns (encrypted but still copyable

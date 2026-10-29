@@ -43,7 +43,15 @@ Exit 0 on success, 1 on failure. On success, the stdout line tells you where the
 
 ### Snapshot mechanism
 
-Both CLIs invoke `VACUUM INTO 'path'` through the shared DB connection. That's plain SQL — it runs identically on the native (`better-sqlite3`) driver and the optional wasm (`sql.js`) driver, and produces a consistent point-in-time SQLite file on disk. No driver branching.
+**An export never changes the DB it copies.** When the relay already has the DB open in that process, the export snapshots through that connection. Otherwise (a plain `relay backup`) it opens the DB **read-only** and runs no migration, backfill or permission change on it. The manifest records the DB's own schema version.
+
+- **Native driver (the default):** `VACUUM INTO` gives a consistent point-in-time copy, safe while the daemon writes, and it includes commits still in the WAL. A read-only open of a WAL DB does write its `-shm` side file: the data is unchanged, but the directory is not byte-identical. In a **read-only directory** with no `-shm` yet, that open cannot work, and the backup is refused with a message saying so.
+- **Wasm driver:** it reads only the DB's main file, so it **refuses** a DB with any `-wal`, `-shm` or `-journal` file beside it (even empty): another process may have it open, or commits may not be in the main file yet, and they would be missing from the backup, silently. It checks before and after the snapshot.
+  - A DB whose header says WAL mode, but with no side file (a native DB whose last connection closed cleanly), holds every commit in its main file and is backed up.
+  - If the main file's bytes change while it is being read (the bytes loaded hash differently from the file re-read after), the read is retried once, then refused.
+  - The copy, from a fresh read or the relay's own open connection, must pass `PRAGMA integrity_check` before it is archived.
+  - **These are best-effort detection, not a guarantee.** A wasm read takes no lock, so a process writing the DB at the same time can still race it. A guarantee comes with the single-owner lock (a follow-up).
+  - It never writes the DB back.
 
 ### Archive layout
 
