@@ -1,0 +1,112 @@
+name: Full gate (weekly)
+
+# The pre-publish gate WITH --full (load-smoke, chaos, cross-version) on main, weekly and on demand, so
+# the --full steps cannot rot unseen between publishes (they are outside the default test run).
+#
+# Two jobs, so write access never meets repo code:
+#   gate:   runs the repo's gate; read-only token.
+#   report: runs NO repo code (gh only). It sets the commit status `release/full-gate` on the exact SHA
+#           the gate job checked out (success/failure, linking this run), and on failure opens or updates
+#           the open `gate-rot` issue. Its token: statuses: write and issues: write; contents stays read.
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'   # Mondays 02:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-gate
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Pre-publish gate --full (main)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Record the SHA under test
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # The CI-smoke marker skips only the publish-only steps (branch identity, CI green, the known-bad
+      # registry control); every other step, the --full ones included, runs as in a publish.
+      - name: Pre-publish gate with --full
+        env:
+          RELAY_SMOKE_ONLY: '1'
+        run: bash scripts/pre-publish-check.sh --full
+
+  report:
+    name: Record the verdict
+    needs: gate
+    # Always: a gate that failed before recording its SHA (a checkout failure) is still reported.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: write
+      issues: write
+    steps:
+      - name: Commit status release/full-gate on the gated SHA
+        if: needs.gate.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.gate.outputs.sha }}
+          RESULT: ${{ needs.gate.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$RESULT" in
+            success) state=success; desc="Pre-publish gate --full passed" ;;
+            *)       state=failure; desc="Pre-publish gate --full: $RESULT" ;;
+          esac
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state="$state" -f context="release/full-gate" -f description="$desc" -f target_url="$RUN_URL"
+
+      - name: Open or update the gate-rot issue
+        # Independent of the status step: it runs whatever that step did.
+        if: always() && needs.gate.result != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.gate.outputs.sha }}
+          RESULT: ${{ needs.gate.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          sha_line="${SHA:-UNAVAILABLE: the gate job failed before recording the commit it checked out (see the run)}"
+          gh label create gate-rot --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "The weekly --full pre-publish gate failed on main" 2>/dev/null || true
+          body="The weekly pre-publish gate with --full did not pass on main.
+
+          - commit: ${sha_line}
+          - result: ${RESULT}
+          - run: ${RUN_URL}
+
+          A publish runs this same gate, so it would stop at the same step. Fix main, then re-run the workflow."
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --label gate-rot --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label gate-rot --title "Full gate failing on main" --body "$body"
+          fi
