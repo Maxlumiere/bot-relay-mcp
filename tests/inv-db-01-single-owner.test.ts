@@ -357,6 +357,33 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: every other native 
     }
   }, 60_000);
 
+  it("a persist refused at CLOSE is reported BY NAME, counting the writes it LOST; never silent, and the handle is cleared", async () => {
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const db = await import("../src/db.js");
+    const compat = (await import("../src/sqlite-compat.js")) as unknown as {
+      _setPersistRenameForTests?: (fn: ((from: string, to: string) => void) | null) => void;
+    };
+    await db.initializeDb();
+    const h = db.getDb();
+    h.exec("CREATE TABLE IF NOT EXISTS persist_probe (v TEXT)");
+    const ins = h.prepare("INSERT INTO persist_probe (v) VALUES (?)");
+    ins.run("kept");
+    compat._setPersistRenameForTests!(() => {
+      throw Object.assign(new Error("EPERM: operation not permitted (injected)"), { code: "EPERM" });
+    });
+    try {
+      expect(() => ins.run("lost")).toThrow(/nothing was written/);
+      expect(() => db.closeDb(), "a refused final persist is reported").toThrow(/final persist was refused, so 1 write\(s\) since the last successful persist (are|were) LOST/);
+    } finally {
+      compat._setPersistRenameForTests!(null);
+    }
+    // The handle was cleared, and the lock released: a fresh open works, and holds only what was persisted.
+    await db.initializeDb();
+    const vs = (db.getDb().prepare("SELECT v FROM persist_probe ORDER BY rowid").all() as Array<{ v: string }>).map((r) => r.v);
+    db.closeDb();
+    expect(vs).toEqual(["kept"]);
+  }, 60_000);
+
   it.each(["wasm", "native"] as const)("a RESTORE (driver %s) while another process owns the DB is refused, and the owner's data survives", async (driver) => {
     expect(await child("write", "seed", "native").out).toMatch(/OK/);
     process.env.RELAY_SQLITE_DRIVER = "native";
