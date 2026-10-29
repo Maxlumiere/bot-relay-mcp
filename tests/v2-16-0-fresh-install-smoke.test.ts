@@ -22,7 +22,7 @@
  * The launchd daemon is skipped (RELAY_SKIP_DAEMON) — its logic is unit-tested;
  * here we start the daemon directly to exercise the register → vault loop.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterAll } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -31,12 +31,17 @@ import { fileURLToPath } from "url";
 import bcrypt from "bcryptjs";
 import Database from "better-sqlite3";
 import { getFreePort } from "./_helpers/port.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
 const RELAY_BIN = path.join(REPO_ROOT, "bin", "relay");
 const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
-const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "v2160-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 
 async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
   const start = Date.now();
@@ -145,6 +150,7 @@ describe("v2.16.0 — fresh-install smoke (adoption acceptance bar)", () => {
         RELAY_CONFIG_PATH: configPath,
         RELAY_HTTP_HOST: "127.0.0.1",
         RELAY_HTTP_PORT: String(port),
+        RELAY_TEST_CLOCK: "0",
       };
       const hook = spawnSync("bash", [HOOK], { encoding: "utf-8", timeout: 15_000, env: hookEnv, input: "" });
       expect(hook.stderr).toMatch(/using default agent name from config: smoke-agent/);

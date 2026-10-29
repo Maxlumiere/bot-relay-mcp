@@ -32,6 +32,7 @@ import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
 import { mintHeaders } from "./_helpers/mint.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -194,7 +195,10 @@ describe("CANARY regressions (publish-blockers if red)", () => {
     // register_agent over HTTP, and the server enforces the invariants. This
     // canary seeds an empty DB, spawns the hook pointed at our test daemon,
     // and asserts the row came out correctly.
-    const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
+    // A seamed hooks copy (tests/_helpers/hook-budget-tree.ts): its budgeted steps read RELAY_TEST_CLOCK, fixed at 0
+    // below. bash SECONDS ticks on whole wall-clock seconds, and this row has the least headroom (its stdin is
+    // open, so the payload read waits its share): on a slow runner registration could be skipped for budget.
+    const HOOK = path.join(budgetTree(path.join(TEST_ROOT, "canary6-seamed"), path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
     const tmpHome = path.join(TEST_ROOT, "canary6-home");
     fs.mkdirSync(tmpHome, { recursive: true });
     const hookDb = path.join(tmpHome, ".bot-relay", "relay.db");
@@ -228,6 +232,7 @@ describe("CANARY regressions (publish-blockers if red)", () => {
         RELAY_HTTP_PORT: String(port),
         RELAY_AGENT_TOKEN: "",
         RELAY_HOOK_DEBUG: "1",
+        RELAY_TEST_CLOCK: "0",
       },
     });
     let stdoutBuf = "";

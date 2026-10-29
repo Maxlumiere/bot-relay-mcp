@@ -31,6 +31,7 @@ import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -112,6 +113,7 @@ function runHook(): { stdout: string; stderr: string; status: number } {
       RELAY_AGENT_TOKEN: "dummy-token-no-daemon",
       RELAY_HTTP_HOST: "127.0.0.1",
       RELAY_HTTP_PORT: "54997", // nothing listening → daemon probes fail fast
+      RELAY_TEST_CLOCK: "0",
     },
   });
   return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", status: r.status ?? -1 };
@@ -119,10 +121,12 @@ function runHook(): { stdout: string; stderr: string; status: number } {
 
 beforeEach(async () => {
   resetRoot();
-  fs.cpSync(REAL_HOOKS, HOOK_COPY_DIR, { recursive: true }); // isolated, byte-identical hooks
-  // ADR-0048: the hooks ask the ONE resolver (the relay CLI beside them, as in
-  // every install): link the real bin/ next to the copied hooks/.
-  fs.symlinkSync(path.join(REAL_HOOKS, "..", "bin"), path.join(HOOK_COPY_DIR, "..", "bin"));
+  // Isolated hooks copy. ADR-0048: the hooks ask the ONE resolver (the relay CLI beside them, as in every
+  // install), so budgetTree links the real bin/ (and dist/) next to the copied hooks/. The copy's budget
+  // arithmetic reads RELAY_TEST_CLOCK, fixed at 0 by runHook (tests/_helpers/hook-budget-tree.ts).
+  // budgetTree replaces TEST_ROOT, so the private mode is set again after it.
+  budgetTree(TEST_ROOT, REAL_HOOKS, path.join(REPO_ROOT, "bin"));
+  fs.chmodSync(TEST_ROOT, 0o700);
   writeHealthyClaudeJson();
   const { closeDb } = await import("../src/db.js");
   closeDb();

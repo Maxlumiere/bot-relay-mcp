@@ -31,9 +31,14 @@ import os from "os";
 import cp from "child_process";
 import http from "http";
 import { fileURLToPath } from "url";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const HOOK = path.resolve(HERE, "..", "hooks", "post-tool-use-check.sh");
+// Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
+// ticks on whole wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "a46na-seamed-"));
+const HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(path.resolve(HERE, ".."), "hooks"), path.join(path.resolve(HERE, ".."), "bin")), "post-tool-use-check.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 const DIR = path.join(os.tmpdir(), "bot-relay-adr0046-notice-" + process.pid);
 const DB_PATH = path.join(DIR, "relay.db");
 const HOME = path.join(DIR, "home");
@@ -108,7 +113,7 @@ function seed(): void {
  */
 function spawnHook(env: Record<string, string>): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
-    const c = cp.spawn("bash", [HOOK], { env });
+    const c = cp.spawn("bash", [HOOK], { env: { ...env, RELAY_TEST_CLOCK: "0" } });
     let stdout = "";
     c.stdout.on("data", (d) => (stdout += d.toString()));
     c.on("error", reject);

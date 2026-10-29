@@ -110,8 +110,9 @@ describe("v2.1 Phase 2c — exportRelayState", () => {
       fs.rmSync(stage1, { recursive: true, force: true });
     }
 
-    // Drop a config.json → archive should contain it.
-    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ hello: "world" }));
+    // Drop a config.json → archive should contain it. A RelayConfig field: the archive's config is serialized through
+    // the field classification (SEC-23), so a key the relay does not know is dropped.
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ http_host: "hello.example" }));
     const withConfig = await exportRelayState();
     const stage2 = fs.mkdtempSync(path.join(os.tmpdir(), "verify-"));
     try {

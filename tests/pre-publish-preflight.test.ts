@@ -5,7 +5,8 @@
 
 /**
  * scripts/pre-publish-check.sh's preflight, and the extension-deps check (the 4.0.0 publish, 26 Oct):
- *   - the gate refuses to start in the SERVING tree (prebuild-guard --publish), before any step;
+ *   - a real `npm publish` runs the release-tree qualification (scripts/publish-gate.mjs) FIRST, and its refusal
+ *     stops everything; run standalone, the gate refuses only the marked SERVING tree;
  *   - a real `npm publish` (npm_lifecycle_event=prepublishOnly) checks `npm whoami` BEFORE the gate, not after
  *     the ~20-minute run (the gate passed, then the upload failed on an expired login);
  *   - the extension steps install when a tool they run is missing, not only when node_modules is absent (an
@@ -13,6 +14,8 @@
  *
  * The script runs from a temp COPY of scripts/ (its PROJECT_ROOT is the copy's parent), with `npm` and `npx`
  * replaced by logging stubs on PATH and a private HOME, so nothing installs, builds or reaches the registry.
+ * The copy's publish-gate.mjs is a logging stub that passes or refuses: the qualification itself is tested in
+ * tests/publish-gate.test.ts; these rows test what the script does with its answer, and in what order.
  */
 import { describe, it, expect, afterAll } from "vitest";
 import fs from "fs";
@@ -74,16 +77,20 @@ describe("relay_ext_deps_missing (scripts/lib/ext-deps.sh): install when a tool 
 describe("pre-publish-check.sh preflight: refused or stopped BEFORE any step", () => {
   /** A copy of scripts/ under a fresh root, plus PATH stubs for npm/npx that log every call. */
   const DEFAULT_REG = "https://reg.default.test/";
-  const sandbox = (tag: string, opts: { marker?: boolean; whoami: "ok" | "fail"; publishRegistry?: string; config?: { status: number; out: string } }) => {
+  const sandbox = (tag: string, opts: { marker?: boolean; whoami: "ok" | "fail"; gate?: "pass" | "refuse"; config?: { status: number; out: string } }) => {
     const config = opts.config ?? { status: 0, out: DEFAULT_REG };
     const root = path.join(TMP, tag);
     fs.mkdirSync(root, { recursive: true });
     fs.cpSync(path.join(REPO, "scripts"), path.join(root, "scripts"), { recursive: true });
     if (opts.marker) fs.writeFileSync(path.join(root, ".relay-prod-tree"), "");
-    fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "bot-relay-mcp", version: "0.0.0", ...(opts.publishRegistry ? { publishConfig: { registry: opts.publishRegistry } } : {}) }));
+    fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "bot-relay-mcp", version: "0.0.0" }));
     const bin = path.join(root, ".stub-bin");
     fs.mkdirSync(bin);
     const log = path.join(root, "calls.log");
+    fs.writeFileSync(
+      path.join(root, "scripts", "publish-gate.mjs"),
+      `import fs from "fs";\nfs.appendFileSync(${JSON.stringify(log)}, ["gate", ...process.argv.slice(2)].join(" ") + "\\n");\nprocess.exit(${opts.gate === "refuse" ? 1 : 0});\n`,
+    );
     fs.writeFileSync(
       path.join(bin, "npm"),
       `#!/bin/sh\necho "npm $*" >> "${log}"\n[ "$1 $2 $3" = "config get registry" ] && { printf '%s' '${config.out}'; exit ${config.status}; }\n[ "$1" = whoami ] && exit ${opts.whoami === "ok" ? 0 : 1}\nexit 1\n`,
@@ -104,12 +111,20 @@ describe("pre-publish-check.sh preflight: refused or stopped BEFORE any step", (
     return { status: r.status, out: `${r.stdout}\n${r.stderr}`, calls };
   };
 
-  it("HARM: the SERVING tree (.relay-prod-tree) is refused first: exit 1, no npm/npx call, no step started", () => {
-    const s = sandbox("serving", { marker: true, whoami: "ok" });
+  it("HARM: a publish from an UNQUALIFIED tree is refused by the qualification FIRST: exit 1, no npm/npx call, no step", () => {
+    const s = sandbox("unqualified", { whoami: "ok", gate: "refuse" });
     const r = run(s, { npm_lifecycle_event: "prepublishOnly", RELAY_ALLOW_PROD_BUILD: "1" });
     expect(r.status).toBe(1);
-    expect(r.out).toMatch(/REFUSING to run the pre-publish gate in the PRODUCTION relay tree/);
-    expect(r.calls, "nothing ran: not even the login check").toEqual([]);
+    expect(r.calls, "the qualification ran (no flag: the publish mode), and nothing after it").toEqual(["gate"]);
+    expect(r.out).not.toMatch(/=== pre-publish:/);
+  });
+
+  it("HARM: run standalone in the SERVING tree (.relay-prod-tree): refused, no npm/npx call, no step", () => {
+    const s = sandbox("serving", { marker: true, whoami: "ok" });
+    const r = run(s, { RELAY_ALLOW_PROD_BUILD: "1" });
+    expect(r.status).toBe(1);
+    expect(r.out).toMatch(/REFUSING to run the pre-publish gate in the serving tree/);
+    expect(r.calls).toEqual([]);
     expect(r.out).not.toMatch(/=== pre-publish:/);
   });
 
@@ -118,23 +133,16 @@ describe("pre-publish-check.sh preflight: refused or stopped BEFORE any step", (
     const r = run(s, { npm_lifecycle_event: "prepublishOnly" });
     expect(r.status).toBe(1);
     expect(r.out).toMatch(/npm whoami --registry https:\/\/reg\.default\.test\/ failed: not logged in/);
-    expect(r.calls, "the configured registry is asked, then the login is checked THERE").toEqual(["npm config get registry", `npm whoami --registry ${DEFAULT_REG}`]);
+    expect(r.calls, "the qualification, then the in-script registry, then the login THERE").toEqual(["gate", "npm config get registry", `npm whoami --registry ${DEFAULT_REG}`]);
     expect(r.out).not.toMatch(/=== pre-publish:/);
   });
 
   it("TWIN: a publish WITH a login passes the preflight and reaches step 1 (the stubbed npx fails it there)", () => {
     const s = sandbox("login", { whoami: "ok" });
     const r = run(s, { npm_lifecycle_event: "prepublishOnly" });
-    expect(r.calls.slice(0, 2)).toEqual(["npm config get registry", `npm whoami --registry ${DEFAULT_REG}`]);
+    expect(r.calls.slice(0, 3)).toEqual(["gate", "npm config get registry", `npm whoami --registry ${DEFAULT_REG}`]);
     expect(r.out).toMatch(/=== pre-publish: tsc --noEmit ===/);
     expect(r.calls).toContain("npx tsc --noEmit");
-  });
-
-  it("publishConfig.registry wins: the login is checked against the registry npm publish will upload to", () => {
-    const s = sandbox("pubreg", { whoami: "fail", publishRegistry: "https://reg.publish.test/" });
-    const r = run(s, { npm_lifecycle_event: "prepublishOnly" });
-    expect(r.status).toBe(1);
-    expect(r.calls, "no fallback to the configured registry when publishConfig names one").toEqual(["npm whoami --registry https://reg.publish.test/"]);
   });
 
   for (const [label, config] of [["fails", { status: 1, out: "" }], ["prints nothing", { status: 0, out: "" }]] as const) {
@@ -143,7 +151,7 @@ describe("pre-publish-check.sh preflight: refused or stopped BEFORE any step", (
       const r = run(s, { npm_lifecycle_event: "prepublishOnly" });
       expect(r.status).toBe(1);
       expect(r.out).toMatch(/could not determine the registry npm publish would use/);
-      expect(r.calls, "no login check without a registry").toEqual(["npm config get registry"]);
+      expect(r.calls, "no login check without a registry").toEqual(["gate", "npm config get registry"]);
       expect(r.out).not.toMatch(/=== pre-publish:/);
     });
   }
@@ -151,7 +159,7 @@ describe("pre-publish-check.sh preflight: refused or stopped BEFORE any step", (
   it("HARM: a registry URL that carries a credential is never printed raw (userinfo and query stripped)", () => {
     const secret = ["s3c", "retTOKEN"].join("");
     const q = ["q1", "w2"].join("");
-    const s = sandbox("credreg", { whoami: "fail", publishRegistry: `https://user:${secret}@reg.cred.test/path/?auth=${q}` });
+    const s = sandbox("credreg", { whoami: "fail", config: { status: 0, out: `https://user:${secret}@reg.cred.test/path/?auth=${q}` } });
     const r = run(s, { npm_lifecycle_event: "prepublishOnly" });
     expect(r.status).toBe(1);
     expect(r.out, "the credential never reaches stdout or stderr").not.toContain(secret);
@@ -163,6 +171,7 @@ describe("pre-publish-check.sh preflight: refused or stopped BEFORE any step", (
     const s = sandbox("standalone", { whoami: "fail" });
     const r = run(s, {});
     expect(r.calls.some((c) => c.startsWith("npm whoami")), "no login check outside npm publish").toBe(false);
+    expect(r.calls, "nor the release-tree qualification").not.toContain("gate");
     expect(r.out).toMatch(/=== pre-publish: tsc --noEmit ===/);
   });
 });

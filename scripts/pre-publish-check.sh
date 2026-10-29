@@ -14,6 +14,9 @@
 #       `expect(...).toBe("X.Y.Z")` that go stale on bump and slipped past
 #       the src/-only check until v2.6.0 publish-prep --full gate caught one
 #   6. End-to-end 25-tool smoke + CLI subcommand smoke against an isolated relay
+#   LAST. Re-pack identity: `npm publish` packs the tree AGAIN after this gate and uploads that
+#      tarball, so the gate ends by checking that the tree still packs to the tarball the release
+#      security gate tested, and that no prepack/prepare/postpack script would run in between.
 #
 # POST-PUBLISH (same day as `npm publish`, Maxime): tag vX.Y.Z at the published
 # gitHead and create the matching GitHub Release from the CHANGELOG section. GitHub's
@@ -25,29 +28,32 @@
 # Wired via package.json "prepublishOnly" so `npm publish` will refuse to ship
 # unless every check passes. Also runnable standalone for operator confidence.
 #
-# NEVER IN THE SERVING TREE: publish from a throwaway git worktree (or a fresh clone) at
-# origin/main, with its own node_modules. In the tree the live daemon runs from (the
-# .relay-prod-tree marker, or a launchd/claude.json entry pointing at its dist), a
-# `git pull` + `npm ci` swaps packages under the running build; this gate refuses to
-# start there (scripts/prebuild-guard.mjs --publish, first thing below, no override). That check
-# is NOT complete yet: the .relay-prod-tree marker is its reliable signal (the consumer detection
-# sees only the forms it parses); a follow-up replaces it with a positive qualification of the tree.
+# ONLY FROM A QUALIFIED RELEASE TREE. A real `npm publish` (npm sets npm_lifecycle_event=
+# prepublishOnly) runs scripts/publish-gate.mjs FIRST. It refuses, fail-closed, unless the tree
+# PROVES it is a fresh release tree: a linked worktree under the workspace's .worktrees/, no
+# .relay-prod-tree, its own real node_modules (root and extensions/vscode), clean at the remote's
+# main (or the release tag), with a release marker minted when the tree was created; and unless
+# the registry checked below is the one npm uploads to (no publishConfig.registry, an unscoped
+# name, no workspace publish). Run standalone (CI's smoke, a dev loop), this gate refuses only
+# the marked serving tree (.relay-prod-tree).
+# This gate CANNOT undo an earlier pull or `npm ci`: by the time it runs, they have happened.
+# So never run them in the serving tree at all.
 #
-# UNTIL THE POSITIVE-QUALIFICATION GATE LANDS, check these MANUALLY before publishing (this
-# gate's serving-tree check is not enough on its own):
-#   - a fresh linked worktree created for this release;
-#   - no .relay-prod-tree in it;
-#   - its OWN real node_modules (root AND extensions/vscode), never a worktree tool's symlink
-#     to the main checkout;
-#   - a clean tree at the fetched origin/main SHA;
-#   - `npm whoami` succeeds.
-# This gate CANNOT undo an earlier pull or `npm ci`: by the time it runs, they have
-# happened. So never run them in the serving tree at all; publish from a disposable
-# worktree with its own node_modules.
+# THE RELEASE PROCEDURE:
+#   1. create a linked worktree at origin/main under the workspace's .worktrees/;
+#   2. `node scripts/publish-gate.mjs --mint` in it, BEFORE npm ci (the marker is for this SHA);
+#   3. remove any node_modules link, then `npm ci` (root and extensions/vscode);
+#   4. `node scripts/publish-gate.mjs --check` (the qualification on demand; not the whole gate);
+#   5. `npm publish` (it runs this whole gate, the qualification first).
+# KNOWN LIMIT: `npm publish --ignore-scripts` skips prepublishOnly, and with it this WHOLE gate,
+# the qualification included. It is allowed ONLY to retry the UPLOAD after a run that completed
+# EVERY step of this gate and then failed at the upload itself (npm's own publish request), on the
+# SAME tree at the SAME SHA, untouched since (no build, install or edit: the retry packs the tree
+# again and nothing re-checks it against the tested tarball). A login failure is NOT that: it stops this gate BEFORE the build and the
+# tests, so fix the login and run a plain `npm publish` again (the whole gate runs). `--check`
+# proves the tree's QUALIFICATION only, never that this gate passed.
 #
-# IN THAT DISPOSABLE WORKTREE OR FRESH CLONE (the real `npm publish` path): run
-# `npm ci` there first (its own node_modules, never one linked to another tree), then
-# `npm publish` (which invokes this gate) or the gate standalone. You do NOT need a manual `npm run build` first — the gate builds
+# You do NOT need a manual `npm run build` first — the gate builds
 # dist/ itself (step 2) before any test. Both stumbles that hit the 2.25.0 publish
 # from a fresh checkout are covered here: missing node_modules (→ `npm ci`) and
 # missing dist (→ the step-2 build-before-tests ordering).
@@ -80,17 +86,18 @@ done
 
 # PREFLIGHT, before any step. Skipped under --list-steps, which runs NO step (it only prints the
 # labels), so there is nothing to protect and nothing to publish (both checks cost no load):
-#  1. the serving tree is refused first (no override for a publish);
-#  2. a real `npm publish` (npm sets npm_lifecycle_event=prepublishOnly) checks the npm login NOW,
-#     not after the ~20-minute gate: on 26 Oct the gate passed and the upload then failed on an
-#     expired login.
-# The registry `npm publish` uploads to: package.json publishConfig.registry when set, else the
-# configured registry. The package name is unscoped, so no @scope:registry mapping applies.
-# KNOWN GAP: a CLI `npm publish --registry X` is not seen here; a follow-up closes it.
+#  1. a real `npm publish`: the release-tree qualification (scripts/publish-gate.mjs), no override;
+#     standalone: the marked serving tree is refused;
+#  2. a real `npm publish` checks the npm login NOW, not after the ~20-minute gate: on 26 Oct the
+#     gate passed and the upload then failed on an expired login.
+# The registry `npm publish` uploads to, as npm reports it INSIDE this script (`npm config get
+# registry`): measured on npm 11.6.2 to be the real target for a CLI --registry, either env
+# spelling and .npmrc. Not with publishConfig.registry set (then a CLI and an env registry look
+# the same from here), so publish-gate.mjs refuses publishConfig.registry, a scoped name and a
+# workspace publish before this runs.
 publish_registry() {
   local r
-  r=$(node -e 'const p=require(process.argv[1]); process.stdout.write((p.publishConfig && p.publishConfig.registry) || "")' "$PROJECT_ROOT/package.json" 2>/dev/null) || r=""
-  [ -n "$r" ] || r=$(npm config get registry 2>/dev/null) || r=""
+  r=$(npm config get registry 2>/dev/null) || r=""
   printf '%s' "$r"
 }
 # A registry URL may carry a credential (user:token@) or a query: print it without either, never raw.
@@ -98,11 +105,11 @@ redact_registry() {
   printf '%s' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#; s#[?#].*$##'
 }
 if [ "$LIST_STEPS_MODE" != "1" ]; then
-  node "$PROJECT_ROOT/scripts/prebuild-guard.mjs" --publish || exit 1
   if [ "${npm_lifecycle_event:-}" = "prepublishOnly" ]; then
+    node "$PROJECT_ROOT/scripts/publish-gate.mjs" || exit 1
     _reg=$(publish_registry)
     if [ -z "$_reg" ]; then
-      echo "✖ could not determine the registry npm publish would use (publishConfig.registry / npm config get registry)." >&2
+      echo "✖ could not determine the registry npm publish would use (npm config get registry)." >&2
       exit 1
     fi
     if ! npm whoami --registry "$_reg" >/dev/null 2>&1; then
@@ -111,6 +118,9 @@ if [ "$LIST_STEPS_MODE" != "1" ]; then
       echo "  Run \`npm login --registry $_shown\`, then \`npm publish\` again. Checked before the gate, so nothing ran." >&2
       exit 1
     fi
+  elif [ -e "$PROJECT_ROOT/.relay-prod-tree" ]; then
+    echo "✖ REFUSING to run the pre-publish gate in the serving tree (.relay-prod-tree): it installs, builds and packs here, under the live daemon's dist/." >&2
+    exit 1
   fi
 fi
 
@@ -120,6 +130,22 @@ fi
 
 FAIL=0
 STEPS=()
+
+# The TESTED PACK: the tarball the release security gate packs and tests, and its identity, for the re-pack identity
+# step that ends the gate. Shell variables of THIS run only: reset here, before any step, so a value in the
+# environment (or anything an earlier run left behind) is never read; never exported, never written to a file.
+tested_pack_reset() {
+  tested_pack_integrity=""
+  tested_pack_file=""
+  tested_pack_dir=""
+  export -n tested_pack_integrity tested_pack_file tested_pack_dir
+}
+tested_pack_reset
+# Reads `npm pack --json` on stdin; prints the LAST entry's integrity and filename (one per line). Fails closed: no
+# JSON, no entry, or no sha512 integrity prints nothing and exits 1.
+npm_pack_identity() {
+  node -e 'let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => { try { const e = JSON.parse(s).at(-1); if (!e || typeof e.integrity !== "string" || !e.integrity.startsWith("sha512-") || typeof e.filename !== "string") process.exit(1); process.stdout.write(`${e.integrity}\n${e.filename}\n`); } catch { process.exit(1); } });'
+}
 step() {
   local label="$1"; shift
   # --list-steps: record the label and SKIP the command "$@". Emitting the label without
@@ -750,13 +776,47 @@ step "25-tool + CLI smoke (isolated relay)" smoke_25_isolated || exit 1
 # registry's latest published tarball must still FAIL the harms pinned in security/known-bad.json, or the suite went
 # blind. The control needs the registry: offline, it FAILS (no skip flag). In the CI smoke only, the control is left
 # to .github/workflows/release-gate.yml (main pushes, tags, gate-changing PRs), never during a real publish.
-release_security_gate() {
-  node "$PROJECT_ROOT/scripts/release-invariants.mjs" candidate --pack || return 1
-  if _relay_is_ci_smoke; then
-    echo "  SKIP  the known-bad control runs in .github/workflows/release-gate.yml; RELAY_SMOKE_ONLY set (CI smoke, not a publish)."
-    return 0
+# The candidate is packed HERE (pack_tested_tarball), not by release-invariants.mjs --pack, so the tarball the suite
+# tests and the identity the re-pack identity step compares are the same file by construction.
+pack_tested_tarball() {
+  tested_pack_reset
+  if [ ! -f "$PROJECT_ROOT/dist/index.js" ]; then
+    echo "  FAIL  no dist/: build first (npm pack ships whatever dist/ holds)."
+    return 1
   fi
-  node "$PROJECT_ROOT/scripts/release-invariants.mjs" control latest || return 1
+  local dir out ident
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/relay-tested-pack-XXXXXX")" || return 1
+  if ! out="$(cd "$PROJECT_ROOT" && npm pack --pack-destination "$dir" --json)"; then
+    echo "  FAIL  npm pack (the tarball to test) failed."
+    rm -rf -- "$dir"
+    return 1
+  fi
+  if ! ident="$(printf '%s' "$out" | npm_pack_identity)" || [ ! -f "$dir/$(printf '%s\n' "$ident" | sed -n 2p)" ]; then
+    echo "  FAIL  npm pack printed no integrity and filename for the tarball to test."
+    rm -rf -- "$dir"
+    return 1
+  fi
+  tested_pack_dir="$dir"
+  tested_pack_file="$dir/$(printf '%s\n' "$ident" | sed -n 2p)"
+  tested_pack_integrity="$(printf '%s\n' "$ident" | sed -n 1p)"
+  echo "  tested pack: $(basename "$tested_pack_file") $tested_pack_integrity"
+}
+release_security_gate() {
+  pack_tested_tarball || return 1
+  local rc=0
+  node "$PROJECT_ROOT/scripts/release-invariants.mjs" candidate "$tested_pack_file" || rc=1
+  if [ "$rc" -eq 0 ]; then
+    if _relay_is_ci_smoke; then
+      echo "  SKIP  the known-bad control runs in .github/workflows/release-gate.yml; RELAY_SMOKE_ONLY set (CI smoke, not a publish)."
+    else
+      node "$PROJECT_ROOT/scripts/release-invariants.mjs" control latest || rc=1
+    fi
+  fi
+  # The tarball is tested; only its identity is kept, for the re-pack identity step.
+  rm -rf -- "$tested_pack_dir"
+  tested_pack_dir=""
+  tested_pack_file=""
+  return "$rc"
 }
 step "release security gate (packed install: candidate + known-bad control)" release_security_gate || exit 1
 
@@ -1009,6 +1069,50 @@ if [ "$FULL_MODE" = "1" ]; then
   step "chaos (--full)" npx vitest run --config vitest.full.config.ts tests/chaos.test.ts || exit 1
   step "cross-version (--full)" npx vitest run --config vitest.full.config.ts tests/cross-version.test.ts || exit 1
 fi
+
+# --- 8. Re-pack identity: the LAST step ---
+# `npm publish` packs the tree AGAIN after this script (its prepublishOnly) returns, and uploads THAT tarball, not the
+# one the release security gate tested. Measured on npm 11.6.2: for an untouched tree, `npm pack --dry-run --json`
+# gives the integrity of the tarball npm then uploads, and a packed file changed in between shows in it. So this
+# compares the tree's integrity NOW with the tested pack's (pack_tested_tarball) and refuses:
+#  - a prepack, prepare or postpack script in package.json: it would run between this check and npm's pack, where
+#    this comparison cannot see what it changes;
+#  - no record of a tested pack in this run;
+#  - a different integrity (a packed file changed after the tested pack).
+# It proves the tree is the tested one when this step runs; npm's own pack follows it. `npm publish --ignore-scripts`
+# skips this whole script (the KNOWN LIMIT in the header).
+repack_identity_gate() {
+  local lifecycle
+  if ! lifecycle="$(cd "$PROJECT_ROOT" && node -e 'const s = JSON.parse(require("fs").readFileSync("package.json", "utf8")).scripts ?? {}; process.stdout.write(["prepack", "prepare", "postpack"].filter((k) => Object.prototype.hasOwnProperty.call(s, k)).join(" "));')"; then
+    echo "  FAIL  could not read the scripts in package.json."
+    return 1
+  fi
+  if [ -n "$lifecycle" ]; then
+    echo "  FAIL  package.json has a lifecycle script ($lifecycle): it would run between this check and npm's pack, so the uploaded tarball could differ from the tested one."
+    echo "        Move that work into the build, then re-run the full gate (npm publish). Never publish with --ignore-scripts to get past this."
+    return 1
+  fi
+  if [ -z "$tested_pack_integrity" ]; then
+    echo "  FAIL  no record of a tested pack in this run (the release security gate did not pack): nothing to compare the upload with."
+    echo "        Re-run the full gate (npm publish). Never publish with --ignore-scripts to get past this."
+    return 1
+  fi
+  local out now
+  if ! out="$(cd "$PROJECT_ROOT" && npm pack --dry-run --json)" || ! now="$(printf '%s' "$out" | npm_pack_identity | sed -n 1p)" || [ -z "$now" ]; then
+    echo "  FAIL  npm pack --dry-run --json gave no integrity: the tree npm would upload cannot be compared with the tested one."
+    echo "        Re-run the full gate (npm publish). Never publish with --ignore-scripts to get past this."
+    return 1
+  fi
+  if [ "$now" != "$tested_pack_integrity" ]; then
+    echo "  FAIL  the tree npm would upload is not the tarball the release gate tested: a packed file (dist/, bin/, hooks/, roles/, docs/, the root files) changed after the tested pack."
+    echo "        tested  $tested_pack_integrity"
+    echo "        now     $now"
+    echo "        Re-run the full gate on an untouched tree (npm publish). Never publish with --ignore-scripts to get past this."
+    return 1
+  fi
+  echo "  the tree npm will pack is the tested one: $now"
+}
+step "re-pack identity (the uploaded tarball is the tested one)" repack_identity_gate || exit 1
 
 # --- Summary ---
 echo ""

@@ -26,17 +26,24 @@ import path from "path";
  * budget arithmetic). On a construction failure the destination is removed before the error is rethrown.
  *
  * `bin` is a symlink to the repo's: Node resolves a main script's symlinks, so bin/relay still finds the real dist/.
+ * `dist` is linked too (the dist/ beside the given bin/, when it exists): check-relay.sh loads
+ * `$HOOKS_DIR/../dist/wake-coverage-status.js` and silently skips the wake-coverage line without it, so a copy
+ * without dist/ (as before this) differed from the real hooks on that line.
  */
 export const BUDGET_CLOCK_READ = "${SECONDS:-0}";
 export const BUDGET_CLOCK_SEAMED = "${RELAY_TEST_CLOCK:-${SECONDS:-0}}";
 export const BUDGET_FUNCTIONS = ["relay_margin_secs", "relay_pending_deadline"] as const;
 
 /** The text of a top-level `name() {` … `}` function in a hook script, as [start, end) character offsets. */
+// Line endings may be CRLF. An LF-only match finds neither function in a CRLF file, so their own reads are refused
+// as unclassified: exactly the Windows CI job's refusal on the first copy it built (reproduced with a CRLF copy).
 function functionSpan(src: string, name: string): [number, number] | null {
-  const m = new RegExp(`^${name}\\(\\) \\{\\n`, "m").exec(src);
+  const m = new RegExp(`^${name}\\(\\) \\{\\r?\\n`, "m").exec(src);
   if (!m) return null;
-  const end = src.indexOf("\n}\n", m.index);
-  return end === -1 ? null : [m.index, end + 3];
+  const close = /\r?\n\}\r?\n/g;
+  close.lastIndex = m.index;
+  const end = close.exec(src);
+  return end === null ? null : [m.index, end.index + end[0].length];
 }
 
 /** Every hook line that reads SECONDS outside the two budget functions, and is not a known non-budget use. */
@@ -77,7 +84,10 @@ export function budgetTree(dir: string, hooksDir: string, binDir: string): strin
   fs.rmSync(dir, { recursive: true, force: true });
   try {
     fs.cpSync(hooksDir, path.join(base, "hooks"), { recursive: true });
-    fs.symlinkSync(binDir, path.join(base, "bin"));
+    // "junction": a directory link Windows creates without a privilege (the Windows CI job runs hook rows); POSIX ignores it.
+    fs.symlinkSync(binDir, path.join(base, "bin"), "junction");
+    const distDir = path.join(path.dirname(binDir), "dist");
+    if (fs.existsSync(distDir)) fs.symlinkSync(distDir, path.join(base, "dist"), "junction");
     const copy = path.join(base, "hooks");
     const stray = unclassifiedSecondsReads(copy);
     if (stray.length) throw new Error(`budgetTree: SECONDS read outside the seamed budget arithmetic, unclassified: ${stray.join(" | ")}`);

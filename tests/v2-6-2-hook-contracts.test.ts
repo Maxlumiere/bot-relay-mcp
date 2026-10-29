@@ -19,13 +19,14 @@
  *   3. Daemon-down handling (no HTTP daemon → graceful degrade)
  *   4. Token validation paths (env / vault / both empty / shape-rejected)
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import Database from "better-sqlite3";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,6 +35,13 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 const HOOK_CHECK_RELAY = path.join(REPO_ROOT, "hooks", "check-relay.sh");
 const HOOK_POST_TOOL = path.join(REPO_ROOT, "hooks", "post-tool-use-check.sh");
 const HOOK_STOP = path.join(REPO_ROOT, "hooks", "stop-check.sh");
+// runHook runs these three from a seamed copy (tests/_helpers/hook-budget-tree.ts) whose budgeted steps read
+// RELAY_TEST_CLOCK, fixed at 0: bash SECONDS ticks on whole wall-clock seconds, so on a slow runner a step could be
+// skipped for budget and the row read the skip. Any other path (a hookCopy, the Codex hook) runs as given.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "v262-seamed-"));
+const SEAMED_HOOKS = budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin"));
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
+const SEAMED_PATH = new Map([HOOK_CHECK_RELAY, HOOK_POST_TOOL, HOOK_STOP].map((h) => [h, path.join(SEAMED_HOOKS, path.basename(h))]));
 
 /**
  * DERIVED HOOK SET — deliberately NOT a written list.
@@ -245,6 +253,7 @@ function runHook(o: RunOpts): { status: number; stdout: string; stderr: string }
     HOME: o.home,
     PATH: process.env.PATH || "/usr/bin:/bin",
     RELAY_HOME: o.home,
+    RELAY_TEST_CLOCK: "0",
     ...o.extraEnv,
   };
   if (o.agentName !== undefined) env.RELAY_AGENT_NAME = o.agentName;
@@ -253,7 +262,7 @@ function runHook(o: RunOpts): { status: number; stdout: string; stderr: string }
   // Never the hook's default (3777, the operator's live daemon): a test that wants a daemon says which.
   env.RELAY_HTTP_PORT = String(o.httpPort ?? 1);
   if (o.httpHost !== undefined) env.RELAY_HTTP_HOST = o.httpHost;
-  const r = spawnSync("bash", [o.hook], {
+  const r = spawnSync("bash", [SEAMED_PATH.get(o.hook) ?? o.hook], {
     encoding: "utf-8",
     timeout: 8000,
     env,
