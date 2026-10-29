@@ -18,6 +18,9 @@
  *   recorded 10 s window was 5 audit events), an acquirer takes the lock within its budget; a tight-loop probe storm
  *   is REPORT-ONLY (INV_DB_01_STORM=1: it prints how many rounds were starved, and never gates);
  * - a probe CREATES nothing (a read-only HOME, no locks dir: it answers FREE and no locks dir appears);
+ * - processes with DIFFERENT HOMEs (one in a minimal, launchd-like env) on one DB: exactly one owner; on macOS the lock
+ *   is ONE dotfile in the DB's real parent dir (0600), whatever the spelling, and a planted one that is not private
+ *   (a wider mode, a symlink, another owner) is a named refusal;
  * - a probe of an ABSENT owner answers FREE within the probe bound; a connect that never answers is a named refusal.
  * The racers run from FILES (an eval'd module breaks worker pools), under a SANDBOX HOME; every recorded child is
  * checked exited at the end.
@@ -120,8 +123,8 @@ fs.writeFileSync(
 );
 const env = { ...process.env, HOME, USERPROFILE: HOME };
 
-function run(file: string, args: string[]): { child: ChildProcess; out: Promise<string> } {
-  const child = spawn(process.execPath, [file, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+function run(file: string, args: string[], envFor: NodeJS.ProcessEnv = env): { child: ChildProcess; out: Promise<string> } {
+  const child = spawn(process.execPath, [file, ...args], { env: envFor, stdio: ["ignore", "pipe", "pipe"] });
   recorded.push(child);
   let buf = "";
   child.stdout!.on("data", (d) => (buf += d));
@@ -386,6 +389,88 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     }
   }, 60_000);
 
+  it("two processes with DIFFERENT HOMEs (one in a minimal, launchd-like env) on one DB: exactly ONE owner", async () => {
+    const db = path.join(ROOT, "two-homes.db");
+    fs.writeFileSync(db, "");
+    const other = path.join(ROOT, "other-home");
+    fs.mkdirSync(other, { recursive: true });
+    const minimal: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH,
+      HOME: other,
+      USERPROFILE: other,
+      ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot } : {}),
+    };
+    const h = await holding(db);
+    try {
+      const go = path.join(ROOT, "go-two-homes");
+      fs.writeFileSync(go, "");
+      expect(await run(RACER, [db, go, "0"], minimal).out, "a process with another HOME is the same contender").toMatch(/LOST/);
+    } finally {
+      await h.kill();
+    }
+  }, 60_000);
+
+  it.skipIf(process.platform !== "darwin")("macOS: the lock is ONE dotfile in the DB's REAL parent dir (0600), whatever the spelling, never under HOME", async () => {
+    const realDir = path.join(ROOT, "lf-real");
+    const linkDir = path.join(ROOT, "lf-link");
+    fs.mkdirSync(realDir);
+    fs.mkdirSync(linkDir);
+    const db = path.join(realDir, "Lf.db");
+    fs.writeFileSync(db, "");
+    const link = path.join(linkDir, "via-link.db");
+    fs.symlinkSync(db, link);
+    const h = await holding(link);
+    try {
+      const lf = path.join(fs.realpathSync.native(realDir), ".Lf.db.relay-owner");
+      expect(fs.existsSync(lf), "the lock file sits beside the canonical DB").toBe(true);
+      expect(fs.statSync(lf).mode & 0o777, "and is private").toBe(0o600);
+      expect(fs.readdirSync(linkDir).filter((f) => f.includes("relay-owner")), "nothing beside the link").toEqual([]);
+      expect(fs.existsSync(path.join(HOME, ".bot-relay", "locks")), "nothing under HOME").toBe(false);
+      expect(await oneTry(db), "the canonical spelling is the same owner").toMatch(/LOST/);
+    } finally {
+      await h.kill();
+    }
+  }, 60_000);
+
+  it.skipIf(process.platform !== "darwin")("macOS: a PLANTED lock file that is not private (a wider mode, a symlink) is a NAMED refusal, for an acquire and a probe", async () => {
+    const m = (await import("../dist/db-owner-lock.js")) as unknown as {
+      acquirePrimitive: (p: string, o?: { attempts?: number }) => Promise<{ release(): void }>;
+      isOwnedElsewhere: (p: string) => Promise<boolean>;
+    };
+    const dir = path.join(ROOT, "planted");
+    fs.mkdirSync(dir);
+    const wide = path.join(dir, "Wide.db");
+    fs.writeFileSync(wide, "");
+    fs.writeFileSync(path.join(dir, ".Wide.db.relay-owner"), "");
+    fs.chmodSync(path.join(dir, ".Wide.db.relay-owner"), 0o644);
+    await expect(m.acquirePrimitive(wide, { attempts: 1 })).rejects.toThrow(/owner lock file .* is not private/);
+    await expect(m.isOwnedElsewhere(wide)).rejects.toThrow(/owner lock file .* is not private/);
+    const linked = path.join(dir, "Linked.db");
+    fs.writeFileSync(linked, "");
+    fs.symlinkSync(path.join(ROOT, "elsewhere"), path.join(dir, ".Linked.db.relay-owner"));
+    await expect(m.acquirePrimitive(linked, { attempts: 1 })).rejects.toThrow(/owner lock file .* is not private|is a symlink/);
+    await expect(m.isOwnedElsewhere(linked)).rejects.toThrow(/owner lock file .* is not private|is a symlink/);
+    expect(fs.existsSync(path.join(ROOT, "elsewhere")), "nothing was created through the planted symlink").toBe(false);
+  }, 60_000);
+
+  const canSudo = process.platform === "darwin" && !!process.env.CI && spawnSync("sudo", ["-n", "true"]).status === 0;
+  it.skipIf(!canSudo)("macOS CI: a PLANTED lock file owned by ANOTHER user (root) is a NAMED refusal", async () => {
+    const m = (await import("../dist/db-owner-lock.js")) as unknown as {
+      acquirePrimitive: (p: string, o?: { attempts?: number }) => Promise<{ release(): void }>;
+      isOwnedElsewhere: (p: string) => Promise<boolean>;
+    };
+    const dir = path.join(ROOT, "foreign");
+    fs.mkdirSync(dir);
+    const db = path.join(dir, "F.db");
+    fs.writeFileSync(db, "");
+    const lf = path.join(dir, ".F.db.relay-owner");
+    fs.writeFileSync(lf, "");
+    fs.chmodSync(lf, 0o600);
+    expect(spawnSync("sudo", ["-n", "chown", "0", lf]).status, "chown to root").toBe(0);
+    await expect(m.acquirePrimitive(db, { attempts: 1 })).rejects.toThrow(/owner lock file .* is not private/);
+    await expect(m.isOwnedElsewhere(db)).rejects.toThrow(/owner lock file .* is not private/);
+  }, 60_000);
+
   const canBindMount = process.platform === "linux" && !!process.env.CI && spawnSync("sudo", ["-n", "true"]).status === 0;
   it.skipIf(!canBindMount)("Linux CI: a BIND MOUNT of the DB's directory names ONE owner (the parent directory's identity collapses it)", async () => {
     const src = path.join(ROOT, "bind-src");
@@ -426,6 +511,7 @@ describe("INV-DB-01: the enable gate, judged for ANY platform (so it runs on eve
     await expect(m.acquireOwnerLock(db, { platform: "freebsd" })).rejects.toThrow(/wasm writes are refused on freebsd/);
     expect(fs.existsSync(db), "the DB was materialized").toBe(false);
     expect(lockFiles(), "a lock file was written").toEqual(before);
+    expect(fs.existsSync(path.join(ROOT, ".gate-freebsd.db.relay-owner")), "a lock file was written beside the DB").toBe(false);
   });
 
   it.each(["darwin", "linux", "win32"])("twin: %s (measured green in CI) is enabled", async (platform) => {

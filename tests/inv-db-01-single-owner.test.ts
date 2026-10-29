@@ -15,7 +15,7 @@ import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -282,6 +282,25 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: every other native 
     // The remedy WORKS as named: one native open of the DB (the relay's own), then the wasm open succeeds.
     expect(await child("write", "remedy", "native").out).toMatch(/OK/);
     expect(await child("write", "after-remedy", "wasm").out, "the wasm open after the remedy").toMatch(/OK/);
+  }, 60_000);
+
+  it.each(["native", "wasm"] as const)("a %s cold export beside the owner's lock file: a NORMAL archive name is not refused, it succeeds, and the lock file is NOT archived", async (driver) => {
+    expect(await child("write", "seed", "native").out).toMatch(/OK/);
+    const a = child("hold", "wasm-owner", "wasm"); // the owner creates its lock file (macOS: beside the DB)
+    expect(await a.ready).toMatch(/READY/);
+    a.proc.kill("SIGTERM");
+    await a.out;
+    if (process.platform === "darwin") {
+      expect(fs.existsSync(path.join(fs.realpathSync.native(dbDir), ".relay.db.relay-owner")), "precondition: the owner's lock file is there").toBe(true);
+    }
+    process.env.RELAY_SQLITE_DRIVER = driver;
+    const { exportRelayState } = await import("../src/backup.js");
+    const r = await exportRelayState({ destinationPath: path.join(dbDir, `backup-${driver}.tar.gz`) });
+    const listed = spawnSync("tar", ["-tzf", path.basename(r.archive_path)], { cwd: path.dirname(r.archive_path), encoding: "utf-8" });
+    expect(listed.status, listed.stderr).toBe(0);
+    const members = listed.stdout.split(/\r?\n/).filter(Boolean);
+    expect(members.length, "precondition: the archive has members").toBeGreaterThan(0);
+    expect(members.filter((x) => x.includes("relay-owner")), "the lock file was archived").toEqual([]);
   }, 60_000);
 
   it.each(["wasm", "native"] as const)("a RESTORE (driver %s) while another process owns the DB is refused, and the owner's data survives", async (driver) => {
