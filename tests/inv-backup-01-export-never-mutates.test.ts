@@ -136,6 +136,20 @@ describe("INV-BACKUP-01: an export never mutates its source DB", () => {
     expect(exp.schema_version, "the manifest records the source's schema version").toBe(CURRENT_SCHEMA_VERSION - 1);
   });
 
+  it("(2) the WARM path too: with the connection open, the export runs no migration or write (the logical content is identical before and after)", async () => {
+    await makeSourceDb({ webhookSecret: "plain-secret-warm" });
+    const db = await import("../src/db.js");
+    await db.initializeDb(); // the connection's own open (and its migrations) happen HERE, before the export
+    // The dump reads the main file only, so the TEST checkpoints the WAL into it first (its own write, not the export's).
+    const checkpoint = () => db.getDb().pragma("wal_checkpoint(TRUNCATE)");
+    checkpoint();
+    const before = await logicalDump(dbPath);
+    const { exportRelayState } = await import("../src/backup.js");
+    await exportRelayState({ destinationPath: path.join(root, "warm-only.tar.gz") });
+    checkpoint();
+    expect(await logicalDump(dbPath)).toBe(before);
+  });
+
   it("(3) WARM = COLD: the same DB exported with its connection open and then closed gives the same archived content", async () => {
     await makeSourceDb({ webhookSecret: "plain-secret-3" });
     const db = await import("../src/db.js");
