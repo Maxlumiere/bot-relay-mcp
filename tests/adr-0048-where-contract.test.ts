@@ -22,6 +22,7 @@ import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
+import { MEASURED_PLATFORMS } from "../src/db-owner-lock.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO_ROOT, "bin", "relay");
@@ -234,6 +235,41 @@ describe("ADR-0048 — the daemon re-checks containment AFTER create (TOCTOU)", 
       }
     });
   }
+
+  // INV-DB-01: the wasm driver's owner lock MATERIALIZES an absent DB. A swap AFTER db.ts's pre-open containment check
+  // and BEFORE that materialize must still leave NO file outside the roots.
+  it.skipIf(!MEASURED_PLATFORMS.has(process.platform))("wasm: a swap between the pre-open check and the lock's materialize leaves NO file outside the roots", async () => {
+    const saved = { HOME: process.env.HOME, RELAY_DB_PATH: process.env.RELAY_DB_PATH, D: process.env.RELAY_SQLITE_DRIVER };
+    process.env.HOME = HOME;
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const dir = path.join(HOME, "racy-materialize");
+    const dbPath = path.join(dir, "relay.db");
+    process.env.RELAY_DB_PATH = dbPath;
+    const db = await import("../src/db.js");
+    db.closeDb();
+    const realOpen = fs.openSync.bind(fs);
+    let swapped = false;
+    vi.spyOn(fs, "openSync").mockImplementation(((p: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
+      if (!swapped && String(p) === dbPath) {
+        swapped = true;
+        fs.rmSync(dir, { recursive: true, force: true });
+        fs.symlinkSync(OUTSIDE, dir);
+      }
+      return realOpen(p, flags, mode);
+    }) as never);
+    try {
+      await expect(db.initializeDb()).rejects.toThrow(/REFUSING the relay DB/);
+      expect(swapped, "precondition: the swap ran in the window (the materialize's open)").toBe(true);
+      expect(fs.readdirSync(OUTSIDE), "a file was left outside the roots").toEqual([]);
+    } finally {
+      db.closeDb();
+      process.env.HOME = saved.HOME;
+      if (saved.RELAY_DB_PATH === undefined) delete process.env.RELAY_DB_PATH;
+      else process.env.RELAY_DB_PATH = saved.RELAY_DB_PATH;
+      if (saved.D === undefined) delete process.env.RELAY_SQLITE_DRIVER;
+      else process.env.RELAY_SQLITE_DRIVER = saved.D;
+    }
+  });
 });
 
 describe("ADR-0048 — tripwires (literal spellings only; the guards are the contract tests)", () => {

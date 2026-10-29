@@ -10,7 +10,9 @@
  * - 8 racer processes x 20 rounds, each round after a SIGKILLed holder: EXACTLY one owner every round;
  * - the key is stable across a rename persist (the wasm driver's tmp + rename gives the DB a new inode);
  * - alias spellings of one DB (a symlink, `..`, a case variant where the volume folds case) give one owner;
- * - Linux CI: a bind mount of the DB's directory gives one owner, when the runner can mount; otherwise UNMEASURED.
+ * - Linux CI: a bind mount of the DB's directory gives one owner, when the runner can mount; otherwise UNMEASURED;
+ * - a DB the acquire just CREATED and its caller's verify refuses is removed only when it is provably that file (the
+ *   same dev + ino as the created fd, still empty), with the open fd held (on Windows too).
  * The racers run from FILES (an eval'd module breaks worker pools), under a SANDBOX HOME; every recorded child is
  * checked exited at the end.
  */
@@ -137,6 +139,38 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
       await h.kill();
     }
     expect(spellings.length, "the spellings judged (the case variant only where the volume folds case)").toBeGreaterThanOrEqual(process.platform === "win32" ? 1 : 2);
+  }, 60_000);
+
+  type Acquire = (p: string, o?: { verifyCreated?: (p: string) => void }) => Promise<{ release(): void }>;
+  const refuse = () => {
+    throw new Error("refused by verify");
+  };
+  it("a DB the acquire just CREATED, refused by its verify, is REMOVED (provably its own: same dev + ino, empty), and the refusal stands", async () => {
+    const { acquirePrimitive } = (await import("../dist/db-owner-lock.js")) as { acquirePrimitive: Acquire };
+    const db = path.join(ROOT, "refused-new.db");
+    await expect(acquirePrimitive(db, { verifyCreated: refuse })).rejects.toThrow(/refused by verify/);
+    expect(fs.existsSync(db), "the file it created is gone").toBe(false);
+  }, 60_000);
+
+  it.each([
+    ["a DIFFERENT empty file replaced it (another inode)", (p: string) => { fs.renameSync(p, `${p}.moved`); fs.writeFileSync(p, ""); }],
+    ["its own file is no longer EMPTY", (p: string) => fs.appendFileSync(p, "x")],
+  ])("twin: NOT removed when %s, and the refusal says so", async (_label, meddle) => {
+    const { acquirePrimitive } = (await import("../dist/db-owner-lock.js")) as { acquirePrimitive: Acquire };
+    const db = path.join(ROOT, `kept-${Math.random().toString(36).slice(2)}.db`);
+    await expect(acquirePrimitive(db, { verifyCreated: (p) => { meddle(p); refuse(); } })).rejects.toThrow(/refused by verify.*NOT removed/);
+    expect(fs.existsSync(db), "a file not provably its own is left in place").toBe(true);
+  }, 60_000);
+
+  it("twin: a DB that already EXISTED is never verified as created (nor removed)", async () => {
+    const { acquirePrimitive } = (await import("../dist/db-owner-lock.js")) as { acquirePrimitive: Acquire };
+    const db = path.join(ROOT, "pre-existing.db");
+    fs.writeFileSync(db, "");
+    let called = false;
+    const lock = await acquirePrimitive(db, { verifyCreated: () => { called = true; refuse(); } });
+    lock.release();
+    expect(called, "verifyCreated ran on a DB this call did not create").toBe(false);
+    expect(fs.existsSync(db)).toBe(true);
   }, 60_000);
 
   const canBindMount = process.platform === "linux" && !!process.env.CI && spawnSync("sudo", ["-n", "true"]).status === 0;
