@@ -513,9 +513,10 @@ export function assertWasmSourceReadable(dbPath: string, what = "backup refused 
   for (const side of ["-wal", "-shm", "-journal"]) {
     if (fs.existsSync(dbPath + side)) {
       throw new Error(
-        `${what}: a ${side} file is beside the DB at '${dbPath}', so another process may have it open ` +
-          `or its last transaction is not in the main file, and the wasm driver reads only the main file. Use ` +
-          `the native driver, or wait until no other process has the DB open.`
+        `${what}: a ${side} file is beside the DB at '${dbPath}'. Either another process has the DB open, or the ` +
+          `file was left by a native open (e.g. a native \`relay backup\`), and the last transaction may not be in ` +
+          `the main file, which is all the wasm driver reads. If no other process has it open: open it once with the ` +
+          `native driver to checkpoint (closing its last connection removes the side files), then retry.`
       );
     }
   }

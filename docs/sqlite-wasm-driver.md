@@ -75,12 +75,18 @@ For relay workloads these differences are imperceptible. If you are building som
 
 ### Single-process only
 
-The wasm driver operates on an in-memory copy of the database. Two processes sharing the same `relay.db` file will overwrite each other's changes on write-back. There is no file-level locking.
+The wasm driver operates on an in-memory copy of the database and writes it back to the file. One process **owns** a wasm-driven DB (INV-DB-01): it holds a kernel lock for that DB for as long as it has it open, the kernel releases it if the process dies, and every write-back happens only under it, as an atomic replace (a temp file renamed over the DB).
+
+- A **second process** on the same DB is **refused** by name, wasm or native. It does not silently overwrite the first one's changes.
+- A wasm open is also refused when a `-wal`, `-shm` or `-journal` file sits beside the DB (another process has it open natively, or a native open left them). The refusal names the remedy: if no other process has it open, open it once with the native driver to checkpoint, then retry.
+- A **hard-linked** DB is refused for wasm writes: a rename write-back would split its names into two databases.
+- The lock is **enabled per platform**, once CI measures exactly one owner there (`MEASURED_PLATFORMS` in `src/db-owner-lock.ts`). Elsewhere a wasm open is refused by name: use the native driver.
+- Keep a wasm DB on a **local filesystem**. The same network share mounted twice is two different devices to the lock, so two hosts (or two mounts) are not stopped from both owning it.
 
 **This means:**
 - HTTP transport (single daemon process): safe.
 - Single-terminal stdio: safe.
-- Multi-terminal stdio (multiple MCP processes sharing the same DB): **NOT SAFE. Use native.**
+- Multi-terminal stdio (multiple MCP processes sharing the same DB): only the first process gets the DB; the others are refused. **Use native** for this.
 
 ### No WAL mode
 
@@ -106,7 +112,7 @@ If the process crashes between a write and the write-back flush, the last write 
 
 **"Failed to flush DB to disk"** — the relay cannot write to the DB path. Check permissions on `~/.bot-relay/` or set `RELAY_DB_PATH` to a writable location.
 
-**Data seems to disappear between restarts** — check that you're not running two processes with the wasm driver on the same DB file (see "Single-process only" above).
+**"could not be locked for this process"** or **"owned by a wasm-driver process"** — another relay process already owns the DB with the wasm driver (see "Single-process only" above). Stop it, or use the native driver for every process.
 
 ## Related
 
