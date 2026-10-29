@@ -206,7 +206,7 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: one wasm owner, enf
     }
   }, 60_000);
 
-  it("a native open racing a wasm owner (the owner arrives between the native open and its RE-CHECK) is refused", async () => {
+  it("a native open racing a wasm owner (the owner arrives between the native open and its RE-CHECK) is refused; on Windows the owner cannot persist at all, and is refused BY NAME with nothing written", async () => {
     const compat = (await import("../dist/sqlite-compat.js")) as {
       _setNativeAfterOpenHookForTests?: (fn: (() => Promise<void>) | null) => void;
       initializeDb: (p: string) => Promise<unknown>;
@@ -214,15 +214,29 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: one wasm owner, enf
     };
     expect(typeof compat._setNativeAfterOpenHookForTests, "the post-open seam exists").toBe("function");
     let owner: ReturnType<typeof child> | null = null;
+    let sizeWhileOpen = -1;
     compat._setNativeAfterOpenHookForTests!(async () => {
+      sizeWhileOpen = fs.statSync(dbPath).size;
       owner = child("hold", "wasm-late", "wasm");
-      expect(await owner.ready).toMatch(/READY/);
+      if (process.platform === "win32") {
+        // Windows cannot replace a file another process holds open: the owner's first persist is refused BY NAME, it
+        // writes nothing, and it exits (so the native's re-check finds no owner).
+        expect(await owner.ready).toMatch(/REFUSED .*another process has the DB file open; Windows cannot replace it; nothing was written/);
+        await owner.out;
+        expect(fs.statSync(dbPath).size, "the refused owner wrote nothing").toBe(sizeWhileOpen);
+      } else {
+        expect(await owner.ready).toMatch(/READY/);
+      }
     });
     const prev = { driver: process.env.RELAY_SQLITE_DRIVER, home: process.env.HOME };
     process.env.RELAY_SQLITE_DRIVER = "native";
     process.env.HOME = HOME;
     try {
-      await expect(compat.initializeDb(dbPath)).rejects.toThrow(/owned by a wasm-driver process/);
+      if (process.platform === "win32") {
+        await expect(compat.initializeDb(dbPath), "the native open, its owner gone, proceeds").resolves.toBeTruthy();
+      } else {
+        await expect(compat.initializeDb(dbPath)).rejects.toThrow(/owned by a wasm-driver process/);
+      }
     } finally {
       compat._setNativeAfterOpenHookForTests!(null);
       compat.closeInitializedDb?.();
@@ -301,6 +315,46 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: every other native 
     const members = listed.stdout.split(/\r?\n/).filter(Boolean);
     expect(members.length, "precondition: the archive has members").toBeGreaterThan(0);
     expect(members.filter((x) => x.includes("relay-owner")), "the lock file was archived").toEqual([]);
+  }, 60_000);
+
+  it.each(["a single statement", "a transaction"])("a REFUSED persist (%s) loses no write: nothing on disk changes, no temp file is left, and the NEXT persist writes it", async (path_) => {
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const db = await import("../src/db.js");
+    const compat = (await import("../src/sqlite-compat.js")) as unknown as {
+      _setPersistRenameForTests?: (fn: ((from: string, to: string) => void) | null) => void;
+    };
+    expect(typeof compat._setPersistRenameForTests, "the persist seam exists").toBe("function");
+    await db.initializeDb();
+    const h = db.getDb();
+    h.exec("CREATE TABLE IF NOT EXISTS persist_probe (v TEXT)");
+    const ins = h.prepare("INSERT INTO persist_probe (v) VALUES (?)");
+    const write = (v: string) => (path_ === "a transaction" ? h.transaction(() => ins.run(v))() : ins.run(v));
+    write("before");
+    const bytesBefore = fs.readFileSync(dbPath);
+    let fail = true;
+    compat._setPersistRenameForTests!((from, to) => {
+      if (fail) throw Object.assign(new Error("EPERM: operation not permitted (injected)"), { code: "EPERM" });
+      fs.renameSync(from, to);
+    });
+    try {
+      expect(() => write("during")).toThrow(/nothing was written.*next successful persist/);
+      expect(fs.readFileSync(dbPath).equals(bytesBefore), "the DB file changed").toBe(true);
+      expect(fs.readdirSync(dbDir).filter((f) => f.endsWith(".tmp")), "a temp file was left").toEqual([]);
+      fail = false;
+      write("after");
+      // Read the FILE before closing (a close persists too, and would hide a dropped persist).
+      const Database = (await import("better-sqlite3")).default;
+      const ro = new Database(dbPath, { readonly: true });
+      try {
+        const vs = (ro.prepare("SELECT v FROM persist_probe ORDER BY rowid").all() as Array<{ v: string }>).map((r) => r.v);
+        expect(vs, "the next persist wrote the earlier write too").toEqual(["before", "during", "after"]);
+      } finally {
+        ro.close();
+      }
+    } finally {
+      compat._setPersistRenameForTests!(null);
+      db.closeDb();
+    }
   }, 60_000);
 
   it.each(["wasm", "native"] as const)("a RESTORE (driver %s) while another process owns the DB is refused, and the owner's data survives", async (driver) => {
