@@ -8,9 +8,13 @@
  *
  * The owner holds ONE exclusive KERNEL primitive per platform, released by the kernel when the owner dies (no pid, no
  * lock file judged for staleness):
- * - macOS/BSD: open(<HOME>/.bot-relay/locks/<key>.owner, O_RDWR|O_CREAT|O_NONBLOCK|O_EXLOCK). O_EXLOCK is 0x20 there
- *   (Node has no constant; libuv passes the flag through, MEASURED). A flock-style lock on its OWN file, so the wasm
- *   driver's opens and closes of the DB file never drop it.
+ * - macOS/BSD: open(<the DB's real parent dir>/.<canonical basename>.relay-owner,
+ *   O_RDWR|O_CREAT|O_NONBLOCK|O_NOFOLLOW|O_EXLOCK, 0600), RULED: beside the DB, never under HOME, so every process on
+ *   the DB contends for the same file whatever its HOME (two users, a launchd daemon). O_EXLOCK is 0x20 there (Node
+ *   has no constant; libuv passes the flag through, MEASURED). A flock-style lock on its OWN file, so the wasm driver's
+ *   opens and closes of the DB file never drop it. The leading "." keeps it out of SQLite's side-file names and the
+ *   backup's destination-name rule; it is never archived. A lock file that is not private (another owner, a wider
+ *   mode, a symlink) is a named refusal. It is never deleted (an unlink would race a contender).
  * - Linux: a listening ABSTRACT-namespace socket ("\0bot-relay-<key>"): no file, so no stale state.
  * - Windows: a listening named pipe (\\.\pipe\bot-relay-<key>); a second listener fails.
  *
@@ -32,7 +36,6 @@
 import crypto from "crypto";
 import fs from "fs";
 import net from "net";
-import os from "os";
 import path from "path";
 
 /**
@@ -122,8 +125,35 @@ export function assertSingleLink(dbPath: string): void {
   }
 }
 
-function locksDir(): string {
-  return path.join(os.homedir(), ".bot-relay", "locks");
+/** macOS: the owner's lock file, a private dotfile beside the DB's canonical file (RULED). */
+export function lockFilePath(dbPath: string): string {
+  const real = fs.realpathSync.native(dbPath);
+  return path.join(path.dirname(real), `.${path.basename(real)}.relay-owner`);
+}
+
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+
+/** Fail closed on a lock file this process cannot trust: not a regular file, another owner, or any group/other bit. */
+function assertPrivateLockFile(fd: number, file: string): void {
+  const st = fs.fstatSync(fd);
+  const uid = typeof process.getuid === "function" ? process.getuid() : st.uid;
+  if (!st.isFile() || st.uid !== uid || (st.mode & 0o077) !== 0) {
+    throw new OwnerLockError(
+      `the owner lock file ${file} is not private to this user (owner uid ${st.uid}, mode ${(st.mode & 0o777).toString(8)}), so it is not trusted. If no relay process uses the DB, remove it.`
+    );
+  }
+}
+
+/** Open the lock file, never through a symlink; ELOOP (a planted symlink) is the same named refusal. */
+function openLockFile(file: string, flags: number, mode?: number): number {
+  try {
+    return fs.openSync(file, flags | O_NOFOLLOW, mode);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new OwnerLockError(`the owner lock file ${file} is not private to this user (it is a symlink), so it is not trusted. If no relay process uses the DB, remove it.`);
+    }
+    throw err;
+  }
 }
 
 /** Every primitive this process holds, by key, PINNED (a collected handle must never drop a lock). */
@@ -139,18 +169,24 @@ function primitiveName(key: string): string {
   return process.platform === "win32" ? `\\\\.\\pipe\\bot-relay-${key}` : `\0bot-relay-${key}`;
 }
 
-function tryPrimitiveOnce(key: string): Promise<(() => void) | null> {
+function tryPrimitiveOnce(key: string, dbPath: string): Promise<(() => void) | null> {
   if (process.platform === "darwin") {
-    fs.mkdirSync(locksDir(), { recursive: true, mode: 0o700 });
-    const file = path.join(locksDir(), `${key}.owner`);
+    const file = lockFilePath(dbPath);
+    let fd: number;
     try {
-      const fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NONBLOCK | O_EXLOCK_DARWIN, 0o600);
-      return Promise.resolve(() => fs.closeSync(fd));
+      fd = openLockFile(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NONBLOCK | O_EXLOCK_DARWIN, 0o600);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "EAGAIN" || code === "EWOULDBLOCK") return Promise.resolve(null);
-      throw err;
+      return Promise.reject(err);
     }
+    try {
+      assertPrivateLockFile(fd, file);
+    } catch (err) {
+      fs.closeSync(fd);
+      return Promise.reject(err);
+    }
+    return Promise.resolve(() => fs.closeSync(fd));
   }
   if (process.platform !== "linux" && process.platform !== "win32") {
     return Promise.reject(new OwnerLockError(`no single-owner lock primitive is defined for ${process.platform}`));
@@ -207,7 +243,7 @@ export async function acquirePrimitive(dbPath: string, opts: AcquireOptions = {}
       own.refs++;
       return { key, release: () => releaseKey(key) };
     }
-    const drop = await tryPrimitiveOnce(key);
+    const drop = await tryPrimitiveOnce(key, dbPath);
     if (drop) {
       afterAcquireHook?.();
       let now: string | null;
@@ -288,17 +324,23 @@ export async function isOwnedElsewhere(dbPath: string): Promise<boolean> {
   if (HELD.has(key)) return false; // our own wasm connection, not another process
   if (process.platform === "darwin") {
     // A probe CREATES nothing (a native read must not write): an owner creates its lock file before it locks it, so
-    // no locks dir or no lock file means no owner.
+    // no lock file means no owner. A lock file that is not private is the same named refusal as for an acquire.
+    const file = lockFilePath(dbPath);
+    let fd: number;
     try {
-      const fd = fs.openSync(path.join(locksDir(), `${key}.owner`), fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | O_SHLOCK_DARWIN);
-      fs.closeSync(fd);
-      return false;
+      fd = openLockFile(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | O_SHLOCK_DARWIN);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "ENOENT") return false;
       if (code === "EAGAIN" || code === "EWOULDBLOCK") return true;
       throw err;
     }
+    try {
+      assertPrivateLockFile(fd, file);
+    } finally {
+      fs.closeSync(fd);
+    }
+    return false;
   }
   return new Promise((resolve, reject) => {
     const sock = probeConnect(primitiveName(key));

@@ -80,6 +80,7 @@ The wasm driver operates on an in-memory copy of the database and writes it back
 - A **second process** on the same DB is **refused** by name, wasm or native. It does not silently overwrite the first one's changes.
 - A wasm open is also refused when a `-wal`, `-shm` or `-journal` file sits beside the DB (another process has it open natively, or a native open left them). The refusal names the remedy: if no other process has it open, open it once with the native driver to checkpoint, then retry.
 - A **hard-linked** DB is refused for wasm writes: a rename write-back would split its names into two databases.
+- On macOS the lock is a private dotfile beside the DB (`.relay.db.relay-owner`, mode 0600), so every process on the DB contends for it whatever its `HOME`. It stays after the owner exits, which is harmless: the kernel lock goes with the process. It is never archived, and one that is not private to you (another owner, a wider mode, a symlink) is refused by name. On Linux and Windows the lock is a named socket or pipe, with no file.
 - The lock is **enabled per platform**, once CI measures exactly one owner there (`MEASURED_PLATFORMS` in `src/db-owner-lock.ts`). Elsewhere a wasm open is refused by name: use the native driver.
 - Keep a wasm DB on a **local filesystem**. The same network share mounted twice is two different devices to the lock, so two hosts (or two mounts) are not stopped from both owning it.
 
