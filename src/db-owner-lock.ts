@@ -41,6 +41,15 @@ export const MEASURED_PLATFORMS: ReadonlySet<NodeJS.Platform> = new Set<NodeJS.P
 const O_EXLOCK_DARWIN = 0x20;
 const O_SHLOCK_DARWIN = 0x10;
 
+/** How long an owner probe waits for the owner's socket or pipe to answer before refusing (never guessing). */
+export const PROBE_TIMEOUT_MS = 1000;
+
+let probeConnect: (name: string) => net.Socket = (name) => net.connect(name);
+/** Test-only: replaces the probe's connect (e.g. with a socket that never answers). */
+export function _setProbeConnectForTests(fn: ((name: string) => net.Socket) | null): void {
+  probeConnect = fn ?? ((name) => net.connect(name));
+}
+
 export class OwnerLockError extends Error {
   constructor(message: string) {
     super(message);
@@ -253,7 +262,8 @@ export function holdsOwnerLock(dbPath: string): boolean {
  * absent DB has no owner (a wasm owner materializes the file before it keys it). A probe never TAKES the primitive (two
  * native probers would each read the other as an owner): macOS takes a SHARED flock on the owner file (probers are
  * compatible with each other; a wasm acquirer racing one retries); Linux and Windows CONNECT to the owner's socket or
- * pipe (a listener answering is an owner).
+ * pipe (a listener answering is an owner), bounded by PROBE_TIMEOUT_MS: no answer in time is a named refusal, never
+ * read as FREE.
  */
 export async function isOwnedElsewhere(dbPath: string): Promise<boolean> {
   if (!fs.existsSync(dbPath)) return false;
@@ -273,16 +283,30 @@ export async function isOwnedElsewhere(dbPath: string): Promise<boolean> {
     }
   }
   return new Promise((resolve, reject) => {
-    const sock = net.connect(primitiveName(key));
-    sock.once("connect", () => {
+    const sock = probeConnect(primitiveName(key));
+    const settle = (then: () => void) => {
+      clearTimeout(timer);
       sock.destroy();
-      resolve(true);
-    });
-    sock.once("error", (e: NodeJS.ErrnoException) => {
-      sock.destroy();
-      if (e.code === "ECONNREFUSED" || e.code === "ENOENT") resolve(false);
-      else if (e.code === "EAGAIN" || e.code === "EBUSY") resolve(true); // a listener exists, its queue is full
-      else reject(e);
-    });
+      then();
+    };
+    const timer = setTimeout(
+      () =>
+        settle(() =>
+          reject(
+            new OwnerLockError(
+              `could not tell within ${PROBE_TIMEOUT_MS} ms whether a wasm-driver process owns the DB at ${dbPath} (its owner ${process.platform === "win32" ? "pipe" : "socket"} did not answer), so it is not opened. Retry; if it persists, stop any wasm-driver relay process on it.`
+            )
+          )
+        ),
+      PROBE_TIMEOUT_MS
+    );
+    sock.once("connect", () => settle(() => resolve(true)));
+    sock.once("error", (e: NodeJS.ErrnoException) =>
+      settle(() => {
+        if (e.code === "ECONNREFUSED" || e.code === "ENOENT") resolve(false);
+        else if (e.code === "EAGAIN" || e.code === "EBUSY") resolve(true); // a listener exists, its queue is full
+        else reject(e);
+      })
+    );
   });
 }
