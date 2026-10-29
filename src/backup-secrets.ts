@@ -19,7 +19,7 @@
  */
 import type { RelayConfig } from "./config.js";
 import type { CompatDatabase } from "./sqlite-compat.js";
-import { backupKeyFingerprint, classifyStored, getKeyringInfo, parseEnvelope, type UnverifiableReason } from "./encryption.js";
+import { backupKeyFingerprint, backupKeyFingerprintStatus, classifyStored, getKeyringInfo, parseEnvelope, type FingerprintStatus, type UnverifiableReason } from "./encryption.js";
 
 export type ConfigArchiveClass = "secret" | "copy";
 
@@ -130,7 +130,7 @@ export interface WebhookSecretCount {
  * table cannot be discovered or read. No decrypted value is kept.
  */
 export function classifyWebhookSecrets(db: CompatDatabase): WebhookSecretCount | null {
-  const count: WebhookSecretCount = { plaintext: 0, encrypted: 0, unverifiable: 0, unverifiable_reasons: { no_keyring: 0, key_not_held: 0, auth_failed: 0 } };
+  const count: WebhookSecretCount = { plaintext: 0, encrypted: 0, unverifiable: 0, unverifiable_reasons: { no_keyring: 0, key_not_held: 0, auth_failed: 0, keyring_unreadable: 0 } };
   try {
     const found = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'webhook_subscriptions' COLLATE NOCASE").get() as { name: string } | undefined;
     if (!found) return count;
@@ -150,13 +150,20 @@ export function classifyWebhookSecrets(db: CompatDatabase): WebhookSecretCount |
 export interface ManifestKey {
   key_id: string;
   rows: number;
-  /** backupKeyFingerprint(key_id) when the backup was made; null when that keyring did not hold the key. */
+  /** backupKeyFingerprint(key_id) when the backup was made; null when there was none, with `fingerprint_reason`. */
   fingerprint: string | null;
+  /** Why there is no fingerprint: no keyring, the key id not held, or a keyring that could not be loaded. */
+  fingerprint_reason?: Exclude<FingerprintStatus["reason"], null>;
 }
 
 /** The manifest's `encryption` block for the key ids `db` needs. */
 export function manifestKeysOf(needed: NeededKeys): ManifestKey[] {
-  return [...needed.keys()].sort().map((key_id) => ({ key_id, rows: needed.get(key_id)!.rows, fingerprint: backupKeyFingerprint(key_id) }));
+  return [...needed.keys()].sort().map((key_id) => {
+    const st = backupKeyFingerprintStatus(key_id);
+    const entry: ManifestKey = { key_id, rows: needed.get(key_id)!.rows, fingerprint: st.fingerprint };
+    if (st.reason !== null) entry.fingerprint_reason = st.reason;
+    return entry;
+  });
 }
 
 /**

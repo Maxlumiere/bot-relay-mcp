@@ -13,8 +13,8 @@
  *   - No half-written state (CAS either committed or rolled back, no torn rows)
  *   - Rotation state coherent (never rotation_grace w/ missing previous_token_hash)
  *
- * Runs SEQUENTIALLY (`describe.sequential`) — each test needs a clean
- * subprocess lifecycle.
+ * Runs SEQUENTIALLY (`{ concurrent: false }`, vitest 5's spelling: `describe.sequential` is gone) — each
+ * test needs a clean subprocess lifecycle.
  *
  * Gated behind --full in pre-publish-check.sh; NOT part of the default
  * vitest run (each test takes 2-10s).
@@ -26,6 +26,8 @@ import os from "os";
 import { spawn, type ChildProcess } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { toolCallResult, type ToolRefusal } from "./_helpers/mcp-tool-call.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -84,20 +86,31 @@ async function killDaemon(signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
   daemon = null;
 }
 
-async function rpc(tool: string, args: any, token?: string): Promise<any> {
+async function rpc(tool: string, args: any, token?: string, refusal?: ToolRefusal): Promise<any> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
   };
   if (token) headers["X-Agent-Token"] = token;
+  // PR-D: a NEW name over HTTP needs the daemon's registration secret (created beside TEST_DB_PATH at start).
+  if (tool === "register_agent") Object.assign(headers, mintHeaders(TEST_DB_PATH));
   const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
   });
-  const text = await res.text();
-  const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-  return JSON.parse(JSON.parse(dataLine!.slice(5).trim()).result.content[0].text);
+  return toolCallResult(res, { tool, expect: refusal });
+}
+
+/** PRAGMA wal_checkpoint(FULL) on the test DB, from a second connection while the daemon holds its own. */
+function checkpointFull(): { busy: number; log: number; checkpointed: number } {
+  const Better = require("better-sqlite3");
+  const db = new Better(TEST_DB_PATH);
+  try {
+    return db.pragma("wal_checkpoint(FULL)")[0] as { busy: number; log: number; checkpointed: number };
+  } finally {
+    db.close();
+  }
 }
 
 function integrityCheck(): string {
@@ -118,7 +131,7 @@ afterEach(async () => {
   if (fs.existsSync(TEST_ROOT)) fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
-describe.sequential("v2.1 Phase 5b — chaos injection", () => {
+describe("v2.1 Phase 5b — chaos injection", { concurrent: false }, () => {
   it("(C.1) SIGTERM during concurrent writes — integrity_check ok after restart, no torn rows", async () => {
     await startDaemon();
     const tokA = (await rpc("register_agent", { name: "c1-a", role: "r", capabilities: [] })).agent_token;
@@ -188,11 +201,20 @@ describe.sequential("v2.1 Phase 5b — chaos injection", () => {
     }
   }, 30_000);
 
-  it("(C.4) WAL file rename while daemon is running — next open detects + recovers cleanly", async () => {
+  it("(C.4) WAL file deleted while the daemon is down — the CHECKPOINTED baseline survives, integrity ok, and the restarted daemon serves authenticated writes and reads", async () => {
     await startDaemon();
-    const tok = (await rpc("register_agent", { name: "c4-w", role: "r", capabilities: [] })).agent_token;
-    await rpc("register_agent", { name: "c4-peer", role: "r", capabilities: [] });
-    await rpc("send_message", { from: "c4-w", to: "c4-peer", content: "pre-wal-chaos" }, tok);
+    const tokW = (await rpc("register_agent", { name: "c4-w", role: "r", capabilities: [] })).agent_token;
+    const tokPeer = (await rpc("register_agent", { name: "c4-peer", role: "r", capabilities: [] })).agent_token;
+    const baseline = await rpc("send_message", { from: "c4-w", to: "c4-peer", content: "c4-baseline" }, tokW);
+    expect(baseline.success).toBe(true);
+    // The BASELINE (both agents, the baseline message) is checkpointed into the main DB file explicitly, so the WAL
+    // deletion below cannot take it.
+    const cp = checkpointFull();
+    expect(cp.busy, "the checkpoint was not blocked").toBe(0);
+    expect(cp.checkpointed, "every WAL frame was copied into the main DB").toBe(cp.log);
+    // WAL-ONLY writes after the checkpoint. Whether they survive the deletion depends on SQLite's own checkpointing at
+    // kill time, which this test does not control: they are asserted NEITHER way below.
+    await rpc("send_message", { from: "c4-w", to: "c4-peer", content: "c4-wal-only" }, tokW);
     // Kill + remove WAL file (simulates partial corruption).
     await killDaemon("SIGKILL");
     const walPath = TEST_DB_PATH + "-wal";
@@ -201,16 +223,20 @@ describe.sequential("v2.1 Phase 5b — chaos injection", () => {
     }
     // Restart — SQLite should recover from the main DB file alone.
     await startDaemon();
-    const msgs = await rpc("get_messages", { agent_name: "c4-peer", status: "pending", limit: 10 });
-    // Depending on WAL checkpoint state at kill time, the pre-chaos message
-    // may or may not have made it to the main DB. Key invariant: integrity
-    // still ok + server accepts new writes.
     expect(integrityCheck()).toBe("ok");
-    // Post-restart write round-trip works.
-    const tok2 = (await rpc("register_agent", { name: "c4-post", role: "r", capabilities: [] })).agent_token;
-    const r = await rpc("send_message", { from: "c4-post", to: "c4-peer", content: "post-wal-chaos" }, tok2);
-    expect(r.success).toBe(true);
-    void msgs;
+    // The baseline survived: c4-peer still authenticates (its token row was checkpointed), and its inbox holds the
+    // baseline message, by id and content. (A pending read marks what it returns as read.)
+    const inbox = await rpc("get_messages", { agent_name: "c4-peer", status: "pending", limit: 50 }, tokPeer);
+    const kept = inbox.messages.filter((m: { id: string }) => m.id === baseline.message_id);
+    expect(kept, "the checkpointed baseline message survived the WAL deletion").toHaveLength(1);
+    expect(kept[0].content).toBe("c4-baseline");
+    // A post-restart send to an AUTHENTICATED recipient reads back as exactly that message (an empty inbox fails).
+    const post = await rpc("send_message", { from: "c4-w", to: "c4-peer", content: "c4-post-restart" }, tokW);
+    expect(post.success).toBe(true);
+    const after = await rpc("get_messages", { agent_name: "c4-peer", status: "pending", limit: 50 }, tokPeer);
+    const got = after.messages.filter((m: { id: string }) => m.id === post.message_id);
+    expect(got, "the post-restart message reads back by its id").toHaveLength(1);
+    expect(got[0].content).toBe("c4-post-restart");
   }, 30_000);
 
   it("(C.5) DB file downgrade — older-schema DB in place is detected + migrated or errored cleanly", async () => {

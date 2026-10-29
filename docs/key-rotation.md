@@ -72,7 +72,7 @@ Phase 4b.3 auto-wraps this into a keyring shape: `{current:"<RELAY_ENCRYPTION_LE
 openssl rand -base64 32
 ```
 
-Copy the output into the `keys` map with a unique `key_id`.
+Copy the output into the `keys` map with a unique `key_id`. **Do not choose `__proto__`, `constructor` or `prototype`.** They work (the relay treats them as ordinary ids), but the relay warns about them at every load, since they are Object.prototype names. If your keyring already uses one, add a new key, make it `current`, and run `relay re-encrypt --from <that id> --to <new id>`.
 
 ## Rotation workflow
 

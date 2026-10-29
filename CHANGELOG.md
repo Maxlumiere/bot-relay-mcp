@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Encryption: a key id that is an Object.prototype name (`__proto__`, `constructor`, `prototype`) is an ordinary key id
+
+- **Fixed:** the keyring kept its keys in a plain object, so a key id named `__proto__` replaced the object's prototype instead of being stored as a key. That key was missing from the keyring's key list (`known_key_ids`), yet its rows still decrypted. A keyring whose `current` was `__proto__` encrypted every new row under a key it reported it did not have, which `relay re-encrypt` and restore's keyring check then could not see. A row under a missing `constructor` id failed with a `TypeError` instead of the named "not in the keyring" error.
+- **Now** the keys are kept in a Map and every lookup is by own key: such an id is listed, decrypts its own rows, works as `current`, and can be re-encrypted away from with `relay re-encrypt --from <id> --to <new id>`. Loading a keyring that uses one logs a loud warning naming that command. No keyring that loaded before is refused now.
+- **Backup with a keyring that is configured but cannot be loaded** (e.g. malformed JSON): the export itself no longer aborts. A backup is most needed when the config is broken. **Not yet in every case:** opening the DB runs a migration that encrypts any webhook secret lacking an `enc:`/`enc1:` prefix, and with a broken keyring that migration throws. So `relay backup` still aborts at DB open when the DB is not already open in that process and holds such a secret. The fix (the export never mutates its source DB) is tracked separately. Otherwise the archive is written; each key id it needs has no fingerprint and says why (`fingerprint_reason: "keyring_unreadable"`); its webhook secrets are unverifiable for that reason; and the warning is on stderr and in the result. Restore still requires the keyring it is given to hold each key id the archive needs and to authenticate one sample row under each (a decrypt test), so a missing fingerprint lets no wrong key through for those ids.
+- **The reserved-id warning is written whatever `RELAY_LOG_LEVEL` is**, once per keyring load.
+
 ### `relay backup` / `relay restore`: what an archive carries, and a keyring check on restore (SEC-23)
 
 - **What a backup leaves out, concretely:** the keyring and its sources and the mint-secret file are never archived, and the config credentials the relay recognises are redacted. Arbitrary copied content is NOT inspected: a copied config value (a nested one included) and the application data in the DB (message bodies, task text) are archived as they are.

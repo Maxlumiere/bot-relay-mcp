@@ -252,12 +252,20 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
           why.no_keyring ? `${why.no_keyring} with no keyring to check them` : "",
           why.key_not_held ? `${why.key_not_held} under a key id this keyring does not hold` : "",
           why.auth_failed ? `${why.auth_failed} whose authentication FAILED under the key this keyring holds for their id (corruption, or the wrong key)` : "",
+          why.keyring_unreadable ? `${why.keyring_unreadable} because the configured keyring could not be LOADED (fix its configuration)` : "",
         ].filter(Boolean);
         warnings.push(
           `${nUnv} webhook secret${nUnv === 1 ? " looks" : "s look"} encrypted but could NOT be verified (${reasons.join("; ")}): treat ${nUnv === 1 ? "it" : "them"} as possibly PLAINTEXT, IN this archive. ` +
             `${KEYRING} that holds the key, or re-register the webhooks.`
         );
       }
+    }
+    const unloadable = encryption.keys.filter((k) => k.fingerprint_reason === "keyring_unreadable").map((k) => k.key_id);
+    if (unloadable.length) {
+      warnings.push(
+        `the configured encryption keyring could not be LOADED (fix its configuration): key id(s) ${unloadable.join(", ")} have NO fingerprint in this archive, ` +
+          `and the encrypted contents could not be checked. The archive was still written; on restore, the keyring it is given must hold each key id the archive needs and authenticate one sample row under each.`
+      );
     }
     if (config?.omitted) warnings.push(config.omitted + ".");
 
@@ -306,7 +314,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     for (const fault of restrictToOwnerWindows(archivePath, false)) warnings.push(`the archive is NOT owner-only: ${fault}.`);
 
     if (encryption.keys.length) {
-      const k = encryption.keys.map((e) => `${e.key_id} (${e.rows} rows, fingerprint ${e.fingerprint ?? "unknown: this keyring does not hold it"})`).join(", ");
+      const k = encryption.keys.map((e) => `${e.key_id} (${e.rows} rows, fingerprint ${e.fingerprint ?? `none: ${e.fingerprint_reason}`})`).join(", ");
       process.stderr.write(`relay backup: rows encrypted under key id(s) ${k}. The key is NOT in this archive: keep it, or the archive cannot be restored.\n`);
     }
     for (const w of warnings) process.stderr.write(`relay backup: WARNING: ${w}\n`);
