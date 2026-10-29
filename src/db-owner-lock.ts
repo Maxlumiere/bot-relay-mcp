@@ -179,7 +179,10 @@ export function _setAfterAcquireHookForTests(fn: (() => void) | null): void {
  * still held, is a named refusal.
  */
 export interface AcquireOptions {
+  /** At most this many tries (default: as many as the time budget allows). */
   attempts?: number;
+  /** The total time budget for the retries (default ACQUIRE_BUDGET_MS); exhausting it is a named refusal. */
+  budgetMs?: number;
   baseMs?: number;
   /** Runs when the acquire CREATED the DB (see materializeDb); a throw refuses, and the created file is removed. */
   verifyCreated?: (dbPath: string) => void;
@@ -188,9 +191,13 @@ export interface AcquireOptions {
   platform?: NodeJS.Platform;
 }
 
+/** The acquire's default retry budget: a probe (a shared lock on macOS) racing the acquirer only delays it. */
+export const ACQUIRE_BUDGET_MS = 3000;
+
 export async function acquirePrimitive(dbPath: string, opts: AcquireOptions = {}): Promise<OwnerLock> {
-  const attempts = opts.attempts ?? 6;
+  const attempts = opts.attempts ?? Number.POSITIVE_INFINITY;
   const base = opts.baseMs ?? 20;
+  const deadline = Date.now() + (opts.budgetMs ?? ACQUIRE_BUDGET_MS);
   let lastReason = "held by another process";
   for (let i = 0; i < attempts; i++) {
     materializeDb(dbPath, opts.verifyCreated);
@@ -216,7 +223,11 @@ export async function acquirePrimitive(dbPath: string, opts: AcquireOptions = {}
       drop(); // the canonical path moved while we took the lock: never keep an owner on a stale key
       lastReason = "its canonical path changed while the lock was being taken";
     }
-    if (i < attempts - 1) await new Promise((r) => setTimeout(r, base * (i + 1) + Math.floor(Math.random() * base)));
+    if (i >= attempts - 1) break;
+    // Jittered backoff, growing to a cap, never past the budget.
+    const wait = Math.min(base * (i + 1), 200) + Math.floor(Math.random() * base);
+    if (Date.now() + wait > deadline) break;
+    await new Promise((r) => setTimeout(r, wait));
   }
   throw new OwnerLockError(
     `the DB at ${dbPath} could not be locked for this process (${lastReason}). Another relay process (wasm driver) may own it: stop it, or use the native driver.`
@@ -265,8 +276,8 @@ export function holdsOwnerLock(dbPath: string): boolean {
 /**
  * Whether ANOTHER process owns the DB at `dbPath`: a native process checks before opening and again right after. An
  * absent DB has no owner (a wasm owner materializes the file before it keys it). A probe never TAKES the primitive (two
- * native probers would each read the other as an owner): macOS takes a SHARED flock on the owner file (probers are
- * compatible with each other; a wasm acquirer racing one retries); Linux and Windows CONNECT to the owner's socket or
+ * native probers would each read the other as an owner), and CREATES nothing: macOS takes a SHARED flock on the owner
+ * file if it exists (probers are compatible with each other; a wasm acquirer racing one retries within its budget); Linux and Windows CONNECT to the owner's socket or
  * pipe (a listener answering is an owner), bounded by PROBE_TIMEOUT_MS: no answer in time is a named refusal, never
  * read as FREE.
  */
@@ -276,13 +287,15 @@ export async function isOwnedElsewhere(dbPath: string): Promise<boolean> {
   const key = lockKey(dbPath);
   if (HELD.has(key)) return false; // our own wasm connection, not another process
   if (process.platform === "darwin") {
-    fs.mkdirSync(locksDir(), { recursive: true, mode: 0o700 });
+    // A probe CREATES nothing (a native read must not write): an owner creates its lock file before it locks it, so
+    // no locks dir or no lock file means no owner.
     try {
-      const fd = fs.openSync(path.join(locksDir(), `${key}.owner`), fs.constants.O_RDONLY | fs.constants.O_CREAT | fs.constants.O_NONBLOCK | O_SHLOCK_DARWIN, 0o600);
+      const fd = fs.openSync(path.join(locksDir(), `${key}.owner`), fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | O_SHLOCK_DARWIN);
       fs.closeSync(fd);
       return false;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return false;
       if (code === "EAGAIN" || code === "EWOULDBLOCK") return true;
       throw err;
     }
