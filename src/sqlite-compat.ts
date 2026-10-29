@@ -17,6 +17,7 @@
  * sharing the same DB file will overwrite each other's changes. Use native
  * for multi-terminal stdio setups. See docs/sqlite-wasm-driver.md.
  */
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
@@ -402,20 +403,7 @@ async function openReadOnlyUnchecked(dbPath: string, driver: SqliteDriver): Prom
   if (!fs.existsSync(dbPath)) {
     throw new Error(`openReadOnly: file not found at '${dbPath}'`);
   }
-  if (driver === "wasm") {
-    let initSqlJs: any;
-    try {
-      const mod = await import("sql.js");
-      initSqlJs = mod.default;
-    } catch {
-      throw new Error(
-        "sql.js is not installed. RELAY_SQLITE_DRIVER=wasm requires sql.js. " +
-        "Install it with: npm install sql.js",
-      );
-    }
-    const SQL = await initSqlJs();
-    return new WasmDatabase(new SQL.Database(fs.readFileSync(dbPath)), dbPath);
-  }
+  if (driver === "wasm") return openWasmFromBytes(fs.readFileSync(dbPath), dbPath);
   const { default: Database } = await import("better-sqlite3");
   return new Database(dbPath, { readonly: true }) as unknown as CompatDatabase;
 }
@@ -428,13 +416,33 @@ async function openReadOnlyUnchecked(dbPath: string, driver: SqliteDriver): Prom
  *   that is refused as "a read-only directory" (MEASURED, SQLITE_READONLY_DIRECTORY).
  * - wasm reads only the main file, so the caller must first refuse a WAL DB or side files (assertWasmSourceReadable).
  */
-export async function openExportSource(dbPath: string, driver: SqliteDriver): Promise<{ db: CompatDatabase; release: () => void }> {
+export async function openExportSource(
+  dbPath: string,
+  driver: SqliteDriver
+): Promise<{ db: CompatDatabase; release: () => void; loadedSha256: string | null }> {
   if (driver === "wasm") assertWasmSourceReadable(dbPath);
-  let db: CompatDatabase;
+  let db: CompatDatabase | null = null;
+  let loadedSha256: string | null = null;
   try {
-    db = await openReadOnlyUnchecked(dbPath, driver);
+    if (driver === "wasm") {
+      // The EXACT bytes the image is built from, hashed, so the caller can tell a read that raced a writer.
+      const bytes = fs.readFileSync(dbPath);
+      loadedSha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+      db = await openWasmFromBytes(bytes, dbPath);
+    } else {
+      db = await openReadOnlyUnchecked(dbPath, driver);
+    }
     db.prepare("SELECT 1 FROM sqlite_master LIMIT 1").get(); // a native read-only open fails here, not at open
   } catch (err) {
+    // Never leak the handle a failed probe opened (Codex #372 R1 P3); the error is kept.
+    if (db) {
+      try {
+        if (db instanceof WasmDatabase) db.discard();
+        else db.close();
+      } catch {
+        /* best-effort */
+      }
+    }
     const code = (err as { code?: string }).code ?? "";
     if (code === "SQLITE_READONLY_DIRECTORY" || /readonly database|read-only/i.test(String((err as Error).message))) {
       throw new Error(
@@ -444,15 +452,21 @@ export async function openExportSource(dbPath: string, driver: SqliteDriver): Pr
     }
     throw err;
   }
+  const opened = db as CompatDatabase;
   const release = () => {
     try {
-      if (db instanceof WasmDatabase) db.discard();
-      else db.close();
+      if (opened instanceof WasmDatabase) opened.discard();
+      else opened.close();
     } catch {
       /* releasing a read-only handle is best-effort */
     }
   };
-  return { db, release };
+  return { db: opened, release, loadedSha256 };
+}
+
+/** The SHA-256 of a file's current bytes (the torn-read guard's after-read). */
+export function fileSha256(p: string): string {
+  return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
 }
 
 /**
@@ -473,10 +487,20 @@ export function assertWasmSourceReadable(dbPath: string): void {
   }
 }
 
-/** The main file's identity (size + mtime in ns), to tell a read that raced a writer (a torn read). */
-export function mainFileIdentity(dbPath: string): string {
-  const st = fs.statSync(dbPath, { bigint: true });
-  return `${st.size}:${st.mtimeNs}`;
+/** A wasm (sql.js) database over the given bytes, tied to `dbPath` (whose write-back a caller must never trigger on a source). */
+async function openWasmFromBytes(bytes: Buffer, dbPath: string): Promise<CompatDatabase> {
+  let initSqlJs: any;
+  try {
+    const mod = await import("sql.js");
+    initSqlJs = mod.default;
+  } catch {
+    throw new Error(
+      "sql.js is not installed. RELAY_SQLITE_DRIVER=wasm requires sql.js. " +
+      "Install it with: npm install sql.js",
+    );
+  }
+  const SQL = await initSqlJs();
+  return new WasmDatabase(new SQL.Database(bytes), dbPath);
 }
 
 // --- Public API ---

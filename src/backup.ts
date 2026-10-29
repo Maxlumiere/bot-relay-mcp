@@ -39,8 +39,9 @@ import { pipeline } from "stream/promises";
 import { withDeadline } from "./http-deadline.js";
 
 import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
+import { comparePaths, isProtected } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
-import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, mainFileIdentity, driverOf, configuredDriver, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
+import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
@@ -171,6 +172,39 @@ interface ExportOptions {
  * `destinationPath` (tar.gz). Opens its own read-only connection to the source
  * DB so it is safe to call while the relay daemon is running.
  */
+function destinationExists(archivePath: string): Error {
+  return new Error(`backup refused: ${archivePath} already exists. A backup never overwrites a file: choose another --output.`);
+}
+
+/**
+ * INV-BACKUP-01 (Codex #372 R1): the archive's destination is never the source DB or one of its files (-wal, -shm,
+ * -journal), under any spelling: judged by the shared path walk (isProtected(comparePaths(...)): a symlink, `..`, a
+ * case variant, and a hardlink, which is the same entry by dev + inode). An existing destination of any kind is refused
+ * before anything is staged. The stated over-block, path-walk's: a NEW file in the DB's own directory while a side
+ * file is missing compares inconclusive, and is refused.
+ */
+function assertDestinationIsNotSource(archivePath: string, srcDbPath: string): void {
+  for (const own of [srcDbPath, `${srcDbPath}-wal`, `${srcDbPath}-shm`, `${srcDbPath}-journal`]) {
+    let protectedPath: boolean;
+    try {
+      protectedPath = isProtected(comparePaths(archivePath, own));
+    } catch {
+      protectedPath = true; // a walk that cannot judge refuses
+    }
+    if (protectedPath) {
+      throw new Error(`backup refused: the destination ${archivePath} is the database or one of its files (${own}), or cannot be told apart from it. Choose an --output outside the database's directory.`);
+    }
+  }
+  let exists = false;
+  try {
+    fs.lstatSync(archivePath);
+    exists = true;
+  } catch {
+    exists = false;
+  }
+  if (exists) throw destinationExists(archivePath);
+}
+
 /** Test-only: runs between a snapshot and its after-checks, so a test can act "during" the read. */
 let exportReadHook: (() => void) | null = null;
 export function _setExportReadHookForTests(fn: (() => void) | null): void {
@@ -182,8 +216,10 @@ export function _setExportReadHookForTests(fn: (() => void) | null): void {
  * - Warm (a connection already open in this process): through that connection, as it is.
  * - Cold: a READ-ONLY open with no initializeDb() (openExportSource): no migration, backfill or permission change.
  * - Wasm reads only the main file, so: no -wal/-shm/-journal beside it, BEFORE and AFTER the snapshot; on a cold read,
- *   the main file's identity (size + mtime ns) unchanged across the read (a torn read), retried ONCE; and the loaded
- *   image passes PRAGMA integrity_check before anything is archived.
+ *   the bytes the image was loaded from must hash the same as the file re-read after the snapshot (a torn read),
+ *   retried ONCE; and the image, warm or cold, passes PRAGMA integrity_check before anything is archived. This is
+ *   BEST-EFFORT DETECTION, not a guarantee: a wasm read takes no lock, so a writer in another process can still race it
+ *   (e.g. change the file and restore it between the two reads). INV-DB-01's lock makes it a guarantee.
  */
 async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<SqliteDriver> {
   const live = peekDb();
@@ -192,19 +228,21 @@ async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<
     if (d === "wasm") assertWasmSourceReadable(srcDbPath);
     snapshotToFile(live, snapshotDbPath);
     exportReadHook?.();
-    if (d === "wasm") assertWasmSourceReadable(srcDbPath);
+    if (d === "wasm") {
+      assertWasmSourceReadable(srcDbPath);
+      assertImageIntact(live, srcDbPath);
+    }
     return d;
   }
   const d = configuredDriver();
   for (let attempt = 1; ; attempt++) {
-    const before = d === "wasm" ? mainFileIdentity(srcDbPath) : "";
     const source = await openExportSource(srcDbPath, d);
     try {
       snapshotToFile(source.db, snapshotDbPath);
       exportReadHook?.();
       if (d !== "wasm") return d;
       assertWasmSourceReadable(srcDbPath);
-      if (mainFileIdentity(srcDbPath) === before) {
+      if (fileSha256(srcDbPath) === source.loadedSha256) {
         assertImageIntact(source.db, srcDbPath);
         return d;
       }
@@ -265,6 +303,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
   const archivePath = options.destinationPath
     ? assertSafePath(options.destinationPath, "destinationPath")
     : path.join(backupsDir, `relay-backup-${isoTimestamp()}.tar.gz`);
+  assertDestinationIsNotSource(archivePath, srcDbPath);
 
   // Stage the snapshot + manifest + optional config under a unique temp dir
   // (keyed off a random suffix so parallel exports can't collide).
@@ -385,7 +424,13 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     if (plainSize > MAX_DECOMPRESSED_BYTES) {
       throw new Error(`backup refused: the archive is ${plainSize} bytes uncompressed, over the ${MAX_DECOMPRESSED_BYTES}-byte cap; restore would refuse it.`);
     }
-    await pipeline(fs.createReadStream(plainTar), zlib.createGzip(), fs.createWriteStream(archivePath, { mode: 0o600 }));
+    // Created EXCLUSIVELY ("wx"): an existing file is never truncated (Codex #372 R1), whoever made it.
+    try {
+      await pipeline(fs.createReadStream(plainTar), zlib.createGzip(), fs.createWriteStream(archivePath, { mode: 0o600, flags: "wx" }));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw destinationExists(archivePath);
+      throw err;
+    }
 
     // v2.1 Phase 4c.4: narrow the archive to 0600 — the tarball contains a
     // full DB snapshot + any sensitive columns (encrypted but still copyable

@@ -48,8 +48,9 @@ Exit 0 on success, 1 on failure. On success, the stdout line tells you where the
 - **Native driver (the default):** `VACUUM INTO` gives a consistent point-in-time copy, safe while the daemon writes, and it includes commits still in the WAL. A read-only open of a WAL DB does write its `-shm` side file: the data is unchanged, but the directory is not byte-identical. In a **read-only directory** with no `-shm` yet, that open cannot work, and the backup is refused with a message saying so.
 - **Wasm driver:** it reads only the DB's main file, so it **refuses** a DB with any `-wal`, `-shm` or `-journal` file beside it (even empty): another process may have it open, or commits may not be in the main file yet, and they would be missing from the backup, silently. It checks before and after the snapshot.
   - A DB whose header says WAL mode, but with no side file (a native DB whose last connection closed cleanly), holds every commit in its main file and is backed up.
-  - If the main file changes while it is being read (its size or modification time), the read is retried once, then refused.
-  - The loaded copy must pass `PRAGMA integrity_check` before it is archived.
+  - If the main file's bytes change while it is being read (the bytes loaded hash differently from the file re-read after), the read is retried once, then refused.
+  - The copy, from a fresh read or the relay's own open connection, must pass `PRAGMA integrity_check` before it is archived.
+  - **These are best-effort detection, not a guarantee.** A wasm read takes no lock, so a process writing the DB at the same time can still race it. A guarantee comes with the single-owner lock (a follow-up).
   - It never writes the DB back.
 
 ### Archive layout
