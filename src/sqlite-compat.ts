@@ -22,7 +22,7 @@ import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
-import { acquireOwnerLock, assertSingleLink, holdsOwnerLock, isOwnedElsewhere, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
+import { acquireOwnerLock, assertSingleLink, holdsOwnerLock, isOwnedElsewhere, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -201,6 +201,12 @@ class WasmDatabase implements CompatDatabase {
   readonly readOnly: boolean;
   /** INV-DB-01: the single-owner lock a WRITABLE handle holds; released when it closes. */
   ownerLock: OwnerLock | null = null;
+  /**
+   * INV-DB-01: the DB's CANONICAL path, captured when the lock was taken. Every persist replaces THIS name: replacing
+   * the caller's spelling would, on a case-insensitive volume (Windows), give the file that spelling, so its key would
+   * drift and the owner would lose its own lock (and a later opener could be a second owner).
+   */
+  canonicalPath: string | null = null;
   /** Writes since the last successful persist (a refused persist keeps them in memory, for the next one). */
   private unpersisted = 0;
   private closed = false;
@@ -377,16 +383,17 @@ class WasmDatabase implements CompatDatabase {
     // INV-DB-01: persist ONLY under this process's single-owner lock (never a write another owner could race), never
     // to a hard-linked DB, and ATOMICALLY: a fresh temp file beside the DB, then renamed over it. A failure is
     // propagated (disk full, permissions, a lost lock).
-    if (!this.ownerLock || !holdsOwnerLock(this.dbPath)) {
+    const target = this.canonicalPath ?? this.dbPath;
+    if (!this.ownerLock || !holdsOwnerLock(target) || lockKey(target) !== this.ownerLock.key) {
       throw new OwnerLockError(
         `wasm persist refused: this process does not hold the single-owner lock for ${this.dbPath}, so another process may own it. Nothing was written.`
       );
     }
-    assertSingleLink(this.dbPath);
-    const tmp = `${this.dbPath}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+    assertSingleLink(target);
+    const tmp = `${target}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
     try {
       fs.writeFileSync(tmp, Buffer.from(data), { mode: 0o600, flag: "wx" });
-      replaceWithRetry(tmp, this.dbPath);
+      replaceWithRetry(tmp, target);
     } catch (err) {
       fs.rmSync(tmp, { force: true });
       throw err;
@@ -650,6 +657,7 @@ export function initializeDb(dbPath: string, opts: { verifyCreated?: (dbPath: st
         throw err;
       }
       wdb.ownerLock = lock;
+      wdb.canonicalPath = fs.realpathSync.native(dbPath);
       _initializedDb = wdb;
     } else {
       // INV-DB-01: a native process never opens a DB a wasm-driver process owns: checked BEFORE the open and again

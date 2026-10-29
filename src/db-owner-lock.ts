@@ -149,13 +149,35 @@ function assertPrivateLockFile(fd: number, file: string): void {
   }
 }
 
-/** Open the lock file, never through a symlink; ELOOP (a planted symlink) is the same named refusal. */
+/**
+ * Open the lock file, never through a symlink. Each refusal names its cause: a planted symlink (ELOOP) or a lock file
+ * that EXISTS but cannot be opened (another owner, mode 000) is "not private"; a lock file that cannot be CREATED (a
+ * read-only DB directory) says so, and where.
+ */
 function openLockFile(file: string, flags: number, mode?: number): number {
   try {
     return fs.openSync(file, flags | O_NOFOLLOW, mode);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ELOOP") {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") {
       throw new OwnerLockError(`the owner lock file ${file} is not private to this user (it is a symlink), so it is not trusted. If no relay process uses the DB, remove it.`);
+    }
+    if (code === "EACCES" || code === "EPERM") {
+      let exists = false;
+      try {
+        fs.lstatSync(file);
+        exists = true;
+      } catch {
+        /* absent, or its directory cannot be searched */
+      }
+      if (exists) {
+        throw new OwnerLockError(
+          `the owner lock file ${file} is not private to this user (it exists but cannot be opened: ${code}; check its owner and mode), so it is not trusted. If no relay process uses the DB, remove it.`
+        );
+      }
+      throw new OwnerLockError(
+        `cannot create the owner lock file in ${path.dirname(file)} (${code}): the wasm driver needs to write the DB's directory. Make it writable, or use the native driver.`
+      );
     }
     throw err;
   }

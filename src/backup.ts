@@ -680,13 +680,16 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     if (!swapLock) await assertNotOwnedByWasm(srcDbPath);
     try {
       const newPath = srcDbPath + ".new";
+      // INV-DB-01: replace the DB's CANONICAL name, never the caller's spelling (on a case-insensitive volume the
+      // replaced file would take that spelling, and its lock key would drift).
+      const swapTarget = fs.existsSync(srcDbPath) ? fs.realpathSync.native(srcDbPath) : srcDbPath;
       fs.copyFileSync(extractedDbPath, newPath);
       try {
-        fs.renameSync(newPath, srcDbPath);
+        fs.renameSync(newPath, swapTarget);
       } catch (err) {
         if (process.platform === "win32") {
           // Windows fallback: non-atomic replace. Documented behavior.
-          fs.copyFileSync(newPath, srcDbPath);
+          fs.copyFileSync(newPath, swapTarget);
           fs.unlinkSync(newPath);
         } else {
           throw err;
