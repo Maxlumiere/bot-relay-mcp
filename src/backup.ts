@@ -252,7 +252,8 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
   assertTarLocatable(); // before anything is opened, created or written
   const srcDbPath = getDbPath();
   if (!fs.existsSync(srcDbPath)) {
-    throw new Error(`Source DB not found at '${srcDbPath}'. Nothing to back up.`);
+    // INV-BACKUP-01: an export never creates its source either.
+    throw new Error(`no relay database at ${srcDbPath}; nothing to back up. Start the relay once, or set RELAY_DB_PATH to the database's location.`);
   }
 
   const backupsDir = getBackupsDir();
