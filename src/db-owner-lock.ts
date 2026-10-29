@@ -35,8 +35,13 @@ import net from "net";
 import os from "os";
 import path from "path";
 
-/** The platforms whose primitive the CI racer harness has measured green (exactly one owner every round). */
-export const MEASURED_PLATFORMS: ReadonlySet<NodeJS.Platform> = new Set<NodeJS.Platform>(["darwin"]);
+/**
+ * The platforms whose primitive the CI racer harness has measured green (exactly one owner in every round, the key
+ * stable across a rename persist, alias spellings one owner; on Linux a bind mount one owner too). Measured at the
+ * primitive's commit f3bba84, CI jobs: Linux 123434321139 and 123434320394 (the bind-mount row ran), macOS
+ * 123434320925, Windows 123434321133.
+ */
+export const MEASURED_PLATFORMS: ReadonlySet<NodeJS.Platform> = new Set<NodeJS.Platform>(["darwin", "linux", "win32"]);
 
 const O_EXLOCK_DARWIN = 0x20;
 const O_SHLOCK_DARWIN = 0x10;
