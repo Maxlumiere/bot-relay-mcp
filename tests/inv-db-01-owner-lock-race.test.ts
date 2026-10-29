@@ -30,9 +30,15 @@ const PLATFORM_OK = ["darwin", "linux", "win32"].includes(process.platform);
 const RACERS = 8;
 const ROUNDS = 20;
 const recorded: ChildProcess[] = [];
-afterAll(() => {
+afterAll(async () => {
+  // A child killed by afterEach may not have emitted "exit" yet: kill what is left and WAIT (bounded) for every one.
+  const waitExit = (c: ChildProcess) =>
+    c.exitCode !== null || c.signalCode !== null
+      ? Promise.resolve()
+      : new Promise<void>((res) => { c.once("exit", () => res()); setTimeout(res, 5000); });
+  for (const c of recorded) if (c.exitCode === null && c.signalCode === null) c.kill("SIGKILL");
+  await Promise.all(recorded.map(waitExit));
   const alive = recorded.filter((c) => c.exitCode === null && c.signalCode === null);
-  for (const c of alive) c.kill("SIGKILL");
   fs.rmSync(ROOT, { recursive: true, force: true });
   expect(alive.length, "every recorded racer had exited").toBe(0);
 });

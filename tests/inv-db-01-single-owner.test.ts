@@ -27,9 +27,15 @@ fs.mkdirSync(HOME);
 const { MEASURED_PLATFORMS } = (await import("../dist/db-owner-lock.js")) as { MEASURED_PLATFORMS: ReadonlySet<string> };
 const ENABLED = MEASURED_PLATFORMS.has(process.platform);
 const recorded: ChildProcess[] = [];
-afterAll(() => {
+afterAll(async () => {
+  // A child killed by afterEach may not have emitted "exit" yet: kill what is left and WAIT (bounded) for every one.
+  const waitExit = (c: ChildProcess) =>
+    c.exitCode !== null || c.signalCode !== null
+      ? Promise.resolve()
+      : new Promise<void>((res) => { c.once("exit", () => res()); setTimeout(res, 5000); });
+  for (const c of recorded) if (c.exitCode === null && c.signalCode === null) c.kill("SIGKILL");
+  await Promise.all(recorded.map(waitExit));
   const alive = recorded.filter((c) => c.exitCode === null && c.signalCode === null);
-  for (const c of alive) c.kill("SIGKILL");
   fs.rmSync(ROOT, { recursive: true, force: true });
   expect(alive.length, "every recorded child had exited").toBe(0);
 });
@@ -212,6 +218,58 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: one wasm owner, enf
       process.env.HOME = prev.home;
     }
   }, 60_000);
+});
+
+describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: every other native open of the DB checks the owner, and a restore swap is locked`, () => {
+  const ENV_KEYS = ["HOME", "RELAY_DB_PATH", "RELAY_SQLITE_DRIVER", "RELAY_HTTP_PORT", "RELAY_CONFIG_PATH"] as const;
+  let saved: Record<string, string | undefined>;
+  beforeEach(async () => {
+    saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+    process.env.HOME = HOME; // the darwin lock dir lives under HOME: the SANDBOX one
+    process.env.RELAY_DB_PATH = dbPath;
+    process.env.RELAY_HTTP_PORT = "1";
+    process.env.RELAY_CONFIG_PATH = path.join(dbDir, "config.json");
+    (await import("../src/db.js")).closeDb();
+  });
+  afterEach(async () => {
+    (await import("../src/db.js")).closeDb();
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  it.each([true, false])("openRawRelayDb (relay bind / pending / fleet / recover / purges), readonly=%s, refuses a wasm-owned DB", async (readonly) => {
+    expect(await child("write", "seed", "native").out).toMatch(/OK/);
+    const a = child("hold", "wasm-a", "wasm");
+    expect(await a.ready).toMatch(/READY/);
+    const { openRawRelayDb } = await import("../src/cli/_instance-db.js");
+    await expect(openRawRelayDb(dbPath, { readonly })).rejects.toThrow(/owned by a wasm-driver process/);
+  }, 60_000);
+
+  it("a NATIVE export (relay backup, no connection open) of a wasm-owned DB is refused", async () => {
+    expect(await child("write", "seed", "native").out).toMatch(/OK/);
+    const a = child("hold", "wasm-a", "wasm");
+    expect(await a.ready).toMatch(/READY/);
+    process.env.RELAY_SQLITE_DRIVER = "native";
+    const { exportRelayState } = await import("../src/backup.js");
+    await expect(exportRelayState({ destinationPath: path.join(ROOT, `exp-${path.basename(dbDir)}.tar.gz`) })).rejects.toThrow(/owned by a wasm-driver process/);
+  }, 60_000);
+
+  it.each(["wasm", "native"] as const)("a RESTORE (driver %s) while another process owns the DB is refused, and the owner's data survives", async (driver) => {
+    expect(await child("write", "seed", "native").out).toMatch(/OK/);
+    process.env.RELAY_SQLITE_DRIVER = "native";
+    const { exportRelayState, importRelayState } = await import("../src/backup.js");
+    const archive = (await exportRelayState({ destinationPath: path.join(ROOT, `arc-${driver}-${path.basename(dbDir)}.tar.gz`) })).archive_path;
+    (await import("../src/db.js")).closeDb();
+    const a = child("hold", "wasm-owner", "wasm");
+    expect(await a.ready).toMatch(/READY/);
+    process.env.RELAY_SQLITE_DRIVER = driver;
+    await expect(importRelayState(archive, { force: true })).rejects.toThrow(/could not be locked|owned by a wasm-driver process/);
+    a.proc.kill("SIGTERM");
+    await a.out;
+    expect(await nativeRows(), "the owner's rows were not swapped away").toContain("wasm-owner");
+  }, 90_000);
 });
 
 describe.skipIf(ENABLED)(`INV-DB-01 on ${process.platform}: the lock is not measured here, so wasm writes are refused`, () => {
