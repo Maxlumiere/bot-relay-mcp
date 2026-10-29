@@ -68,7 +68,8 @@ fs.writeFileSync(
 let dbDir: string;
 let dbPath: string;
 beforeEach(() => {
-  dbDir = fs.mkdtempSync(path.join(ROOT, "case-"));
+  // Under the SANDBOX HOME: always an approved root (on Windows, ROOT itself is not one for the children).
+  dbDir = fs.mkdtempSync(path.join(HOME, "case-"));
   dbPath = path.join(dbDir, "relay.db");
 });
 afterEach(() => {
@@ -146,7 +147,7 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: one wasm owner, enf
     const spellings = [path.join(dbDir, ".", "x", "..", "relay.db")];
     fs.mkdirSync(path.join(dbDir, "x"));
     if (process.platform !== "win32") {
-      const link = path.join(ROOT, `link-${path.basename(dbDir)}.db`);
+      const link = path.join(HOME, `link-${path.basename(dbDir)}.db`);
       fs.symlinkSync(dbPath, link);
       spellings.push(link);
     }
@@ -264,14 +265,14 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: every other native 
     expect(await a.ready).toMatch(/READY/);
     process.env.RELAY_SQLITE_DRIVER = "native";
     const { exportRelayState } = await import("../src/backup.js");
-    await expect(exportRelayState({ destinationPath: path.join(ROOT, `exp-${path.basename(dbDir)}.tar.gz`) })).rejects.toThrow(/owned by a wasm-driver process/);
+    await expect(exportRelayState({ destinationPath: path.join(HOME, `exp-${path.basename(dbDir)}.tar.gz`) })).rejects.toThrow(/owned by a wasm-driver process/);
   }, 60_000);
 
   it("a -wal/-shm left by a native cold export: the wasm open refuses, and NAMES the cause and the remedy", async () => {
     expect(await child("write", "seed", "native").out).toMatch(/OK/);
     process.env.RELAY_SQLITE_DRIVER = "native";
     const { exportRelayState } = await import("../src/backup.js");
-    await exportRelayState({ destinationPath: path.join(ROOT, `wal-${path.basename(dbDir)}.tar.gz`) });
+    await exportRelayState({ destinationPath: path.join(HOME, `wal-${path.basename(dbDir)}.tar.gz`) });
     (await import("../src/db.js")).closeDb();
     expect(fs.existsSync(dbPath + "-wal"), "precondition: the native cold export left a -wal (MEASURED)").toBe(true);
     const w = await child("write", "w", "wasm").out;
@@ -287,7 +288,7 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: every other native 
     expect(await child("write", "seed", "native").out).toMatch(/OK/);
     process.env.RELAY_SQLITE_DRIVER = "native";
     const { exportRelayState, importRelayState } = await import("../src/backup.js");
-    const archive = (await exportRelayState({ destinationPath: path.join(ROOT, `arc-${driver}-${path.basename(dbDir)}.tar.gz`) })).archive_path;
+    const archive = (await exportRelayState({ destinationPath: path.join(HOME, `arc-${driver}-${path.basename(dbDir)}.tar.gz`) })).archive_path;
     (await import("../src/db.js")).closeDb();
     // A native cold export (a read-only open of a WAL DB) leaves -wal/-shm beside it (MEASURED); the relay's own native
     // open (one that READS: a bare open + close does not, MEASURED) checkpoints and removes them on its last close.
