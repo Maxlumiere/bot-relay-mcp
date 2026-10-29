@@ -256,6 +256,22 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: every other native 
     await expect(exportRelayState({ destinationPath: path.join(ROOT, `exp-${path.basename(dbDir)}.tar.gz`) })).rejects.toThrow(/owned by a wasm-driver process/);
   }, 60_000);
 
+  it("a -wal/-shm left by a native cold export: the wasm open refuses, and NAMES the cause and the remedy", async () => {
+    expect(await child("write", "seed", "native").out).toMatch(/OK/);
+    process.env.RELAY_SQLITE_DRIVER = "native";
+    const { exportRelayState } = await import("../src/backup.js");
+    await exportRelayState({ destinationPath: path.join(ROOT, `wal-${path.basename(dbDir)}.tar.gz`) });
+    (await import("../src/db.js")).closeDb();
+    expect(fs.existsSync(dbPath + "-wal"), "precondition: the native cold export left a -wal (MEASURED)").toBe(true);
+    const w = await child("write", "w", "wasm").out;
+    expect(w).toMatch(/REFUSED .*-(wal|shm) file is beside the DB/);
+    expect(w, "the cause").toMatch(/left by a native open \(e\.g\. a native `relay backup`\)/);
+    expect(w, "the remedy").toMatch(/open it once with the native driver to checkpoint.*then retry/);
+    // The remedy WORKS as named: one native open of the DB (the relay's own), then the wasm open succeeds.
+    expect(await child("write", "remedy", "native").out).toMatch(/OK/);
+    expect(await child("write", "after-remedy", "wasm").out, "the wasm open after the remedy").toMatch(/OK/);
+  }, 60_000);
+
   it.each(["wasm", "native"] as const)("a RESTORE (driver %s) while another process owns the DB is refused, and the owner's data survives", async (driver) => {
     expect(await child("write", "seed", "native").out).toMatch(/OK/);
     process.env.RELAY_SQLITE_DRIVER = "native";

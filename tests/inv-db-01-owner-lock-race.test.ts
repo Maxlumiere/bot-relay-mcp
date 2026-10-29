@@ -13,7 +13,8 @@
  * - Linux CI: a bind mount of the DB's directory gives one owner, when the runner can mount; otherwise UNMEASURED;
  * - a DB the acquire just CREATED and its caller's verify refuses is removed only when it is provably that file (the
  *   same dev + ino as the created fd, still empty), with the open fd held (on Windows too);
- * - native PROBERS (isOwnedElsewhere) racing each other never see an owner that is not there, and do see one that is.
+ * - native PROBERS (isOwnedElsewhere) racing each other never see an owner that is not there, and do see one that is;
+ *   and with probers looping CONTINUOUSLY, an acquirer still takes the lock within its bounded retry.
  * The racers run from FILES (an eval'd module breaks worker pools), under a SANDBOX HOME; every recorded child is
  * checked exited at the end.
  */
@@ -73,6 +74,27 @@ fs.writeFileSync(
     `const seen = [];\n` +
     `for (let i = 0; i < 5; i++) seen.push(await isOwnedElsewhere(db) ? "OWNED" : "FREE");\n` +
     `process.stdout.write(seen.join(" ") + "\\n");\n` +
+    `process.exit(0);\n`
+);
+const LOOPER = path.join(ROOT, "looper.mjs");
+fs.writeFileSync(
+  LOOPER,
+  `const { isOwnedElsewhere } = await import(${JSON.stringify(LOCK_JS)});\n` +
+    `const fs = await import("fs");\n` +
+    `const [db, stop] = process.argv.slice(2);\n` +
+    `const end = Date.now() + 30000; // self-terminating, whatever the parent does\n` +
+    `let n = 0;\n` +
+    `while (!fs.existsSync(stop) && Date.now() < end) { await isOwnedElsewhere(db); n++; }\n` +
+    `process.stdout.write(String(n) + "\\n");\n` +
+    `process.exit(0);\n`
+);
+const ACQUIRER = path.join(ROOT, "acquirer.mjs");
+fs.writeFileSync(
+  ACQUIRER,
+  `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
+    `const t = performance.now();\n` +
+    `try { const l = await acquirePrimitive(process.argv[2]); process.stdout.write("OWNER " + Math.round(performance.now() - t) + "\\n"); l.release(); }\n` +
+    `catch (e) { process.stdout.write("LOST " + Math.round(performance.now() - t) + " " + e.message + "\\n"); }\n` +
     `process.exit(0);\n`
 );
 const env = { ...process.env, HOME, USERPROFILE: HOME };
@@ -214,6 +236,24 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
       await h.kill();
     }
   }, 60_000);
+
+  it(`with ${RACERS} probers looping CONTINUOUSLY, an acquirer still takes the lock within its bounded retry (10 rounds)`, async () => {
+    const db = path.join(ROOT, "probe-storm.db");
+    fs.writeFileSync(db, "");
+    const stop = path.join(ROOT, "stop-storm");
+    const loopers = Array.from({ length: RACERS }, () => run(LOOPER, [db, stop]));
+    const results: string[] = [];
+    try {
+      await new Promise((res) => setTimeout(res, 500)); // every looper is spinning
+      for (let r = 0; r < 10; r++) results.push((await run(ACQUIRER, [db]).out).trim());
+    } finally {
+      fs.writeFileSync(stop, "");
+    }
+    const probes = (await Promise.all(loopers.map((x) => x.out))).map((o) => Number(o.trim()));
+    process.stdout.write(`probe storm: acquirer ${results.join(" | ")}; probes per looper ${probes.join(",")}\n`);
+    expect(probes.every((n) => n > 0), "precondition: every looper probed during the window").toBe(true);
+    expect(results.filter((x) => !x.startsWith("OWNER ")), "an acquirer starved by probes").toEqual([]);
+  }, 120_000);
 
   const canBindMount = process.platform === "linux" && !!process.env.CI && spawnSync("sudo", ["-n", "true"]).status === 0;
   it.skipIf(!canBindMount)("Linux CI: a BIND MOUNT of the DB's directory names ONE owner (the parent directory's identity collapses it)", async () => {
