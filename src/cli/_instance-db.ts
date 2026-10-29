@@ -34,10 +34,14 @@ export async function openRawRelayDb(
   opts: { readonly: boolean },
 ): Promise<import("../sqlite-compat.js").CompatDatabase> {
   const Better = (await import("better-sqlite3")).default;
+  // INV-DB-01: a native process never opens a wasm-owned DB: checked before the open and again right after it.
+  const { assertNotOwnedByWasm } = await import("../sqlite-compat.js");
+  await assertNotOwnedByWasm(dbPath);
   const db = new Better(dbPath, { readonly: opts.readonly, fileMustExist: true });
   try {
     const { assertStillContained } = await import("../db.js");
     assertStillContained(dbPath);
+    await assertNotOwnedByWasm(dbPath);
   } catch (err) {
     try {
       db.close();

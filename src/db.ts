@@ -338,6 +338,10 @@ export async function initializeDb(): Promise<void> {
   // narrowed only after the re-check below (ADR-0048: never chmod through an
   // unverified path).
   createDbDir(path.dirname(dbPath));
+  // INV-DB-01: the wasm driver's single-owner lock MATERIALIZES an absent DB before it keys it, so containment is
+  // checked BEFORE the driver opens anything too (a path escaped out of the approved roots gets no file created
+  // through it); the re-check below still covers a swap between this check and the open.
+  assertStillContained(dbPath);
   _db = await initDriver(dbPath);
   // Re-check BEFORE anything else touches the file: on a refusal the handle is
   // DISCARDED (a WASM close() would flush its image through the escaped path),

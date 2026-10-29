@@ -41,7 +41,8 @@ import { withDeadline } from "./http-deadline.js";
 import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
 import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
-import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
+import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, assertNotOwnedByWasm, fileSha256, driverOf, configuredDriver, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
+import { acquireOwnerLock, lockKey } from "./db-owner-lock.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
@@ -672,28 +673,40 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // destination already exists. Fall back to copy-then-unlink — NOT
     // atomic on Windows, but documented and the best POSIX-API equivalent
     // we can offer without shelling out to MoveFileExW.
-    const newPath = srcDbPath + ".new";
-    fs.copyFileSync(extractedDbPath, newPath);
+    // INV-DB-01: the swap renames the DB file: exactly the write a wasm-driven DB allows only to its single owner. Under
+    // the wasm driver it holds the owner lock across the swap and re-derives the key after it; under native it refuses
+    // a DB a wasm-driver process owns.
+    const swapLock = configuredDriver() === "wasm" ? await acquireOwnerLock(srcDbPath) : null;
+    if (!swapLock) await assertNotOwnedByWasm(srcDbPath);
     try {
-      fs.renameSync(newPath, srcDbPath);
-    } catch (err) {
-      if (process.platform === "win32") {
-        // Windows fallback: non-atomic replace. Documented behavior.
-        fs.copyFileSync(newPath, srcDbPath);
-        fs.unlinkSync(newPath);
-      } else {
-        throw err;
+      const newPath = srcDbPath + ".new";
+      fs.copyFileSync(extractedDbPath, newPath);
+      try {
+        fs.renameSync(newPath, srcDbPath);
+      } catch (err) {
+        if (process.platform === "win32") {
+          // Windows fallback: non-atomic replace. Documented behavior.
+          fs.copyFileSync(newPath, srcDbPath);
+          fs.unlinkSync(newPath);
+        } else {
+          throw err;
+        }
       }
-    }
-    // Remove stale WAL/shm AFTER the rename — they'll be regenerated from
-    // the new DB on next open. Running before the rename (the old order)
-    // would leave a window where both the old and new WALs could apply to
-    // an ambiguous DB file mid-swap.
-    for (const suffix of ["-wal", "-shm"]) {
-      const p = srcDbPath + suffix;
-      if (fs.existsSync(p)) {
-        fs.unlinkSync(p);
+      // Remove stale WAL/shm AFTER the rename — they'll be regenerated from
+      // the new DB on next open. Running before the rename (the old order)
+      // would leave a window where both the old and new WALs could apply to
+      // an ambiguous DB file mid-swap.
+      for (const suffix of ["-wal", "-shm"]) {
+        const p = srcDbPath + suffix;
+        if (fs.existsSync(p)) {
+          fs.unlinkSync(p);
+        }
       }
+      if (swapLock && lockKey(srcDbPath) !== swapLock.key) {
+        throw new Error(`restore: the database's path changed during the swap (${srcDbPath}); restore again.`);
+      }
+    } finally {
+      swapLock?.release();
     }
 
     return {

@@ -461,7 +461,10 @@ export async function openExportSource(
       loadedSha256 = crypto.createHash("sha256").update(bytes).digest("hex");
       db = await openWasmFromBytes(bytes, dbPath);
     } else {
+      // INV-DB-01: a native process never opens a wasm-owned DB: checked before the open and right after.
+      await assertNotOwnedByWasm(dbPath);
       db = await openReadOnlyUnchecked(dbPath, driver);
+      await assertNotOwnedByWasm(dbPath);
     }
     db.prepare("SELECT 1 FROM sqlite_master LIMIT 1").get(); // a native read-only open fails here, not at open
   } catch (err) {
@@ -548,7 +551,8 @@ let _initPromise: Promise<CompatDatabase> | null = null;
  * any getDb() call). For native: sync under the hood. For wasm: loads the
  * wasm binary async. Thread-safe: concurrent callers share the same promise.
  */
-async function assertNotOwnedByWasm(dbPath: string): Promise<void> {
+/** INV-DB-01: refuse, by name, a DB a wasm-driver process owns (every native open checks before and right after). */
+export async function assertNotOwnedByWasm(dbPath: string): Promise<void> {
   if (await isOwnedElsewhere(dbPath)) {
     throw new OwnerLockError(
       `the DB at ${dbPath} is owned by a wasm-driver process; a native process does not open it meanwhile. Stop that process first.`
