@@ -85,7 +85,8 @@ function child(op: "hold" | "write", name: string, driver: "wasm" | "native", db
   let buf = "";
   const ready = new Promise<string>((res) => proc.stdout!.on("data", (d) => { buf += d; if (/READY|REFUSED|OK/.test(buf)) res(buf); }));
   proc.stdout!.on("data", () => {});
-  return { proc, out: new Promise((res) => proc.on("exit", () => res(buf))), ready };
+  // "close", not "exit": a child can exit before its stdout is drained, and its LAST line (OK, REFUSED) would be lost.
+  return { proc, out: new Promise((res) => proc.on("close", () => res(buf))), ready };
 }
 async function nativeRows(db = dbPath): Promise<string[]> {
   const Database = (await import("better-sqlite3")).default;
@@ -167,6 +168,15 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: one wasm owner, enf
     fs.writeFileSync(probe, "");
     return fs.existsSync(path.join(ROOT, "caseprobe"));
   })();
+  it.skipIf(!folds)("a DB opened through a CASE VARIANT keeps its canonical name across persists: the owner keeps persisting, and another spelling is refused", async () => {
+    const canonical = path.join(dbDir, "Canon.db");
+    expect(await child("write", "seed", "native", canonical).out).toMatch(/OK/);
+    const a = child("hold", "wasm-a", "wasm", path.join(dbDir, "CANON.DB")); // four writes: four persists
+    expect(await a.ready, "the owner kept persisting through a case variant").toMatch(/READY/);
+    expect(fs.readdirSync(dbDir).filter((f) => f.toLowerCase() === "canon.db"), "the on-disk name stayed canonical").toEqual(["Canon.db"]);
+    expect(await child("write", "b", "wasm", path.join(dbDir, "canon.db")).out, "another spelling is the same owner").toMatch(/REFUSED .*could not be locked/);
+  }, 60_000);
+
   it.skipIf(!folds)("ruled (4): a NEW DB created concurrently through two case spellings: exactly ONE owner", async () => {
     const lower = path.join(dbDir, "new.db");
     const upper = path.join(dbDir, "NEW.DB");

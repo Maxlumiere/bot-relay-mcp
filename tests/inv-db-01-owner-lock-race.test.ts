@@ -128,7 +128,8 @@ function run(file: string, args: string[], envFor: NodeJS.ProcessEnv = env): { c
   recorded.push(child);
   let buf = "";
   child.stdout!.on("data", (d) => (buf += d));
-  return { child, out: new Promise((res) => child.on("exit", () => res(buf))) };
+  // "close", not "exit": a child can exit before its stdout is drained, and the LAST line (a COUNT, an OWNER) would be lost.
+  return { child, out: new Promise((res) => child.on("close", () => res(buf))) };
 }
 async function holding(db: string): Promise<{ kill: () => Promise<void> }> {
   const h = run(HOLDER, [db]);
@@ -451,6 +452,36 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     await expect(m.acquirePrimitive(linked, { attempts: 1 })).rejects.toThrow(/owner lock file .* is not private|is a symlink/);
     await expect(m.isOwnedElsewhere(linked)).rejects.toThrow(/owner lock file .* is not private|is a symlink/);
     expect(fs.existsSync(path.join(ROOT, "elsewhere")), "nothing was created through the planted symlink").toBe(false);
+    // A lock file that EXISTS but cannot be opened (mode 000, so even its owner gets EACCES) is the same named refusal.
+    const shut = path.join(dir, "Shut.db");
+    fs.writeFileSync(shut, "");
+    fs.writeFileSync(path.join(dir, ".Shut.db.relay-owner"), "");
+    fs.chmodSync(path.join(dir, ".Shut.db.relay-owner"), 0o000);
+    try {
+      await expect(m.acquirePrimitive(shut, { attempts: 1 })).rejects.toThrow(/owner lock file .* is not private/);
+      await expect(m.isOwnedElsewhere(shut)).rejects.toThrow(/owner lock file .* is not private/);
+    } finally {
+      fs.chmodSync(path.join(dir, ".Shut.db.relay-owner"), 0o600);
+    }
+  }, 60_000);
+
+  it.skipIf(process.platform !== "darwin")("macOS: a READ-ONLY DB directory with no lock file yet: an acquire is refused with the CREATE message, and a probe answers FREE and creates nothing", async () => {
+    const m = (await import("../dist/db-owner-lock.js")) as unknown as {
+      acquirePrimitive: (p: string, o?: { attempts?: number }) => Promise<{ release(): void }>;
+      isOwnedElsewhere: (p: string) => Promise<boolean>;
+    };
+    const dir = path.join(ROOT, "ro-db-dir");
+    fs.mkdirSync(dir);
+    const db = path.join(dir, "R.db");
+    fs.writeFileSync(db, "");
+    fs.chmodSync(dir, 0o500);
+    try {
+      await expect(m.acquirePrimitive(db, { attempts: 1 })).rejects.toThrow(/cannot create the owner lock file in .*ro-db-dir/);
+      expect(await m.isOwnedElsewhere(db)).toBe(false);
+      expect(fs.readdirSync(dir), "nothing was created").toEqual(["R.db"]);
+    } finally {
+      fs.chmodSync(dir, 0o700);
+    }
   }, 60_000);
 
   const canSudo = process.platform === "darwin" && !!process.env.CI && spawnSync("sudo", ["-n", "true"]).status === 0;
