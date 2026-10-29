@@ -39,7 +39,7 @@ import { pipeline } from "stream/promises";
 import { withDeadline } from "./http-deadline.js";
 
 import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
-import { comparePaths, isProtected } from "./path-walk.js";
+import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
 import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
@@ -197,18 +197,35 @@ function namesASideFile(destName: string, dbName: string): boolean {
 /** Test-only: the rule above, for its property test. */
 export const _namesASideFileForTests = namesASideFile;
 
+/** Test-only: the fold, for the property tests. */
+export const _foldForRefusalForTests = foldForRefusal;
+
+/** The source DB's names a destination must not start with: as configured, and resolved through the shared walk. */
+function sourceNames(srcDbPath: string): string[] {
+  let resolved: string;
+  try {
+    resolved = walkPath(srcDbPath).real;
+  } catch (err) {
+    throw new Error(`backup refused: the database path ${srcDbPath} cannot be resolved (${(err as Error).message}).`);
+  }
+  return [...new Set([path.basename(srcDbPath), path.basename(resolved)])];
+}
+
 /**
- * INV-BACKUP-01 (ruled; Codex #372 R1): the archive's destination is never the source DB or a file SQLite would take
- * as one of its own.
+ * INV-BACKUP-01 (ruled; Codex #372 R1 and R2): the archive's destination is refused when it exists, or when it has a name SQLite could
+ * take as one of the source DB's own files.
  * - An EXISTING destination is refused, whatever it is (the DB, a symlink or hardlink to it, any file): never truncated
  *   (and the archive is created "wx", so a file appearing in between is refused too).
- * - A NEW destination whose parent directory is the DB's (path-walk: isProtected(comparePaths(...)) on the two
- *   parents, which both exist; a symlinked alias of the directory is the same entry) is refused when its name is one
- *   SQLite would treat as the DB's own: a NEW file at an ABSENT side-file name (-wal, -shm, -journal, the super-journal
- *   -mj*) is a file SQLite would later take as its own, through hot-journal or WAL recovery, and corrupt the DB.
- * - The stated cost: a name like "RELAY.DB-backup.tgz" beside the DB is refused too.
+ * - A NEW destination is refused, in ANY directory, when its name starts with the DB's CONFIGURED basename or its
+ *   RESOLVED one (raw or under the widen-only fold). Why: a new file at an absent side-file name (-wal, -shm, -journal,
+ *   the super-journal -mj*) is a file SQLite would later take as its own, through hot-journal or WAL recovery, and
+ *   corrupt the DB. Directory-independent, because a parent directory compared now can be swapped for a link to the
+ *   DB's directory before the archive is opened (Codex R2), and a source that is itself a symlink has a second name.
+ * - The stated cost: a destination named like the DB is refused anywhere (e.g. "RELAY.DB-backup.tgz", or "data-x.tgz"
+ *   for a DB named "data"). The default relay-backup-<iso>.tar.gz does not start with the default relay.db.
+ * Returns the names judged, so the caller re-derives and compares them right before the archive is opened.
  */
-function assertDestinationIsNotSource(archivePath: string, srcDbPath: string): void {
+function assertDestinationIsNotSource(archivePath: string, srcDbPath: string): string[] {
   let exists = false;
   try {
     fs.lstatSync(archivePath);
@@ -217,16 +234,25 @@ function assertDestinationIsNotSource(archivePath: string, srcDbPath: string): v
     exists = false;
   }
   if (exists) throw destinationExists(archivePath);
-  let sameDir: boolean;
-  try {
-    sameDir = isProtected(comparePaths(path.dirname(archivePath), path.dirname(srcDbPath)));
-  } catch {
-    sameDir = true; // a walk that cannot judge refuses
+  const names = sourceNames(srcDbPath);
+  for (const dbName of names) {
+    if (namesASideFile(path.basename(archivePath), dbName)) {
+      throw new Error(
+        `backup refused: the destination ${archivePath} has a name SQLite would treat as one of the database's own files: ` +
+          `it starts with the database's name (${dbName}). Choose another name for the archive.`
+      );
+    }
   }
-  if (sameDir && namesASideFile(path.basename(archivePath), path.basename(srcDbPath))) {
+  return names;
+}
+
+/** Right before the archive is opened: the source's names must be the ones judged (a source re-pointed meanwhile). */
+function assertSourceNamesUnchanged(srcDbPath: string, judged: string[]): void {
+  const now = sourceNames(srcDbPath);
+  if (now.length !== judged.length || now.some((n, i) => n !== judged[i])) {
     throw new Error(
-      `backup refused: the destination ${archivePath} is beside the database and has a name SQLite would treat as one of ` +
-        `the database's own files (it starts with ${path.basename(srcDbPath)}). Choose another name or directory.`
+      `backup refused: the source changed while it was being backed up (${srcDbPath} now resolves to ${now.join(" / ")}, ` +
+        `not ${judged.join(" / ")}). Run the backup again.`
     );
   }
 }
@@ -329,7 +355,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
   const archivePath = options.destinationPath
     ? assertSafePath(options.destinationPath, "destinationPath")
     : path.join(backupsDir, `relay-backup-${isoTimestamp()}.tar.gz`);
-  assertDestinationIsNotSource(archivePath, srcDbPath);
+  const judgedNames = assertDestinationIsNotSource(archivePath, srcDbPath);
 
   // Stage the snapshot + manifest + optional config under a unique temp dir
   // (keyed off a random suffix so parallel exports can't collide).
@@ -450,7 +476,10 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     if (plainSize > MAX_DECOMPRESSED_BYTES) {
       throw new Error(`backup refused: the archive is ${plainSize} bytes uncompressed, over the ${MAX_DECOMPRESSED_BYTES}-byte cap; restore would refuse it.`);
     }
-    // Created EXCLUSIVELY ("wx"): an existing file is never truncated (Codex #372 R1), whoever made it.
+    // Created EXCLUSIVELY ("wx"): an existing file is never truncated (Codex #372 R1), whoever made it. Right before it,
+    // the destination is judged again against the source's names as they are NOW (Codex R2).
+    assertSourceNamesUnchanged(srcDbPath, judgedNames);
+    assertDestinationIsNotSource(archivePath, srcDbPath);
     try {
       await pipeline(fs.createReadStream(plainTar), zlib.createGzip(), fs.createWriteStream(archivePath, { mode: 0o600, flags: "wx" }));
     } catch (err) {
