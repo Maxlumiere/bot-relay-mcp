@@ -12,7 +12,8 @@
  * - alias spellings of one DB (a symlink, `..`, a case variant where the volume folds case) give one owner;
  * - Linux CI: a bind mount of the DB's directory gives one owner, when the runner can mount; otherwise UNMEASURED;
  * - a DB the acquire just CREATED and its caller's verify refuses is removed only when it is provably that file (the
- *   same dev + ino as the created fd, still empty), with the open fd held (on Windows too).
+ *   same dev + ino as the created fd, still empty), with the open fd held (on Windows too);
+ * - native PROBERS (isOwnedElsewhere) racing each other never see an owner that is not there, and do see one that is.
  * The racers run from FILES (an eval'd module breaks worker pools), under a SANDBOX HOME; every recorded child is
  * checked exited at the end.
  */
@@ -61,6 +62,18 @@ fs.writeFileSync(
   HOLDER,
   `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
     `await acquirePrimitive(process.argv[2]); process.stdout.write("HELD\\n"); setInterval(() => {}, 1000);\n`
+);
+const PROBER = path.join(ROOT, "prober.mjs");
+fs.writeFileSync(
+  PROBER,
+  `const { isOwnedElsewhere } = await import(${JSON.stringify(LOCK_JS)});\n` +
+    `const fs = await import("fs");\n` +
+    `const [db, go] = process.argv.slice(2);\n` +
+    `while (!fs.existsSync(go)) await new Promise((r) => setTimeout(r, 2));\n` +
+    `const seen = [];\n` +
+    `for (let i = 0; i < 5; i++) seen.push(await isOwnedElsewhere(db) ? "OWNED" : "FREE");\n` +
+    `process.stdout.write(seen.join(" ") + "\\n");\n` +
+    `process.exit(0);\n`
 );
 const env = { ...process.env, HOME, USERPROFILE: HOME };
 
@@ -171,6 +184,35 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     lock.release();
     expect(called, "verifyCreated ran on a DB this call did not create").toBe(false);
     expect(fs.existsSync(db)).toBe(true);
+  }, 60_000);
+
+  async function probeRound(db: string, tag: string): Promise<string[]> {
+    const go = path.join(ROOT, `go-probe-${tag}`);
+    const probers = Array.from({ length: RACERS }, () => run(PROBER, [db, go]));
+    await new Promise((res) => setTimeout(res, 150));
+    fs.writeFileSync(go, "");
+    return (await Promise.all(probers.map((x) => x.out))).flatMap((o) => o.trim().split(" "));
+  }
+  it(`native PROBERS racing each other (${RACERS} x 5 probes, 5 rounds) with NO owner never see one`, async () => {
+    const db = path.join(ROOT, "probe-free.db");
+    fs.writeFileSync(db, "");
+    const seen: string[] = [];
+    for (let r = 0; r < 5; r++) seen.push(...(await probeRound(db, `free-${r}`)));
+    expect(seen.filter((s) => s !== "FREE"), `false "owned" among ${seen.length} probes`).toEqual([]);
+    expect(seen.length).toBe(5 * RACERS * 5);
+  }, 120_000);
+
+  it(`twin: with an owner ALIVE, every racing prober sees it`, async () => {
+    const db = path.join(ROOT, "probe-held.db");
+    fs.writeFileSync(db, "");
+    const h = await holding(db);
+    try {
+      const seen = await probeRound(db, "held");
+      expect(seen.filter((s) => s !== "OWNED"), `"free" among ${seen.length} probes of a held DB`).toEqual([]);
+      expect(seen.length).toBe(RACERS * 5);
+    } finally {
+      await h.kill();
+    }
   }, 60_000);
 
   const canBindMount = process.platform === "linux" && !!process.env.CI && spawnSync("sudo", ["-n", "true"]).status === 0;

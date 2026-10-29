@@ -262,6 +262,10 @@ describe.skipIf(!ENABLED)(`INV-DB-01 on ${process.platform}: every other native 
     const { exportRelayState, importRelayState } = await import("../src/backup.js");
     const archive = (await exportRelayState({ destinationPath: path.join(ROOT, `arc-${driver}-${path.basename(dbDir)}.tar.gz`) })).archive_path;
     (await import("../src/db.js")).closeDb();
+    // A native cold export (a read-only open of a WAL DB) leaves -wal/-shm beside it (MEASURED); the relay's own native
+    // open (one that READS: a bare open + close does not, MEASURED) checkpoints and removes them on its last close.
+    expect(await child("write", "normalize", "native").out).toMatch(/OK/);
+    expect(["-wal", "-shm"].filter((x) => fs.existsSync(dbPath + x)), "precondition: no side files").toEqual([]);
     const a = child("hold", "wasm-owner", "wasm");
     expect(await a.ready).toMatch(/READY/);
     process.env.RELAY_SQLITE_DRIVER = driver;
