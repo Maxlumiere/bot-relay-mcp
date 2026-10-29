@@ -23,6 +23,13 @@ const PREMISE =
   "is refused (a sibling, another name). Review the guard's scope (the #343 PR body) before adding a caller of atomicWriteJson";
 
 describe("the guarded writer's callers are exactly the ones the guard's scope was reviewed for", () => {
+  // A precautionary 45 s budget aligned with #371; this test has no observed 15 s timeout (measured 2.1-7.2 s). It builds the
+  // whole src/ TypeScript program (srcProgram()), the same work as tests/sec-22-system-binaries.test.ts:159, which timed
+  // out at the 15 s default in a slow macOS-runner window. macOS CI, 28-29 Oct (42 test jobs, the reporter's per-file ms;
+  // this file is this one test): 2,100-5,175 ms normally, 5,275 / 7,183 ms in that window (jobs 122799086386,
+  // 122803027574), in which sec-22:159 took 20,303 / 18,498 ms. Investigate sustained increases from the measured
+  // baseline even below this timeout.
+  const SRC_PROGRAM_SCAN_BUDGET_MS = 45_000;
   it("atomicWriteJson: 3 calls, all in src/cli/init.ts, and no other use", () => {
     const rel = (f: string) => path.relative(REPO, f).split(path.sep).join("/");
     const refs = pinnedReferences(srcProgram(), rel, ["src/cli/config-merge.ts:atomicWriteJson"]);
@@ -31,5 +38,5 @@ describe("the guarded writer's callers are exactly the ones the guard's scope wa
     expect(others.map((r) => `${r.site} (${r.how})`), PREMISE).toEqual([]);
     expect(calls.every((r) => r.site.startsWith("src/cli/init.ts:")), `${PREMISE}: ${calls.map((r) => r.site).join(", ")}`).toBe(true);
     expect(calls.length, PREMISE).toBe(3);
-  });
+  }, SRC_PROGRAM_SCAN_BUDGET_MS);
 });
