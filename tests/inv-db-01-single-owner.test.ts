@@ -24,6 +24,16 @@ const LOCK_JS = pathToFileURL(path.join(REPO, "dist", "db-owner-lock.js")).href;
 const ROOT = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "inv-db-01-")));
 const HOME = path.join(ROOT, "home");
 fs.mkdirSync(HOME);
+// In-process lock calls (macOS keeps its lock files under os.homedir()) use the SANDBOX home too, never the operator's.
+const SAVED_HOME = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+process.env.HOME = HOME;
+process.env.USERPROFILE = HOME;
+const restoreHome = () => {
+  for (const [k, v] of Object.entries(SAVED_HOME)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+};
 const { MEASURED_PLATFORMS } = (await import("../dist/db-owner-lock.js")) as { MEASURED_PLATFORMS: ReadonlySet<string> };
 const ENABLED = MEASURED_PLATFORMS.has(process.platform);
 const recorded: ChildProcess[] = [];
@@ -36,6 +46,7 @@ afterAll(async () => {
   for (const c of recorded) if (c.exitCode === null && c.signalCode === null) c.kill("SIGKILL");
   await Promise.all(recorded.map(waitExit));
   const alive = recorded.filter((c) => c.exitCode === null && c.signalCode === null);
+  restoreHome();
   fs.rmSync(ROOT, { recursive: true, force: true });
   expect(alive.length, "every recorded child had exited").toBe(0);
 });
