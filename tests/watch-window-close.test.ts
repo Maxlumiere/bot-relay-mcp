@@ -17,7 +17,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
-import { openWindow, findEscapes, selfAndAncestors, snapshotProcessEnv, parseProcessTable, parseReadyAck } from "./helpers/watch-window.js";
+import { openWindow, findEscapes, selfAndAncestors, snapshotProcessEnv, parseProcessTable, parseReadyAck, parseGroupMembers, readGroupMembers } from "./helpers/watch-window.js";
 import { ownPid, parentPidOf, parsePid, signalOwnedPid, type OwnedPid } from "./_helpers/recorded-pid.js";
 import { probePid, processStartedAt as readStart, startOrNull } from "../src/liveness.js";
 
@@ -165,6 +165,108 @@ describe.skipIf(process.platform === "win32")("the test window's close()", () =>
       cleanup(w, leaderStart);
     }
   }, 15_000);
+
+  it("the not-empty failure NAMES what is still in the group (the reader's text), so the next CI occurrence carries its own evidence", async () => {
+    const dir = path.join(ROOT, "named");
+    const w = openWindow(dir, env, { closeWaitMs: 200, groupAlive: () => true, groupMembers: async (pgid) => `pid 4242 ppid 1 stat Z etime 00:05 comm sleep (group ${pgid})` });
+    const leaderStart = processStartedAt(w.leaderPid);
+    try {
+      await expect(w.close()).rejects.toThrow(new RegExp(`process group ${w.leaderPid} is not empty after 200 ms: .*; members: pid 4242 ppid 1 stat Z etime 00:05 comm sleep \\(group ${w.leaderPid}\\)$`));
+    } finally {
+      cleanup(w, leaderStart);
+    }
+  }, 15_000);
+
+  it("a members reading that NEVER returns cannot delay the rejection: it lands on time, the members 'unavailable (diagnostic still running)'", async () => {
+    const dir = path.join(ROOT, "stuck-reader");
+    const w = openWindow(dir, env, { closeWaitMs: 200, groupAlive: () => true, groupMembers: () => new Promise<string>(() => {}) });
+    const leaderStart = processStartedAt(w.leaderPid);
+    try {
+      const t0 = Date.now();
+      await expect(w.close()).rejects.toThrow(/is not empty after 200 ms: .*; members: unavailable \(diagnostic still running\)$/);
+      // The configured deadline (200 ms) + an explicit SCHEDULING ALLOWANCE of 300 ms (the 25 ms poll, the ownership
+      // checks before the kill, a loaded runner): nowhere near the reader, which never returns.
+      expect(Date.now() - t0, "rejected at the deadline, never waiting for the reader").toBeLessThan(200 + 300);
+    } finally {
+      cleanup(w, leaderStart);
+    }
+  }, 15_000);
+
+  it("a members reader that THROWS or REJECTS never replaces the original error: it is appended as 'unavailable (<reason>)'", async () => {
+    for (const [tag, reader] of [
+      ["throws", () => { throw new Error("planted: reader threw"); }],
+      ["rejects", () => Promise.reject(new Error("planted: reader rejected"))],
+    ] as const) {
+      const dir = path.join(ROOT, `reader-${tag}`);
+      const w = openWindow(dir, env, { closeWaitMs: 200, groupAlive: () => true, groupMembers: reader as (pgid: number) => Promise<string> });
+      const leaderStart = processStartedAt(w.leaderPid);
+      try {
+        await expect(w.close(), tag).rejects.toThrow(new RegExp(`process group ${w.leaderPid} is not empty after 200 ms: something it started may still write into this dir; members: unavailable \\(planted: reader ${tag === "throws" ? "threw" : "rejected"}\\)$`));
+      } finally {
+        cleanup(w, leaderStart);
+      }
+    }
+  }, 20_000);
+
+  it("a reader that REJECTS LATE, after the deadline, is HANDLED (no unhandled rejection): the close rejection already said 'still running'", async () => {
+    const dir = path.join(ROOT, "late-reader");
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    const w = openWindow(dir, env, { closeWaitMs: 200, groupAlive: () => true, groupMembers: () => new Promise<string>((_r, reject) => setTimeout(() => reject(new Error("planted: late")), 500)) });
+    const leaderStart = processStartedAt(w.leaderPid);
+    try {
+      await expect(w.close()).rejects.toThrow(/members: unavailable \(diagnostic still running\)$/);
+      await new Promise((r) => setTimeout(r, 700)); // past the reader's late rejection
+      expect(unhandled, "the late rejection was handled").toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      cleanup(w, leaderStart);
+    }
+  }, 15_000);
+
+  it.skipIf(process.platform === "win32")("DISPOSAL: a production reading that OUTLIVES the deadline is killed when close() settles (only that child), and holds no handle afterwards", async () => {
+    const dir = path.join(ROOT, "dispose");
+    fs.mkdirSync(dir, { recursive: true });
+    const pidFile = path.join(dir, "slow-ps.pid");
+    // The stand-in "ps": /bin/sh -c, NOT a freshly written script (macOS was measured not to run a new script within
+    // 300 ms, so it never recorded its pid); `exec` keeps the recorded pid the child's own.
+    const slowPs = ["-c", `echo $$ > '${pidFile}'; exec sleep 30`];
+    const processHandles = () => process.getActiveResourcesInfo().filter((t) => t === "ProcessWrap").length;
+    const baseline = processHandles();
+    const w = openWindow(path.join(dir, "win"), env, { closeWaitMs: 300, groupAlive: () => true, groupMembers: (pgid, settled) => readGroupMembers(pgid, settled, "/bin/sh", slowPs) });
+    const leaderStart = processStartedAt(w.leaderPid);
+    try {
+      await expect(w.close()).rejects.toThrow(/members: unavailable \(diagnostic still running\)$/);
+      const slowPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+      expect(slowPid, "precondition: the slow reader really ran").toBeGreaterThan(1);
+      // Liveness by PROBE only (kill(pid, 0) → ESRCH): the test never signals the stand-in itself.
+      for (let i = 0; i < 100 && probePid(slowPid) !== "gone"; i++) await sleep(20);
+      expect(probePid(slowPid), "the reading's ps child was killed when close() settled (ESRCH)").toBe("gone");
+      expect(processHandles(), "no child-process handle is left holding the event loop").toBeLessThanOrEqual(baseline);
+    } finally {
+      cleanup(w, leaderStart);
+    }
+  }, 15_000);
+
+  it("the PRODUCTION reader's unreadable path: a ps that cannot run reads 'unreadable: ps failed (…)', never a member list or 'no members'", async () => {
+    expect(await readGroupMembers(4242, undefined, "/nonexistent/ps-for-this-test")).toMatch(/^unreadable: ps failed \(.*ENOENT/);
+  });
+
+  it("parseGroupMembers: members found (a zombie and a U state included), a VALID table with no match, and output with NO valid row are three different answers", () => {
+    const ps = [
+      "  100   100     1 Ss   01:00 sh",
+      "  101   100   100 Z    00:01 sleep",
+      "  102   999   100 S    00:01 escaped-into-another-group",
+      "  103   100   100 U    00:02 node /x/relay watch",
+      "garbage",
+    ].join("\n");
+    expect(parseGroupMembers(ps, 100)).toBe("pid 100 ppid 1 stat Ss etime 01:00 comm sh; pid 101 ppid 100 stat Z etime 00:01 comm sleep; pid 103 ppid 100 stat U etime 00:02 comm node /x/relay watch");
+    expect(parseGroupMembers(ps, 555), "a valid table, no row in this group").toBe("ps listed no matching members (4 rows read; kill(-pgid, 0) and ps are two readings at two instants)");
+    for (const [tag, out] of [["empty", ""], ["whitespace-only", "   \n  \t\n"], ["malformed-only", "garbage\nfoo bar baz\n12 x 3 S 00:01 sh"]] as const) {
+      expect(parseGroupMembers(out, 100), tag).toBe("unparseable: the ps output had no valid row");
+    }
+  });
 
   it("ONE shutdown: concurrent calls share it, and a call after a REJECTION rejects the same way (never a false success)", async () => {
     const dir = path.join(ROOT, "once");
