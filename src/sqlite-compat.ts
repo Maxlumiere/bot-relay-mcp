@@ -156,6 +156,43 @@ class WasmStatement implements CompatStatement {
   }
 }
 
+let persistRename: (from: string, to: string) => void = (from, to) => fs.renameSync(from, to);
+/** Test-only: replaces the wasm persist's rename (e.g. with one that is refused). */
+export function _setPersistRenameForTests(fn: ((from: string, to: string) => void) | null): void {
+  persistRename = fn ?? ((from, to) => fs.renameSync(from, to));
+}
+
+const WINDOWS_OPEN_FILE_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/**
+ * INV-DB-01: the wasm persist's atomic replace (a rename over the DB). Windows cannot replace a file another process
+ * holds open (an AV scanner, an indexer, a native handle): a short bounded retry for a transient opener, then a NAMED
+ * refusal. Anywhere, a refused replace writes nothing, and the in-memory writes go out with the next persist.
+ */
+function replaceWithRetry(tmp: string, dbPath: string): void {
+  const waits = process.platform === "win32" ? [25, 50, 100, 200] : [];
+  for (let i = 0; ; i++) {
+    try {
+      persistRename(tmp, dbPath);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "";
+      const openOnWindows = process.platform === "win32" && WINDOWS_OPEN_FILE_CODES.has(code);
+      if (openOnWindows && i < waits.length) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waits[i]);
+        continue;
+      }
+      const why = openOnWindows
+        ? `another process has the DB file open; Windows cannot replace it`
+        : `the DB file could not be replaced (${code || (err as Error).message})`;
+      throw new Error(
+        `wasm persist refused: ${why}; nothing was written to ${dbPath}. This change stays in memory and is written ` +
+          `with the next successful persist (it is lost if the process exits first).`
+      );
+    }
+  }
+}
+
 class WasmDatabase implements CompatDatabase {
   private db: any;
   private dbPath: string;
@@ -230,16 +267,14 @@ class WasmDatabase implements CompatDatabase {
       } else {
         this.db.run(`SAVEPOINT ${spName}`);
       }
+      let result: T;
       try {
-        const result = fn();
+        result = fn();
         if (isOutermost) {
           this.db.run("COMMIT");
         } else {
           this.db.run(`RELEASE ${spName}`);
         }
-        this.txDepth--;
-        if (this.txDepth === 0) this.flush();
-        return result;
       } catch (err) {
         this.txDepth--;
         try {
@@ -251,9 +286,21 @@ class WasmDatabase implements CompatDatabase {
         } catch {
           // Transaction/savepoint may already be finalized.
         }
-        if (this.txDepth === 0) this.flush();
+        if (this.txDepth === 0) {
+          try {
+            this.flush();
+          } catch {
+            // The rolled-back image is the pre-transaction one; the original error is the one to report.
+          }
+        }
         throw err;
       }
+      // INV-DB-01: the persist runs AFTER the try. A refused persist used to land in the catch above, decrementing
+      // txDepth a second time (to -1), so no later write was persisted until close. The commit stays in memory and
+      // goes out with the next successful persist.
+      this.txDepth--;
+      if (this.txDepth === 0) this.flush();
+      return result;
     };
   }
 
@@ -326,7 +373,7 @@ class WasmDatabase implements CompatDatabase {
     const tmp = `${this.dbPath}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
     try {
       fs.writeFileSync(tmp, Buffer.from(data), { mode: 0o600, flag: "wx" });
-      fs.renameSync(tmp, this.dbPath);
+      replaceWithRetry(tmp, this.dbPath);
     } catch (err) {
       fs.rmSync(tmp, { force: true });
       throw err;
