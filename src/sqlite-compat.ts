@@ -420,6 +420,69 @@ async function openReadOnlyUnchecked(dbPath: string, driver: SqliteDriver): Prom
   return new Database(dbPath, { readonly: true }) as unknown as CompatDatabase;
 }
 
+/**
+ * INV-BACKUP-01: open an export's SOURCE DB read-only, WITHOUT initializeDb(): no migration, backfill or permission
+ * change runs on it. `release()` closes it without ever writing it back (wasm: discard(), never close(), which would
+ * rewrite the file). Refusals are named:
+ * - native: a read-only open of a WAL DB must create -shm when there is none, so in a read-only directory it fails;
+ *   that is refused as "a read-only directory" (MEASURED, SQLITE_READONLY_DIRECTORY).
+ * - wasm reads only the main file, so the caller must first refuse a WAL DB or side files (assertWasmSourceReadable).
+ */
+export async function openExportSource(dbPath: string, driver: SqliteDriver): Promise<{ db: CompatDatabase; release: () => void }> {
+  if (driver === "wasm") assertWasmSourceReadable(dbPath);
+  let db: CompatDatabase;
+  try {
+    db = await openReadOnlyUnchecked(dbPath, driver);
+    db.prepare("SELECT 1 FROM sqlite_master LIMIT 1").get(); // a native read-only open fails here, not at open
+  } catch (err) {
+    const code = (err as { code?: string }).code ?? "";
+    if (code === "SQLITE_READONLY_DIRECTORY" || /readonly database|read-only/i.test(String((err as Error).message))) {
+      throw new Error(
+        `backup refused: the DB at '${dbPath}' is in a read-only directory and has no -shm file, which a read-only open ` +
+          `must create. Make the directory writable, or back up while the relay has the DB open.`
+      );
+    }
+    throw err;
+  }
+  const release = () => {
+    try {
+      if (db instanceof WasmDatabase) db.discard();
+      else db.close();
+    } catch {
+      /* releasing a read-only handle is best-effort */
+    }
+  };
+  return { db, release };
+}
+
+/**
+ * The wasm driver reads ONLY a DB's main file (sql.js loads its bytes), so a DB in WAL mode, or with any -wal or -shm
+ * beside it (even empty), may hold commits it cannot see (MEASURED: it silently missed them). Refused by name.
+ */
+export function assertWasmSourceReadable(dbPath: string): void {
+  const fd = fs.openSync(dbPath, "r");
+  const head = Buffer.alloc(20);
+  try {
+    fs.readSync(fd, head, 0, 20, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (head[18] === 2 && head[19] === 2) {
+    throw new Error(
+      `backup refused (wasm driver): the DB at '${dbPath}' is in WAL mode (its header says so), and the wasm driver reads ` +
+        `only the main file, so commits still in the WAL would be missing. Back up with the native driver.`
+    );
+  }
+  for (const side of ["-wal", "-shm"]) {
+    if (fs.existsSync(dbPath + side)) {
+      throw new Error(
+        `backup refused (wasm driver): a ${side} file is beside the DB at '${dbPath}', so another process may have it open ` +
+          `in WAL mode, and the wasm driver reads only the main file. Back up with the native driver.`
+      );
+    }
+  }
+}
+
 // --- Public API ---
 
 let _initializedDb: CompatDatabase | null = null;

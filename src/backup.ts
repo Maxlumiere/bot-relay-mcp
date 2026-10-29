@@ -38,9 +38,9 @@ import zlib from "zlib";
 import { pipeline } from "stream/promises";
 import { withDeadline } from "./http-deadline.js";
 
-import { getDbPath, getDb, peekDb, closeDb, initializeDb, CURRENT_SCHEMA_VERSION, getSchemaVersion } from "./db.js";
+import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
-import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDriver } from "./sqlite-compat.js";
+import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, driverOf, configuredDriver, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
@@ -171,167 +171,191 @@ interface ExportOptions {
  * `destinationPath` (tar.gz). Opens its own read-only connection to the source
  * DB so it is safe to call while the relay daemon is running.
  */
+/** The source's own schema_info version (INV-BACKUP-01: never a migration's); 0 when it predates schema_info. */
+function sourceSchemaVersion(db: CompatDatabase): number {
+  try {
+    const row = db.prepare("SELECT version FROM schema_info WHERE id = 1").get() as { version: number } | undefined;
+    return typeof row?.version === "number" ? row.version : 0;
+  } catch {
+    return 0;
+  }
+}
+
 export async function exportRelayState(options: ExportOptions = {}): Promise<ExportResult> {
   assertTarLocatable(); // before anything is opened, created or written
-  await initializeDb();
   const srcDbPath = getDbPath();
   if (!fs.existsSync(srcDbPath)) {
     throw new Error(`Source DB not found at '${srcDbPath}'. Nothing to back up.`);
   }
-
-  const backupsDir = getBackupsDir();
-  // v2.1 Phase 4c.4: the backups directory lives inside ~/.bot-relay so it
-  // inherits 0700 from the parent, but be explicit here too in case the
-  // parent was created by a pre-v2.1 relay with a wider mode.
-  ensureSecureDir(backupsDir, 0o700);
-
-  const archivePath = options.destinationPath
-    ? assertSafePath(options.destinationPath, "destinationPath")
-    : path.join(backupsDir, `relay-backup-${isoTimestamp()}.tar.gz`);
-
-  // Stage the snapshot + manifest + optional config under a unique temp dir
-  // (keyed off a random suffix so parallel exports can't collide).
-  const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-export-"));
+  // INV-BACKUP-01: an export NEVER MUTATES its source. The connection already open in this process is used as it is
+  // (warm); with none, the source is opened READ-ONLY with no initializeDb(), so no migration, backfill or permission
+  // change runs on it (cold). The wasm driver reads only the main file: it refuses a WAL DB or side files, before the
+  // snapshot and again after it.
+  const live = peekDb();
+  const srcDriver: SqliteDriver = live ? driverOf(live) : configuredDriver();
+  const source = live ? { db: live, release: () => {} } : await openExportSource(srcDbPath, srcDriver);
   try {
-    assertPrivateStaging(stagingDir);
-    const snapshotDbPath = path.join(stagingDir, "relay.db");
+    if (srcDriver === "wasm") assertWasmSourceReadable(srcDbPath);
 
-    // #171: driver-aware consistent snapshot. native → VACUUM INTO (online-safe
-    // while the daemon writes); wasm → atomic export() bytes (tear-proof — a
-    // plain copy of the write-back file could observe a half-written flush). See
-    // sqlite-compat.snapshotToFile. Works on BOTH drivers.
-    // #171/#190: snapshotToFile branches on the ACTUAL db object; openReadOnly
-    // takes the driver EXPLICITLY — driverOf reads it from the live connection.
-    snapshotToFile(getDb(), snapshotDbPath);
+    const backupsDir = getBackupsDir();
+    // v2.1 Phase 4c.4: the backups directory lives inside ~/.bot-relay so it
+    // inherits 0700 from the parent, but be explicit here too in case the
+    // parent was created by a pre-v2.1 relay with a wider mode.
+    ensureSecureDir(backupsDir, 0o700);
 
-    // Row counts from the snapshot (not the live DB) so they match the archive.
-    const snap = await openReadOnly(snapshotDbPath, driverOf(getDb()));
-    const row_counts: Record<string, number> = {};
-    const tables = ["agents", "messages", "tasks", "channels", "channel_members", "channel_messages", "webhook_subscriptions", "webhook_delivery_log", "agent_capabilities", "audit_log"];
-    for (const t of tables) {
-      try {
-        const r = snap.prepare(`SELECT COUNT(*) AS c FROM ${t}`).get() as { c: number } | undefined;
-        if (r) row_counts[t] = r.c;
-      } catch {
-        // Table may not exist on older schemas — skip silently.
+    const archivePath = options.destinationPath
+      ? assertSafePath(options.destinationPath, "destinationPath")
+      : path.join(backupsDir, `relay-backup-${isoTimestamp()}.tar.gz`);
+
+    // Stage the snapshot + manifest + optional config under a unique temp dir
+    // (keyed off a random suffix so parallel exports can't collide).
+    const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-export-"));
+    try {
+      assertPrivateStaging(stagingDir);
+      const snapshotDbPath = path.join(stagingDir, "relay.db");
+
+      // #171: driver-aware consistent snapshot. native → VACUUM INTO (online-safe
+      // while the daemon writes); wasm → atomic export() bytes (tear-proof — a
+      // plain copy of the write-back file could observe a half-written flush). See
+      // sqlite-compat.snapshotToFile. Works on BOTH drivers.
+      // #171/#190: snapshotToFile branches on the ACTUAL db object; openReadOnly
+      // takes the driver EXPLICITLY — driverOf reads it from the live connection.
+      snapshotToFile(source.db, snapshotDbPath);
+      if (srcDriver === "wasm") assertWasmSourceReadable(srcDbPath); // nothing appeared beside it during the snapshot
+
+      // Row counts from the snapshot (not the live DB) so they match the archive.
+      const snap = await openReadOnly(snapshotDbPath, srcDriver);
+      const row_counts: Record<string, number> = {};
+      const tables = ["agents", "messages", "tasks", "channels", "channel_members", "channel_messages", "webhook_subscriptions", "webhook_delivery_log", "agent_capabilities", "audit_log"];
+      for (const t of tables) {
+        try {
+          const r = snap.prepare(`SELECT COUNT(*) AS c FROM ${t}`).get() as { c: number } | undefined;
+          if (r) row_counts[t] = r.c;
+        } catch {
+          // Table may not exist on older schemas — skip silently.
+        }
       }
-    }
-    // SEC-23: the key ids the snapshot's ciphertext needs (with a fingerprint each, never the key), and the secrets
-    // it holds in plaintext (no-key mode), both read from the snapshot itself.
-    const needed = scanCiphertextKeyIds(snap, getKeyringInfo().legacy_key_id);
-    const encryption = { keys: manifestKeysOf(needed) };
-    const webhook_secrets = classifyWebhookSecrets(snap);
-    snap.close();
+      // SEC-23: the key ids the snapshot's ciphertext needs (with a fingerprint each, never the key), and the secrets
+      // it holds in plaintext (no-key mode), both read from the snapshot itself.
+      const needed = scanCiphertextKeyIds(snap, getKeyringInfo().legacy_key_id);
+      const encryption = { keys: manifestKeysOf(needed) };
+      const webhook_secrets = classifyWebhookSecrets(snap);
+      snap.close();
 
-    // The config.json, SERIALIZED through the classification of every RelayConfig field (SEC-23): its secrets are
-    // redacted and an unknown key is dropped, never copied as bytes.
-    const configSrc = getConfigPath();
-    let config: ArchivedConfig | undefined;
-    if (fs.existsSync(configSrc)) {
-      const { json, info } = serializeConfigForArchive(fs.readFileSync(configSrc, "utf-8"));
-      if (json !== null) fs.writeFileSync(path.join(stagingDir, "config.json"), json);
-      config = info;
-    }
+      // The config.json, SERIALIZED through the classification of every RelayConfig field (SEC-23): its secrets are
+      // redacted and an unknown key is dropped, never copied as bytes.
+      const configSrc = getConfigPath();
+      let config: ArchivedConfig | undefined;
+      if (fs.existsSync(configSrc)) {
+        const { json, info } = serializeConfigForArchive(fs.readFileSync(configSrc, "utf-8"));
+        if (json !== null) fs.writeFileSync(path.join(stagingDir, "config.json"), json);
+        config = info;
+      }
 
-    const warnings: string[] = [];
-    const KEYRING = "Configure an encryption keyring (RELAY_ENCRYPTION_KEYRING or RELAY_ENCRYPTION_KEYRING_PATH)";
-    if (webhook_secrets === null) {
-      warnings.push(
-        `the webhook secrets could NOT be verified (the webhook table could not be read): treat this archive as possibly carrying them in PLAINTEXT. ${KEYRING} so secrets are encrypted at rest.`
-      );
-    } else {
-      const { plaintext: nPlain, unverifiable: nUnv, unverifiable_reasons: why } = webhook_secrets;
-      if (nPlain > 0) {
+      const warnings: string[] = [];
+      const KEYRING = "Configure an encryption keyring (RELAY_ENCRYPTION_KEYRING or RELAY_ENCRYPTION_KEYRING_PATH)";
+      if (webhook_secrets === null) {
         warnings.push(
-          `${nPlain} webhook secret${nPlain === 1 ? " is" : "s are"} stored in PLAINTEXT and ${nPlain === 1 ? "is" : "are"} IN this archive. ` +
-            `${KEYRING} and re-register the webhooks, so their secrets are encrypted at rest.`
+          `the webhook secrets could NOT be verified (the webhook table could not be read): treat this archive as possibly carrying them in PLAINTEXT. ${KEYRING} so secrets are encrypted at rest.`
+        );
+      } else {
+        const { plaintext: nPlain, unverifiable: nUnv, unverifiable_reasons: why } = webhook_secrets;
+        if (nPlain > 0) {
+          warnings.push(
+            `${nPlain} webhook secret${nPlain === 1 ? " is" : "s are"} stored in PLAINTEXT and ${nPlain === 1 ? "is" : "are"} IN this archive. ` +
+              `${KEYRING} and re-register the webhooks, so their secrets are encrypted at rest.`
+          );
+        }
+        if (nUnv > 0) {
+          const reasons = [
+            why.no_keyring ? `${why.no_keyring} with no keyring to check them` : "",
+            why.key_not_held ? `${why.key_not_held} under a key id this keyring does not hold` : "",
+            why.auth_failed ? `${why.auth_failed} whose authentication FAILED under the key this keyring holds for their id (corruption, or the wrong key)` : "",
+            why.keyring_unreadable ? `${why.keyring_unreadable} because the configured keyring could not be LOADED (fix its configuration)` : "",
+          ].filter(Boolean);
+          warnings.push(
+            `${nUnv} webhook secret${nUnv === 1 ? " looks" : "s look"} encrypted but could NOT be verified (${reasons.join("; ")}): treat ${nUnv === 1 ? "it" : "them"} as possibly PLAINTEXT, IN this archive. ` +
+              `${KEYRING} that holds the key, or re-register the webhooks.`
+          );
+        }
+      }
+      const unloadable = encryption.keys.filter((k) => k.fingerprint_reason === "keyring_unreadable").map((k) => k.key_id);
+      if (unloadable.length) {
+        warnings.push(
+          `the configured encryption keyring could not be LOADED (fix its configuration): key id(s) ${unloadable.join(", ")} have NO fingerprint in this archive, ` +
+            `and the encrypted contents could not be checked. The archive was still written; on restore, the keyring it is given must hold each key id the archive needs and authenticate one sample row under each.`
         );
       }
-      if (nUnv > 0) {
-        const reasons = [
-          why.no_keyring ? `${why.no_keyring} with no keyring to check them` : "",
-          why.key_not_held ? `${why.key_not_held} under a key id this keyring does not hold` : "",
-          why.auth_failed ? `${why.auth_failed} whose authentication FAILED under the key this keyring holds for their id (corruption, or the wrong key)` : "",
-          why.keyring_unreadable ? `${why.keyring_unreadable} because the configured keyring could not be LOADED (fix its configuration)` : "",
-        ].filter(Boolean);
-        warnings.push(
-          `${nUnv} webhook secret${nUnv === 1 ? " looks" : "s look"} encrypted but could NOT be verified (${reasons.join("; ")}): treat ${nUnv === 1 ? "it" : "them"} as possibly PLAINTEXT, IN this archive. ` +
-            `${KEYRING} that holds the key, or re-register the webhooks.`
-        );
+      if (config?.omitted) warnings.push(config.omitted + ".");
+
+      // v2.1 Phase 4c.3: read from schema_info table (DB-actual), not the
+      // CURRENT_SCHEMA_VERSION constant. If the DB is older than the code
+      // thinks it should be, the manifest reflects the truth.
+      // The SOURCE's schema version, read from the snapshot (INV-BACKUP-01: never a migration's). 0 when the source
+      // predates schema_info.
+      const dbSchemaVersion = sourceSchemaVersion(source.db);
+      const manifest: ManifestFile = {
+        schema_version: dbSchemaVersion,
+        archive_format_version: ARCHIVE_FORMAT_VERSION,
+        created_at: new Date().toISOString(),
+        relay_version: VERSION,
+        row_counts,
+        encryption,
+        webhook_secrets,
+        ...(config ? { config } : {}),
+      };
+      fs.writeFileSync(path.join(stagingDir, "manifest.json"), JSON.stringify(manifest, null, 2));
+
+      // Tar entries relative to the staging dir so the archive has flat files
+      // at its root, not a nested temp-dir path.
+      const entries = ["relay.db", "manifest.json"];
+      if (fs.existsSync(path.join(stagingDir, "config.json"))) entries.push("config.json");
+      // A PLAIN ustar archive (no pax or AppleDouble members: MEASURED on macOS with COPYFILE_DISABLE=1), gzipped
+      // in-process (SEC-22 (iii)).
+      // Never write an archive that restore would refuse (its caps, src/backup-archive.ts): checked on each member,
+      // then on the plain archive, before the gzip writes anything at the destination.
+      for (const e of entries) {
+        const size = fs.statSync(path.join(stagingDir, e)).size;
+        const cap = MAX_MEMBER_BYTES[e as ExpectedMember];
+        if (size > cap) throw new Error(`backup refused: ${e} is ${size} bytes, over the ${cap}-byte member cap; restore would refuse it.`);
       }
-    }
-    const unloadable = encryption.keys.filter((k) => k.fingerprint_reason === "keyring_unreadable").map((k) => k.key_id);
-    if (unloadable.length) {
-      warnings.push(
-        `the configured encryption keyring could not be LOADED (fix its configuration): key id(s) ${unloadable.join(", ")} have NO fingerprint in this archive, ` +
-          `and the encrypted contents could not be checked. The archive was still written; on restore, the keyring it is given must hold each key id the archive needs and authenticate one sample row under each.`
-      );
-    }
-    if (config?.omitted) warnings.push(config.omitted + ".");
+      const plainTar = path.join(stagingDir, ".archive.tar");
+      runTar(["--format=ustar", "-cf", plainTar, ...entries], stagingDir);
+      const plainSize = fs.statSync(plainTar).size;
+      if (plainSize > MAX_DECOMPRESSED_BYTES) {
+        throw new Error(`backup refused: the archive is ${plainSize} bytes uncompressed, over the ${MAX_DECOMPRESSED_BYTES}-byte cap; restore would refuse it.`);
+      }
+      await pipeline(fs.createReadStream(plainTar), zlib.createGzip(), fs.createWriteStream(archivePath, { mode: 0o600 }));
 
-    // v2.1 Phase 4c.3: read from schema_info table (DB-actual), not the
-    // CURRENT_SCHEMA_VERSION constant. If the DB is older than the code
-    // thinks it should be, the manifest reflects the truth.
-    const dbSchemaVersion = getSchemaVersion();
-    const manifest: ManifestFile = {
-      schema_version: dbSchemaVersion,
-      archive_format_version: ARCHIVE_FORMAT_VERSION,
-      created_at: new Date().toISOString(),
-      relay_version: VERSION,
-      row_counts,
-      encryption,
-      webhook_secrets,
-      ...(config ? { config } : {}),
-    };
-    fs.writeFileSync(path.join(stagingDir, "manifest.json"), JSON.stringify(manifest, null, 2));
+      // v2.1 Phase 4c.4: narrow the archive to 0600 — the tarball contains a
+      // full DB snapshot + any sensitive columns (encrypted but still copyable
+      // for offline analysis) + the config.json. Same protection as the live DB.
+      ensureSecureFile(archivePath, 0o600);
+      // SEC-23: owner-only on Windows too (the mode above means nothing there), as the DB and the mint secret are.
+      for (const fault of restrictToOwnerWindows(archivePath, false)) warnings.push(`the archive is NOT owner-only: ${fault}.`);
 
-    // Tar entries relative to the staging dir so the archive has flat files
-    // at its root, not a nested temp-dir path.
-    const entries = ["relay.db", "manifest.json"];
-    if (fs.existsSync(path.join(stagingDir, "config.json"))) entries.push("config.json");
-    // A PLAIN ustar archive (no pax or AppleDouble members: MEASURED on macOS with COPYFILE_DISABLE=1), gzipped
-    // in-process (SEC-22 (iii)).
-    // Never write an archive that restore would refuse (its caps, src/backup-archive.ts): checked on each member,
-    // then on the plain archive, before the gzip writes anything at the destination.
-    for (const e of entries) {
-      const size = fs.statSync(path.join(stagingDir, e)).size;
-      const cap = MAX_MEMBER_BYTES[e as ExpectedMember];
-      if (size > cap) throw new Error(`backup refused: ${e} is ${size} bytes, over the ${cap}-byte member cap; restore would refuse it.`);
+      if (encryption.keys.length) {
+        const k = encryption.keys.map((e) => `${e.key_id} (${e.rows} rows, fingerprint ${e.fingerprint ?? `none: ${e.fingerprint_reason}`})`).join(", ");
+        process.stderr.write(`relay backup: rows encrypted under key id(s) ${k}. The key is NOT in this archive: keep it, or the archive cannot be restored.\n`);
+      }
+      for (const w of warnings) process.stderr.write(`relay backup: WARNING: ${w}\n`);
+
+      const bytes = fs.statSync(archivePath).size;
+      return {
+        archive_path: archivePath,
+        schema_version: dbSchemaVersion,
+        row_counts,
+        bytes,
+        encryption,
+        webhook_secrets,
+        ...(config ? { config } : {}),
+        warnings,
+      };
+    } finally {
+      fs.rmSync(stagingDir, { recursive: true, force: true });
     }
-    const plainTar = path.join(stagingDir, ".archive.tar");
-    runTar(["--format=ustar", "-cf", plainTar, ...entries], stagingDir);
-    const plainSize = fs.statSync(plainTar).size;
-    if (plainSize > MAX_DECOMPRESSED_BYTES) {
-      throw new Error(`backup refused: the archive is ${plainSize} bytes uncompressed, over the ${MAX_DECOMPRESSED_BYTES}-byte cap; restore would refuse it.`);
-    }
-    await pipeline(fs.createReadStream(plainTar), zlib.createGzip(), fs.createWriteStream(archivePath, { mode: 0o600 }));
-
-    // v2.1 Phase 4c.4: narrow the archive to 0600 — the tarball contains a
-    // full DB snapshot + any sensitive columns (encrypted but still copyable
-    // for offline analysis) + the config.json. Same protection as the live DB.
-    ensureSecureFile(archivePath, 0o600);
-    // SEC-23: owner-only on Windows too (the mode above means nothing there), as the DB and the mint secret are.
-    for (const fault of restrictToOwnerWindows(archivePath, false)) warnings.push(`the archive is NOT owner-only: ${fault}.`);
-
-    if (encryption.keys.length) {
-      const k = encryption.keys.map((e) => `${e.key_id} (${e.rows} rows, fingerprint ${e.fingerprint ?? `none: ${e.fingerprint_reason}`})`).join(", ");
-      process.stderr.write(`relay backup: rows encrypted under key id(s) ${k}. The key is NOT in this archive: keep it, or the archive cannot be restored.\n`);
-    }
-    for (const w of warnings) process.stderr.write(`relay backup: WARNING: ${w}\n`);
-
-    const bytes = fs.statSync(archivePath).size;
-    return {
-      archive_path: archivePath,
-      schema_version: dbSchemaVersion,
-      row_counts,
-      bytes,
-      encryption,
-      webhook_secrets,
-      ...(config ? { config } : {}),
-      warnings,
-    };
   } finally {
-    fs.rmSync(stagingDir, { recursive: true, force: true });
+    source.release(); // never written back (INV-BACKUP-01)
   }
 }
 

@@ -43,7 +43,10 @@ Exit 0 on success, 1 on failure. On success, the stdout line tells you where the
 
 ### Snapshot mechanism
 
-Both CLIs invoke `VACUUM INTO 'path'` through the shared DB connection. That's plain SQL — it runs identically on the native (`better-sqlite3`) driver and the optional wasm (`sql.js`) driver, and produces a consistent point-in-time SQLite file on disk. No driver branching.
+**An export never changes the DB it copies.** When the relay already has the DB open in that process, the export snapshots through that connection. Otherwise (a plain `relay backup`) it opens the DB **read-only** and runs no migration, backfill or permission change on it. The manifest records the DB's own schema version.
+
+- **Native driver (the default):** `VACUUM INTO` gives a consistent point-in-time copy, safe while the daemon writes, and it includes commits still in the WAL. A read-only open of a WAL DB does write its `-shm` side file: the data is unchanged, but the directory is not byte-identical. In a **read-only directory** with no `-shm` yet, that open cannot work, and the backup is refused with a message saying so.
+- **Wasm driver:** it reads only the DB's main file, so it **refuses** a DB in WAL mode, or one with any `-wal` or `-shm` file beside it (even empty). Commits still in the WAL would otherwise be missing from the backup, silently. It checks before and after the snapshot, and never writes the DB back. Back up a WAL DB with the native driver.
 
 ### Archive layout
 
