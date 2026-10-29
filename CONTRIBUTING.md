@@ -120,7 +120,7 @@ The pre-publish gate ran six checks (tsc, build, vitest, npm audit, version-drif
 5. Drift guard (no hardcoded version literals in src/ outside `src/version.ts`)
 6. 25-tool + CLI smoke against an isolated relay
 
-`--full` adds three more steps: load-smoke, chaos, cross-version. **A publish always runs them:** `npm publish` runs the gate as `prepublishOnly` with `--full`, and the gate forces them under `prepublishOnly` in any case. To run them yourself:
+`--full` adds three more steps: load-smoke, chaos, cross-version. Each must run its suite's expected tests, with none failed or skipped (`scripts/full-suite-check.mjs`). **A publish from the source tree with lifecycle scripts enabled runs them:** `npm publish` runs the gate as `prepublishOnly` with `--full`, and the gate forces them under `prepublishOnly` in any case. `npm publish --ignore-scripts` and publishing a prebuilt tarball skip `prepublishOnly`, and so the whole gate (measured on npm 11.6.2; see the KNOWN LIMIT in the script's header). To run them yourself:
 
 ```bash
 bash scripts/pre-publish-check.sh --full

@@ -48,7 +48,8 @@
 #   4. `node scripts/publish-gate.mjs --check` (the qualification on demand; not the whole gate);
 #   5. `npm publish` (it runs this whole gate, the qualification first).
 # KNOWN LIMIT: `npm publish --ignore-scripts` skips prepublishOnly, and with it this WHOLE gate,
-# the qualification included. It is allowed ONLY to retry the UPLOAD after a run that completed
+# the qualification included. So does publishing a prebuilt tarball (`npm publish <file>.tgz`):
+# measured on npm 11.6.2, prepublishOnly runs for a folder publish and NOT for a tarball one. It is allowed ONLY to retry the UPLOAD after a run that completed
 # EVERY step of this gate and then failed at the upload itself (npm's own publish request), on the
 # SAME tree at the SAME SHA, untouched since (no build, install or edit: the retry packs the tree
 # again and nothing re-checks it against the tested tarball). A login failure is NOT that: it stops this gate BEFORE the build and the
@@ -1075,9 +1076,11 @@ if [ "$FULL_MODE" = "1" ]; then
   # --config vitest.full.config.ts overrides the default exclude list so the
   # load/chaos/cross-version files are picked up. They're opt-in because
   # each spawns subprocesses or runs for 30-60s.
-  step "load-smoke (--full)" npx vitest run --config vitest.full.config.ts tests/load-smoke.test.ts || exit 1
-  step "chaos (--full)" npx vitest run --config vitest.full.config.ts tests/chaos.test.ts || exit 1
-  step "cross-version (--full)" npx vitest run --config vitest.full.config.ts tests/cross-version.test.ts || exit 1
+  # Each suite must RUN and PASS at least its current test count, none skipped (vitest exits 0 for a
+  # fully skipped suite): scripts/full-suite-check.mjs reads vitest's JSON report.
+  step "load-smoke (--full)" node "$PROJECT_ROOT/scripts/full-suite-check.mjs" tests/load-smoke.test.ts 3 || exit 1
+  step "chaos (--full)" node "$PROJECT_ROOT/scripts/full-suite-check.mjs" tests/chaos.test.ts 6 || exit 1
+  step "cross-version (--full)" node "$PROJECT_ROOT/scripts/full-suite-check.mjs" tests/cross-version.test.ts 7 || exit 1
 fi
 
 # --- 8. Re-pack identity: the LAST step ---
@@ -1135,7 +1138,7 @@ release_verdict() {
   echo "=== RELEASE GATE VERDICT ==="
   echo "  commit     ${sha}${dirty}"
   if [ "$FULL_MODE" = "1" ]; then
-    echo "  full gate  PASS (load-smoke, chaos, cross-version ran)"
+    echo "  full gate  PASS (load-smoke, chaos, cross-version: each ran its expected tests, none failed or skipped)"
   else
     echo "  full gate  NOT RUN (no --full: not a publish)"
   fi

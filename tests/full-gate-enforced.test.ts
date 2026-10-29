@@ -47,7 +47,8 @@ describe("a publish always runs the --full steps", () => {
   });
 });
 
-/** The gate's own --full block and step() function, run with a stand-in npx that fails one file. */
+/** The gate's own --full block and step() function, run with a stand-in `node` that fails one suite (the block
+ * runs each suite as `node "$PROJECT_ROOT/scripts/full-suite-check.mjs" <file> <minimum>`). */
 function runFullBlock(failing: string | null): { status: number | null; out: string; ran: string[] } {
   const lines = SOURCE.split("\n");
   const start = lines.findIndex((l) => l === 'if [ "$FULL_MODE" = "1" ]; then');
@@ -58,13 +59,13 @@ function runFullBlock(failing: string | null): { status: number | null; out: str
   const log = path.join(dir, "ran.log");
   fs.mkdirSync(path.join(dir, "bin"));
   fs.writeFileSync(
-    path.join(dir, "bin", "npx"),
+    path.join(dir, "bin", "node"),
     `#!/bin/sh\nfor a in "$@"; do case "$a" in tests/*) echo "$a" >> "${log}";; esac; done\n` +
       (failing ? `for a in "$@"; do [ "$a" = "${failing}" ] && exit 1; done\n` : "") +
       "exit 0\n",
     { mode: 0o755 },
   );
-  const script = `set -u\nFAIL=0\nSTEPS=()\nLIST_STEPS_MODE=0\nFULL_MODE=1\n${shellFunctionSource(GATE, "step")}\n${block}\necho REACHED_THE_END\n`;
+  const script = `set -u\nFAIL=0\nSTEPS=()\nLIST_STEPS_MODE=0\nFULL_MODE=1\nPROJECT_ROOT=${JSON.stringify(ROOT)}\n${shellFunctionSource(GATE, "step")}\n${block}\necho REACHED_THE_END\n`;
   const r = spawnSync("bash", ["-c", script], { env: { ...process.env, PATH: `${path.join(dir, "bin")}:${process.env.PATH}` }, encoding: "utf8", timeout: 60_000 });
   const ran = fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n") : [];
   return { status: r.status, out: `${r.stdout}${r.stderr}`, ran };
@@ -111,7 +112,7 @@ describe.skipIf(process.platform === "win32")("the verdict block a passing run p
     const out = verdict({ FULL_MODE: "1", tested_pack_name: "bot-relay-mcp-4.0.0.tgz", tested_pack_integrity: "sha512-abc" });
     expect(out).toContain("=== RELEASE GATE VERDICT ===");
     expect(out).toContain("  commit     <SHA>\n");
-    expect(out).toContain("  full gate  PASS (load-smoke, chaos, cross-version ran)");
+    expect(out).toContain("  full gate  PASS (load-smoke, chaos, cross-version: each ran its expected tests, none failed or skipped)");
     expect(out).toContain("  tarball    bot-relay-mcp-4.0.0.tgz sha512-abc");
   });
 
@@ -161,6 +162,25 @@ describe("the weekly full-gate workflow", () => {
     expect(report).toContain('context="release/full-gate"');
     expect(report).toMatch(/statuses\/\$\{SHA\}/);  // the exact SHA the gate job checked out
     expect(report).toMatch(/--label gate-rot/);
-    expect(report).toMatch(/if: needs\.gate\.result != 'success'/);  // the issue only on failure
+    expect(report).toMatch(/if: always\(\) && needs\.gate\.result != 'success'/);  // the issue on failure, whatever the status step did
+  });
+
+  it("reporting cannot vanish: the report job always runs, the status needs a SHA, the issue does not", () => {
+    const report = job("report");
+    expect(report).toMatch(/^    needs: gate\n(?:    #[^\n]*\n)*    if: always\(\)\n/m);  // not conditioned on the SHA
+    const status = /- name: Commit status[^\n]*\n        if: ([^\n]+)/.exec(report);
+    expect(status?.[1]).toBe("needs.gate.outputs.sha != ''");
+    expect(report).toContain("UNAVAILABLE: the gate job failed before recording the commit");  // stated in the issue
+  });
+});
+
+describe("each --full step requires its suite's tests to have run", () => {
+  it("every --full step runs the suite check with that suite's current test count as its minimum", () => {
+    const lines = SOURCE.split("\n").filter((l) => /^  step "[a-z-]+ \(--full\)"/.test(l));
+    expect(lines).toEqual([
+      '  step "load-smoke (--full)" node "$PROJECT_ROOT/scripts/full-suite-check.mjs" tests/load-smoke.test.ts 3 || exit 1',
+      '  step "chaos (--full)" node "$PROJECT_ROOT/scripts/full-suite-check.mjs" tests/chaos.test.ts 6 || exit 1',
+      '  step "cross-version (--full)" node "$PROJECT_ROOT/scripts/full-suite-check.mjs" tests/cross-version.test.ts 7 || exit 1',
+    ]);
   });
 });

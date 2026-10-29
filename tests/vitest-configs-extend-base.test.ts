@@ -26,6 +26,7 @@ import fullConfig from "../vitest.full.config.ts";
 import extensionConfig from "../extensions/vscode/vitest.config.ts";
 import fixtureConfig from "./fixtures/operator-tripwire/vitest.config.ts";
 import desktopFixtureConfig from "./fixtures/desktop-tripwire/vitest.config.ts";
+import fullSuiteFixtureConfig from "./fixtures/full-suite/vitest.config.ts";
 import releaseConfig from "../vitest.release.config.ts";
 
 /** Every vitest config in the repo, by its path from the repo root. A new one is added HERE. */
@@ -35,6 +36,7 @@ const IMPORTED: Record<string, unknown> = {
   "extensions/vscode/vitest.config.ts": extensionConfig,
   "tests/fixtures/operator-tripwire/vitest.config.ts": fixtureConfig,
   "tests/fixtures/desktop-tripwire/vitest.config.ts": desktopFixtureConfig,
+  "tests/fixtures/full-suite/vitest.config.ts": fullSuiteFixtureConfig,
   "vitest.release.config.ts": releaseConfig,
 };
 

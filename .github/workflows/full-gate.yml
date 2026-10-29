@@ -61,7 +61,8 @@ jobs:
   report:
     name: Record the verdict
     needs: gate
-    if: always() && needs.gate.outputs.sha != ''
+    # Always: a gate that failed before recording its SHA (a checkout failure) is still reported.
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -70,6 +71,7 @@ jobs:
       issues: write
     steps:
       - name: Commit status release/full-gate on the gated SHA
+        if: needs.gate.outputs.sha != ''
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ needs.gate.outputs.sha }}
@@ -84,18 +86,20 @@ jobs:
             -f state="$state" -f context="release/full-gate" -f description="$desc" -f target_url="$RUN_URL"
 
       - name: Open or update the gate-rot issue
-        if: needs.gate.result != 'success'
+        # Independent of the status step: it runs whatever that step did.
+        if: always() && needs.gate.result != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ needs.gate.outputs.sha }}
           RESULT: ${{ needs.gate.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          sha_line="${SHA:-UNAVAILABLE: the gate job failed before recording the commit it checked out (see the run)}"
           gh label create gate-rot --repo "$GITHUB_REPOSITORY" --color B60205 \
             --description "The weekly --full pre-publish gate failed on main" 2>/dev/null || true
           body="The weekly pre-publish gate with --full did not pass on main.
 
-          - commit: ${SHA}
+          - commit: ${sha_line}
           - result: ${RESULT}
           - run: ${RUN_URL}
 
