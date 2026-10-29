@@ -20,6 +20,8 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
+import { toolCallResult, type ToolRefusal } from "./_helpers/mcp-tool-call.js";
+import { mintHeaders } from "./_helpers/mint.js";
 
 const N_PRODUCERS = parseInt(process.env.RELAY_LOAD_PRODUCERS || "5", 10);
 const M_MESSAGES = parseInt(process.env.RELAY_LOAD_MESSAGES || "100", 10);
@@ -58,20 +60,20 @@ const { closeDb, getDb } = await import("../src/db.js");
 let server: HttpServer;
 let baseUrl: string;
 
-async function rpc(tool: string, args: any, token?: string): Promise<any> {
+async function rpc(tool: string, args: any, token?: string, refusal?: ToolRefusal): Promise<any> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
   };
   if (token) headers["X-Agent-Token"] = token;
+  // PR-D: a NEW name over HTTP needs this daemon's registration secret (created beside RELAY_DB_PATH at start).
+  if (tool === "register_agent") Object.assign(headers, mintHeaders());
   const res = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
   });
-  const text = await res.text();
-  const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-  return JSON.parse(JSON.parse(dataLine!.slice(5).trim()).result.content[0].text);
+  return toolCallResult(res, { tool, expect: refusal });
 }
 
 async function register(name: string, caps: string[] = []): Promise<string> {
@@ -170,7 +172,8 @@ describe("v2.1 Phase 5b — load smoke", () => {
   it("cap check still enforced under concurrent load — unauthed broadcast refused", async () => {
     // Fire 20 concurrent unauthed broadcasts (cap-gated). ALL must refuse.
     const attempts = Array.from({ length: 20 }, (_, i) =>
-      rpc("broadcast", { from: `ghost-${i}`, content: "x" })
+      // The relay's refusal, MEASURED: HTTP 200 with the tool error AUTH_FAILED (see tests/_helpers/mcp-tool-call.ts).
+      rpc("broadcast", { from: `ghost-${i}`, content: "x" }, undefined, { status: 200, toolErrorCode: "AUTH_FAILED" })
     );
     const results = await Promise.all(attempts);
     const refused = results.filter((r) => r.success === false).length;

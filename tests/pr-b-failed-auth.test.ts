@@ -13,15 +13,18 @@
  *   SHAPE  : known-provenance digests decide a wrong token with no bcrypt; unknown-provenance and
  *            digest-less rows are found and healed, and their failures are bounded (throttle + pool).
  */
-import { describe, it, expect, beforeEach, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, beforeAll, afterAll, afterEach } from "vitest";
 import crypto from "crypto";
 import fs from "fs";
 import os from "os";
+import net from "net";
 import path from "path";
 import type { Server as HttpServer } from "http";
 import { monitorEventLoopDelay, PerformanceObserver } from "perf_hooks";
 import { Worker } from "worker_threads";
-import { spawn } from "child_process";
+import { AsyncLocalStorage } from "async_hooks";
+import childProcess, { spawn } from "child_process";
+import { installSyncRecorder, type SyncRecorder } from "./_helpers/sync-call-recorder.js";
 import { LAPSE_MAX_BUSY, OCCUPANCY_FLOOR, lapseReport, lapsedPool, occupancy, type PoolOccupancy, type PoolWork } from "./_helpers/pool-occupancy.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-b-")));
@@ -200,15 +203,35 @@ describe("BOUNDED: where bcrypt must decide, failures are throttled per (source,
 
 // ---------------------------------------------------------------------------------------------------
 // A real daemon: the bars, and the bounded audit, through the HTTP dispatcher.
+/**
+ * Every daemon withDaemon started and has not closed yet. A bar parked past its test's end (refuseLate, as ruled)
+ * never reaches withDaemon's finally, so teardown (barTeardown) closes what is left here. Whoever REMOVES a server
+ * from this set closes it: exactly one close, never a double close.
+ */
+const liveServers = new Set<HttpServer>();
+const SERVER_CLOSE_BOUND_MS = 2_000;
+/** Close a daemon, BOUNDED: drop its open connections, then close; give up waiting after the bound (never a hang). */
+function closeServerBounded(server: HttpServer): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, SERVER_CLOSE_BOUND_MS);
+    timer.unref();
+    server.closeAllConnections();
+    server.close(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
 async function withDaemon(fn: (port: number) => Promise<void>): Promise<void> {
   const { startHttpServer } = await import("../src/transport/http.js");
   const server: HttpServer = startHttpServer(0, "127.0.0.1");
+  liveServers.add(server);
   await new Promise((r) => setTimeout(r, 80));
   const port = (server.address() as { port: number }).port;
   try {
     await fn(port);
   } finally {
-    await new Promise<void>((r) => server.close(() => r()));
+    if (liveServers.delete(server)) await closeServerBounded(server);
   }
 }
 const rpc = (port: number, tool: string, args: Record<string, unknown>, token?: string) =>
@@ -346,6 +369,116 @@ const STOP_MEASURE_SRC = `(function stopAndMeasure(kill, floorMs, maxWaitMs, clo
 })`;
 const stopAndMeasure = new Function(`return ${STOP_MEASURE_SRC}`)() as (kill: () => void, floorMs: number, maxWaitMs: number, clock?: () => number) => number;
 const absNow = () => performance.timeOrigin + performance.now();
+
+/**
+ * DIAGNOSTICS (RELAY_TIMING_DIAG=1 only; REPORT ONLY, never a verdict input): who froze the main thread in a breach?
+ * The daemon runs in this process, so a main-thread freeze is the daemon's synchronous work or the harness's. The
+ * recorder (tests/_helpers/sync-call-recorder.ts) times every sync SQLite call, transaction, fs *Sync and sync child
+ * process at or over DIAG_THRESHOLD_MS, on this clock; each breach line is followed by the recorded calls it overlaps.
+ */
+const DIAG_THRESHOLD_MS = 100;
+/**
+ * The recorder for ONE bar, or null: installed ONLY when RELAY_TIMING_DIAG=1, and runBar uninstalls it when the bar
+ * ends (finally), so outside a DIAG bar nothing is patched and a normal run behaves exactly as without this code.
+ */
+export function diagInstall(env: NodeJS.ProcessEnv = process.env): SyncRecorder | null {
+  if (env.RELAY_TIMING_DIAG !== "1") return null;
+  const handle = db.getDb() as unknown as { prepare(sql: string): object };
+  const rec = installSyncRecorder({
+    now: absNow,
+    thresholdMs: DIAG_THRESHOLD_MS,
+    databaseProto: Object.getPrototypeOf(handle) as Record<string, unknown>,
+    statementProto: Object.getPrototypeOf(handle.prepare("SELECT 1")) as Record<string, unknown>,
+  });
+  liveRecorders.add(rec);
+  return rec;
+}
+/**
+ * THE BAR'S LIFETIME (the ruling on #366's review round 2): every bar test body runs in barScope, an AsyncLocalStorage holding
+ * a controller that is ABORTED when vitest times the test out (its context signal) and at teardown (afterEach). Every
+ * continuation of that body, however late, reads ITS OWN test's signal: runBar checks it before installing and before
+ * every reading, so a timed-out attempt STOPS (no further readings) and a late attempt installs NOTHING. Each refusal
+ * is RECORDED (counted, printed in the run summary under RELAY_TIMING_DIAG), never thrown into an abandoned chain (no
+ * unhandled rejection) and never silent.
+ */
+const barSignalStore = new AsyncLocalStorage<AbortSignal>();
+const liveBarControllers = new Set<AbortController>();
+const NEVER_ABORTED = new AbortController().signal;
+export const diagLateRefusals: string[] = [];
+/** Run a bar test's body with its lifetime signal (aborted on the test's timeout or at teardown). */
+export function barScope<T>(testSignal: AbortSignal, body: () => Promise<T>): Promise<T> {
+  const c = new AbortController();
+  liveBarControllers.add(c);
+  if (testSignal.aborted) c.abort();
+  else testSignal.addEventListener("abort", () => c.abort(), { once: true });
+  return barSignalStore.run(c.signal, body);
+}
+const barIt = (name: string, body: () => Promise<void>, timeout?: number) => it(name, (ctx) => barScope(ctx.signal, body), timeout);
+/** A late or aborted attempt: recorded, then it STOPS (a promise that never settles: no reading, no install, no rejection). */
+function refuseLate(label: string, why: string): Promise<never> {
+  diagLateRefusals.push(`${label}: ${why}`);
+  return new Promise<never>(() => {});
+}
+/** The run summary line for late refusals (printed in afterAll under RELAY_TIMING_DIAG). */
+export const diagRefusalSummary = (): string =>
+  `DIAG late refusals: ${diagLateRefusals.length}${diagLateRefusals.length ? ` (${diagLateRefusals.join("; ")})` : ""}`;
+afterAll(() => {
+  if (process.env.RELAY_TIMING_DIAG === "1") announce(diagRefusalSummary());
+});
+/** Every recorder not yet uninstalled: a bar a test TIMEOUT abandons never reaches its finally; teardown cleans up. */
+const liveRecorders = new Set<SyncRecorder>();
+/** Uninstall every live recorder (idempotent). Registered with afterEach, so no wrapper outlives its test. */
+export function diagCleanupAll(): void {
+  for (const r of liveRecorders) r.uninstall();
+  liveRecorders.clear();
+}
+/**
+ * The bars' teardown (afterEach), in this order: (1) abort this test's bars (the lifetime flag: a parked bar takes no
+ * further reading and installs nothing); (2) restore the recorder, so nothing patched is on the path of what follows;
+ * (3) close every daemon a parked bar left listening (bounded, once each; see withDaemon).
+ */
+export async function barTeardown(): Promise<void> {
+  for (const c of liveBarControllers) c.abort(); // the lifetime flag: this test's bars are over
+  liveBarControllers.clear();
+  diagCleanupAll();
+  const servers = [...liveServers];
+  liveServers.clear();
+  await Promise.all(servers.map(closeServerBounded));
+}
+afterEach(barTeardown);
+/** Run `fn` with a recorder for its duration (null unless RELAY_TIMING_DIAG=1): uninstalled when it settles, either way. */
+export async function withDiag<T>(env: NodeJS.ProcessEnv, fn: (rec: SyncRecorder | null) => Promise<T>, signal: AbortSignal = NEVER_ABORTED, label = "bar"): Promise<T> {
+  if (signal.aborted) return refuseLate(label, "an install after its test ended (refused; nothing installed)");
+  const rec = diagInstall(env);
+  try {
+    return await fn(rec);
+  } finally {
+    if (rec) {
+      rec.uninstall();
+      liveRecorders.delete(rec);
+    }
+  }
+}
+/** One DIAG line per located breach (every arm), naming the recorded sync calls that overlap it, or saying none did. */
+export function diagLines(label: string, b: Pick<BarStats, "auth" | "control" | "control2">, rec: Pick<SyncRecorder, "overlapping" | "count">): string[] {
+  const out: string[] = [];
+  for (const [arm, rs] of [["auth", b.auth], ["control", b.control], ["control'", b.control2]] as const) {
+    rs.forEach((r, i) => {
+      for (const x of r.breaches.filter((g) => g.to - g.from >= CEILING_MS)) {
+        const calls = rec.overlapping(x.from, x.to);
+        out.push(
+          `DIAG ${label} | arm ${arm} round ${i + 1} | ${x.kind} ${(x.to - x.from).toFixed(1)} ms | ` +
+            (calls.length
+              ? `${calls.length} sync call(s) >= ${DIAG_THRESHOLD_MS} ms overlap it`
+              : `NO recorded sync call >= ${DIAG_THRESHOLD_MS} ms overlaps it (the block is not a recorded SQLite/fs/child-process call: widen the instrument)`),
+        );
+        for (const c of calls) out.push(`DIAG   - ${c.what} ${(c.to - c.from).toFixed(1)} ms [${c.detail}] at ${c.stack}`);
+      }
+    });
+  }
+  out.push(`DIAG ${label} | recorder: ${rec.count()} sync call(s) >= ${DIAG_THRESHOLD_MS} ms recorded during this bar`);
+  return out;
+}
 
 /** What LOOP reads for one window, from the MAIN ticker (8). */
 interface LoopReading {
@@ -1173,14 +1306,16 @@ function announce(bare: string): void {
  * (architect b72c3ac4): BOTH controls also run the pool work the design INTENDS for this load, so the bar compares
  * the auth PATH against the bcrypt work itself. `authPool`: the auth arm runs pool work too (a pool-loaded A/A).
  */
-async function runBar(
-  label: string,
-  port: number,
-  load: Load,
-  opts: { onLoop?: () => void; onOpen?: () => void; poolControl?: PoolWork; authPool?: PoolWork; controlOnLoop?: () => void; measureImpl?: typeof measure } = {},
-): Promise<BarStats> {
+type BarOpts = { onLoop?: () => void; onOpen?: () => void; poolControl?: PoolWork; authPool?: PoolWork; controlOnLoop?: () => void; measureImpl?: typeof measure };
+async function runBar(label: string, port: number, load: Load, opts: BarOpts = {}): Promise<BarStats> {
+  const signal = barSignalStore.getStore() ?? NEVER_ABORTED; // THIS test's lifetime, however late this runs
+  return withDiag(process.env, (rec) => runBarMeasured(label, port, load, opts, rec, signal), signal, label); // rec is null unless RELAY_TIMING_DIAG=1
+}
+async function runBarMeasured(label: string, port: number, load: Load, opts: BarOpts, rec: SyncRecorder | null, signal: AbortSignal = NEVER_ABORTED): Promise<BarStats> {
   // `measureImpl`: a seam for the WIRING MUTANT only (a measure that drops the occupancy reading).
-  const measure = opts.measureImpl ?? measureWindow;
+  const measureRaw = opts.measureImpl ?? measureWindow;
+  // Every reading is gated by the bar's lifetime: an aborted attempt takes NO further reading.
+  const measure: typeof measureWindow = (...a) => (signal.aborted ? refuseLate(label, "a reading after its test ended (refused)") : measureRaw(...a));
   _resetAuthThrottleForTests();
   await measure(port, controlLoad(load.n), undefined, opts.poolControl); // WARM-UP, discarded: a fresh daemon's first burst pays one-off costs
   const control: Reading[] = [];
@@ -1217,6 +1352,7 @@ async function runBar(
       exactTail({ auth, control, control2, health, eld }),
   );
   for (const line of breachDiagnostics(label, { auth, control, control2 })) announce(line); // T-A, report only
+  if (rec) for (const line of diagLines(label, { auth, control, control2 }, rec)) announce(line); // RELAY_TIMING_DIAG, report only
   return { label, control, control2, auth, compares: count, perRound, health, eld, pooled: opts.poolControl !== undefined };
 }
 
@@ -1478,6 +1614,154 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
       "BREACH t | arm control round 1 | /health 560.0 ms, the sentinel covers 0.0 ms, uncovered 560.0 ms (no sentinel overlap) | process-wide counters: voluntary cs 3, involuntary cs 33, CPU 333.0 ms of 700.0 ms wall",
     ]);
     expect(breachDiagnostics("t", { auth: [r()], control: [r()], control2: [r()] }), "no breach: no line").toEqual([]);
+  });
+  it("DIAG is INERT unless asked: without RELAY_TIMING_DIAG=1 nothing is patched; with it the wrappers exist only until uninstall, which restores every function (fs, child_process, the SQLite prototypes)", () => {
+    const handle = db.getDb() as unknown as { prepare(sql: string): object };
+    const dbProto = Object.getPrototypeOf(handle) as Record<string, unknown>;
+    const stProto = Object.getPrototypeOf(handle.prepare("SELECT 1")) as Record<string, unknown>;
+    const snapshot = () => [fs.readFileSync, fs.writeFileSync, childProcess.spawnSync, dbProto.prepare, dbProto.transaction, stProto.run, stProto.get];
+    const before = snapshot();
+    expect(diagInstall({}), "not asked: no recorder").toBeNull();
+    expect(snapshot(), "not asked: nothing patched").toEqual(before);
+    const rec = diagInstall({ RELAY_TIMING_DIAG: "1" })!;
+    try {
+      const during = snapshot();
+      during.forEach((f, i) => expect(f, `function ${i} is wrapped while a DIAG bar runs`).not.toBe(before[i]));
+    } finally {
+      rec.uninstall();
+    }
+    expect(snapshot(), "after the bar: every function restored, identical").toEqual(before);
+  });
+  it("DIAG cleanup: a REJECTING bar restores everything; a NEVER-SETTLING bar (a test timeout abandons it) is restored by the teardown cleanup, idempotently", async () => {
+    const snapshot = () => [fs.readFileSync, childProcess.spawnSync];
+    const before = snapshot();
+    await expect(withDiag({ RELAY_TIMING_DIAG: "1" }, async () => {
+      expect(fs.readFileSync, "wrapped during the bar").not.toBe(before[0]);
+      throw new Error("the bar failed");
+    })).rejects.toThrow("the bar failed");
+    expect(snapshot(), "a rejecting bar: restored").toEqual(before);
+    void withDiag({ RELAY_TIMING_DIAG: "1" }, () => new Promise<never>(() => {})); // never settles: its finally never runs
+    expect(fs.readFileSync, "the abandoned bar left the wrappers installed").not.toBe(before[0]);
+    diagCleanupAll(); // what afterEach runs
+    expect(snapshot(), "the teardown cleanup restored them").toEqual(before);
+    diagCleanupAll();
+    expect(snapshot(), "idempotent").toEqual(before);
+  });
+  const stubReading = (): Reading => ({ healthMax: 30, eldMax: 20, eldHist: 20, mainGapCount: 0, tickerBusy: 0, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0 });
+  const until = async (cond: () => boolean) => {
+    for (let i = 0; i < 400 && !cond(); i++) await new Promise((r) => setTimeout(r, 5));
+  };
+  it("LIFETIME: a bar SUSPENDED past its test's end takes no further reading and installs NOTHING when it resumes; a late retry is refused too; both refusals are RECORDED in the summary", async () => {
+    const prevEnv = process.env.RELAY_TIMING_DIAG;
+    process.env.RELAY_TIMING_DIAG = "1";
+    try {
+      const before = [fs.readFileSync, childProcess.spawnSync];
+      const test = new AbortController(); // stands for the test's own signal (vitest aborts it on a timeout)
+      let calls = 0;
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const stub = (async () => {
+        calls++;
+        if (calls === 1) await gate; // the bar is suspended inside its first reading
+        return stubReading();
+      }) as unknown as typeof measureWindow;
+      const refusedBefore = diagLateRefusals.length;
+      void barScope(test.signal, () => runBar("late-bar", 0, controlLoad(1), { measureImpl: stub }));
+      await until(() => calls === 1);
+      expect(fs.readFileSync, "precondition: the recorder is installed while the bar runs").not.toBe(before[0]);
+      test.abort(); // the test timed out
+      diagCleanupAll(); // its teardown
+      expect([fs.readFileSync, childProcess.spawnSync], "teardown restored everything").toEqual(before);
+      release(); // the suspended reading returns, after the test ended
+      await new Promise((r) => setTimeout(r, 50));
+      expect(calls, "no further reading after the abort").toBe(1);
+      expect([fs.readFileSync, childProcess.spawnSync], "nothing re-installed").toEqual(before);
+      void barScope(test.signal, () => runBar("late-retry", 0, controlLoad(1), { measureImpl: stub })); // a late retry
+      await new Promise((r) => setTimeout(r, 20));
+      expect(calls, "the late retry took no reading").toBe(1);
+      expect(fs.readFileSync, "and installed nothing").toBe(before[0]);
+      expect(diagLateRefusals.slice(refusedBefore)).toEqual([
+        "late-bar: a reading after its test ended (refused)",
+        "late-retry: an install after its test ended (refused; nothing installed)",
+      ]);
+      expect(diagRefusalSummary()).toMatch(/^DIAG late refusals: \d+ \(.*late-bar: a reading after its test ended \(refused\); late-retry: an install after its test ended/);
+    } finally {
+      if (prevEnv === undefined) delete process.env.RELAY_TIMING_DIAG;
+      else process.env.RELAY_TIMING_DIAG = prevEnv;
+    }
+  });
+  it("LIFETIME: a bar suspended past its test's end inside withDaemon does NOT leave the daemon listening: teardown closes it (bounded, once)", async () => {
+    const test = new AbortController(); // stands for the test's own signal
+    let port = 0;
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const stub = (async () => {
+      calls++;
+      if (calls === 1) await gate; // suspended inside its first reading
+      return stubReading();
+    }) as unknown as typeof measureWindow;
+    void barScope(test.signal, () => withDaemon(async (p) => {
+      port = p;
+      await runBar("daemon-bar", p, controlLoad(1), { measureImpl: stub });
+    }));
+    await until(() => calls === 1);
+    const accepts = () => new Promise<boolean>((resolve) => {
+      const sock = net.connect({ port, host: "127.0.0.1" });
+      sock.once("connect", () => { sock.destroy(); resolve(true); });
+      sock.once("error", () => resolve(false));
+    });
+    expect(await accepts(), "precondition: the daemon listens while the bar runs").toBe(true);
+    test.abort(); // the test timed out
+    await barTeardown(); // what afterEach runs
+    release(); // the suspended reading returns, after the test ended: the bar refuses and parks (as ruled)
+    await new Promise((r) => setTimeout(r, 50));
+    expect(calls, "no further reading after the abort").toBe(1);
+    expect(await accepts(), "the daemon no longer accepts connections after teardown").toBe(false);
+  });
+  it("TWIN: a withDaemon that finishes normally closes its server ONCE; a teardown after it finds nothing to close (no double-close error)", async () => {
+    let port = 0;
+    await withDaemon(async (p) => {
+      port = p;
+    });
+    await expect(barTeardown(), "teardown after a normal close: nothing to close, no error").resolves.toBeUndefined();
+    const refused = await new Promise<boolean>((resolve) => {
+      const sock = net.connect({ port, host: "127.0.0.1" });
+      sock.once("connect", () => { sock.destroy(); resolve(false); });
+      sock.once("error", () => resolve(true));
+    });
+    expect(refused, "closed by withDaemon itself").toBe(true);
+  });
+  it("LIFETIME: an attempt whose signal is ABORTED mid-bar STOPS: no reading after the abort", async () => {
+    const test = new AbortController();
+    let calls = 0;
+    const stub = (async () => {
+      calls++;
+      if (calls === 3) test.abort(); // aborted during the 3rd reading
+      return stubReading();
+    }) as unknown as typeof measureWindow;
+    void barScope(test.signal, () => runBar("aborted-bar", 0, controlLoad(1), { measureImpl: stub }));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(calls, "the reading in flight finished; none started after the abort").toBe(3);
+  });
+  it("DIAG (RELAY_TIMING_DIAG, report only): each located breach of every arm is matched to the recorded sync calls that OVERLAP it, or says none did; a call outside it is not listed", () => {
+    const r = (o: Partial<Reading> = {}): Reading => ({ healthMax: 30, eldMax: 20, eldHist: 20, mainGapCount: 0, tickerBusy: 0, shed: 0, breaches: [], sentinelGaps: [], sentinelMax: 0, loadGapMax: 0, gcMax: 0, windowFrom: 0, ...o });
+    const calls = [
+      { what: "sqlite Statement#run", detail: "INSERT INTO audit_log …", from: 1100, to: 1650, stack: "run <- handler" },
+      { what: "fs.writeFileSync", detail: "/tmp/x", from: 7000, to: 7200, stack: "writer" },
+    ];
+    const rec = { overlapping: (from: number, to: number) => calls.filter((c) => c.from < to && c.to > from), count: () => calls.length };
+    const lines = diagLines("t", {
+      auth: [r({ eldMax: 600, breaches: [{ from: 1000, to: 1600, kind: "loop-delay" }] })],
+      control: [r({ healthMax: 560, breaches: [{ from: 9000, to: 9560, kind: "/health" }] })],
+      control2: [],
+    }, rec);
+    expect(lines).toEqual([
+      "DIAG t | arm auth round 1 | loop-delay 600.0 ms | 1 sync call(s) >= 100 ms overlap it",
+      "DIAG   - sqlite Statement#run 550.0 ms [INSERT INTO audit_log …] at run <- handler",
+      "DIAG t | arm control round 1 | /health 560.0 ms | NO recorded sync call >= 100 ms overlaps it (the block is not a recorded SQLite/fs/child-process call: widen the instrument)",
+      "DIAG t | recorder: 2 sync call(s) >= 100 ms recorded during this bar",
+    ]);
   });
   it("T-A (report only, verdict parked): a breach with NO sentinel overlap FAILS with the T-A wording and the window's PROCESS-WIDE counters; a covered breach carries the counters too; no verdict reads them", () => {
     const proc: ProcCounters = { volCs: 12, invCs: 340, cpuMs: 1234.5, wallMs: 700.2 };
@@ -1771,14 +2055,16 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     else process.env.RELAY_HTTP_RATE_LIMIT_PER_MINUTE = savedRate;
   });
 
-  it("A/A CONTROL: control vs control under the same rule never FAILS (a noisy runner reads NOT_EVALUATED, not red)", async () => {
+  barIt("A/A CONTROL: control vs control under the same rule never FAILS (a noisy runner reads NOT_EVALUATED, not red)", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
-      expectGated(await gatedBar("A/A control vs control", () => runBar("A/A control vs control", port, controlLoad(20))));
+      const aa = await gatedBar("A/A control vs control", () => runBar("A/A control vs control", port, controlLoad(20)));
+      if (process.env.RELAY_TIMING_DIAG === "1") announce(`DIAG A/A TERMINAL | every attempt finished (${aa.attempts} attempt(s))`); // the workflow's completion marker
+      expectGated(aa);
     });
   }, 300_000);
 
-  it("(b) 20 wrong-token register_agent, (c) 20 wrong-token get_messages, (d) 20 unknown tokens with 51 agents", async () => {
+  barIt("(b) 20 wrong-token register_agent, (c) 20 wrong-token get_messages, (d) 20 unknown tokens with 51 agents", async () => {
     for (let i = 0; i < 50; i++) reg(`fleet-${i}`);
     reg("victim");
     await withDaemon(async (port) => {
@@ -1791,7 +2077,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     });
   }, 600_000);
 
-  it("unknown-provenance rows: wrong tokens are BOUNDED (the source's scan budget) and move the loop no more than the control (bcrypt off the loop)", async () => {
+  barIt("unknown-provenance rows: wrong tokens are BOUNDED (the source's scan budget) and move the loop no more than the control (bcrypt off the loop)", async () => {
     for (let i = 0; i < 4; i++) {
       reg(`legacy-${i}`);
       db.getDb().prepare("UPDATE agents SET token_lookup = NULL WHERE name = ?").run(`legacy-${i}`);
@@ -1844,7 +2130,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     });
   }, 600_000);
 
-  it("THE LOOP TICKET's RED, live: the gross block SYNCHRONOUSLY as each auth window opens (before any tick of a freshly enabled histogram, blind there) TRIPS; its twin, the same block mid-window, trips too", async () => {
+  barIt("THE LOOP TICKET's RED, live: the gross block SYNCHRONOUSLY as each auth window opens (before any tick of a freshly enabled histogram, blind there) TRIPS; its twin, the same block mid-window, trips too", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       await measure(port, controlLoad(20));
@@ -1855,7 +2141,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     });
   }, 600_000);
 
-  it("NEGATIVE CONTROL + THE RESOLUTION, live: +200 ms TRIPS on every run; an injected noise source reads NOT_EVALUATED; on an evaluated run each boundary FAIL block (80 + that run's median control max, per instrument) FAILS and +20 PASSES", async () => {
+  barIt("NEGATIVE CONTROL + THE RESOLUTION, live: +200 ms TRIPS on every run; an injected noise source reads NOT_EVALUATED; on an evaluated run each boundary FAIL block (80 + that run's median control max, per instrument) FAILS and +20 PASSES", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       await measure(port, controlLoad(20));
@@ -1968,7 +2254,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     };
   };
 
-  it("CEILING, a freeze: one auth round's daemon loop blocked 600 ms with the sentinel quiet FAILS, final, never re-run; every round blocked FAILS too", async () => {
+  barIt("CEILING, a freeze: one auth round's daemon loop blocked 600 ms with the sentinel quiet FAILS, final, never re-run; every round blocked FAILS too", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       // R2: each planted block's own duration is recorded, and verified with the sentinel quiet, before its verdict.
@@ -2012,7 +2298,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     });
   }, 300_000);
 
-  it("CEILING, a host stall: the whole test process stopped 600 ms in one auth round reads NOT_EVALUATED (the dedicated sentinel's own stall COVERS the breach) and is re-run; three stalled attempts are a FINAL NOT_EVALUATED, never FAIL", async () => {
+  barIt("CEILING, a host stall: the whole test process stopped 600 ms in one auth round reads NOT_EVALUATED (the dedicated sentinel's own stall COVERS the breach) and is re-run; three stalled attempts are a FINAL NOT_EVALUATED, never FAIL", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       const stalledAttempt = async (label: string, stall: boolean): Promise<BarStats> => {
@@ -2061,7 +2347,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
   /** One auth window held open `holdMs` (its pool work is a sleep), so planted stalls land INSIDE it. */
   const heldWindow = (port: number, load: Load, onLoop: () => void, holdMs: number) => measure(port, load, onLoop, () => new Promise((r) => setTimeout(r, holdMs)));
 
-  it("CEILING, the load worker is not a sentinel: a LOAD-worker-only stall and a SEPARATE daemon freeze in one window FAIL (Codex's counterexample)", async () => {
+  barIt("CEILING, the load worker is not a sentinel: a LOAD-worker-only stall and a SEPARATE daemon freeze in one window FAIL (Codex's counterexample)", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       // The load worker busy 600 ms as the window opens; the daemon's loop blocked 600 ms from 700 ms: never overlapping.
@@ -2082,7 +2368,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     });
   }, 60_000);
 
-  it("CEILING, a busy load worker OVERLAPPING a daemon freeze, the idle sentinel quiet: FAIL", async () => {
+  barIt("CEILING, a busy load worker OVERLAPPING a daemon freeze, the idle sentinel quiet: FAIL", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       let plant: PlantSpan = null;
@@ -2101,7 +2387,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     });
   }, 60_000);
 
-  it("CEILING, a host stall during PREPARATION (before the window opens), its covering sentinel gap entirely before the window: a sentinel-covered breach reads NOT_EVALUATED, not FAIL", async () => {
+  barIt("CEILING, a host stall during PREPARATION (before the window opens), its covering sentinel gap entirely before the window: a sentinel-covered breach reads NOT_EVALUATED, not FAIL", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       const helper = await armHostStall();
@@ -2126,7 +2412,7 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
     });
   }, 60_000);
 
-  it("CEILING, a missing sentinel stream is an INSTRUMENT FAULT, never a pass (the ceiling and the bar both refuse)", async () => {
+  barIt("CEILING, a missing sentinel stream is an INSTRUMENT FAULT, never a pass (the ceiling and the bar both refuse)", async () => {
     await withDaemon(async (port) => {
       await fetch(`http://127.0.0.1:${port}/health`);
       let plant: PlantSpan = null;
