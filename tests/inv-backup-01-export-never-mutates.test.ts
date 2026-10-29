@@ -359,62 +359,77 @@ describe("INV-BACKUP-01: the wasm export refuses what it cannot read completely,
   });
 });
 
-describe("Codex R1: the archive's destination is never the source DB, its side files, or an existing file", () => {
-  const sourceUnchanged = () => statOf(dbPath);
+describe("Codex R1 (ruled): the archive's destination is never the source DB, a name SQLite would take as one of its files, or an existing file", () => {
   it.each([
     ["the DB itself", () => dbPath],
-    ["the DB's -wal path", () => dbPath + "-wal"],
-    ["the DB's -shm path", () => dbPath + "-shm"],
-    ["the DB's -journal path", () => dbPath + "-journal"],
-  ])("REFUSED: --output is %s; the source is untouched and no side file is created", async (_label, dest) => {
+    ["a symlink to the DB", () => { const l = path.join(root, "link.tar.gz"); fs.symlinkSync(dbPath, l); return l; }],
+    ["a hardlink to the DB", () => { const h = path.join(root, "hard.tar.gz"); fs.linkSync(dbPath, h); return h; }],
+    ["an unrelated existing file", () => { const e = path.join(root, "existing.tar.gz"); fs.writeFileSync(e, "do not truncate me"); return e; }],
+  ])("REFUSED (it exists, never truncated): --output is %s; the source is untouched", async (label, make) => {
+    if (WIN && label === "a symlink to the DB") return;
     await makeSourceDb();
-    const before = sourceUnchanged();
+    const dest = make();
+    const before = statOf(dbPath);
+    const destBefore = fs.readFileSync(dest);
     const { exportRelayState } = await import("../src/backup.js");
-    await expect(exportRelayState({ destinationPath: dest() })).rejects.toThrow(/backup refused: the destination .* is the database or one of its files/);
+    await expect(exportRelayState({ destinationPath: dest })).rejects.toThrow(/already exists/);
     expect(statOf(dbPath)).toEqual(before);
-    for (const s of ["-wal", "-shm", "-journal"]) if (dest() === dbPath + s) expect(fs.existsSync(dbPath + s), `no ${s} created`).toBe(false);
+    expect(fs.readFileSync(dest)).toEqual(destBefore);
   });
 
-  it.skipIf(WIN)("REFUSED: --output is a SYMLINK to the DB; the source is untouched", async () => {
+  it.each(["relay.db-wal", "relay.db-shm", "relay.db-journal", "relay.db-mj1A2B3C", "RELAY.DB-wal", "Relay.Db-Journal"])(
+    "REFUSED: a NEW file named %s beside the DB (a name SQLite would treat as the DB's own file); nothing is created",
+    async (name) => {
+      await makeSourceDb();
+      for (const s of ["-wal", "-shm", "-journal"]) expect(fs.existsSync(dbPath + s), `precondition: no ${s}`).toBe(false);
+      const dest = path.join(root, "db", name);
+      const { exportRelayState } = await import("../src/backup.js");
+      await expect(exportRelayState({ destinationPath: dest })).rejects.toThrow(/a name SQLite would treat as one of the database's own files/);
+      expect(fs.existsSync(dest), "nothing created").toBe(false);
+    }
+  );
+
+  it.skipIf(WIN)("REFUSED: relay.db-wal beside the DB reached through a SYMLINKED alias of the DB's directory", async () => {
     await makeSourceDb();
-    const link = path.join(root, "link.tar.gz");
-    fs.symlinkSync(dbPath, link);
-    const before = sourceUnchanged();
+    const alias = path.join(root, "alias-dir");
+    fs.symlinkSync(path.join(root, "db"), alias);
     const { exportRelayState } = await import("../src/backup.js");
-    await expect(exportRelayState({ destinationPath: link })).rejects.toThrow(/is the database or one of its files/);
-    expect(statOf(dbPath)).toEqual(before);
+    await expect(exportRelayState({ destinationPath: path.join(alias, "relay.db-wal") })).rejects.toThrow(/a name SQLite would treat/);
+    expect(fs.existsSync(dbPath + "-wal")).toBe(false);
   });
 
-  it("REFUSED: --output is a HARDLINK to the DB (the same inode: path-walk's identity); the source is untouched", async () => {
-    await makeSourceDb();
-    const hard = path.join(root, "hard.tar.gz");
-    fs.linkSync(dbPath, hard);
-    const before = sourceUnchanged();
-    const { exportRelayState } = await import("../src/backup.js");
-    await expect(exportRelayState({ destinationPath: hard })).rejects.toThrow(/is the database or one of its files/);
-    expect(statOf(dbPath)).toEqual(before);
-  });
-
-  it("REFUSED: --output is an EXISTING file: never truncated (the archive is created exclusively)", async () => {
-    await makeSourceDb();
-    const existing = path.join(root, "existing.tar.gz");
-    fs.writeFileSync(existing, "do not truncate me");
-    const { exportRelayState } = await import("../src/backup.js");
-    await expect(exportRelayState({ destinationPath: existing })).rejects.toThrow(/already exists/);
-    expect(fs.readFileSync(existing, "utf-8")).toBe("do not truncate me");
-  });
-
-  it("the stated over-block: a NEW file in the DB's own directory, while a side file is missing, compares inconclusive and is refused", async () => {
-    await makeSourceDb();
-    for (const s of ["-wal", "-shm", "-journal"]) expect(fs.existsSync(dbPath + s), `precondition: no ${s}`).toBe(false);
-    const { exportRelayState } = await import("../src/backup.js");
-    await expect(exportRelayState({ destinationPath: path.join(root, "db", "beside.tar.gz") })).rejects.toThrow(/is the database or one of its files/);
-  });
-
-  it("known-good twin: a NEW file in another directory is written", async () => {
+  it("ALLOWED: relay-backup.tgz beside the DB (not a name SQLite takes)", async () => {
     await makeSourceDb();
     const { exportRelayState } = await import("../src/backup.js");
-    const exp = await exportRelayState({ destinationPath: path.join(root, "elsewhere.tar.gz") });
+    const exp = await exportRelayState({ destinationPath: path.join(root, "db", "relay-backup.tgz") });
     expect(fs.existsSync(exp.archive_path)).toBe(true);
+  });
+
+  it("ALLOWED: relay.db-wal in an UNRELATED directory", async () => {
+    await makeSourceDb();
+    fs.mkdirSync(path.join(root, "elsewhere"));
+    const { exportRelayState } = await import("../src/backup.js");
+    const exp = await exportRelayState({ destinationPath: path.join(root, "elsewhere", "relay.db-wal") });
+    expect(fs.existsSync(exp.archive_path)).toBe(true);
+  });
+
+  it("the STATED COST: RELAY.DB-backup.tgz beside the DB is refused (the widen-only fold's prefix match)", async () => {
+    await makeSourceDb();
+    const { exportRelayState } = await import("../src/backup.js");
+    await expect(exportRelayState({ destinationPath: path.join(root, "db", "RELAY.DB-backup.tgz") })).rejects.toThrow(/a name SQLite would treat/);
+  });
+
+  it("PROPERTY: the fold only ever WIDENS refusal: every name refused on its raw spelling is refused, for any DB name (incl. a combining mark NFKC would compose)", async () => {
+    const { _namesASideFileForTests: refuses } = (await import("../src/backup.js")) as { _namesASideFileForTests: (dest: string, db: string) => boolean };
+    const dbNames = ["relay.db", "café", "cafe\u0301", "ﬁle.db", "Straße.db", "ΣΊΣΥΦΟΣ.db", "x"];
+    const suffixes = ["", "-wal", "-shm", "-journal", "-mjABC", "\u0301", "\u0301-wal", "ß", "-backup.tgz", "\u0130", "ς"];
+    let checked = 0;
+    for (const d of dbNames) for (const sfx of suffixes) {
+      const name = d + sfx; // raw-prefixed by construction: it MUST be refused
+      expect(refuses(name, d), `${JSON.stringify(name)} vs ${JSON.stringify(d)}`).toBe(true);
+      checked++;
+    }
+    expect(checked).toBe(dbNames.length * suffixes.length);
+    expect(refuses("relay-backup.tgz", "relay.db"), "twin: an unrelated name is allowed").toBe(false);
   });
 });
