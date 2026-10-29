@@ -120,13 +120,13 @@ The pre-publish gate ran six checks (tsc, build, vitest, npm audit, version-drif
 5. Drift guard (no hardcoded version literals in src/ outside `src/version.ts`)
 6. 25-tool + CLI smoke against an isolated relay
 
-For publish, use `--full`:
+`--full` adds three more steps: load-smoke, chaos, cross-version. Each must run its suite's expected tests, with none failed or skipped (`scripts/full-suite-check.mjs`). **A publish from the source tree with lifecycle scripts enabled runs them:** `npm publish` runs the gate as `prepublishOnly` with `--full`, and the gate forces them under `prepublishOnly` in any case. `npm publish --ignore-scripts` and publishing a prebuilt tarball skip `prepublishOnly`, and so the whole gate (measured on npm 11.6.2; see the KNOWN LIMIT in the script's header). To run them yourself:
 
 ```bash
 bash scripts/pre-publish-check.sh --full
 ```
 
-Adds three more steps: load-smoke, chaos, cross-version. Wall clock ~90s total; gate passes unconditionally or exits non-zero at the first red step.
+The gate exits non-zero at the first red step. A passing run ends with a `RELEASE GATE VERDICT` block (the commit, whether `--full` ran, the tested tarball's integrity). `.github/workflows/full-gate.yml` runs the gate with `--full` on `main` every week (and on demand): it sets the commit status `release/full-gate` on the commit it checked, and opens or updates a `gate-rot` issue when it fails.
 
 ---
 

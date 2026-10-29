@@ -156,6 +156,11 @@ function scanOffenders(sites: Array<{ program: string; api: string; key: string;
 describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outside the reasoned allowlist", () => {
   const rel = (f: string) => path.relative(REPO, f).split(path.sep).join("/");
 
+  // A MEASURED budget, not the 15 s CI default: this test builds the whole src/ TypeScript program. macOS CI, 27-28 Oct
+  // (15 jobs, the reporter's per-test ms): normal 3,212-7,810 ms; a slow-RUNNER window (jobs 122799086386 and
+  // 122803027574, whole suite 1,573 s / 2,032 s vs 755-1,050 s normally) 20,303 / 18,498 ms, which timed out at 15 s.
+  // 45 s = 2.2x the worst slow-window reading. Past it, re-measure: a regression of this test and a worse runner look alike.
+  const SRC_PROGRAM_SCAN_BUDGET_MS = 45_000;
   it("every child_process call in src/ goes through systemBinary(...) or process.execPath, or is ALLOWLISTED; no allowlist entry is stale", () => {
     const sites = subprocessSites(srcProgram(), rel, (f) => f.startsWith("src/"));
     // The floor: every allowlisted site plus spawnSystem's own (the other system-tool sites now go through the
@@ -165,7 +170,7 @@ describe("SEC-22: no subprocess in src/ is started by a PATH-resolved name outsi
     expect(sites.filter((s) => s.program === "systemBinary" && s.key.startsWith("src/system-binary.ts::")).length, "the scan sees spawnSystem's own systemBinary(...) site").toBeGreaterThan(0);
     const seen = new Set(sites.map((s) => s.key));
     expect(Object.keys(ALLOWLIST).filter((k) => !seen.has(k)), "allowlist entries that match no site (remove them)").toEqual([]);
-  });
+  }, SRC_PROGRAM_SCAN_BUDGET_MS);
 
   // Each form Codex #336 R1 named (P2 DESIGN: references, not only calls; P2 DETAIL: options per API, the real
   // `process`), and the architect's rejects. Each fixture file holds ONE form; `by(file)` is what the scan made of it.

@@ -39,6 +39,27 @@ const TEST_DB_DIR = path.join(TEST_HOME, ".bot-relay");
 const TEST_DB_PATH = path.join(TEST_DB_DIR, "relay.db");
 const TEST_CONFIG_PATH = path.join(TEST_DB_DIR, "config.json");
 
+/**
+ * A REAL relay DB at TEST_DB_PATH, made by the relay's own initializeDb() (run from a FILE: an eval'd module would
+ * break the bcrypt worker pool). Neither `relay init` nor `relay doctor` creates the DB file (doctor only opens an
+ * existing one), and since INV-BACKUP-01 `relay backup` never creates the DB it copies.
+ */
+function seedRealDb(): void {
+  const script = path.join(TEST_HOME, "seed-db.mjs");
+  fs.mkdirSync(TEST_HOME, { recursive: true });
+  fs.writeFileSync(
+    script,
+    `const db = await import(${JSON.stringify(new URL(`file://${path.join(REPO_ROOT, "dist", "db.js")}`).href)});\n` +
+      `await db.initializeDb(); db.registerAgent("cli-seed", "r", []); db.closeDb();\n`
+  );
+  const r = spawnSync(process.execPath, [script], {
+    encoding: "utf-8",
+    env: { ...process.env, RELAY_DB_PATH: TEST_DB_PATH, RELAY_CONFIG_PATH: TEST_CONFIG_PATH, RELAY_HTTP_PORT: "39988", HOME: TEST_HOME },
+  });
+  expect(r.status, `seeding the DB: ${r.stderr}`).toBe(0);
+  expect(fs.existsSync(TEST_DB_PATH), "the seeded DB exists").toBe(true);
+}
+
 function runRelay(args: string[], extraEnv: Record<string, string | undefined> = {}): { status: number; stdout: string; stderr: string } {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -250,13 +271,10 @@ describe("v2.1 Phase 4h — unified relay CLI", () => {
   });
 
   it("(9) `relay backup` writes an archive + exits 0 when DB exists", () => {
-    // Seed a DB via init + a test round-trip.
     runRelay(["init", "--yes"]);
-    // Force relay test to populate the DB (creates schema_info + an agent).
-    // relay test uses a throwaway DB — we need to seed the REAL configured
-    // DB_PATH. Run `relay backup` against a freshly-initialized DB.
-    // First, create the DB file by invoking any DB-touching subcommand with
-    // the same env: doctor will do it.
+    // `relay init` and `relay doctor` do NOT create the DB file (doctor only opens an existing one); before
+    // INV-BACKUP-01 this test passed only because `relay backup` created it. Seed a REAL DB.
+    seedRealDb();
     runRelay(["doctor"]);
     const archivePath = path.join(TEST_HOME, "backup-output.tar.gz");
     const r = runRelay(["backup", "--output", archivePath]);
@@ -267,9 +285,23 @@ describe("v2.1 Phase 4h — unified relay CLI", () => {
     }
   });
 
+  it("(9b) INV-BACKUP-01: with NO DB file, `relay backup` creates none: it says there is nothing to back up, naming the path, and exits 1", () => {
+    runRelay(["init", "--yes"]);
+    runRelay(["doctor"]);
+    expect(fs.existsSync(TEST_DB_PATH), "precondition: init and doctor created no DB file").toBe(false);
+    const archivePath = path.join(TEST_HOME, "nothing.tar.gz");
+    const r = runRelay(["backup", "--output", archivePath]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(`no relay database at ${TEST_DB_PATH}; nothing to back up`);
+    expect(r.stderr).toMatch(/RELAY_DB_PATH/);
+    expect(fs.existsSync(TEST_DB_PATH), "no DB file was created").toBe(false);
+    expect(fs.existsSync(archivePath), "no archive").toBe(false);
+  });
+
   it("(10) `relay restore PATH` restores from an archive (force for daemon check)", () => {
     runRelay(["init", "--yes"]);
-    runRelay(["doctor"]); // seed schema_info
+    seedRealDb(); // a real DB to back up (init and doctor create none)
+    runRelay(["doctor"]);
     const archivePath = path.join(TEST_HOME, "snapshot.tar.gz");
     expect(runRelay(["backup", "--output", archivePath]).status).toBe(0);
     // Restore with --force so the daemon-probe check doesn't reject us.
