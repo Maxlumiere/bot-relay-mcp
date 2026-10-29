@@ -39,10 +39,15 @@ import net from "net";
 import path from "path";
 
 /**
- * The platforms whose primitive the CI racer harness has measured green (exactly one owner in every round, the key
- * stable across a rename persist, alias spellings one owner; on Linux a bind mount one owner too). Measured at the
- * primitive's commit f3bba84, CI jobs: Linux 123434321139 and 123434320394 (the bind-mount row ran), macOS
- * 123434320925, Windows 123434321133.
+ * The platforms whose lock CI has measured green: the racer harness (exactly one owner in every round, the key stable
+ * across a rename persist, alias spellings one owner; on Linux a bind mount one owner too) AND the behavioural
+ * single-owner rows.
+ * - macOS: the primitive at f3bba84 (job 123434320925); the behaviour at 48f24d5 (job 123461087379).
+ * - Linux: the primitive at f3bba84 (jobs 123434321139 and 123434320394, where the bind-mount row ran); the behaviour
+ *   at 48f24d5 (jobs 123461087219 and 123461086526).
+ * - Windows: the primitive at f3bba84 (job 123434321133); its behavioural rows are NOT yet measured (at 48f24d5 a
+ *   harness defect had ADR-0048 refuse them before the lock). It is listed so the next run measures them: the commit
+ *   after that run cites its job id, or removes win32.
  */
 export const MEASURED_PLATFORMS: ReadonlySet<NodeJS.Platform> = new Set<NodeJS.Platform>(["darwin", "linux", "win32"]);
 
