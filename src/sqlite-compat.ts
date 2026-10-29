@@ -22,6 +22,7 @@ import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
+import { acquireOwnerLock, assertSingleLink, holdsOwnerLock, isOwnedElsewhere, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -159,10 +160,15 @@ class WasmDatabase implements CompatDatabase {
   private db: any;
   private dbPath: string;
   private txDepth = 0;
+  /** INV-DB-01: a read-only handle (a probe, a snapshot source) never writes the file back, not even on close(). */
+  readonly readOnly: boolean;
+  /** INV-DB-01: the single-owner lock a WRITABLE handle holds; released when it closes. */
+  ownerLock: OwnerLock | null = null;
 
-  constructor(rawDb: any, dbPath: string) {
+  constructor(rawDb: any, dbPath: string, opts: { readOnly?: boolean } = {}) {
     this.db = rawDb;
     this.dbPath = dbPath;
+    this.readOnly = opts.readOnly ?? false;
     // Attach conditional flush so WasmStatement can call it.
     // Skips actual flush when inside a transaction (depth > 0) — the
     // transaction() wrapper handles flushing at COMMIT/ROLLBACK.
@@ -252,8 +258,18 @@ class WasmDatabase implements CompatDatabase {
   }
 
   close(): void {
-    this.flush();
-    this.db.close();
+    try {
+      if (!this.readOnly) this.flush();
+    } finally {
+      this.db.close();
+      this.releaseOwner();
+    }
+  }
+
+  private releaseOwner(): void {
+    const lock = this.ownerLock;
+    this.ownerLock = null;
+    lock?.release();
   }
 
   /**
@@ -263,6 +279,7 @@ class WasmDatabase implements CompatDatabase {
    */
   discard(): void {
     this.db.close();
+    this.releaseOwner();
   }
 
   /**
@@ -294,12 +311,26 @@ class WasmDatabase implements CompatDatabase {
       }
       throw err;
     }
-    const dir = path.dirname(this.dbPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    if (this.readOnly) {
+      throw new OwnerLockError(`wasm persist refused: the handle on ${this.dbPath} is read-only.`);
     }
-    // THIS write-to-disk failure IS propagated (disk full, permissions, etc.)
-    fs.writeFileSync(this.dbPath, Buffer.from(data));
+    // INV-DB-01: persist ONLY under this process's single-owner lock (never a write another owner could race), never
+    // to a hard-linked DB, and ATOMICALLY: a fresh temp file beside the DB, then renamed over it. A failure is
+    // propagated (disk full, permissions, a lost lock).
+    if (!this.ownerLock || !holdsOwnerLock(this.dbPath)) {
+      throw new OwnerLockError(
+        `wasm persist refused: this process does not hold the single-owner lock for ${this.dbPath}, so another process may own it. Nothing was written.`
+      );
+    }
+    assertSingleLink(this.dbPath);
+    const tmp = `${this.dbPath}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+    try {
+      fs.writeFileSync(tmp, Buffer.from(data), { mode: 0o600, flag: "wx" });
+      fs.renameSync(tmp, this.dbPath);
+    } catch (err) {
+      fs.rmSync(tmp, { force: true });
+      throw err;
+    }
   }
 }
 
@@ -475,13 +506,13 @@ export function fileSha256(p: string): string {
  * them); a -journal means a rollback may be pending. Each is refused by name. The WAL header alone is NOT (ruled): a
  * native DB whose last connection closed cleanly holds every commit in its main file (MEASURED).
  */
-export function assertWasmSourceReadable(dbPath: string): void {
+export function assertWasmSourceReadable(dbPath: string, what = "backup refused (wasm driver)"): void {
   for (const side of ["-wal", "-shm", "-journal"]) {
     if (fs.existsSync(dbPath + side)) {
       throw new Error(
-        `backup refused (wasm driver): a ${side} file is beside the DB at '${dbPath}', so another process may have it open ` +
-          `or its last transaction is not in the main file, and the wasm driver reads only the main file. Back up with ` +
-          `the native driver, or once no other process has the DB open.`
+        `${what}: a ${side} file is beside the DB at '${dbPath}', so another process may have it open ` +
+          `or its last transaction is not in the main file, and the wasm driver reads only the main file. Use ` +
+          `the native driver, or wait until no other process has the DB open.`
       );
     }
   }
@@ -500,7 +531,7 @@ async function openWasmFromBytes(bytes: Buffer, dbPath: string): Promise<CompatD
     );
   }
   const SQL = await initSqlJs();
-  return new WasmDatabase(new SQL.Database(bytes), dbPath);
+  return new WasmDatabase(new SQL.Database(bytes), dbPath, { readOnly: true });
 }
 
 // --- Public API ---
@@ -517,6 +548,20 @@ let _initPromise: Promise<CompatDatabase> | null = null;
  * any getDb() call). For native: sync under the hood. For wasm: loads the
  * wasm binary async. Thread-safe: concurrent callers share the same promise.
  */
+async function assertNotOwnedByWasm(dbPath: string): Promise<void> {
+  if (await isOwnedElsewhere(dbPath)) {
+    throw new OwnerLockError(
+      `the DB at ${dbPath} is owned by a wasm-driver process; a native process does not open it meanwhile. Stop that process first.`
+    );
+  }
+}
+
+/** Test-only: runs between a native open and its re-check (an owner arriving in that window). */
+let nativeAfterOpenHook: (() => Promise<void>) | null = null;
+export function _setNativeAfterOpenHookForTests(fn: (() => Promise<void>) | null): void {
+  nativeAfterOpenHook = fn;
+}
+
 export function initializeDb(dbPath: string): Promise<CompatDatabase> {
   if (_initializedDb) return Promise.resolve(_initializedDb);
   if (_initPromise) return _initPromise;
@@ -526,14 +571,42 @@ export function initializeDb(dbPath: string): Promise<CompatDatabase> {
     log.info(`[db] Initializing SQLite driver: ${driver}`);
 
     if (driver === "wasm") {
-      _initializedDb = await createWasmDb(dbPath);
+      // INV-DB-01, the wasm write protocol: the single-owner lock FIRST (it materializes an absent DB; a bounded
+      // jittered retry, then a named refusal), then no side file beside the DB, no hard link, and only then the load.
+      const lock = await acquireOwnerLock(dbPath);
+      let wdb: WasmDatabase;
+      try {
+        assertWasmSourceReadable(dbPath, "wasm open refused");
+        assertSingleLink(dbPath);
+        wdb = (await createWasmDb(dbPath)) as WasmDatabase;
+      } catch (err) {
+        lock.release();
+        throw err;
+      }
+      wdb.ownerLock = lock;
+      _initializedDb = wdb;
     } else {
-      _initializedDb = await createNativeDb(dbPath);
+      // INV-DB-01: a native process never opens a DB a wasm-driver process owns: checked BEFORE the open and again
+      // right AFTER it, before anything is written (an owner may arrive in between).
+      await assertNotOwnedByWasm(dbPath);
+      const ndb = await createNativeDb(dbPath);
+      try {
+        await nativeAfterOpenHook?.();
+        await assertNotOwnedByWasm(dbPath);
+      } catch (err) {
+        ndb.close();
+        throw err;
+      }
+      _initializedDb = ndb;
     }
 
     _driverUsed = driver;
     return _initializedDb;
   })();
+  // A refused open (e.g. another owner, INV-DB-01) must not stay cached: a later call tries again.
+  _initPromise.catch(() => {
+    _initPromise = null;
+  });
 
   return _initPromise;
 }
