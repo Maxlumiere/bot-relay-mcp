@@ -177,24 +177,38 @@ function destinationExists(archivePath: string): Error {
 }
 
 /**
- * INV-BACKUP-01 (Codex #372 R1): the archive's destination is never the source DB or one of its files (-wal, -shm,
- * -journal), under any spelling: judged by the shared path walk (isProtected(comparePaths(...)): a symlink, `..`, a
- * case variant, and a hardlink, which is the same entry by dev + inode). An existing destination of any kind is refused
- * before anything is staged. The stated over-block, path-walk's: a NEW file in the DB's own directory while a side
- * file is missing compares inconclusive, and is refused.
+ * The ONE loose fold, used ONLY to WIDEN a refusal, never to allow: NFKC, then an upper/lower round trip (so "ß", "ς",
+ * "İ" and compatibility forms meet their plain spellings). It is no claim that two names ARE the same file (path-walk
+ * makes no such claim either); it only adds names to refuse.
+ */
+function foldForRefusal(name: string): string {
+  return name.normalize("NFKC").toUpperCase().toLowerCase().normalize("NFKC");
+}
+
+/**
+ * Whether `destName`, a NEW file beside the DB, is a name SQLite could take as one of the DB's own files: the DB's
+ * basename as a prefix covers -wal, -shm, -journal, the super-journal -mj*, and any future one. Refused on the RAW
+ * spelling OR the folded one, so the fold can only add refusals: NFKC can compose a combining mark into the DB name's
+ * last letter, so a fold-only test could LOSE a raw match.
+ */
+function namesASideFile(destName: string, dbName: string): boolean {
+  return destName.startsWith(dbName) || foldForRefusal(destName).startsWith(foldForRefusal(dbName));
+}
+/** Test-only: the rule above, for its property test. */
+export const _namesASideFileForTests = namesASideFile;
+
+/**
+ * INV-BACKUP-01 (ruled; Codex #372 R1): the archive's destination is never the source DB or a file SQLite would take
+ * as one of its own.
+ * - An EXISTING destination is refused, whatever it is (the DB, a symlink or hardlink to it, any file): never truncated
+ *   (and the archive is created "wx", so a file appearing in between is refused too).
+ * - A NEW destination whose parent directory is the DB's (path-walk: isProtected(comparePaths(...)) on the two
+ *   parents, which both exist; a symlinked alias of the directory is the same entry) is refused when its name is one
+ *   SQLite would treat as the DB's own: a NEW file at an ABSENT side-file name (-wal, -shm, -journal, the super-journal
+ *   -mj*) is a file SQLite would later take as its own, through hot-journal or WAL recovery, and corrupt the DB.
+ * - The stated cost: a name like "RELAY.DB-backup.tgz" beside the DB is refused too.
  */
 function assertDestinationIsNotSource(archivePath: string, srcDbPath: string): void {
-  for (const own of [srcDbPath, `${srcDbPath}-wal`, `${srcDbPath}-shm`, `${srcDbPath}-journal`]) {
-    let protectedPath: boolean;
-    try {
-      protectedPath = isProtected(comparePaths(archivePath, own));
-    } catch {
-      protectedPath = true; // a walk that cannot judge refuses
-    }
-    if (protectedPath) {
-      throw new Error(`backup refused: the destination ${archivePath} is the database or one of its files (${own}), or cannot be told apart from it. Choose an --output outside the database's directory.`);
-    }
-  }
   let exists = false;
   try {
     fs.lstatSync(archivePath);
@@ -203,6 +217,18 @@ function assertDestinationIsNotSource(archivePath: string, srcDbPath: string): v
     exists = false;
   }
   if (exists) throw destinationExists(archivePath);
+  let sameDir: boolean;
+  try {
+    sameDir = isProtected(comparePaths(path.dirname(archivePath), path.dirname(srcDbPath)));
+  } catch {
+    sameDir = true; // a walk that cannot judge refuses
+  }
+  if (sameDir && namesASideFile(path.basename(archivePath), path.basename(srcDbPath))) {
+    throw new Error(
+      `backup refused: the destination ${archivePath} is beside the database and has a name SQLite would treat as one of ` +
+        `the database's own files (it starts with ${path.basename(srcDbPath)}). Choose another name or directory.`
+    );
+  }
 }
 
 /** Test-only: runs between a snapshot and its after-checks, so a test can act "during" the read. */
