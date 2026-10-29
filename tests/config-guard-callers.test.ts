@@ -23,12 +23,12 @@ const PREMISE =
   "is refused (a sibling, another name). Review the guard's scope (the #343 PR body) before adding a caller of atomicWriteJson";
 
 describe("the guarded writer's callers are exactly the ones the guard's scope was reviewed for", () => {
-  // A MEASURED budget, not the 15 s CI default: this test builds the whole src/ TypeScript program (srcProgram()), the
-  // same work as tests/sec-22-system-binaries.test.ts:159. macOS CI, 28-29 Oct (42 test jobs, the reporter's per-file ms;
-  // this file is this one test): 2,100-5,175 ms normally, 5,275 / 7,183 ms in the slow-runner window (jobs 122799086386,
-  // 122803027574) in which sec-22:159 took 20,303 / 18,498 ms and timed out. An 8,201 ms reading was REPORTED from an
-  // earlier job. 45 s = the budget #371 gives sec-22:159 for the same build. Past it, re-measure: a regression and a worse runner
-  // look alike.
+  // A precautionary 45 s budget aligned with #371; this test has no observed 15 s timeout (measured 2.1-7.2 s). It builds the
+  // whole src/ TypeScript program (srcProgram()), the same work as tests/sec-22-system-binaries.test.ts:159, which timed
+  // out at the 15 s default in a slow macOS-runner window. macOS CI, 28-29 Oct (42 test jobs, the reporter's per-file ms;
+  // this file is this one test): 2,100-5,175 ms normally, 5,275 / 7,183 ms in that window (jobs 122799086386,
+  // 122803027574), in which sec-22:159 took 20,303 / 18,498 ms. Investigate sustained increases from the measured
+  // baseline even below this timeout.
   const SRC_PROGRAM_SCAN_BUDGET_MS = 45_000;
   it("atomicWriteJson: 3 calls, all in src/cli/init.ts, and no other use", () => {
     const rel = (f: string) => path.relative(REPO, f).split(path.sep).join("/");
