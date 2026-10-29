@@ -111,6 +111,14 @@ jobs:
         # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
         run: node scripts/run-timing-bars.mjs
 
+      - name: INV-DB-01 probe storm, report-only and serial (a known liveness limit; it never gates)
+        # A tight-loop probe storm against an acquirer: the starved rounds are PRINTED, never asserted. The step fails
+        # only if the row did not run (a -t that matches nothing passes vacuously).
+        shell: bash
+        run: |
+          INV_DB_01_STORM=1 npx vitest run --no-file-parallelism tests/inv-db-01-owner-lock-race.test.ts -t "REPORT-ONLY" | tee inv-db-01-storm.log
+          grep -q "adversarial probe storm (report-only)" inv-db-01-storm.log
+
       - name: npm audit (high+) — via resilience wrapper
         # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high
         # after GHSA-w5hq-g745-h8pq (uuid <14 buffer bounds, v3/v5/v6+buf).
@@ -152,8 +160,15 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: INV-DB-01 single-owner lock, serial and isolated (Windows parity)
+        # The lock harness spawns racer and prober processes and has time bounds, so it runs ALONE: never in parallel
+        # with other files (e.g. pr-d-stdio-perms' icacls loops). INV_DB_01_STORM=1 adds the report-only probe storm.
+        run: npx vitest run --no-file-parallelism tests/inv-db-01-owner-lock-race.test.ts tests/inv-db-01-single-owner.test.ts
+        env:
+          INV_DB_01_STORM: "1"
+
       - name: Registration secret + owner-only ACLs + the operator tripwire (Windows parity)
-        run: npx vitest run tests/inv-db-01-owner-lock-race.test.ts tests/inv-db-01-single-owner.test.ts tests/sec-23-backup-secrets.test.ts tests/pr-d-stdio-perms.test.ts tests/pr-d-mint-gate.test.ts tests/pr-d-init-mint.test.ts tests/pr-d-no-open-mint-in-tests.test.ts tests/pr-d-pair-private-write.test.ts tests/operator-tripwire.test.ts tests/operator-path-scan.test.ts tests/vitest-configs-extend-base.test.ts tests/sec-22-system-binaries.test.ts tests/sec-22-clean-env.test.ts tests/backup-archive.test.ts tests/path-walk.test.ts tests/path-walk-verdict-scan.test.ts --reporter=verbose
+        run: npx vitest run tests/sec-23-backup-secrets.test.ts tests/pr-d-stdio-perms.test.ts tests/pr-d-mint-gate.test.ts tests/pr-d-init-mint.test.ts tests/pr-d-no-open-mint-in-tests.test.ts tests/pr-d-pair-private-write.test.ts tests/operator-tripwire.test.ts tests/operator-path-scan.test.ts tests/vitest-configs-extend-base.test.ts tests/sec-22-system-binaries.test.ts tests/sec-22-clean-env.test.ts tests/backup-archive.test.ts tests/path-walk.test.ts tests/path-walk-verdict-scan.test.ts --reporter=verbose
 
       # SEC-24 (the HTTP request body's structural bound), Windows parity: its black-box test runs the built daemon in a
       # child process, and a child's ESM import of an absolute path needs a file:// URL on Windows. Seen in the release
@@ -218,6 +233,14 @@ jobs:
         # that must fail. The BAR lines are the numbers to report.
         # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
         run: node scripts/run-timing-bars.mjs
+
+      - name: INV-DB-01 probe storm, report-only and serial (a known liveness limit; it never gates)
+        # A tight-loop probe storm against an acquirer: the starved rounds are PRINTED, never asserted. The step fails
+        # only if the row did not run (a -t that matches nothing passes vacuously).
+        shell: bash
+        run: |
+          INV_DB_01_STORM=1 npx vitest run --no-file-parallelism tests/inv-db-01-owner-lock-race.test.ts -t "REPORT-ONLY" | tee inv-db-01-storm.log
+          grep -q "adversarial probe storm (report-only)" inv-db-01-storm.log
 
       - name: Assert the suite installed NO real launchd service
         run: |
