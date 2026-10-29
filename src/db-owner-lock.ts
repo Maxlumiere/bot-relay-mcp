@@ -47,12 +47,43 @@ export class OwnerLockError extends Error {
   }
 }
 
-/** Create the DB file empty if it is absent (O_CREAT|O_EXCL: never truncates, a racer's file is kept). */
-export function materializeDb(dbPath: string): void {
+/**
+ * Create the DB file empty if it is absent (O_CREAT|O_EXCL: never truncates, a racer's file is kept). When THIS call
+ * created it, `verifyCreated` runs with the creating fd still open (e.g. the caller's containment re-check: its path
+ * may have been swapped since the caller last checked). A refusal removes the file only when it is PROVABLY the one
+ * just created: the name still resolves to the fd's (dev, ino) and both are still empty. Otherwise it is left, and the
+ * refusal says so. Residual (stated): the name can still be re-pointed between that comparison and the unlink.
+ */
+export function materializeDb(dbPath: string, verifyCreated?: (dbPath: string) => void): void {
+  let fd: number;
   try {
-    fs.closeSync(fs.openSync(dbPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR, 0o600));
+    fd = fs.openSync(dbPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR, 0o600);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return;
+    throw err;
+  }
+  try {
+    verifyCreated?.(dbPath);
+  } catch (err) {
+    const left = removeIfJustCreated(dbPath, fd);
+    if (left && err instanceof Error) err.message += ` The empty file this open had created at ${dbPath} was NOT removed (${left}).`;
+    throw err;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Unlink `dbPath` only if it still names the fd's file and both are empty; returns why it was kept, or null. */
+function removeIfJustCreated(dbPath: string, fd: number): string | null {
+  try {
+    const created = fs.fstatSync(fd, { bigint: true });
+    const named = fs.lstatSync(dbPath, { bigint: true });
+    if (named.dev !== created.dev || named.ino !== created.ino) return "the name now resolves to another file";
+    if (created.size !== 0n || named.size !== 0n) return "it is no longer empty";
+    fs.unlinkSync(dbPath);
+    return null;
+  } catch (err) {
+    return `it could not be checked or removed: ${(err as Error).message}`;
   }
 }
 
@@ -128,12 +159,19 @@ export function _setAfterAcquireHookForTests(fn: (() => void) | null): void {
  * with a bounded jittered retry, then re-derives the key: a changed key releases and retries; still changing, or
  * still held, is a named refusal.
  */
-export async function acquirePrimitive(dbPath: string, opts: { attempts?: number; baseMs?: number } = {}): Promise<OwnerLock> {
+export interface AcquireOptions {
+  attempts?: number;
+  baseMs?: number;
+  /** Runs when the acquire CREATED the DB (see materializeDb); a throw refuses, and the created file is removed. */
+  verifyCreated?: (dbPath: string) => void;
+}
+
+export async function acquirePrimitive(dbPath: string, opts: AcquireOptions = {}): Promise<OwnerLock> {
   const attempts = opts.attempts ?? 6;
   const base = opts.baseMs ?? 20;
   let lastReason = "held by another process";
   for (let i = 0; i < attempts; i++) {
-    materializeDb(dbPath);
+    materializeDb(dbPath, opts.verifyCreated);
     const key = lockKey(dbPath);
     const own = HELD.get(key);
     if (own) {
@@ -176,7 +214,7 @@ function releaseKey(key: string): void {
 }
 
 /** The single-owner lock for a wasm-driven DB. Refuses by name on a platform not measured green, or another owner. */
-export async function acquireOwnerLock(dbPath: string, opts: { attempts?: number; baseMs?: number } = {}): Promise<OwnerLock> {
+export async function acquireOwnerLock(dbPath: string, opts: AcquireOptions = {}): Promise<OwnerLock> {
   if (!MEASURED_PLATFORMS.has(process.platform)) {
     throw new OwnerLockError(
       `wasm writes are refused on ${process.platform}: its single-owner lock has not been measured here. Use the native driver.`

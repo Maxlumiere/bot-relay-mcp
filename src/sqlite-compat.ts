@@ -566,7 +566,7 @@ export function _setNativeAfterOpenHookForTests(fn: (() => Promise<void>) | null
   nativeAfterOpenHook = fn;
 }
 
-export function initializeDb(dbPath: string): Promise<CompatDatabase> {
+export function initializeDb(dbPath: string, opts: { verifyCreated?: (dbPath: string) => void } = {}): Promise<CompatDatabase> {
   if (_initializedDb) return Promise.resolve(_initializedDb);
   if (_initPromise) return _initPromise;
 
@@ -577,7 +577,7 @@ export function initializeDb(dbPath: string): Promise<CompatDatabase> {
     if (driver === "wasm") {
       // INV-DB-01, the wasm write protocol: the single-owner lock FIRST (it materializes an absent DB; a bounded
       // jittered retry, then a named refusal), then no side file beside the DB, no hard link, and only then the load.
-      const lock = await acquireOwnerLock(dbPath);
+      const lock = await acquireOwnerLock(dbPath, { verifyCreated: opts.verifyCreated });
       let wdb: WasmDatabase;
       try {
         assertWasmSourceReadable(dbPath, "wasm open refused");
