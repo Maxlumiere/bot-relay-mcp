@@ -169,6 +169,9 @@ export interface AcquireOptions {
   baseMs?: number;
   /** Runs when the acquire CREATED the DB (see materializeDb); a throw refuses, and the created file is removed. */
   verifyCreated?: (dbPath: string) => void;
+  /** The platform the ENABLE gate judges (default: this one), so the gate is testable for any platform on any OS. The
+   * primitive is always this OS's own. */
+  platform?: NodeJS.Platform;
 }
 
 export async function acquirePrimitive(dbPath: string, opts: AcquireOptions = {}): Promise<OwnerLock> {
@@ -218,13 +221,21 @@ function releaseKey(key: string): void {
   }
 }
 
-/** The single-owner lock for a wasm-driven DB. Refuses by name on a platform not measured green, or another owner. */
-export async function acquireOwnerLock(dbPath: string, opts: AcquireOptions = {}): Promise<OwnerLock> {
-  if (!MEASURED_PLATFORMS.has(process.platform)) {
+/** The enable gate: a platform whose lock CI has not measured green refuses wasm writes, by name, with the remedy. */
+export function assertPlatformEnabled(platform: NodeJS.Platform = process.platform): void {
+  if (!MEASURED_PLATFORMS.has(platform)) {
     throw new OwnerLockError(
-      `wasm writes are refused on ${process.platform}: its single-owner lock has not been measured here. Use the native driver.`
+      `wasm writes are refused on ${platform}: its single-owner lock has not been measured here. Use the native driver.`
     );
   }
+}
+
+/**
+ * The single-owner lock for a wasm-driven DB. Refuses by name on a platform not measured green (before anything is
+ * materialized or locked), or when another process owns it.
+ */
+export async function acquireOwnerLock(dbPath: string, opts: AcquireOptions = {}): Promise<OwnerLock> {
+  assertPlatformEnabled(opts.platform ?? process.platform);
   return acquirePrimitive(dbPath, opts);
 }
 
