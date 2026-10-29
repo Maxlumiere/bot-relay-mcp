@@ -92,7 +92,7 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
   }, 240_000);
 
   it("MEASURED: the key is stable across a rename persist (tmp + rename gives the DB a NEW inode, its directory keeps its own)", async () => {
-    const { lockKey } = (await import(LOCK_JS)) as { lockKey: (p: string) => string };
+    const { lockKey } = (await import("../dist/db-owner-lock.js")) as { lockKey: (p: string) => string };
     const db = path.join(ROOT, "persist.db");
     fs.writeFileSync(db, "v1");
     const inoBefore = fs.statSync(db, { bigint: true }).ino;
