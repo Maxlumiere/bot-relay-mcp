@@ -26,7 +26,7 @@
  * the SAME OS source the extension reader uses (host-identity.ts) — asserted
  * against machineGuid() below, which mirrors relay_machine_guid().
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterAll } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -34,12 +34,19 @@ import { spawn, spawnSync, execFileSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { machineGuid as tsMachineGuid, type HostPlatform } from "../extensions/vscode/src/host-identity.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, "..");
 const CLAUDE_HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
 const CODEX_HOOK = path.join(REPO_ROOT, "hooks", "codex", "codex-session-start.sh");
+// (C2) runs the Claude hook from a seamed copy (tests/_helpers/hook-budget-tree.ts): its budgeted steps read
+// RELAY_TEST_CLOCK, fixed at 0 by runHook. bash SECONDS ticks on whole wall-clock seconds, so on a slow runner the
+// registration could be skipped for budget and the row read no host_id. The Codex hook has no budget.
+const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "v2163-seamed-"));
+const CLAUDE_HOOK_SEAMED = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
+afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 const DIST_INDEX = path.join(REPO_ROOT, "dist", "index.js");
 
 async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
@@ -143,6 +150,7 @@ function runHook(hook: string, h: Harness, name: string, terminalTitle?: string)
     RELAY_DB_PATH: h.dbPath,
     RELAY_HTTP_HOST: "127.0.0.1",
     RELAY_HTTP_PORT: String(h.port),
+    RELAY_TEST_CLOCK: "0",
   };
   if (terminalTitle !== undefined) env.RELAY_TERMINAL_TITLE = terminalTitle;
   return spawnSync("bash", [hook], { encoding: "utf-8", timeout: 12_000, env, input: "" });
@@ -186,7 +194,7 @@ describe("v2.16.3 P0 — Codex SessionStart hook sends the Tether PID-handshake"
     try {
       const claudeName = "claude-parity";
       const codexName = "codex-parity";
-      const rc = runHook(CLAUDE_HOOK, h, claudeName);
+      const rc = runHook(CLAUDE_HOOK_SEAMED, h, claudeName);
       expect(rc.status, `claude hook stderr: ${rc.stderr}`).toBe(0);
       const rx = runHook(CODEX_HOOK, h, codexName);
       expect(rx.status, `codex hook stderr: ${rx.stderr}`).toBe(0);

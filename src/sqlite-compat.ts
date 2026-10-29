@@ -27,6 +27,8 @@ export interface CompatStatement {
   run(...params: any[]): { changes: number; lastInsertRowid: number | bigint };
   get(...params: any[]): any;
   all(...params: any[]): any[];
+  /** Rows one at a time, never all held at once (better-sqlite3's own; the wasm adapter steps sql.js). */
+  iterate(...params: any[]): IterableIterator<any>;
 }
 
 export interface CompatDatabase {
@@ -124,6 +126,21 @@ class WasmStatement implements CompatStatement {
         results.push(stmt.getAsObject());
       }
       return results;
+    } finally {
+      stmt.free();
+    }
+  }
+
+  /** Rows one at a time: the sql.js statement is stepped and each row yielded, never collected; freed when the loop ends or breaks. */
+  *iterate(...params: any[]): IterableIterator<any> {
+    const stmt = this.db.prepare(this.sql);
+    try {
+      if (params.length > 0) {
+        stmt.bind(params);
+      }
+      while (stmt.step()) {
+        yield stmt.getAsObject();
+      }
     } finally {
       stmt.free();
     }

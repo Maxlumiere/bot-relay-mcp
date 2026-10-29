@@ -150,23 +150,9 @@ describe("prebuild-guard — shipped script end-to-end (HOME isolated)", () => {
     }
   });
 
-  // --publish (run first by scripts/pre-publish-check.sh): the same detection, NO override. The publish
-  // environment sets RELAY_ALLOW_PROD_BUILD=1, so honouring it here would wave a publish through the
-  // serving tree, the one place it must not run.
-  it("--publish in a prod dir → exit 1, EVEN with RELAY_ALLOW_PROD_BUILD=1 (no override for a publish)", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guard-pub-prod-"));
-    fs.writeFileSync(path.join(dir, ".relay-prod-tree"), "");
-    try {
-      expect(run(dir, {}, ["--publish"])).toBe(1);
-      expect(run(dir, { RELAY_ALLOW_PROD_BUILD: "1" }, ["--publish"])).toBe(1);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
   // An UNMARKED serving tree, reached by its consumer through a SYMLINKED alias: the plist names <alias>/dist/index.js,
   // whose text never equals the tree's canonical path. The guard resolves both to their real paths.
-  it("--publish in an UNMARKED tree whose launchd consumer names it through a SYMLINK alias → exit 1 (canonical compare)", () => {
+  it("a build in an UNMARKED tree whose launchd consumer names it through a SYMLINK alias → exit 1 (canonical compare)", () => {
     const tree = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "guard-alias-tree-")));
     const aliasDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "guard-alias-link-")));
     const alias = path.join(aliasDir, "relay");
@@ -176,7 +162,7 @@ describe("prebuild-guard — shipped script end-to-end (HOME isolated)", () => {
     fs.writeFileSync(path.join(home, "Library", "LaunchAgents", "relay.plist"), `<plist><string>${alias}/dist/index.js</string></plist>`);
     const status = (dir: string) => {
       try {
-        execFileSync("node", [GUARD, "--publish"], { cwd: dir, env: { ...process.env, HOME: home }, stdio: "pipe" });
+        execFileSync("node", [GUARD], { cwd: dir, env: { ...process.env, HOME: home, RELAY_ALLOW_PROD_BUILD: "" }, stdio: "pipe" });
         return 0;
       } catch (e) {
         return (e as { status?: number }).status ?? -1;
@@ -191,12 +177,9 @@ describe("prebuild-guard — shipped script end-to-end (HOME isolated)", () => {
     }
   });
 
-  it("TWIN: --publish in a clean dir (a throwaway worktree) → exit 0", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guard-pub-clean-"));
-    try {
-      expect(run(dir, { RELAY_ALLOW_PROD_BUILD: "1" }, ["--publish"])).toBe(0);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+  it("a publish is not this guard's: no --publish mode is left (scripts/publish-gate.mjs qualifies a publish)", () => {
+    const src = fs.readFileSync(GUARD, "utf8");
+    expect(src).not.toMatch(/--publish/);
+    expect(src).not.toMatch(/argv\.includes/);
   });
 });

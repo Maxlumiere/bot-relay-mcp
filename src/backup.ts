@@ -44,7 +44,9 @@ import { snapshotToFile, openReadOnly, driverOf, configuredDriver, type SqliteDr
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
-import { ensureSecureDir, ensureSecureFile } from "./fs-perms.js";
+import { ensureSecureDir, ensureSecureFile, restrictToOwnerWindows } from "./fs-perms.js";
+import { serializeConfigForArchive, scanCiphertextKeyIds, classifyWebhookSecrets, manifestKeysOf, assertKeyringCanRead, type ArchivedConfig, type ManifestKey, type WebhookSecretCount } from "./backup-secrets.js";
+import { getKeyringInfo } from "./encryption.js";
 import { ERROR_CODES } from "./error-codes.js";
 
 /**
@@ -129,14 +131,29 @@ function runTar(args: string[], cwd: string): void {
   }
 }
 
-export interface ExportResult {
+/** SEC-23: what a backup states about the secrets it does and does not carry. */
+export interface BackupSecretsStatement {
+  /** Per key id the DB's ciphertext needs: its row count and fingerprint (never the key; the key is NOT archived). */
+  encryption: { keys: ManifestKey[] };
+  /**
+   * The webhook secrets the archive carries, by the classifier's verdict: plaintext (no-key mode), encrypted
+   * (authenticated under the keyring), unverifiable (with reasons). null: the table could not be read at all.
+   */
+  webhook_secrets: WebhookSecretCount | null;
+  /** The archived config.json: the secrets redacted and the unknown keys dropped. Absent when there is no config file. */
+  config?: ArchivedConfig;
+}
+
+export interface ExportResult extends BackupSecretsStatement {
   archive_path: string;
   schema_version: number;
   row_counts: Record<string, number>;
   bytes: number;
+  /** What the operator must know about this archive (also written to stderr). */
+  warnings: string[];
 }
 
-export interface ManifestFile {
+export interface ManifestFile extends Partial<BackupSecretsStatement> {
   schema_version: number;
   archive_format_version: number;
   created_at: string;
@@ -199,13 +216,58 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
         // Table may not exist on older schemas — skip silently.
       }
     }
+    // SEC-23: the key ids the snapshot's ciphertext needs (with a fingerprint each, never the key), and the secrets
+    // it holds in plaintext (no-key mode), both read from the snapshot itself.
+    const needed = scanCiphertextKeyIds(snap, getKeyringInfo().legacy_key_id);
+    const encryption = { keys: manifestKeysOf(needed) };
+    const webhook_secrets = classifyWebhookSecrets(snap);
     snap.close();
 
-    // Optional config.json copy
+    // The config.json, SERIALIZED through the classification of every RelayConfig field (SEC-23): its secrets are
+    // redacted and an unknown key is dropped, never copied as bytes.
     const configSrc = getConfigPath();
+    let config: ArchivedConfig | undefined;
     if (fs.existsSync(configSrc)) {
-      fs.copyFileSync(configSrc, path.join(stagingDir, "config.json"));
+      const { json, info } = serializeConfigForArchive(fs.readFileSync(configSrc, "utf-8"));
+      if (json !== null) fs.writeFileSync(path.join(stagingDir, "config.json"), json);
+      config = info;
     }
+
+    const warnings: string[] = [];
+    const KEYRING = "Configure an encryption keyring (RELAY_ENCRYPTION_KEYRING or RELAY_ENCRYPTION_KEYRING_PATH)";
+    if (webhook_secrets === null) {
+      warnings.push(
+        `the webhook secrets could NOT be verified (the webhook table could not be read): treat this archive as possibly carrying them in PLAINTEXT. ${KEYRING} so secrets are encrypted at rest.`
+      );
+    } else {
+      const { plaintext: nPlain, unverifiable: nUnv, unverifiable_reasons: why } = webhook_secrets;
+      if (nPlain > 0) {
+        warnings.push(
+          `${nPlain} webhook secret${nPlain === 1 ? " is" : "s are"} stored in PLAINTEXT and ${nPlain === 1 ? "is" : "are"} IN this archive. ` +
+            `${KEYRING} and re-register the webhooks, so their secrets are encrypted at rest.`
+        );
+      }
+      if (nUnv > 0) {
+        const reasons = [
+          why.no_keyring ? `${why.no_keyring} with no keyring to check them` : "",
+          why.key_not_held ? `${why.key_not_held} under a key id this keyring does not hold` : "",
+          why.auth_failed ? `${why.auth_failed} whose authentication FAILED under the key this keyring holds for their id (corruption, or the wrong key)` : "",
+          why.keyring_unreadable ? `${why.keyring_unreadable} because the configured keyring could not be LOADED (fix its configuration)` : "",
+        ].filter(Boolean);
+        warnings.push(
+          `${nUnv} webhook secret${nUnv === 1 ? " looks" : "s look"} encrypted but could NOT be verified (${reasons.join("; ")}): treat ${nUnv === 1 ? "it" : "them"} as possibly PLAINTEXT, IN this archive. ` +
+            `${KEYRING} that holds the key, or re-register the webhooks.`
+        );
+      }
+    }
+    const unloadable = encryption.keys.filter((k) => k.fingerprint_reason === "keyring_unreadable").map((k) => k.key_id);
+    if (unloadable.length) {
+      warnings.push(
+        `the configured encryption keyring could not be LOADED (fix its configuration): key id(s) ${unloadable.join(", ")} have NO fingerprint in this archive, ` +
+          `and the encrypted contents could not be checked. The archive was still written; on restore, the keyring it is given must hold each key id the archive needs and authenticate one sample row under each.`
+      );
+    }
+    if (config?.omitted) warnings.push(config.omitted + ".");
 
     // v2.1 Phase 4c.3: read from schema_info table (DB-actual), not the
     // CURRENT_SCHEMA_VERSION constant. If the DB is older than the code
@@ -217,6 +279,9 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
       created_at: new Date().toISOString(),
       relay_version: VERSION,
       row_counts,
+      encryption,
+      webhook_secrets,
+      ...(config ? { config } : {}),
     };
     fs.writeFileSync(path.join(stagingDir, "manifest.json"), JSON.stringify(manifest, null, 2));
 
@@ -245,6 +310,14 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     // full DB snapshot + any sensitive columns (encrypted but still copyable
     // for offline analysis) + the config.json. Same protection as the live DB.
     ensureSecureFile(archivePath, 0o600);
+    // SEC-23: owner-only on Windows too (the mode above means nothing there), as the DB and the mint secret are.
+    for (const fault of restrictToOwnerWindows(archivePath, false)) warnings.push(`the archive is NOT owner-only: ${fault}.`);
+
+    if (encryption.keys.length) {
+      const k = encryption.keys.map((e) => `${e.key_id} (${e.rows} rows, fingerprint ${e.fingerprint ?? `none: ${e.fingerprint_reason}`})`).join(", ");
+      process.stderr.write(`relay backup: rows encrypted under key id(s) ${k}. The key is NOT in this archive: keep it, or the archive cannot be restored.\n`);
+    }
+    for (const w of warnings) process.stderr.write(`relay backup: WARNING: ${w}\n`);
 
     const bytes = fs.statSync(archivePath).size;
     return {
@@ -252,6 +325,10 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
       schema_version: dbSchemaVersion,
       row_counts,
       bytes,
+      encryption,
+      webhook_secrets,
+      ...(config ? { config } : {}),
+      warnings,
     };
   } finally {
     fs.rmSync(stagingDir, { recursive: true, force: true });
@@ -366,8 +443,6 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       );
     }
 
-    // SLOT (SEC-23): the keyring check goes HERE, still before any mutation: every key id the manifest records must be
-    // available, else a named refusal listing the missing ids. Not in this change: SEC-23 adds it with its own RED.
 
     // The integrity check of the STAGED DB. #171/#190: a driver-aware read-only open of the ARCHIVE, the driver passed
     // EXPLICITLY (openReadOnly never infers): the LIVE connection's when one is open (peekDb: a read that opens
@@ -381,6 +456,10 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       if (!check || check.integrity_check !== "ok") {
         throw new Error(`Archive DB failed PRAGMA integrity_check (result=${check?.integrity_check ?? "null"}).`);
       }
+      // SEC-23, still before any mutation: this keyring can read every key id the STAGED DB's ciphertext needs (the
+      // ids come from the DB itself, not the manifest alone): held, the manifest's fingerprint when it has one, and a
+      // staged row that decrypts. Each failure is a named refusal.
+      assertKeyringCanRead(scanCiphertextKeyIds(probe, getKeyringInfo().legacy_key_id), manifest.encryption);
     } finally {
       probe.close();
     }

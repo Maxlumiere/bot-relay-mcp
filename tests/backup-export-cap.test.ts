@@ -56,7 +56,8 @@ describe("export refuses what restore would refuse, BEFORE it writes an archive"
   });
   it("HARM: a config.json over its member cap is refused, and no archive is written", async () => {
     CAPS.config = 16;
-    fs.writeFileSync(path.join(ROOT, "db", "config.json"), JSON.stringify({ padding: "x".repeat(64) }));
+    // A copied RelayConfig field: the archive's config is serialized (SEC-23), so an unknown key would be dropped.
+    fs.writeFileSync(path.join(ROOT, "db", "config.json"), JSON.stringify({ http_host: "x".repeat(64) }));
     const dest = path.join(ROOT, "db", "config-over.tar.gz");
     const { exportRelayState } = await import("../src/backup.js");
     await expect(exportRelayState({ destinationPath: dest })).rejects.toThrow(/config\.json.*restore would refuse it/);
