@@ -13,8 +13,10 @@
  * collected nothing, so the exit code alone is not a gate. This reads vitest's JSON report and refuses
  * unless, for the named file: vitest exited 0; the file was collected and reported; no test failed; NONE was
  * skipped or todo; no file-level failure (a hook or collection error); and at least <minimum passed> tests
- * passed. The minimum is the suite's current test count (a floor: adding tests never breaks it; losing or
- * skipping one does). The default config is vitest.full.config.ts.
+ * passed. The minimum is a BASELINE: the suite's test count when it was set. Fewer passing than it fails; a
+ * skipped test fails at any count. But once a suite grows past its baseline, losing one of the added tests
+ * is NOT caught until the baseline is raised: raise it whenever a suite grows. The default config is
+ * vitest.full.config.ts.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -57,7 +59,7 @@ try {
 }
 
 const target = path.resolve(ROOT, file);
-const results = (json.testResults ?? []).filter((r) => path.resolve(r.name) === target);
+const results = (json.testResults ?? []).filter((r) => path.resolve(ROOT, r.name) === target);
 if (results.length !== 1) refuse(`${file}: expected exactly one report entry for this file, found ${results.length} (nothing collected?)`);
 const [result] = results;
 const assertions = result.assertionResults ?? [];

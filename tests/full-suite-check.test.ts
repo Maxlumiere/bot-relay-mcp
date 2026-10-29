@@ -70,10 +70,12 @@ describe.skipIf(process.platform === "win32")("full-suite-check: the tests must 
     expect(r.out).toMatch(/REFUSED: .*collect-error\.fixture\.ts: vitest exited 1; a file-level failure/);
   }, 60_000);
 
-  it("RED: a file the run does not collect at all is refused", async () => {
-    const r = await check("tests/fixtures/full-suite/absent.fixture.ts", "1", "--config", CONFIG);
+  it("RED: a readable report that lacks the named file is refused (the file was not collected)", async () => {
+    // vitest filters by substring: this prefix runs pass.fixture.ts, so the report is readable and complete,
+    // but it holds no entry for the path the checker was asked about.
+    const r = await check("tests/fixtures/full-suite/pass", "1", "--config", CONFIG);
     expect(r.code).toBe(1);
-    expect(r.out).toMatch(/REFUSED: /);
+    expect(r.out).toContain("REFUSED: tests/fixtures/full-suite/pass: expected exactly one report entry for this file, found 0");
   }, 60_000);
 
   it("refuses a missing or non-positive minimum", async () => {

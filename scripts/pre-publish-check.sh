@@ -1076,8 +1076,9 @@ if [ "$FULL_MODE" = "1" ]; then
   # --config vitest.full.config.ts overrides the default exclude list so the
   # load/chaos/cross-version files are picked up. They're opt-in because
   # each spawns subprocesses or runs for 30-60s.
-  # Each suite must RUN and PASS at least its current test count, none skipped (vitest exits 0 for a
-  # fully skipped suite): scripts/full-suite-check.mjs reads vitest's JSON report.
+  # Each suite must RUN and PASS at least its BASELINE count (its test count when set), none failed or
+  # skipped (vitest exits 0 for a fully skipped suite): scripts/full-suite-check.mjs reads vitest's JSON
+  # report. A baseline only catches losses below it: RAISE it here whenever a suite grows.
   step "load-smoke (--full)" node "$PROJECT_ROOT/scripts/full-suite-check.mjs" tests/load-smoke.test.ts 3 || exit 1
   step "chaos (--full)" node "$PROJECT_ROOT/scripts/full-suite-check.mjs" tests/chaos.test.ts 6 || exit 1
   step "cross-version (--full)" node "$PROJECT_ROOT/scripts/full-suite-check.mjs" tests/cross-version.test.ts 7 || exit 1
