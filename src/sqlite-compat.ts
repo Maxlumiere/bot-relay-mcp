@@ -201,6 +201,9 @@ class WasmDatabase implements CompatDatabase {
   readonly readOnly: boolean;
   /** INV-DB-01: the single-owner lock a WRITABLE handle holds; released when it closes. */
   ownerLock: OwnerLock | null = null;
+  /** Writes since the last successful persist (a refused persist keeps them in memory, for the next one). */
+  private unpersisted = 0;
+  private closed = false;
 
   constructor(rawDb: any, dbPath: string, opts: { readOnly?: boolean } = {}) {
     this.db = rawDb;
@@ -305,8 +308,15 @@ class WasmDatabase implements CompatDatabase {
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     try {
-      if (!this.readOnly) this.flush();
+      if (!this.readOnly) this.flush("close");
+    } catch (err) {
+      // Nothing is left to retry it: the writes since the last successful persist are lost. Say so, loudly and by name.
+      const msg = `wasm close: the final persist was refused, so ${this.unpersisted} write(s) since the last successful persist were LOST (${(err as Error).message})`;
+      log.error(`[db-wasm] ${msg}`);
+      throw new Error(msg);
     } finally {
       this.db.close();
       this.releaseOwner();
@@ -325,6 +335,8 @@ class WasmDatabase implements CompatDatabase {
    * close() would export() and write the image THROUGH the escaped path.
    */
   discard(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.db.close();
     this.releaseOwner();
   }
@@ -344,7 +356,8 @@ class WasmDatabase implements CompatDatabase {
   // are caught and retried — sql.js's wasm layer sometimes throws ErrnoError
   // on export() due to Emscripten virtual filesystem quirks that do not
   // affect the in-memory data integrity.
-  private flush(): void {
+  private flush(cause: "write" | "close" = "write"): void {
+    if (cause === "write") this.unpersisted++;
     let data: Uint8Array;
     try {
       data = this.db.export();
@@ -378,6 +391,7 @@ class WasmDatabase implements CompatDatabase {
       fs.rmSync(tmp, { force: true });
       throw err;
     }
+    this.unpersisted = 0;
   }
 }
 
@@ -715,10 +729,10 @@ export function discardInitializedDb(): void {
 }
 
 export function closeInitializedDb(): void {
-  if (_initializedDb) {
-    _initializedDb.close();
-    _initializedDb = null;
-    _driverUsed = null;
-    _initPromise = null;
-  }
+  const db = _initializedDb;
+  _initializedDb = null;
+  _driverUsed = null;
+  _initPromise = null;
+  // Cleared FIRST: a close that throws (a refused final persist, reported by name) never leaves a stale handle.
+  db?.close();
 }

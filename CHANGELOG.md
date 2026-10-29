@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Wasm driver: a refused write-back no longer stops every later write-back
+
+- **Fixed:** under the wasm driver, when writing the database file back failed inside a transaction (for example, a full disk), the driver lost count of its open transactions, and **no later write was written to disk until the relay closed the database**. A crash before that lost them all, silently.
+- **Now** a refused write-back keeps the change in memory, and the next successful write-back writes it. The refusal names what happened and says nothing was written.
+- **A write-back refused when the database closes** is now reported, with the number of writes that were lost. There is nothing left to retry it.
+
+### Wasm driver: one process owns a wasm-driven database (INV-DB-01)
+
+- **Fixed:** two relay processes using the wasm driver on the same database overwrote each other's changes, silently. A native process writing the database after a wasm one could also lose the wasm process's rows.
+- **Now** one process owns a wasm-driven database, through a kernel lock that the kernel releases when the process dies:
+  - **macOS:** a private dotfile beside the database (`.relay.db.relay-owner`);
+  - **Linux:** an abstract socket;
+  - **Windows:** a named pipe.
+- **A second process is refused by name,** wasm or native, and so is a wasm open with `-wal`/`-shm`/`-journal` files beside the database (the message names the remedy).
+- **Write-backs are atomic** (a temporary file renamed over the database) and happen only under the lock.
+- **The lock is enabled per platform, once CI measures exactly one owner there.** Elsewhere a wasm open is refused by name.
+- **On Windows**, a write-back can be refused while another program (an antivirus scanner, an indexer) holds the file open. Nothing is written, and the change goes out with the next write-back.
+
 ### `relay backup` never changes the DB it copies
 
 - **Fixed:** with no DB connection open in the process, `relay backup` opened the DB the way the daemon does, running every migration on it. So a backup could change the DB it was copying (an older DB was upgraded; webhook secrets stored without an encryption prefix were rewritten), and under a broken keyring that migration aborted the backup. Now the export opens the DB **read-only** and runs nothing on it; the manifest records the DB's own schema version. When the relay already has the DB open, the export still snapshots through that connection.

@@ -503,11 +503,14 @@ function migrateSchemaToV1_7(db: CompatDatabase): void {
 }
 
 export function closeDb(): void {
-  if (_db) {
-    _db.close();
-    _db = null;
+  const db = _db;
+  _db = null;
+  try {
+    // A close can throw (a refused final persist under wasm, reported by name); the handles are cleared regardless.
+    db?.close();
+  } finally {
+    closeInitializedDb();
   }
-  closeInitializedDb();
 }
 
 function initSchema(db: CompatDatabase): void {
