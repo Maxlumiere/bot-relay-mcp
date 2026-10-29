@@ -6,7 +6,7 @@
 
 - **Fixed:** with no DB connection open in the process, `relay backup` opened the DB the way the daemon does, running every migration on it. So a backup could change the DB it was copying (an older DB was upgraded; webhook secrets stored without an encryption prefix were rewritten), and under a broken keyring that migration aborted the backup. Now the export opens the DB **read-only** and runs nothing on it; the manifest records the DB's own schema version. When the relay already has the DB open, the export still snapshots through that connection.
 - **A read-only directory:** a read-only open of a WAL DB must create its `-shm` file, so a backup of a DB in a read-only directory with no `-shm` yet is refused with a message saying so (it used to fail with SQLite's own error).
-- **Wasm driver:** the wasm driver reads only the DB's main file, so commits still in a WAL were silently missing from its backups. It now refuses a DB in WAL mode, or with a `-wal` or `-shm` file beside it, naming the remedy (back up with the native driver), and it never writes the DB back.
+- **Wasm driver:** the wasm driver reads only the DB's main file, so commits still in a WAL were silently missing from its backups. It now refuses a DB with a `-wal`, `-shm` or `-journal` file beside it (another process may have it, or commits are not in the main file), checked before and after the snapshot, naming the remedy. A cleanly closed native DB, WAL header and no side file, is backed up. A main file that changes during the read is retried once, then refused. The loaded copy must pass `PRAGMA integrity_check`. It never writes the DB back.
 
 ### Encryption: a key id that is an Object.prototype name (`__proto__`, `constructor`, `prototype`) is an ordinary key id
 

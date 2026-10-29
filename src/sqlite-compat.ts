@@ -456,31 +456,27 @@ export async function openExportSource(dbPath: string, driver: SqliteDriver): Pr
 }
 
 /**
- * The wasm driver reads ONLY a DB's main file (sql.js loads its bytes), so a DB in WAL mode, or with any -wal or -shm
- * beside it (even empty), may hold commits it cannot see (MEASURED: it silently missed them). Refused by name.
+ * The wasm driver reads ONLY a DB's main file (sql.js loads its bytes). A -wal or -shm beside it (even empty) means
+ * another process may have it open or commits may sit outside the main file (MEASURED: the wasm read silently missed
+ * them); a -journal means a rollback may be pending. Each is refused by name. The WAL header alone is NOT (ruled): a
+ * native DB whose last connection closed cleanly holds every commit in its main file (MEASURED).
  */
 export function assertWasmSourceReadable(dbPath: string): void {
-  const fd = fs.openSync(dbPath, "r");
-  const head = Buffer.alloc(20);
-  try {
-    fs.readSync(fd, head, 0, 20, 0);
-  } finally {
-    fs.closeSync(fd);
-  }
-  if (head[18] === 2 && head[19] === 2) {
-    throw new Error(
-      `backup refused (wasm driver): the DB at '${dbPath}' is in WAL mode (its header says so), and the wasm driver reads ` +
-        `only the main file, so commits still in the WAL would be missing. Back up with the native driver.`
-    );
-  }
-  for (const side of ["-wal", "-shm"]) {
+  for (const side of ["-wal", "-shm", "-journal"]) {
     if (fs.existsSync(dbPath + side)) {
       throw new Error(
         `backup refused (wasm driver): a ${side} file is beside the DB at '${dbPath}', so another process may have it open ` +
-          `in WAL mode, and the wasm driver reads only the main file. Back up with the native driver.`
+          `or its last transaction is not in the main file, and the wasm driver reads only the main file. Back up with ` +
+          `the native driver, or once no other process has the DB open.`
       );
     }
   }
+}
+
+/** The main file's identity (size + mtime in ns), to tell a read that raced a writer (a torn read). */
+export function mainFileIdentity(dbPath: string): string {
+  const st = fs.statSync(dbPath, { bigint: true });
+  return `${st.size}:${st.mtimeNs}`;
 }
 
 // --- Public API ---
