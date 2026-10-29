@@ -14,12 +14,14 @@
  * - a DB the acquire just CREATED and its caller's verify refuses is removed only when it is provably that file (the
  *   same dev + ino as the created fd, still empty), with the open fd held (on Windows too);
  * - native PROBERS (isOwnedElsewhere) racing each other never see an owner that is not there, and do see one that is;
- *   and with probers looping CONTINUOUSLY, an acquirer still takes the lock within its bounded retry.
+ *   and with probers looping CONTINUOUSLY, an acquirer still takes the lock within its bounded retry;
+ * - a probe of an ABSENT owner answers FREE within the probe bound; a connect that never answers is a named refusal.
  * The racers run from FILES (an eval'd module breaks worker pools), under a SANDBOX HOME; every recorded child is
  * checked exited at the end.
  */
 import { describe, it, expect, afterAll } from "vitest";
 import fs from "fs";
+import net from "net";
 import os from "os";
 import path from "path";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
@@ -265,6 +267,42 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     expect(probes.every((n) => n > 0), "precondition: every looper probed during the window").toBe(true);
     expect(results.filter((x) => !x.startsWith("OWNER ")), "an acquirer starved by probes").toEqual([]);
   }, 120_000);
+
+  type Probe = {
+    isOwnedElsewhere: (p: string) => Promise<boolean>;
+    PROBE_TIMEOUT_MS: number;
+    _setProbeConnectForTests: (fn: ((name: string) => net.Socket) | null) => void;
+  };
+  it("a probe of a DB with NO owner answers FREE within the probe bound (an absent socket or pipe never blocks)", async () => {
+    const m = (await import("../dist/db-owner-lock.js")) as unknown as Probe;
+    expect(typeof m.PROBE_TIMEOUT_MS, "the probe has an explicit bound").toBe("number");
+    const db = path.join(ROOT, "probe-absent.db");
+    fs.writeFileSync(db, "");
+    const ms: number[] = [];
+    for (let i = 0; i < 20; i++) {
+      const t = performance.now();
+      expect(await m.isOwnedElsewhere(db)).toBe(false);
+      ms.push(Math.round(performance.now() - t));
+    }
+    process.stdout.write(`absent-owner probe ms (bound ${m.PROBE_TIMEOUT_MS}): ${ms.join(",")}\n`);
+    expect(Math.max(...ms)).toBeLessThan(m.PROBE_TIMEOUT_MS);
+  }, 60_000);
+
+  it.skipIf(process.platform === "darwin")("twin (where the probe CONNECTS): a connect that never answers is a NAMED refusal at the bound, never FREE", async () => {
+    const m = (await import("../dist/db-owner-lock.js")) as unknown as Probe;
+    const db = path.join(ROOT, "probe-silent.db");
+    fs.writeFileSync(db, "");
+    m._setProbeConnectForTests(() => new net.Socket()); // never connects, never errors
+    try {
+      const t = performance.now();
+      await expect(m.isOwnedElsewhere(db)).rejects.toThrow(/could not tell within \d+ ms whether a wasm-driver process owns/);
+      const el = performance.now() - t;
+      expect(el, "it waited for the bound").toBeGreaterThanOrEqual(m.PROBE_TIMEOUT_MS - 50);
+      expect(el, "and not much longer").toBeLessThan(m.PROBE_TIMEOUT_MS + 2000);
+    } finally {
+      m._setProbeConnectForTests(null);
+    }
+  }, 60_000);
 
   const canBindMount = process.platform === "linux" && !!process.env.CI && spawnSync("sudo", ["-n", "true"]).status === 0;
   it.skipIf(!canBindMount)("Linux CI: a BIND MOUNT of the DB's directory names ONE owner (the parent directory's identity collapses it)", async () => {
