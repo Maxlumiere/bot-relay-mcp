@@ -405,12 +405,63 @@ describe("Codex R1 (ruled): the archive's destination is never the source DB, a 
     expect(fs.existsSync(exp.archive_path)).toBe(true);
   });
 
-  it("ALLOWED: relay.db-wal in an UNRELATED directory", async () => {
+  it("Codex R2 (ruled, directory-INDEPENDENT): relay.db-wal is refused in ANY directory, so a parent swapped for a link to the DB's directory later cannot turn it into the DB's own file", async () => {
     await makeSourceDb();
     fs.mkdirSync(path.join(root, "elsewhere"));
     const { exportRelayState } = await import("../src/backup.js");
-    const exp = await exportRelayState({ destinationPath: path.join(root, "elsewhere", "relay.db-wal") });
+    await expect(exportRelayState({ destinationPath: path.join(root, "elsewhere", "relay.db-wal") })).rejects.toThrow(/starts with the database's name/);
+    expect(fs.existsSync(path.join(root, "elsewhere", "relay.db-wal"))).toBe(false);
+  });
+
+  it.skipIf(WIN)("Codex R2: the SOURCE is a symlink (alias.db -> actual/relay.db): a dest named after the RESOLVED name (relay.db-journal) is refused in any directory", async () => {
+    await makeSourceDb();
+    const alias = path.join(root, "db", "alias.db");
+    fs.symlinkSync(dbPath, alias);
+    process.env.RELAY_DB_PATH = alias;
+    fs.mkdirSync(path.join(root, "out"));
+    const { exportRelayState } = await import("../src/backup.js");
+    await expect(exportRelayState({ destinationPath: path.join(root, "out", "relay.db-journal") })).rejects.toThrow(/starts with the database's name/);
+    await expect(exportRelayState({ destinationPath: path.join(root, "out", "alias.db-journal") }), "the configured name too").rejects.toThrow(/starts with the database's name/);
+  });
+
+  it("Codex R2: the DEFAULT archive name does not collide: relay backup with no --output writes", async () => {
+    await makeSourceDb();
+    const { exportRelayState } = await import("../src/backup.js");
+    const exp = await exportRelayState();
+    expect(path.basename(exp.archive_path)).toMatch(/^relay-backup-/);
     expect(fs.existsSync(exp.archive_path)).toBe(true);
+  });
+
+  it("Codex R2, the stated cost: a CUSTOM DB basename ('data') refuses 'data-x.tgz' anywhere, with a named message suggesting another name", async () => {
+    const custom = path.join(root, "db", "data");
+    process.env.RELAY_DB_PATH = custom;
+    const db = await import("../src/db.js");
+    await db.initializeDb();
+    db.closeDb();
+    fs.mkdirSync(path.join(root, "out"));
+    const { exportRelayState } = await import("../src/backup.js");
+    await expect(exportRelayState({ destinationPath: path.join(root, "out", "data-x.tgz") })).rejects.toThrow(/starts with the database's name \(data\).*choose another name/i);
+  });
+
+  it.skipIf(WIN)("Codex R2: the SOURCE retargeted between validation and the archive's open (a symlinked DB re-pointed during the snapshot) is refused, and nothing is written", async () => {
+    await makeSourceDb();
+    const other = path.join(root, "db", "other.sqlite");
+    fs.copyFileSync(dbPath, other);
+    const alias = path.join(root, "db", "alias.db");
+    fs.symlinkSync(dbPath, alias);
+    process.env.RELAY_DB_PATH = alias;
+    const { exportRelayState, _setExportReadHookForTests } = await import("../src/backup.js");
+    _setExportReadHookForTests(() => {
+      fs.unlinkSync(alias);
+      fs.symlinkSync(other, alias); // now resolves to other.sqlite: a different resolved basename
+    });
+    const dest = path.join(root, "retarget.tar.gz");
+    try {
+      await expect(exportRelayState({ destinationPath: dest })).rejects.toThrow(/source changed/);
+    } finally {
+      _setExportReadHookForTests(null);
+    }
+    expect(fs.existsSync(dest), "nothing written").toBe(false);
   });
 
   it("the STATED COST: RELAY.DB-backup.tgz beside the DB is refused (the widen-only fold's prefix match)", async () => {
@@ -431,5 +482,31 @@ describe("Codex R1 (ruled): the archive's destination is never the source DB, a 
     }
     expect(checked).toBe(dbNames.length * suffixes.length);
     expect(refuses("relay-backup.tgz", "relay.db"), "twin: an unrelated name is allowed").toBe(false);
+  });
+
+  it("Codex R2 P3: the fold IS exercised: FOLDED-ONLY pairs (no raw prefix) are refused", async () => {
+    const { _namesASideFileForTests: refuses } = (await import("../src/backup.js")) as { _namesASideFileForTests: (dest: string, db: string) => boolean };
+    const pairs: Array<[string, string]> = [
+      ["RELAY.DB-wal", "relay.db"],
+      ["\uff32\uff25\uff2c\uff21\uff39.db-journal", "relay.db"], // fullwidth RELAY: NFKC
+      ["STRASSE.DB-wal", "Straße.db"], // ß ↔ SS
+      ["\ufb01le.db-shm", "file.db"], // the ﬁ ligature: NFKC
+    ];
+    for (const [dest, db] of pairs) {
+      expect(dest.startsWith(db), `precondition: ${JSON.stringify(dest)} has NO raw prefix`).toBe(false);
+      expect(refuses(dest, db), `${JSON.stringify(dest)} vs ${JSON.stringify(db)}`).toBe(true);
+    }
+  });
+
+  it("Codex R2 P3: a FOLD-ONLY rule would LOSE the combining-mark case, which raw-OR-folded keeps", async () => {
+    const { _foldForRefusalForTests: fold, _namesASideFileForTests: refuses } = (await import("../src/backup.js")) as {
+      _foldForRefusalForTests: (s: string) => string;
+      _namesASideFileForTests: (dest: string, db: string) => boolean;
+    };
+    const db = "cafe";
+    const dest = "cafe\u0301-wal"; // raw-prefixed by "cafe"; NFKC composes e + U+0301 into é
+    const foldOnly = fold(dest).startsWith(fold(db));
+    expect(foldOnly, "a fold-only implementation would ALLOW it").toBe(false);
+    expect(refuses(dest, db), "raw OR folded refuses it").toBe(true);
   });
 });
