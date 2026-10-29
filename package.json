@@ -36,7 +36,7 @@
     "start": "node dist/index.js",
     "test": "vitest run",
     "dev": "tsc --watch",
-    "prepublishOnly": "bash scripts/pre-publish-check.sh"
+    "prepublishOnly": "bash scripts/pre-publish-check.sh --full"
   },
   "keywords": [
     "mcp",

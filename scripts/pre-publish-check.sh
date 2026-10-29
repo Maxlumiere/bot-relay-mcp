@@ -14,6 +14,8 @@
 #       `expect(...).toBe("X.Y.Z")` that go stale on bump and slipped past
 #       the src/-only check until v2.6.0 publish-prep --full gate caught one
 #   6. End-to-end 25-tool smoke + CLI subcommand smoke against an isolated relay
+#   7. --full: load-smoke, chaos, cross-version. ALWAYS run by a real publish (prepublishOnly forces
+#      them); weekly on main by .github/workflows/full-gate.yml; opt-in on a dev run.
 #   LAST. Re-pack identity: `npm publish` packs the tree AGAIN after this gate and uploads that
 #      tarball, so the gate ends by checking that the tree still packs to the tarball the release
 #      security gate tested, and that no prepack/prepare/postpack script would run in between.
@@ -71,8 +73,10 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$PROJECT_ROOT"
 
 # v2.1 Phase 5b: --full flag runs load / chaos / cross-version on top of
-# the default gate. REQUIRED before npm publish, NOT required on dev loops
-# (chaos tests spawn subprocesses + take 30-60s end-to-end).
+# the default gate. ENFORCED for a publish: a real `npm publish` (prepublishOnly)
+# always runs them, whatever its command line (below); package.json passes --full
+# as well. Not required on dev loops (chaos tests spawn subprocesses + take
+# 30-60s end-to-end); .github/workflows/full-gate.yml runs them weekly on main.
 FULL_MODE=0
 # #197b: --list-steps prints the gate's RUN LIST (every step label that would execute)
 # WITHOUT running any step command — so a test can assert each guard is actually REACHED
@@ -83,6 +87,9 @@ for arg in "$@"; do
   if [ "$arg" = "--full" ]; then FULL_MODE=1; fi
   if [ "$arg" = "--list-steps" ]; then LIST_STEPS_MODE=1; fi
 done
+# A real publish never skips the --full steps: npm sets npm_lifecycle_event=prepublishOnly, an input
+# that is the same for a --list-steps run (the step-gate premise holds).
+if [ "${npm_lifecycle_event:-}" = "prepublishOnly" ]; then FULL_MODE=1; fi
 
 # PREFLIGHT, before any step. Skipped under --list-steps, which runs NO step (it only prints the
 # labels), so there is nothing to protect and nothing to publish (both checks cost no load):
@@ -138,7 +145,8 @@ tested_pack_reset() {
   tested_pack_integrity=""
   tested_pack_file=""
   tested_pack_dir=""
-  export -n tested_pack_integrity tested_pack_file tested_pack_dir
+  tested_pack_name=""
+  export -n tested_pack_integrity tested_pack_file tested_pack_dir tested_pack_name
 }
 tested_pack_reset
 # Reads `npm pack --json` on stdin; prints the LAST entry's integrity and filename (one per line). Fails closed: no
@@ -799,6 +807,7 @@ pack_tested_tarball() {
   tested_pack_dir="$dir"
   tested_pack_file="$dir/$(printf '%s\n' "$ident" | sed -n 2p)"
   tested_pack_integrity="$(printf '%s\n' "$ident" | sed -n 1p)"
+  tested_pack_name="$(basename "$tested_pack_file")"
   echo "  tested pack: $(basename "$tested_pack_file") $tested_pack_integrity"
 }
 release_security_gate() {
@@ -1060,7 +1069,8 @@ step "split-brain DB warn (v2.4.5)" split_brain_warn || exit 1
 # --- 7. (--full only) load / chaos / cross-version — Phase 5b ---
 # These run a subset of tests/*.test.ts files that are NOT included in the
 # default vitest run (they spawn subprocesses, produce load, or take 30-60s).
-# REQUIRED before npm publish; opt-in otherwise.
+# ALWAYS run by a real publish (prepublishOnly forces FULL_MODE above); weekly
+# on main by .github/workflows/full-gate.yml; opt-in (--full) otherwise.
 if [ "$FULL_MODE" = "1" ]; then
   # --config vitest.full.config.ts overrides the default exclude list so the
   # load/chaos/cross-version files are picked up. They're opt-in because
@@ -1114,11 +1124,30 @@ repack_identity_gate() {
 }
 step "re-pack identity (the uploaded tarball is the tested one)" repack_identity_gate || exit 1
 
+# The verdict block a passing run ends with (copied into the release notes): the commit, whether the
+# --full steps ran, and the tarball the gate tested (whose identity the re-pack step re-confirmed).
+# Printed only: no local "gate passed" record is written (nothing would read it under --ignore-scripts).
+release_verdict() {
+  local sha dirty=""
+  sha="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+  if [ -n "$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null)" ]; then dirty=" (uncommitted changes)"; fi
+  echo ""
+  echo "=== RELEASE GATE VERDICT ==="
+  echo "  commit     ${sha}${dirty}"
+  if [ "$FULL_MODE" = "1" ]; then
+    echo "  full gate  PASS (load-smoke, chaos, cross-version ran)"
+  else
+    echo "  full gate  NOT RUN (no --full: not a publish)"
+  fi
+  echo "  tarball    ${tested_pack_name:-none} ${tested_pack_integrity:-(no tested pack)}"
+}
+
 # --- Summary ---
 echo ""
 echo "=== pre-publish summary ==="
 for s in "${STEPS[@]}"; do echo "  $s"; done
 if [ "$FAIL" -eq 0 ]; then
+  if [ "$LIST_STEPS_MODE" != "1" ]; then release_verdict; fi
   echo ""
   echo "pre-publish: PASS (safe to npm publish)"
   exit 0
