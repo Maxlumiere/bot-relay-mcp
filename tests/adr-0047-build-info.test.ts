@@ -29,7 +29,16 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST = path.join(REPO_ROOT, "dist");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "adr0047-pr1-")));
-afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
+// The scratch installs (~18,700 entries) removed at the end. A MEASURED budget, not the 10 s hook default: locally the
+// rmSync takes 905 ms (M2 Max SSD, 28 Oct); in a slow macOS-runner window (job 122803027574, this file 98.8 s vs
+// 17-26 s normally) it exceeded 10,000 ms. CI never printed its own time, so the line below does, for the next sizing.
+// 60 s = 6x that observed lower bound.
+const ROOT_CLEANUP_BUDGET_MS = 60_000;
+afterAll(() => {
+  const t0 = Date.now();
+  fs.rmSync(ROOT, { recursive: true, force: true });
+  process.stderr.write(`[adr-0047] scratch-install cleanup took ${Date.now() - t0} ms\n`);
+}, ROOT_CLEANUP_BUDGET_MS);
 
 const { computeCodeId, checkInstall, parseStamp, renderStamp } = await import("../dist/build-id.js");
 const { computeDepsId } = await import("../dist/deps-snapshot.js");
