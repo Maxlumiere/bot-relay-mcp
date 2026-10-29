@@ -39,6 +39,7 @@ import path from "path";
 export const MEASURED_PLATFORMS: ReadonlySet<NodeJS.Platform> = new Set<NodeJS.Platform>(["darwin"]);
 
 const O_EXLOCK_DARWIN = 0x20;
+const O_SHLOCK_DARWIN = 0x10;
 
 export class OwnerLockError extends Error {
   constructor(message: string) {
@@ -120,6 +121,10 @@ export interface OwnerLock {
   release(): void;
 }
 
+function primitiveName(key: string): string {
+  return process.platform === "win32" ? `\\\\.\\pipe\\bot-relay-${key}` : `\0bot-relay-${key}`;
+}
+
 function tryPrimitiveOnce(key: string): Promise<(() => void) | null> {
   if (process.platform === "darwin") {
     fs.mkdirSync(locksDir(), { recursive: true, mode: 0o700 });
@@ -136,7 +141,7 @@ function tryPrimitiveOnce(key: string): Promise<(() => void) | null> {
   if (process.platform !== "linux" && process.platform !== "win32") {
     return Promise.reject(new OwnerLockError(`no single-owner lock primitive is defined for ${process.platform}`));
   }
-  const name = process.platform === "win32" ? `\\\\.\\pipe\\bot-relay-${key}` : `\0bot-relay-${key}`;
+  const name = primitiveName(key);
   return new Promise((resolve, reject) => {
     const srv = net.createServer((c) => c.destroy());
     srv.once("error", (e: NodeJS.ErrnoException) => (e.code === "EADDRINUSE" ? resolve(null) : reject(e)));
@@ -234,16 +239,39 @@ export function holdsOwnerLock(dbPath: string): boolean {
 
 /**
  * Whether ANOTHER process owns the DB at `dbPath`: a native process checks before opening and again right after. An
- * absent DB has no owner (a wasm owner materializes the file before it keys it). Probing takes the primitive for an
- * instant; a wasm acquirer racing that instant retries.
+ * absent DB has no owner (a wasm owner materializes the file before it keys it). A probe never TAKES the primitive (two
+ * native probers would each read the other as an owner): macOS takes a SHARED flock on the owner file (probers are
+ * compatible with each other; a wasm acquirer racing one retries); Linux and Windows CONNECT to the owner's socket or
+ * pipe (a listener answering is an owner).
  */
 export async function isOwnedElsewhere(dbPath: string): Promise<boolean> {
   if (!fs.existsSync(dbPath)) return false;
   if (!["darwin", "linux", "win32"].includes(process.platform)) return false;
   const key = lockKey(dbPath);
   if (HELD.has(key)) return false; // our own wasm connection, not another process
-  const drop = await tryPrimitiveOnce(key);
-  if (!drop) return true;
-  drop();
-  return false;
+  if (process.platform === "darwin") {
+    fs.mkdirSync(locksDir(), { recursive: true, mode: 0o700 });
+    try {
+      const fd = fs.openSync(path.join(locksDir(), `${key}.owner`), fs.constants.O_RDONLY | fs.constants.O_CREAT | fs.constants.O_NONBLOCK | O_SHLOCK_DARWIN, 0o600);
+      fs.closeSync(fd);
+      return false;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EAGAIN" || code === "EWOULDBLOCK") return true;
+      throw err;
+    }
+  }
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(primitiveName(key));
+    sock.once("connect", () => {
+      sock.destroy();
+      resolve(true);
+    });
+    sock.once("error", (e: NodeJS.ErrnoException) => {
+      sock.destroy();
+      if (e.code === "ECONNREFUSED" || e.code === "ENOENT") resolve(false);
+      else if (e.code === "EAGAIN" || e.code === "EBUSY") resolve(true); // a listener exists, its queue is full
+      else reject(e);
+    });
+  });
 }
