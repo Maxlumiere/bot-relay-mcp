@@ -160,10 +160,13 @@ let wasmPersistWrite: (dbPath: string, bytes: Buffer) => void = (dbPath, bytes) 
 export function _setWasmPersistWriteForTests(fn: ((dbPath: string, bytes: Buffer) => void) | null): void {
   wasmPersistWrite = fn ?? ((dbPath, bytes) => fs.writeFileSync(dbPath, bytes));
 }
-let wasmExportHook: (() => void) | null = null;
-/** Test-only: runs right before the wasm write-back's export() (e.g. throwing an Emscripten ErrnoError). */
-export function _setWasmExportHookForTests(fn: (() => void) | null): void {
-  wasmExportHook = fn;
+let wasmExport: (rawDb: any) => Uint8Array = (rawDb) => rawDb.export();
+/**
+ * Test-only: replaces sql.js's export() for the wasm write-back and serialize(). sql.js's export() CLOSES the database
+ * before reading its in-memory file, so a test that emulates a failed export closes the raw handle and then throws.
+ */
+export function _setWasmExportForTests(fn: ((rawDb: any) => Uint8Array) | null): void {
+  wasmExport = fn ?? ((rawDb) => rawDb.export());
 }
 
 class WasmDatabase implements CompatDatabase {
@@ -345,8 +348,7 @@ class WasmDatabase implements CompatDatabase {
     const sinceExport = Math.max(0, this.totalChanges() - this.rolledBackSinceExport);
     let data: Uint8Array;
     try {
-      wasmExportHook?.();
-      data = this.db.export();
+      data = wasmExport(this.db);
     } catch (err: any) {
       this.unwrittenAtFailure = this.unwrittenChanges + sinceExport;
       // An Emscripten FS error leaves the in-memory DB valid but NOTHING written. At close nothing is left to retry it,

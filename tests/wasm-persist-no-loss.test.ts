@@ -12,8 +12,10 @@
  *   transaction: a refused write-back inside a transaction used to leave every later write unwritten until close);
  * - a write-back refused at close() is reported by name with the number of ROW CHANGES lost (0 for a SELECT-only
  *   transaction), and the handle is cleared, so a fresh open works and holds only what was written;
- * - an ErrnoError from the FINAL export propagates (close reports the loss); one from an earlier export is a warning
- *   that never claims the data is safe.
+ * - an export that fails after sql.js closed the database (its export() closes SQLite before reading the in-memory
+ *   file) is never a success: a named error, every later use refused by name, and close reports the loss;
+ * - serialize() keeps the loss count; a ROLLBACK that failed subtracts nothing; a nested SAVEPOINT that fails leaves the
+ *   depth right; a script or statement that fails after committing rows still writes them back.
  * Each row reads the FILE before closing where it matters: a close writes back too, and would hide a dropped one.
  */
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
@@ -23,7 +25,6 @@ import path from "path";
 import Database from "better-sqlite3";
 import * as db from "../src/db.js";
 import * as compat from "../src/sqlite-compat.js";
-import { log } from "../src/logger.js";
 
 const ROOT = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "wasm-persist-")));
 const KEYS = ["RELAY_DB_PATH", "RELAY_SQLITE_DRIVER", "RELAY_CONFIG_PATH"] as const;
@@ -41,7 +42,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   compat._setWasmPersistWriteForTests(null);
-  compat._setWasmExportHookForTests(null);
+  compat._setWasmExportForTests(null);
   try {
     db.closeDb();
   } catch {
@@ -59,14 +60,17 @@ const refuseWrite = () =>
   compat._setWasmPersistWriteForTests(() => {
     throw Object.assign(new Error("ENOSPC: no space left on device, write (injected)"), { code: "ENOSPC" });
   });
-const errnoOnExport = () =>
-  compat._setWasmExportHookForTests(() => {
-    throw Object.assign(new Error("FS error (injected)"), { name: "ErrnoError" });
+// sql.js's export() closes SQLite BEFORE it reads the in-memory file, so a real export failure leaves the handle CLOSED.
+// This emulates that state: the raw handle is closed, then the export throws an Emscripten ErrnoError.
+const exportFailsAfterClose = () =>
+  compat._setWasmExportForTests((raw) => {
+    raw.close();
+    throw Object.assign(new Error("FS error (injected after sql.js closed the database)"), { name: "ErrnoError" });
   });
-function rowsOnDisk(): string[] {
+function rowsOnDisk(table = "probe"): string[] {
   const ro = new Database(dbPath, { readonly: true });
   try {
-    return (ro.prepare("SELECT v FROM probe ORDER BY rowid").all() as Array<{ v: string }>).map((r) => r.v);
+    return (ro.prepare(`SELECT v FROM ${table} ORDER BY rowid`).all() as Array<{ v: string }>).map((r) => r.v);
   } finally {
     ro.close();
   }
@@ -127,32 +131,98 @@ describe("the wasm write-back loses no committed write silently", () => {
     expect(() => db.closeDb()).toThrow(/final write-back was refused, so 1 row change\(s\)/);
   });
 
-  it("an ErrnoError from the FINAL export propagates: close reports the loss", async () => {
+  it("an export that fails AFTER sql.js closed the database is never a success: a named error, then every use refused by name, and close reports the loss", async () => {
+    const { ins } = await openWithTable();
+    ins.run("kept");
+    exportFailsAfterClose();
+    expect(() => ins.run("lost"), "the failed export is reported, never a silent return").toThrow(/export failed after sql\.js had closed the database/);
+    compat._setWasmExportForTests(null);
+    expect(() => ins.run("later"), "a dead handle refuses by name, not with a raw sqlite error").toThrow(/handle is unusable/);
+    let closeErr: Error | null = null;
+    try {
+      db.closeDb();
+    } catch (e) {
+      closeErr = e as Error;
+    }
+    expect(closeErr?.message, "close reports the loss by name; a cleanup error never replaces it").toMatch(/1 row change\(s\) since the last successful write-back were LOST/);
+    expect(rowsOnDisk()).toEqual(["kept"]);
+    await db.initializeDb(); // the handle was cleared: a fresh open works, from the file
+    expect((db.getDb().prepare("SELECT v FROM probe ORDER BY rowid").all() as Array<{ v: string }>).map((r) => r.v)).toEqual(["kept"]);
+  });
+
+  it("an export that fails after close AT CLOSE is reported by name with the count, never as a raw cleanup error", async () => {
     const { ins } = await openWithTable();
     ins.run("kept");
     refuseWrite();
     expect(() => ins.run("lost")).toThrow();
     compat._setWasmPersistWriteForTests(null);
-    errnoOnExport();
-    expect(() => db.closeDb(), "an export ErrnoError at close is a reported loss, not a silent return").toThrow(
-      /final write-back was refused, so 1 row change\(s\) since the last successful write-back were LOST/
-    );
-    compat._setWasmExportHookForTests(null);
+    exportFailsAfterClose();
+    expect(() => db.closeDb()).toThrow(/final write-back was refused, so 1 row change\(s\) since the last successful write-back were LOST/);
+    compat._setWasmExportForTests(null);
     expect(rowsOnDisk()).toEqual(["kept"]);
   });
 
-  it("an ErrnoError from an EARLIER export is a warning that never claims the data is safe; the next write-back writes it", async () => {
-    const { ins } = await openWithTable();
+  it("serialize() (the snapshot path) keeps the loss count: a later refused close still counts the change", async () => {
+    const { h, ins } = await openWithTable();
     ins.run("kept");
-    const warn = vi.spyOn(log, "warn");
-    errnoOnExport();
-    ins.run("pending"); // the warning path: no throw
-    compat._setWasmExportHookForTests(null);
-    const said = warn.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
-    expect(said, "the warning was emitted").toMatch(/export\(\)/);
-    expect(said, "it never claims the data is safe").not.toMatch(/safe in memory/);
-    expect(said, "it says what is at stake").toMatch(/lost if the process exits first/);
+    // An export that fails BEFORE sql.js closes the handle (the handle stays open, the change stays in SQLite's counter),
+    // then serialize()'s own export, which resets that counter.
+    compat._setWasmExportForTests(() => {
+      throw new Error("export refused (injected, before any close)");
+    });
+    expect(() => ins.run("pending")).toThrow();
+    compat._setWasmExportForTests(null);
+    compat.snapshotToFile(h, path.join(path.dirname(dbPath), "snap.db"));
+    refuseWrite();
+    expect(() => db.closeDb()).toThrow(/final write-back was refused, so 1 row change\(s\)/);
+  });
+
+  it("a ROLLBACK that FAILED subtracts nothing: a row committed inside it is still counted as lost", async () => {
+    const { h, ins } = await openWithTable();
+    ins.run("kept");
+    refuseWrite();
+    // pragma() writes back (an export closes and reopens sql.js's database, ending the transaction), so the insert after
+    // it commits on its own and the ROLLBACK then fails.
+    expect(() =>
+      h.transaction(() => {
+        h.pragma("user_version = 1");
+        ins.run("committed-after-pragma");
+        throw new Error("abort the transaction");
+      })()
+    ).toThrow(/abort the transaction/);
+    expect(() => db.closeDb()).toThrow(/final write-back was refused, so [1-9]\d* row change\(s\)/);
+  });
+
+  it("a NESTED transaction whose SAVEPOINT fails leaves the depth right: the outer commit and a later write reach the file", async () => {
+    const { h, ins } = await openWithTable();
+    h.transaction(() => {
+      const it = h.prepare("INSERT INTO probe (v) VALUES ('a'), ('b') RETURNING v").iterate();
+      it.next(); // a statement is in progress: SQLite refuses a SAVEPOINT now
+      expect(() => h.transaction(() => ins.run("inner"))()).toThrow();
+      for (const _ of it) {
+        /* finish the statement */
+      }
+    })();
     ins.run("after");
-    expect(rowsOnDisk()).toEqual(["kept", "pending", "after"]);
+    expect(rowsOnDisk(), "the outer commit and the later write were written back (read before close)").toEqual(["a", "b", "after"]);
+  });
+
+  it("an INSERT … RETURNING read through get() outside a transaction is written back (a read API that commits)", async () => {
+    const { h } = await openWithTable();
+    expect(h.prepare("INSERT INTO probe (v) VALUES ('returned') RETURNING v").get()).toEqual({ v: "returned" });
+    expect(rowsOnDisk(), "the committed row reached the file (read before close)").toEqual(["returned"]);
+  });
+
+  it.each([
+    ["exec(): a multi-statement script that fails after a committed INSERT", "probe", ["committed"]],
+    ["run(): an INSERT OR FAIL that commits rows before failing", "uniq", ["committed", "also"]],
+  ] as const)("%s: the SQL error is the one thrown, and the committed rows are written back", async (label, table, want) => {
+    const { h } = await openWithTable();
+    h.exec("CREATE TABLE IF NOT EXISTS uniq (v TEXT UNIQUE)");
+    const act = label.startsWith("exec")
+      ? () => h.exec("INSERT INTO probe (v) VALUES ('committed'); SELECT * FROM missing_table")
+      : () => h.prepare("INSERT OR FAIL INTO uniq (v) VALUES ('committed'), ('also'), ('committed')").run();
+    expect(act).toThrow(/missing_table|UNIQUE/);
+    expect(rowsOnDisk(table), "the committed rows reached the file (read before close)").toEqual([...want]);
   });
 });
