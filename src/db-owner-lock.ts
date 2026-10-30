@@ -400,6 +400,9 @@ export async function isOwnedElsewhere(dbPath: string): Promise<boolean> {
       settle(() => {
         if (e.code === "ECONNREFUSED" || e.code === "ENOENT") resolve(false);
         else if (e.code === "EAGAIN" || e.code === "EBUSY") resolve(true); // a listener exists, its queue is full
+        // A listener existed and reset the connect (MEASURED on Linux CI under a tight probe loop: "connect
+        // ECONNRESET" while an owner listened). Fail-closed: an owner.
+        else if (e.code === "ECONNRESET" || e.code === "EPIPE") resolve(true);
         else reject(e);
       })
     );
