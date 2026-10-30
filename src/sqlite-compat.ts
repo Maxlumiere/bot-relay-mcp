@@ -22,6 +22,7 @@ import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
+import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, isOwnedElsewhere, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -155,14 +156,65 @@ class WasmStatement implements CompatStatement {
   }
 }
 
+let persistRename: (from: string, to: string) => void = (from, to) => fs.renameSync(from, to);
+/** Test-only: replaces the wasm persist's rename (e.g. with one that is refused). */
+export function _setPersistRenameForTests(fn: ((from: string, to: string) => void) | null): void {
+  persistRename = fn ?? ((from, to) => fs.renameSync(from, to));
+}
+
+const WINDOWS_OPEN_FILE_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+/**
+ * INV-DB-01: the wasm persist's atomic replace (a rename over the DB). Windows cannot replace a file another process
+ * holds open (an AV scanner, an indexer, a native handle): a short bounded retry for a transient opener, then a NAMED
+ * refusal. Anywhere, a refused replace writes nothing, and the in-memory writes go out with the next persist.
+ */
+function replaceWithRetry(tmp: string, dbPath: string): void {
+  const waits = process.platform === "win32" ? [25, 50, 100, 200] : [];
+  for (let i = 0; ; i++) {
+    try {
+      persistRename(tmp, dbPath);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "";
+      const openOnWindows = process.platform === "win32" && WINDOWS_OPEN_FILE_CODES.has(code);
+      if (openOnWindows && i < waits.length) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waits[i]);
+        continue;
+      }
+      const why = openOnWindows
+        ? `another process has the DB file open; Windows cannot replace it`
+        : `the DB file could not be replaced (${code || (err as Error).message})`;
+      throw new Error(
+        `wasm persist refused: ${why}; nothing was written to ${dbPath}. This change stays in memory and is written ` +
+          `with the next successful persist (it is lost if the process exits first).`
+      );
+    }
+  }
+}
+
 class WasmDatabase implements CompatDatabase {
   private db: any;
   private dbPath: string;
   private txDepth = 0;
+  /** INV-DB-01: a read-only handle (a probe, a snapshot source) never writes the file back, not even on close(). */
+  readonly readOnly: boolean;
+  /** INV-DB-01: the single-owner lock a WRITABLE handle holds; released when it closes. */
+  ownerLock: OwnerLock | null = null;
+  /**
+   * INV-DB-01: the DB's name with its CANONICAL basename, captured when the lock was taken. Every persist replaces THIS
+   * name: replacing the caller's spelling would, on a case-insensitive volume (Windows), give the file that spelling, so
+   * its key would drift and the owner would lose its own lock (and a later opener could be a second owner).
+   */
+  canonicalPath: string | null = null;
+  /** Writes since the last successful persist (a refused persist keeps them in memory, for the next one). */
+  private unpersisted = 0;
+  private closed = false;
 
-  constructor(rawDb: any, dbPath: string) {
+  constructor(rawDb: any, dbPath: string, opts: { readOnly?: boolean } = {}) {
     this.db = rawDb;
     this.dbPath = dbPath;
+    this.readOnly = opts.readOnly ?? false;
     // Attach conditional flush so WasmStatement can call it.
     // Skips actual flush when inside a transaction (depth > 0) — the
     // transaction() wrapper handles flushing at COMMIT/ROLLBACK.
@@ -224,16 +276,14 @@ class WasmDatabase implements CompatDatabase {
       } else {
         this.db.run(`SAVEPOINT ${spName}`);
       }
+      let result: T;
       try {
-        const result = fn();
+        result = fn();
         if (isOutermost) {
           this.db.run("COMMIT");
         } else {
           this.db.run(`RELEASE ${spName}`);
         }
-        this.txDepth--;
-        if (this.txDepth === 0) this.flush();
-        return result;
       } catch (err) {
         this.txDepth--;
         try {
@@ -245,15 +295,44 @@ class WasmDatabase implements CompatDatabase {
         } catch {
           // Transaction/savepoint may already be finalized.
         }
-        if (this.txDepth === 0) this.flush();
+        if (this.txDepth === 0) {
+          try {
+            this.flush();
+          } catch {
+            // The rolled-back image is the pre-transaction one; the original error is the one to report.
+          }
+        }
         throw err;
       }
+      // INV-DB-01: the persist runs AFTER the try. A refused persist used to land in the catch above, decrementing
+      // txDepth a second time (to -1), so no later write was persisted until close. The commit stays in memory and
+      // goes out with the next successful persist.
+      this.txDepth--;
+      if (this.txDepth === 0) this.flush();
+      return result;
     };
   }
 
   close(): void {
-    this.flush();
-    this.db.close();
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      if (!this.readOnly) this.flush("close");
+    } catch (err) {
+      // Nothing is left to retry it: the writes since the last successful persist are lost. Say so, loudly and by name.
+      const msg = `wasm close: the final persist was refused, so ${this.unpersisted} write(s) since the last successful persist were LOST (${(err as Error).message})`;
+      log.error(`[db-wasm] ${msg}`);
+      throw new Error(msg);
+    } finally {
+      this.db.close();
+      this.releaseOwner();
+    }
+  }
+
+  private releaseOwner(): void {
+    const lock = this.ownerLock;
+    this.ownerLock = null;
+    lock?.release();
   }
 
   /**
@@ -262,7 +341,10 @@ class WasmDatabase implements CompatDatabase {
    * close() would export() and write the image THROUGH the escaped path.
    */
   discard(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.db.close();
+    this.releaseOwner();
   }
 
   /**
@@ -280,7 +362,8 @@ class WasmDatabase implements CompatDatabase {
   // are caught and retried — sql.js's wasm layer sometimes throws ErrnoError
   // on export() due to Emscripten virtual filesystem quirks that do not
   // affect the in-memory data integrity.
-  private flush(): void {
+  private flush(cause: "write" | "close" = "write"): void {
+    if (cause === "write") this.unpersisted++;
     let data: Uint8Array;
     try {
       data = this.db.export();
@@ -294,12 +377,28 @@ class WasmDatabase implements CompatDatabase {
       }
       throw err;
     }
-    const dir = path.dirname(this.dbPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    if (this.readOnly) {
+      throw new OwnerLockError(`wasm persist refused: the handle on ${this.dbPath} is read-only.`);
     }
-    // THIS write-to-disk failure IS propagated (disk full, permissions, etc.)
-    fs.writeFileSync(this.dbPath, Buffer.from(data));
+    // INV-DB-01: persist ONLY under this process's single-owner lock (never a write another owner could race), never
+    // to a hard-linked DB, and ATOMICALLY: a fresh temp file beside the DB, then renamed over it. A failure is
+    // propagated (disk full, permissions, a lost lock).
+    const target = this.canonicalPath ?? this.dbPath;
+    if (!this.ownerLock || !holdsOwnerLock(target) || lockKey(target) !== this.ownerLock.key) {
+      throw new OwnerLockError(
+        `wasm persist refused: this process does not hold the single-owner lock for ${this.dbPath}, so another process may own it. Nothing was written.`
+      );
+    }
+    assertSingleLink(target);
+    const tmp = `${target}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+    try {
+      fs.writeFileSync(tmp, Buffer.from(data), { mode: 0o600, flag: "wx" });
+      replaceWithRetry(tmp, target);
+    } catch (err) {
+      fs.rmSync(tmp, { force: true });
+      throw err;
+    }
+    this.unpersisted = 0;
   }
 }
 
@@ -430,7 +529,10 @@ export async function openExportSource(
       loadedSha256 = crypto.createHash("sha256").update(bytes).digest("hex");
       db = await openWasmFromBytes(bytes, dbPath);
     } else {
+      // INV-DB-01: a native process never opens a wasm-owned DB: checked before the open and right after.
+      await assertNotOwnedByWasm(dbPath);
       db = await openReadOnlyUnchecked(dbPath, driver);
+      await assertNotOwnedByWasm(dbPath);
     }
     db.prepare("SELECT 1 FROM sqlite_master LIMIT 1").get(); // a native read-only open fails here, not at open
   } catch (err) {
@@ -475,13 +577,14 @@ export function fileSha256(p: string): string {
  * them); a -journal means a rollback may be pending. Each is refused by name. The WAL header alone is NOT (ruled): a
  * native DB whose last connection closed cleanly holds every commit in its main file (MEASURED).
  */
-export function assertWasmSourceReadable(dbPath: string): void {
+export function assertWasmSourceReadable(dbPath: string, what = "backup refused (wasm driver)"): void {
   for (const side of ["-wal", "-shm", "-journal"]) {
     if (fs.existsSync(dbPath + side)) {
       throw new Error(
-        `backup refused (wasm driver): a ${side} file is beside the DB at '${dbPath}', so another process may have it open ` +
-          `or its last transaction is not in the main file, and the wasm driver reads only the main file. Back up with ` +
-          `the native driver, or once no other process has the DB open.`
+        `${what}: a ${side} file is beside the DB at '${dbPath}'. Either another process has the DB open, or the ` +
+          `file was left by a native open (e.g. a native \`relay backup\`), and the last transaction may not be in ` +
+          `the main file, which is all the wasm driver reads. If no other process has it open: open it once with the ` +
+          `native driver to checkpoint (closing its last connection removes the side files), then retry.`
       );
     }
   }
@@ -500,7 +603,7 @@ async function openWasmFromBytes(bytes: Buffer, dbPath: string): Promise<CompatD
     );
   }
   const SQL = await initSqlJs();
-  return new WasmDatabase(new SQL.Database(bytes), dbPath);
+  return new WasmDatabase(new SQL.Database(bytes), dbPath, { readOnly: true });
 }
 
 // --- Public API ---
@@ -517,7 +620,22 @@ let _initPromise: Promise<CompatDatabase> | null = null;
  * any getDb() call). For native: sync under the hood. For wasm: loads the
  * wasm binary async. Thread-safe: concurrent callers share the same promise.
  */
-export function initializeDb(dbPath: string): Promise<CompatDatabase> {
+/** INV-DB-01: refuse, by name, a DB a wasm-driver process owns (every native open checks before and right after). */
+export async function assertNotOwnedByWasm(dbPath: string): Promise<void> {
+  if (await isOwnedElsewhere(dbPath)) {
+    throw new OwnerLockError(
+      `the DB at ${dbPath} is owned by a wasm-driver process; a native process does not open it meanwhile. Stop that process first.`
+    );
+  }
+}
+
+/** Test-only: runs between a native open and its re-check (an owner arriving in that window). */
+let nativeAfterOpenHook: (() => Promise<void>) | null = null;
+export function _setNativeAfterOpenHookForTests(fn: (() => Promise<void>) | null): void {
+  nativeAfterOpenHook = fn;
+}
+
+export function initializeDb(dbPath: string, opts: { verifyCreated?: (dbPath: string) => void } = {}): Promise<CompatDatabase> {
   if (_initializedDb) return Promise.resolve(_initializedDb);
   if (_initPromise) return _initPromise;
 
@@ -526,14 +644,43 @@ export function initializeDb(dbPath: string): Promise<CompatDatabase> {
     log.info(`[db] Initializing SQLite driver: ${driver}`);
 
     if (driver === "wasm") {
-      _initializedDb = await createWasmDb(dbPath);
+      // INV-DB-01, the wasm write protocol: the single-owner lock FIRST (it materializes an absent DB; a bounded
+      // jittered retry, then a named refusal), then no side file beside the DB, no hard link, and only then the load.
+      const lock = await acquireOwnerLock(dbPath, { verifyCreated: opts.verifyCreated });
+      let wdb: WasmDatabase;
+      try {
+        assertWasmSourceReadable(dbPath, "wasm open refused");
+        assertSingleLink(dbPath);
+        wdb = (await createWasmDb(dbPath)) as WasmDatabase;
+      } catch (err) {
+        lock.release();
+        throw err;
+      }
+      wdb.ownerLock = lock;
+      wdb.canonicalPath = canonicalReplaceTarget(dbPath);
+      _initializedDb = wdb;
     } else {
-      _initializedDb = await createNativeDb(dbPath);
+      // INV-DB-01: a native process never opens a DB a wasm-driver process owns: checked BEFORE the open and again
+      // right AFTER it, before anything is written (an owner may arrive in between).
+      await assertNotOwnedByWasm(dbPath);
+      const ndb = await createNativeDb(dbPath);
+      try {
+        await nativeAfterOpenHook?.();
+        await assertNotOwnedByWasm(dbPath);
+      } catch (err) {
+        ndb.close();
+        throw err;
+      }
+      _initializedDb = ndb;
     }
 
     _driverUsed = driver;
     return _initializedDb;
   })();
+  // A refused open (e.g. another owner, INV-DB-01) must not stay cached: a later call tries again.
+  _initPromise.catch(() => {
+    _initPromise = null;
+  });
 
   return _initPromise;
 }
@@ -590,10 +737,10 @@ export function discardInitializedDb(): void {
 }
 
 export function closeInitializedDb(): void {
-  if (_initializedDb) {
-    _initializedDb.close();
-    _initializedDb = null;
-    _driverUsed = null;
-    _initPromise = null;
-  }
+  const db = _initializedDb;
+  _initializedDb = null;
+  _driverUsed = null;
+  _initPromise = null;
+  // Cleared FIRST: a close that throws (a refused final persist, reported by name) never leaves a stale handle.
+  db?.close();
 }

@@ -338,7 +338,11 @@ export async function initializeDb(): Promise<void> {
   // narrowed only after the re-check below (ADR-0048: never chmod through an
   // unverified path).
   createDbDir(path.dirname(dbPath));
-  _db = await initDriver(dbPath);
+  // INV-DB-01: the wasm driver's single-owner lock MATERIALIZES an absent DB before it keys it, so containment is
+  // checked BEFORE the driver opens anything, and again on the file the lock just CREATED (verifyCreated: a refusal
+  // removes it when it is provably that file); the re-check below still covers a swap after the open.
+  assertStillContained(dbPath);
+  _db = await initDriver(dbPath, { verifyCreated: assertStillContained });
   // Re-check BEFORE anything else touches the file: on a refusal the handle is
   // DISCARDED (a WASM close() would flush its image through the escaped path),
   // and the chmod below never follows an escaped path.
@@ -499,11 +503,14 @@ function migrateSchemaToV1_7(db: CompatDatabase): void {
 }
 
 export function closeDb(): void {
-  if (_db) {
-    _db.close();
-    _db = null;
+  const db = _db;
+  _db = null;
+  try {
+    // A close can throw (a refused final persist under wasm, reported by name); the handles are cleared regardless.
+    db?.close();
+  } finally {
+    closeInitializedDb();
   }
-  closeInitializedDb();
 }
 
 function initSchema(db: CompatDatabase): void {

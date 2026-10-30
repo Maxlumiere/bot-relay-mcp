@@ -50,7 +50,9 @@ Exit 0 on success, 1 on failure. On success, the stdout line tells you where the
   - A DB whose header says WAL mode, but with no side file (a native DB whose last connection closed cleanly), holds every commit in its main file and is backed up.
   - If the main file's bytes change while it is being read (the bytes loaded hash differently from the file re-read after), the read is retried once, then refused.
   - The copy, from a fresh read or the relay's own open connection, must pass `PRAGMA integrity_check` before it is archived.
-  - **These are best-effort detection, not a guarantee.** A wasm read takes no lock, so a process writing the DB at the same time can still race it. A guarantee comes with the single-owner lock (a follow-up).
+  - A `-wal`/`-shm` left by a **native open** (for example a native `relay backup`: a read-only open of a WAL DB writes them and cannot remove them) also makes a wasm open or a wasm export refuse. The refusal names the remedy: if no other process has the DB open, open it once with the native driver to checkpoint (closing its last connection removes the side files), then retry.
+  - A wasm export takes no lock. A wasm **owner** (INV-DB-01) replaces the file only by an atomic rename, and the hash check above catches a read that raced one; a **native** writer is caught by the side-file checks, which are best-effort detection, not a guarantee.
+  - A **restore** replaces the DB file, so under the wasm driver it holds the DB's single-owner lock across the swap, and is refused while another process owns the DB. Under the native driver it is refused while a wasm-driver process owns the DB.
   - It never writes the DB back.
 
 ### Archive layout
