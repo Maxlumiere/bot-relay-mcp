@@ -79,4 +79,9 @@ jobs:
           npm run bundle
 
       - name: Run test suite (against the shipped better-sqlite3 binary)
-        run: npx vitest run
+        # INV-DB-01's lock harness runs in its own serial step below (it spawns racer and prober processes), so it adds
+        # no parallel load to this suite's timing-sensitive tests.
+        run: npx vitest run --exclude "tests/inv-db-01-*.test.ts"
+
+      - name: INV-DB-01 single-owner lock, serial and isolated (against the shipped better-sqlite3 binary)
+        run: npx vitest run --no-file-parallelism tests/inv-db-01-owner-lock-race.test.ts tests/inv-db-01-single-owner.test.ts

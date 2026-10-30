@@ -101,7 +101,9 @@ jobs:
         # on a 4-vCPU runner (they each spawn a daemon subprocess). Measured: default
         # file-parallelism oversubscribes and flakes; the pre-publish gate
         # (--no-file-parallelism) never does. This keeps most parallelism.
-        run: npx vitest run --maxWorkers=2
+        # INV-DB-01's lock harness spawns racer and prober processes: it runs in its own serial step below, so it adds no
+        # parallel load to this suite's timing-sensitive tests.
+        run: npx vitest run --maxWorkers=2 --exclude "tests/inv-db-01-*.test.ts"
 
       - name: Timing bars, serial and isolated (failed-auth loop + availability)
         # The PR-B timing bars measure LATENCY, so they run ALONE after the suite: in parallel with ~300
@@ -111,13 +113,14 @@ jobs:
         # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
         run: node scripts/run-timing-bars.mjs
 
-      - name: INV-DB-01 probe storm, report-only and serial (a known liveness limit; it never gates)
-        # A tight-loop probe storm against an acquirer: the starved rounds are PRINTED, never asserted. The step fails
-        # only if the row did not run (a -t that matches nothing passes vacuously).
+      - name: INV-DB-01 single-owner lock, serial and isolated (with the report-only probe storm)
+        # The lock harness spawns racer and prober processes and has time bounds, so it runs ALONE, never in parallel
+        # with another file. INV_DB_01_STORM=1 adds the tight-loop probe storm, which PRINTS its starved rounds and
+        # never gates; the grep only checks that the storm row ran.
         shell: bash
         run: |
-          INV_DB_01_STORM=1 npx vitest run --no-file-parallelism tests/inv-db-01-owner-lock-race.test.ts -t "REPORT-ONLY" | tee inv-db-01-storm.log
-          grep -q "adversarial probe storm (report-only)" inv-db-01-storm.log
+          INV_DB_01_STORM=1 npx vitest run --no-file-parallelism tests/inv-db-01-owner-lock-race.test.ts tests/inv-db-01-single-owner.test.ts | tee inv-db-01.log
+          grep -q "adversarial probe storm (report-only)" inv-db-01.log
 
       - name: npm audit (high+) — via resilience wrapper
         # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high
@@ -224,7 +227,9 @@ jobs:
         # on a 4-vCPU runner (they each spawn a daemon subprocess). Measured: default
         # file-parallelism oversubscribes and flakes; the pre-publish gate
         # (--no-file-parallelism) never does. This keeps most parallelism.
-        run: npx vitest run --maxWorkers=2
+        # INV-DB-01's lock harness spawns racer and prober processes: it runs in its own serial step below, so it adds no
+        # parallel load to this suite's timing-sensitive tests.
+        run: npx vitest run --maxWorkers=2 --exclude "tests/inv-db-01-*.test.ts"
 
       - name: Timing bars, serial and isolated (failed-auth loop + availability)
         # The PR-B timing bars measure LATENCY, so they run ALONE after the suite: in parallel with ~300
@@ -234,13 +239,14 @@ jobs:
         # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
         run: node scripts/run-timing-bars.mjs
 
-      - name: INV-DB-01 probe storm, report-only and serial (a known liveness limit; it never gates)
-        # A tight-loop probe storm against an acquirer: the starved rounds are PRINTED, never asserted. The step fails
-        # only if the row did not run (a -t that matches nothing passes vacuously).
+      - name: INV-DB-01 single-owner lock, serial and isolated (with the report-only probe storm)
+        # The lock harness spawns racer and prober processes and has time bounds, so it runs ALONE, never in parallel
+        # with another file. INV_DB_01_STORM=1 adds the tight-loop probe storm, which PRINTS its starved rounds and
+        # never gates; the grep only checks that the storm row ran.
         shell: bash
         run: |
-          INV_DB_01_STORM=1 npx vitest run --no-file-parallelism tests/inv-db-01-owner-lock-race.test.ts -t "REPORT-ONLY" | tee inv-db-01-storm.log
-          grep -q "adversarial probe storm (report-only)" inv-db-01-storm.log
+          INV_DB_01_STORM=1 npx vitest run --no-file-parallelism tests/inv-db-01-owner-lock-race.test.ts tests/inv-db-01-single-owner.test.ts | tee inv-db-01.log
+          grep -q "adversarial probe storm (report-only)" inv-db-01.log
 
       - name: Assert the suite installed NO real launchd service
         run: |
