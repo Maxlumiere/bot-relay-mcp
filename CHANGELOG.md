@@ -6,7 +6,12 @@
 
 - **Fixed:** under the wasm driver, when writing the database back to its file failed inside a transaction (for example, a full disk), the driver lost count of its open transactions. After that, **no later write was written to disk until the relay closed the database**, and a crash before then lost them all, silently.
 - **Now** a failed write-back keeps the change in memory, and the next successful write-back writes it. The error says so, and that the file may be partially written: the wasm write-back is an in-place write, not an atomic one.
-- **A write-back that fails when the database closes** is reported by name, with the number of row changes that were lost (there is nothing left to retry it). It used to surface as a bare error, or, for an export error from the wasm layer, not at all. A failed export earlier on is still a warning, but it no longer claims the data is safe.
+- **A write-back that fails when the database closes** is reported by name, with the number of row changes that were lost (there is nothing left to retry it). It used to surface as a bare error, or, for an export error from the wasm layer, not at all. An error from closing the handle no longer replaces that report.
+- **A failed export is an error, never a warning.** sql.js's export closes the database before reading it back, so a failed export can leave the handle closed. It is then marked unusable: every later use is refused by name with the changes lost, and you restart the relay to reopen the database from its file.
+- **More writes are written back:**
+  - a script or a statement that fails after committing rows (`INSERT OR FAIL`);
+  - an `INSERT … RETURNING` read through `get`, `all` or `iterate`;
+  - a transaction whose nested savepoint could not start (that used to stop all later write-backs).
 
 ### `relay backup` never changes the DB it copies
 
