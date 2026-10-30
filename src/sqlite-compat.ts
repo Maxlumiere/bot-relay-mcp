@@ -85,6 +85,15 @@ function totalChangesOf(rawDb: any): number {
 class WasmStatement implements CompatStatement {
   constructor(private db: any, private sql: string) {}
 
+  /** Free a statement best-effort: a dead handle's statements are already finalized, and freeing must not replace the error. */
+  private static freeQuietly(stmt: any): void {
+    try {
+      stmt.free();
+    } catch {
+      /* already finalized */
+    }
+  }
+
   /** A handle whose export failed after sql.js closed it refuses every use by name (never a raw sqlite error). */
   private assertAlive(): void {
     const dead = (this.db as any).__dead;
@@ -92,9 +101,11 @@ class WasmStatement implements CompatStatement {
   }
 
   /**
-   * A statement that changed rows writes them back, even when it then FAILED (a multi-row INSERT OR FAIL commits the
-   * rows before the failing one; an INSERT … RETURNING read through get/all/iterate commits too). The SQL error stays
-   * the one thrown; a write-back that fails as well is logged by name.
+   * A run() that changed rows writes them back even when it then FAILED (a multi-row INSERT OR FAIL commits the rows
+   * before the failing one). The SQL error stays the one thrown; a write-back that fails as well is logged by name.
+   * The read APIs (get/all/iterate) never write back: a write-back runs sql.js's export(), which FINALIZES every other
+   * statement of the handle, so a suspended iterator would break (Codex R2). A commit made through a read API (an
+   * INSERT … RETURNING) goes out with the next write or at close.
    */
   private writeBackIfChanged(changesBefore: number, sqlErr: unknown): void {
     if (totalChangesOf(this.db) === changesBefore) return;
@@ -122,11 +133,11 @@ class WasmStatement implements CompatStatement {
       }
       stmt.step();
     } catch (err) {
-      stmt.free();
+      WasmStatement.freeQuietly(stmt);
       this.writeBackIfChanged(before, err);
       throw err;
     }
-    stmt.free();
+    WasmStatement.freeQuietly(stmt);
     // v1.11.1: capture lastInsertRowid BEFORE flush (which may trigger
     // Emscripten FS operations that could interfere with the db state query).
     const changes = this.db.getRowsModified();
@@ -145,8 +156,6 @@ class WasmStatement implements CompatStatement {
 
   get(...params: any[]): any {
     this.assertAlive();
-    const before = totalChangesOf(this.db);
-    let sqlErr: unknown = undefined;
     const stmt = this.db.prepare(this.sql);
     try {
       if (params.length > 0) {
@@ -156,19 +165,13 @@ class WasmStatement implements CompatStatement {
         return stmt.getAsObject();
       }
       return undefined;
-    } catch (err) {
-      sqlErr = err;
-      throw err;
     } finally {
-      stmt.free();
-      this.writeBackIfChanged(before, sqlErr);
+      WasmStatement.freeQuietly(stmt);
     }
   }
 
   all(...params: any[]): any[] {
     this.assertAlive();
-    const before = totalChangesOf(this.db);
-    let sqlErr: unknown = undefined;
     const stmt = this.db.prepare(this.sql);
     try {
       if (params.length > 0) {
@@ -179,34 +182,27 @@ class WasmStatement implements CompatStatement {
         results.push(stmt.getAsObject());
       }
       return results;
-    } catch (err) {
-      sqlErr = err;
-      throw err;
     } finally {
-      stmt.free();
-      this.writeBackIfChanged(before, sqlErr);
+      WasmStatement.freeQuietly(stmt);
     }
   }
 
   /** Rows one at a time: the sql.js statement is stepped and each row yielded, never collected; freed when the loop ends or breaks. */
   *iterate(...params: any[]): IterableIterator<any> {
     this.assertAlive();
-    const before = totalChangesOf(this.db);
-    let sqlErr: unknown = undefined;
     const stmt = this.db.prepare(this.sql);
     try {
       if (params.length > 0) {
         stmt.bind(params);
       }
-      while (stmt.step()) {
+      for (;;) {
+        // A suspended iterator resumes here: refuse by name if the handle died meanwhile (not a raw "Statement closed").
+        this.assertAlive();
+        if (!stmt.step()) break;
         yield stmt.getAsObject();
       }
-    } catch (err) {
-      sqlErr = err;
-      throw err;
     } finally {
-      stmt.free();
-      this.writeBackIfChanged(before, sqlErr);
+      WasmStatement.freeQuietly(stmt);
     }
   }
 

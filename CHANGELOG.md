@@ -10,8 +10,8 @@
 - **A failed export is an error, never a warning.** sql.js's export closes the database before reading it back, so a failed export can leave the handle closed. It is then marked unusable: every later use is refused by name with the changes lost, and you restart the relay to reopen the database from its file.
 - **More writes are written back:**
   - a script or a statement that fails after committing rows (`INSERT OR FAIL`);
-  - an `INSERT … RETURNING` read through `get`, `all` or `iterate`;
   - a transaction whose nested savepoint could not start (that used to stop all later write-backs).
+- **Commits made through a read** (`get`, `all` or `iterate` on an `INSERT … RETURNING`) are written back with the next write or at close, not at once: a write-back closes and reopens sql.js's database, which would break any other read still in progress. A read in progress when the database becomes unusable is refused by name.
 
 ### `relay backup` never changes the DB it copies
 
