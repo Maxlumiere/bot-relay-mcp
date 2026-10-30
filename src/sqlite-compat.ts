@@ -155,6 +155,17 @@ class WasmStatement implements CompatStatement {
   }
 }
 
+let wasmPersistWrite: (dbPath: string, bytes: Buffer) => void = (dbPath, bytes) => fs.writeFileSync(dbPath, bytes);
+/** Test-only: replaces the wasm write-back's file write (e.g. with one that fails, like a full disk). */
+export function _setWasmPersistWriteForTests(fn: ((dbPath: string, bytes: Buffer) => void) | null): void {
+  wasmPersistWrite = fn ?? ((dbPath, bytes) => fs.writeFileSync(dbPath, bytes));
+}
+let wasmExportHook: (() => void) | null = null;
+/** Test-only: runs right before the wasm write-back's export() (e.g. throwing an Emscripten ErrnoError). */
+export function _setWasmExportHookForTests(fn: (() => void) | null): void {
+  wasmExportHook = fn;
+}
+
 class WasmDatabase implements CompatDatabase {
   private db: any;
   private dbPath: string;
@@ -283,6 +294,7 @@ class WasmDatabase implements CompatDatabase {
   private flush(): void {
     let data: Uint8Array;
     try {
+      wasmExportHook?.();
       data = this.db.export();
     } catch (err: any) {
       if (err?.name === "ErrnoError") {
@@ -299,7 +311,7 @@ class WasmDatabase implements CompatDatabase {
       fs.mkdirSync(dir, { recursive: true });
     }
     // THIS write-to-disk failure IS propagated (disk full, permissions, etc.)
-    fs.writeFileSync(this.dbPath, Buffer.from(data));
+    wasmPersistWrite(this.dbPath, Buffer.from(data));
   }
 }
 
