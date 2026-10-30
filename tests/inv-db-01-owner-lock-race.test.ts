@@ -522,6 +522,28 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     await expect(m.isOwnedElsewhere(db)).rejects.toThrow(/owner lock file .* is not private/);
   }, 60_000);
 
+  it.skipIf(process.platform === "darwin").each(["ECONNRESET", "EPIPE"])(
+    "GATING (where the probe CONNECTS): a connect %s (a listener existed and reset it) reads as OWNED, fail-closed, never a raw error",
+    async (code) => {
+      // MEASURED on Linux CI (job 123865251842): 6 of about 65,000 tight-loop probes got "connect ECONNRESET" while an
+      // owner listened, and the probe REJECTED raw, so a native open racing an owner would have failed unnamed.
+      const m = (await import("../dist/db-owner-lock.js")) as unknown as Probe;
+      const db = path.join(ROOT, `probe-reset-${code}.db`);
+      fs.writeFileSync(db, "");
+      m._setProbeConnectForTests(() => {
+        const sock = new net.Socket();
+        process.nextTick(() => sock.emit("error", Object.assign(new Error(`connect ${code} (injected)`), { code })));
+        return sock;
+      });
+      try {
+        await expect(m.isOwnedElsewhere(db), `a connect ${code} is an owner, not a raw error`).resolves.toBe(true);
+      } finally {
+        m._setProbeConnectForTests(null);
+      }
+    },
+    60_000
+  );
+
   const canBindMount = process.platform === "linux" && !!process.env.CI && spawnSync("sudo", ["-n", "true"]).status === 0;
   it.skipIf(!canBindMount)("Linux CI: a BIND MOUNT of the DB's directory names ONE owner (the parent directory's identity collapses it)", async () => {
     const src = path.join(ROOT, "bind-src");
