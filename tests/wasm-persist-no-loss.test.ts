@@ -131,13 +131,16 @@ describe("the wasm write-back loses no committed write silently", () => {
     expect(() => db.closeDb()).toThrow(/final write-back was refused, so 1 row change\(s\)/);
   });
 
-  it("an export that fails AFTER sql.js closed the database is never a success: a named error, then every use refused by name, and close reports the loss", async () => {
-    const { ins } = await openWithTable();
+  it("an export that fails AFTER sql.js closed the database is never a success: a named error, then every use refused by name (a SUSPENDED iterator too), and close reports the loss", async () => {
+    const { h, ins } = await openWithTable();
     ins.run("kept");
+    const suspended = h.prepare("SELECT v FROM probe").iterate();
+    expect(suspended.next().value).toEqual({ v: "kept" }); // a read in progress when the handle dies
     exportFailsAfterClose();
     expect(() => ins.run("lost"), "the failed export is reported, never a silent return").toThrow(/export failed after sql\.js had closed the database/);
     compat._setWasmExportForTests(null);
     expect(() => ins.run("later"), "a dead handle refuses by name, not with a raw sqlite error").toThrow(/handle is unusable/);
+    expect(() => suspended.next(), "a suspended iterator resuming on a dead handle refuses by name too").toThrow(/handle is unusable/);
     let closeErr: Error | null = null;
     try {
       db.closeDb();
@@ -207,10 +210,32 @@ describe("the wasm write-back loses no committed write silently", () => {
     expect(rowsOnDisk(), "the outer commit and the later write were written back (read before close)").toEqual(["a", "b", "after"]);
   });
 
-  it("an INSERT … RETURNING read through get() outside a transaction is written back (a read API that commits)", async () => {
+  it("Codex R2: a suspended iterator survives a commit made through get(), and the close count never undercounts", async () => {
     const { h } = await openWithTable();
+    const it = h.prepare("INSERT INTO probe (v) VALUES ('a'), ('b') RETURNING v").iterate();
+    expect(it.next().value).toEqual({ v: "a" });
+    refuseWrite();
+    expect(h.prepare("INSERT INTO probe (v) VALUES ('c') RETURNING v").get()).toEqual({ v: "c" });
+    expect([...it].map((row: { v: string }) => row.v), "the suspended iterator finishes (never a raw 'Statement closed')").toEqual(["b"]);
+    expect(() => db.closeDb(), "all 3 committed rows are counted").toThrow(/final write-back was refused, so 3 row change\(s\)/);
+  });
+
+  it("a commit made through a read API (get on INSERT … RETURNING) is written back at the NEXT write (the stated residual)", async () => {
+    const { h, ins } = await openWithTable();
     expect(h.prepare("INSERT INTO probe (v) VALUES ('returned') RETURNING v").get()).toEqual({ v: "returned" });
-    expect(rowsOnDisk(), "the committed row reached the file (read before close)").toEqual(["returned"]);
+    ins.run("next-write");
+    expect(rowsOnDisk(), "the next write wrote the read-API commit back too (read before close)").toEqual(["returned", "next-write"]);
+  });
+
+  it("a consumer exception inside an iterator of INSERT … RETURNING: the consumer's error escapes, and close counts the rows", async () => {
+    const { h } = await openWithTable();
+    refuseWrite();
+    expect(() => {
+      for (const _row of h.prepare("INSERT INTO probe (v) VALUES ('x'), ('y') RETURNING v").iterate()) {
+        throw new Error("consumer error");
+      }
+    }).toThrow(/consumer error/);
+    expect(() => db.closeDb(), "never silent: close reports both rows").toThrow(/final write-back was refused, so 2 row change\(s\)/);
   });
 
   it.each([
