@@ -104,12 +104,16 @@ fs.writeFileSync(
     `const gap = Number(gapMs);\n` +
     `const end = Date.now() + 30000; // self-terminating, whatever the parent does\n` +
     `let n = 0;\n` +
+    `let errors = 0, first = "";\n` +
+    `process.on("uncaughtException", (e) => { process.stdout.write("UNCAUGHT " + (e && e.code) + " " + String(e && e.message).replace(/\\n/g, " ") + "\\n"); process.exit(3); });\n` +
+    `process.on("unhandledRejection", (e) => { process.stdout.write("UNHANDLED " + (e && e.code) + " " + String(e && e.message).replace(/\\n/g, " ") + "\\n"); process.exit(4); });\n` +
     `while (!fs.existsSync(stop) && Date.now() < end) {\n` +
-    `  await isOwnedElsewhere(db);\n` +
+    `  try { await isOwnedElsewhere(db); }\n` +
+    `  catch (e) { if (errors++ === 0) first = (e && e.code) + " " + String(e && e.message).replace(/\\n/g, " "); }\n` +
     `  if (++n === 1) process.stdout.write("SPIN\\n"); // the start barrier: this looper is probing\n` +
     `  if (gap > 0) await new Promise((r) => setTimeout(r, gap));\n` +
     `}\n` +
-    `process.stdout.write("COUNT " + n + "\\n");\n` +
+    `process.stdout.write("COUNT " + n + " ERRORS " + errors + (first ? " FIRST " + first : "") + "\\n");\n` +
     `process.exit(0);\n`
 );
 const ACQUIRER = path.join(ROOT, "acquirer.mjs");
@@ -123,13 +127,15 @@ fs.writeFileSync(
 );
 const env = { ...process.env, HOME, USERPROFILE: HOME };
 
-function run(file: string, args: string[], envFor: NodeJS.ProcessEnv = env): { child: ChildProcess; out: Promise<string> } {
+function run(file: string, args: string[], envFor: NodeJS.ProcessEnv = env): { child: ChildProcess; out: Promise<string>; stderr: () => string } {
   const child = spawn(process.execPath, [file, ...args], { env: envFor, stdio: ["ignore", "pipe", "pipe"] });
   recorded.push(child);
   let buf = "";
+  let errBuf = "";
   child.stdout!.on("data", (d) => (buf += d));
+  child.stderr!.on("data", (d) => (errBuf += d));
   // "close", not "exit": a child can exit before its stdout is drained, and the LAST line (a COUNT, an OWNER) would be lost.
-  return { child, out: new Promise((res) => child.on("close", () => res(buf))) };
+  return { child, out: new Promise((res) => child.on("close", () => res(buf))), stderr: () => errBuf };
 }
 async function holding(db: string): Promise<{ kill: () => Promise<void> }> {
   const h = run(HOLDER, [db]);
@@ -285,8 +291,20 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     return {
       async stop() {
         fs.writeFileSync(stop, "");
-        const counts = (await Promise.all(loopers.map((x) => x.out))).map((o) => Number(/COUNT (\d+)/.exec(o)?.[1] ?? 0));
-        return { counts, seconds: (performance.now() - t0) / 1000 };
+        const outs = await Promise.all(loopers.map((x) => x.out));
+        const counts = outs.map((o) => Number(/COUNT (\d+)/.exec(o)?.[1] ?? 0));
+        // Per looper: its exit code, its error count and first error, and its first stderr line (a looper that died
+        // says why, instead of reading as a silent 0).
+        const detail = loopers.map((x, i) => {
+          const o = outs[i];
+          const died = /(UNCAUGHT|UNHANDLED) .*/.exec(o)?.[0];
+          const errs = /ERRORS (\d+)(?: FIRST (.*))?/.exec(o);
+          const firstErr = x.stderr().split(/\r?\n/).find(Boolean) ?? "";
+          return `#${i} exit=${x.child.exitCode ?? x.child.signalCode} count=${counts[i]} errors=${errs?.[1] ?? "?"}` +
+            (errs?.[2] ? ` first=[${errs[2].slice(0, 160)}]` : "") + (died ? ` died=[${died.slice(0, 160)}]` : "") +
+            (firstErr ? ` stderr=[${firstErr.slice(0, 160)}]` : "");
+        });
+        return { counts, detail, seconds: (performance.now() - t0) / 1000 };
       },
     };
   }
@@ -302,12 +320,13 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     fs.writeFileSync(db, "");
     const storm = await startLoopers(db, path.join(ROOT, "stop-gating"), GATING_GAP_MS);
     let results: string[] = [];
-    let rate = { counts: [] as number[], seconds: 0 };
+    let rate = { counts: [] as number[], detail: [] as string[], seconds: 0 };
     try {
       results = await acquireRounds(db);
     } finally {
       rate = await storm.stop();
     }
+    process.stdout.write(`gating probe loopers: ${rate.detail.join(" ; ")}\n`);
     const total = rate.counts.reduce((a, b) => a + b, 0);
     const perSecond = total / rate.seconds;
     process.stdout.write(`gating probe load: ${perSecond.toFixed(0)} probes/s achieved (target 160); acquirer ${results.join(" | ")}\n`);
@@ -320,12 +339,13 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     fs.writeFileSync(db, "");
     const storm = await startLoopers(db, path.join(ROOT, "stop-storm"), 0);
     let results: string[] = [];
-    let rate = { counts: [] as number[], seconds: 0 };
+    let rate = { counts: [] as number[], detail: [] as string[], seconds: 0 };
     try {
       results = await acquireRounds(db);
     } finally {
       rate = await storm.stop();
     }
+    process.stdout.write(`adversarial probe loopers (report-only): ${rate.detail.join(" ; ")}\n`);
     const starved = results.filter((x) => !x.startsWith("OWNER ")).length;
     // A known liveness limit, measured and reported; it never gates.
     process.stdout.write(
