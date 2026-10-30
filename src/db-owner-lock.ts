@@ -130,6 +130,15 @@ export function assertSingleLink(dbPath: string): void {
   }
 }
 
+/**
+ * The name a persist (or a restore swap) replaces: the caller's DIRECTORY with the DB's CANONICAL basename (the OS's own
+ * spelling). Replacing the caller's basename would, on a case-insensitive volume, give the file that spelling, so its
+ * lock key would drift. The directory is left as the caller spelled it (renaming into a directory never renames it).
+ */
+export function canonicalReplaceTarget(dbPath: string): string {
+  return path.join(path.dirname(dbPath), path.basename(fs.realpathSync.native(dbPath)));
+}
+
 /** macOS: the owner's lock file, a private dotfile beside the DB's canonical file (RULED). */
 export function lockFilePath(dbPath: string): string {
   const real = fs.realpathSync.native(dbPath);

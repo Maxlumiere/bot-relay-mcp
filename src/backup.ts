@@ -42,7 +42,7 @@ import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
 import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
 import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, assertNotOwnedByWasm, fileSha256, driverOf, configuredDriver, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
-import { acquireOwnerLock, lockKey } from "./db-owner-lock.js";
+import { acquireOwnerLock, canonicalReplaceTarget, lockKey } from "./db-owner-lock.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
@@ -682,7 +682,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       const newPath = srcDbPath + ".new";
       // INV-DB-01: replace the DB's CANONICAL name, never the caller's spelling (on a case-insensitive volume the
       // replaced file would take that spelling, and its lock key would drift).
-      const swapTarget = fs.existsSync(srcDbPath) ? fs.realpathSync.native(srcDbPath) : srcDbPath;
+      const swapTarget = fs.existsSync(srcDbPath) ? canonicalReplaceTarget(srcDbPath) : srcDbPath;
       fs.copyFileSync(extractedDbPath, newPath);
       try {
         fs.renameSync(newPath, swapTarget);

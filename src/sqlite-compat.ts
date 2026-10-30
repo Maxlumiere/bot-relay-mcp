@@ -22,7 +22,7 @@ import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
-import { acquireOwnerLock, assertSingleLink, holdsOwnerLock, isOwnedElsewhere, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
+import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, isOwnedElsewhere, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -202,9 +202,9 @@ class WasmDatabase implements CompatDatabase {
   /** INV-DB-01: the single-owner lock a WRITABLE handle holds; released when it closes. */
   ownerLock: OwnerLock | null = null;
   /**
-   * INV-DB-01: the DB's CANONICAL path, captured when the lock was taken. Every persist replaces THIS name: replacing
-   * the caller's spelling would, on a case-insensitive volume (Windows), give the file that spelling, so its key would
-   * drift and the owner would lose its own lock (and a later opener could be a second owner).
+   * INV-DB-01: the DB's name with its CANONICAL basename, captured when the lock was taken. Every persist replaces THIS
+   * name: replacing the caller's spelling would, on a case-insensitive volume (Windows), give the file that spelling, so
+   * its key would drift and the owner would lose its own lock (and a later opener could be a second owner).
    */
   canonicalPath: string | null = null;
   /** Writes since the last successful persist (a refused persist keeps them in memory, for the next one). */
@@ -657,7 +657,7 @@ export function initializeDb(dbPath: string, opts: { verifyCreated?: (dbPath: st
         throw err;
       }
       wdb.ownerLock = lock;
-      wdb.canonicalPath = fs.realpathSync.native(dbPath);
+      wdb.canonicalPath = canonicalReplaceTarget(dbPath);
       _initializedDb = wdb;
     } else {
       // INV-DB-01: a native process never opens a DB a wasm-driver process owns: checked BEFORE the open and again
