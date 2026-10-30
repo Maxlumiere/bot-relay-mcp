@@ -170,6 +170,17 @@ class WasmDatabase implements CompatDatabase {
   private db: any;
   private dbPath: string;
   private txDepth = 0;
+  /**
+   * Committed row changes not yet written back. sql.js's export() closes and reopens the database, which resets
+   * SQLite's total_changes(), so total_changes() read just BEFORE an export is the changes since the previous export:
+   * each write-back adds it (minus the changes rolled back meanwhile), and a successful one clears the tally. Schema
+   * changes are not counted by total_changes().
+   */
+  private unwrittenChanges = 0;
+  private rolledBackSinceExport = 0;
+  /** The committed changes a write-back that just failed left unwritten (what a refused final write-back loses). */
+  private unwrittenAtFailure = 0;
+  private closed = false;
 
   constructor(rawDb: any, dbPath: string) {
     this.db = rawDb;
@@ -235,16 +246,15 @@ class WasmDatabase implements CompatDatabase {
       } else {
         this.db.run(`SAVEPOINT ${spName}`);
       }
+      const changesAtStart = isOutermost ? this.totalChanges() : 0;
+      let result: T;
       try {
-        const result = fn();
+        result = fn();
         if (isOutermost) {
           this.db.run("COMMIT");
         } else {
           this.db.run(`RELEASE ${spName}`);
         }
-        this.txDepth--;
-        if (this.txDepth === 0) this.flush();
-        return result;
       } catch (err) {
         this.txDepth--;
         try {
@@ -256,15 +266,51 @@ class WasmDatabase implements CompatDatabase {
         } catch {
           // Transaction/savepoint may already be finalized.
         }
-        if (this.txDepth === 0) this.flush();
+        if (isOutermost) this.rolledBackSinceExport += this.totalChanges() - changesAtStart; // rolled back: never written
+        if (this.txDepth === 0) {
+          try {
+            this.flush();
+          } catch {
+            // The rolled-back image changes nothing that was committed; the original error is the one to report.
+          }
+        }
         throw err;
       }
+      // The write-back runs AFTER the try: a refused write-back used to fall into the catch above, decrementing txDepth a
+      // second time (to -1), so no later write was written back until close. The commit stays in memory, and goes out
+      // with the next successful write-back.
+      this.txDepth--;
+      if (this.txDepth === 0) this.flush();
+      return result;
     };
   }
 
+  /** SQLite's total_changes(): row changes made through this connection since it opened. */
+  private totalChanges(): number {
+    try {
+      const r = this.db.exec("SELECT total_changes()");
+      return Number(r[0]?.values?.[0]?.[0] ?? 0);
+    } catch {
+      return 0;
+    }
+  }
+
   close(): void {
-    this.flush();
-    this.db.close();
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      this.flush("close");
+    } catch (err) {
+      // Nothing is left to retry it: the committed changes not yet on disk are lost. Say so, loudly and by name.
+      const lost = this.unwrittenAtFailure;
+      const msg =
+        `wasm close: the final write-back was refused, so ${lost} row change(s) since the last successful write-back ` +
+        `were LOST (schema changes are not counted): ${(err as Error).message}`;
+      log.error(`[db-wasm] ${msg}`);
+      throw new Error(msg);
+    } finally {
+      this.db.close();
+    }
   }
 
   /**
@@ -273,6 +319,8 @@ class WasmDatabase implements CompatDatabase {
    * close() would export() and write the image THROUGH the escaped path.
    */
   discard(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.db.close();
   }
 
@@ -291,27 +339,47 @@ class WasmDatabase implements CompatDatabase {
   // are caught and retried — sql.js's wasm layer sometimes throws ErrnoError
   // on export() due to Emscripten virtual filesystem quirks that do not
   // affect the in-memory data integrity.
-  private flush(): void {
+  private flush(cause: "write" | "close" = "write"): void {
+    // The changes since the previous export, read BEFORE this export resets the counter; they join the tally only once
+    // the export completes (an export that throws may not have reset it, and they would be counted twice).
+    const sinceExport = Math.max(0, this.totalChanges() - this.rolledBackSinceExport);
     let data: Uint8Array;
     try {
       wasmExportHook?.();
       data = this.db.export();
     } catch (err: any) {
-      if (err?.name === "ErrnoError") {
-        // Emscripten FS error — the in-memory DB is still valid. Log but
-        // don't propagate: the data is safe in memory, just not flushed yet.
-        // Next write will retry the export.
-        log.warn("[db-wasm] export() hit Emscripten FS error (non-fatal, data safe in memory):", err);
+      this.unwrittenAtFailure = this.unwrittenChanges + sinceExport;
+      // An Emscripten FS error leaves the in-memory DB valid but NOTHING written. At close nothing is left to retry it,
+      // so it propagates (close reports the loss); otherwise the next write-back retries the export.
+      if (err?.name === "ErrnoError" && cause === "write") {
+        log.warn(
+          "[db-wasm] export() hit an Emscripten FS error, so nothing was written back: the change stays in memory and " +
+            "is written with the next successful write-back (it is lost if the process exits first):",
+          err
+        );
         return;
       }
       throw err;
     }
+    this.unwrittenChanges += sinceExport;
+    this.rolledBackSinceExport = 0;
+    this.unwrittenAtFailure = this.unwrittenChanges;
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
     // THIS write-to-disk failure IS propagated (disk full, permissions, etc.)
-    wasmPersistWrite(this.dbPath, Buffer.from(data));
+    try {
+      wasmPersistWrite(this.dbPath, Buffer.from(data));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? (err as Error).message;
+      throw new Error(
+        `wasm write-back failed: could not write ${this.dbPath} (${code}). The change stays in memory and is written ` +
+          `with the next successful write-back (it is lost if the process exits first); the file may be partially ` +
+          `written (an in-place write is not atomic).`
+      );
+    }
+    this.unwrittenChanges = 0;
   }
 }
 
@@ -602,10 +670,10 @@ export function discardInitializedDb(): void {
 }
 
 export function closeInitializedDb(): void {
-  if (_initializedDb) {
-    _initializedDb.close();
-    _initializedDb = null;
-    _driverUsed = null;
-    _initPromise = null;
-  }
+  const db = _initializedDb;
+  _initializedDb = null;
+  _driverUsed = null;
+  _initPromise = null;
+  // Cleared FIRST: a close that throws (a refused final write-back, reported by name) never leaves a stale handle.
+  db?.close();
 }
