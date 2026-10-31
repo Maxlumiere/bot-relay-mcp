@@ -72,19 +72,72 @@ async function createNativeDb(dbPath: string): Promise<CompatDatabase> {
 
 // --- Wasm driver (sql.js adapter) ---
 
+/** SQLite's total_changes() on a raw sql.js handle: row changes since it was opened (or since its last export). */
+function totalChangesOf(rawDb: any): number {
+  try {
+    const r = rawDb.exec("SELECT total_changes()");
+    return Number(r[0]?.values?.[0]?.[0] ?? 0);
+  } catch {
+    return 0;
+  }
+}
+
 class WasmStatement implements CompatStatement {
   constructor(private db: any, private sql: string) {}
 
+  /** Free a statement best-effort: a dead handle's statements are already finalized, and freeing must not replace the error. */
+  private static freeQuietly(stmt: any): void {
+    try {
+      stmt.free();
+    } catch {
+      /* already finalized */
+    }
+  }
+
+  /** A handle whose export failed after sql.js closed it refuses every use by name (never a raw sqlite error). */
+  private assertAlive(): void {
+    const dead = (this.db as any).__dead;
+    if (dead) throw dead;
+  }
+
+  /**
+   * A run() that changed rows writes them back even when it then FAILED (a multi-row INSERT OR FAIL commits the rows
+   * before the failing one). The SQL error stays the one thrown; a write-back that fails as well is logged by name.
+   * The read APIs (get/all/iterate) never write back: a write-back runs sql.js's export(), which FINALIZES every other
+   * statement of the handle, so a suspended iterator would break (Codex R2). A commit made through a read API (an
+   * INSERT … RETURNING) goes out with the next write or at close.
+   */
+  private writeBackIfChanged(changesBefore: number, sqlErr: unknown): void {
+    if (totalChangesOf(this.db) === changesBefore) return;
+    if (sqlErr === undefined) {
+      this._flush();
+      return;
+    }
+    try {
+      this._flush();
+    } catch (flushErr) {
+      log.warn(
+        `[db-wasm] a statement failed after changing rows, and writing them back failed too (${(flushErr as Error).message}); ` +
+          `they stay in memory and go out with the next successful write-back (lost if the process exits first).`
+      );
+    }
+  }
+
   run(...params: any[]): { changes: number; lastInsertRowid: number | bigint } {
+    this.assertAlive();
+    const before = totalChangesOf(this.db);
     const stmt = this.db.prepare(this.sql);
     try {
       if (params.length > 0) {
         stmt.bind(params);
       }
       stmt.step();
-    } finally {
-      stmt.free();
+    } catch (err) {
+      WasmStatement.freeQuietly(stmt);
+      this.writeBackIfChanged(before, err);
+      throw err;
     }
+    WasmStatement.freeQuietly(stmt);
     // v1.11.1: capture lastInsertRowid BEFORE flush (which may trigger
     // Emscripten FS operations that could interfere with the db state query).
     const changes = this.db.getRowsModified();
@@ -102,6 +155,7 @@ class WasmStatement implements CompatStatement {
   }
 
   get(...params: any[]): any {
+    this.assertAlive();
     const stmt = this.db.prepare(this.sql);
     try {
       if (params.length > 0) {
@@ -112,11 +166,12 @@ class WasmStatement implements CompatStatement {
       }
       return undefined;
     } finally {
-      stmt.free();
+      WasmStatement.freeQuietly(stmt);
     }
   }
 
   all(...params: any[]): any[] {
+    this.assertAlive();
     const stmt = this.db.prepare(this.sql);
     try {
       if (params.length > 0) {
@@ -128,22 +183,26 @@ class WasmStatement implements CompatStatement {
       }
       return results;
     } finally {
-      stmt.free();
+      WasmStatement.freeQuietly(stmt);
     }
   }
 
   /** Rows one at a time: the sql.js statement is stepped and each row yielded, never collected; freed when the loop ends or breaks. */
   *iterate(...params: any[]): IterableIterator<any> {
+    this.assertAlive();
     const stmt = this.db.prepare(this.sql);
     try {
       if (params.length > 0) {
         stmt.bind(params);
       }
-      while (stmt.step()) {
+      for (;;) {
+        // A suspended iterator resumes here: refuse by name if the handle died meanwhile (not a raw "Statement closed").
+        this.assertAlive();
+        if (!stmt.step()) break;
         yield stmt.getAsObject();
       }
     } finally {
-      stmt.free();
+      WasmStatement.freeQuietly(stmt);
     }
   }
 
@@ -155,10 +214,39 @@ class WasmStatement implements CompatStatement {
   }
 }
 
+let wasmPersistWrite: (dbPath: string, bytes: Buffer) => void = (dbPath, bytes) => fs.writeFileSync(dbPath, bytes);
+/** Test-only: replaces the wasm write-back's file write (e.g. with one that fails, like a full disk). */
+export function _setWasmPersistWriteForTests(fn: ((dbPath: string, bytes: Buffer) => void) | null): void {
+  wasmPersistWrite = fn ?? ((dbPath, bytes) => fs.writeFileSync(dbPath, bytes));
+}
+let wasmExport: (rawDb: any) => Uint8Array = (rawDb) => rawDb.export();
+/**
+ * Test-only: replaces sql.js's export() for the wasm write-back and serialize(). sql.js's export() CLOSES the database
+ * before reading its in-memory file, so a test that emulates a failed export closes the raw handle and then throws.
+ */
+export function _setWasmExportForTests(fn: ((rawDb: any) => Uint8Array) | null): void {
+  wasmExport = fn ?? ((rawDb) => rawDb.export());
+}
+
 class WasmDatabase implements CompatDatabase {
   private db: any;
   private dbPath: string;
   private txDepth = 0;
+  /**
+   * Committed row changes not yet written back. sql.js's export() closes and reopens the database, which resets
+   * SQLite's total_changes() (MEASURED), so total_changes() read just BEFORE an export is the changes since the previous
+   * export: every export (a write-back's or serialize()'s) adds it, minus what a ROLLBACK that SUCCEEDED undid since,
+   * and only a successful write-back clears the tally. Schema changes are not counted by total_changes().
+   */
+  private unwrittenChanges = 0;
+  private rolledBackSinceExport = 0;
+  /** Bumped by every export attempt: a rollback undid this transaction's changes only if no export ended it first. */
+  private exportEpoch = 0;
+  /** The committed changes a write-back that just failed left unwritten (what a refused final write-back loses). */
+  private unwrittenAtFailure = 0;
+  /** Set when an export failed after sql.js had closed the database: the handle is unusable from then on. */
+  private dead: Error | null = null;
+  private closed = false;
 
   constructor(rawDb: any, dbPath: string) {
     this.db = rawDb;
@@ -171,12 +259,34 @@ class WasmDatabase implements CompatDatabase {
     };
   }
 
+  private assertAlive(): void {
+    if (this.dead) throw this.dead;
+  }
+
   prepare(sql: string): CompatStatement {
+    this.assertAlive();
     return new WasmStatement(this.db, sql);
   }
 
   exec(sql: string): this {
-    this.db.run(sql);
+    this.assertAlive();
+    const before = this.totalChanges();
+    try {
+      this.db.run(sql);
+    } catch (err) {
+      // A script can commit statements before the one that fails: write those back, and keep the SQL error.
+      if (this.txDepth === 0 && this.totalChanges() !== before) {
+        try {
+          this.flush();
+        } catch (flushErr) {
+          log.warn(
+            `[db-wasm] a script failed after changing rows, and writing them back failed too (${(flushErr as Error).message}); ` +
+              `they stay in memory and go out with the next successful write-back (lost if the process exits first).`
+          );
+        }
+      }
+      throw err;
+    }
     // v2.0 beta: respect txDepth so exec() inside a transaction doesn't flush
     // mid-way. Calling export() between DDL statements inside an open
     // transaction loses the in-memory state that hasn't yet been committed.
@@ -185,6 +295,7 @@ class WasmDatabase implements CompatDatabase {
   }
 
   pragma(source: string, _options?: any): any {
+    this.assertAlive();
     // Intercept WAL mode — wasm operates in-memory with write-back. WAL,
     // DELETE, and other journal modes that touch the filesystem are meaningless
     // (and may error on Emscripten's virtual FS). Simply no-op and return the
@@ -216,44 +327,90 @@ class WasmDatabase implements CompatDatabase {
   // transaction within a transaction").
   transaction<T>(fn: () => T): () => T {
     return () => {
+      this.assertAlive();
       const isOutermost = this.txDepth === 0;
       const spName = `sp_${this.txDepth}`;
-      this.txDepth++;
+      // The depth counts a level only once its BEGIN/SAVEPOINT SUCCEEDED (a SAVEPOINT refused while a statement is in
+      // progress used to leave the depth one too high, so nothing was written back again).
       if (isOutermost) {
         this.db.run("BEGIN TRANSACTION");
       } else {
         this.db.run(`SAVEPOINT ${spName}`);
       }
+      this.txDepth++;
+      const changesAtStart = isOutermost ? this.totalChanges() : 0;
+      const epochAtStart = this.exportEpoch;
+      let result: T;
       try {
-        const result = fn();
+        result = fn();
         if (isOutermost) {
           this.db.run("COMMIT");
         } else {
           this.db.run(`RELEASE ${spName}`);
         }
-        this.txDepth--;
-        if (this.txDepth === 0) this.flush();
-        return result;
       } catch (err) {
         this.txDepth--;
+        let rolledBack = false;
         try {
           if (isOutermost) {
             this.db.run("ROLLBACK");
           } else {
             this.db.run(`ROLLBACK TO ${spName}`);
           }
+          rolledBack = true;
         } catch {
           // Transaction/savepoint may already be finalized.
         }
-        if (this.txDepth === 0) this.flush();
+        // Subtract only what a ROLLBACK actually undid: it succeeded, and no export ended the transaction first (an
+        // export closes and reopens sql.js's database). Otherwise subtract nothing: an overcount, never an undercount.
+        if (isOutermost && rolledBack && this.exportEpoch === epochAtStart) {
+          this.rolledBackSinceExport += Math.max(0, this.totalChanges() - changesAtStart);
+        }
+        if (this.txDepth === 0) {
+          try {
+            this.flush();
+          } catch {
+            // The rolled-back image changes nothing that was committed; the original error is the one to report.
+          }
+        }
         throw err;
       }
+      // The write-back runs AFTER the try: a refused write-back used to fall into the catch above, decrementing txDepth a
+      // second time (to -1), so no later write was written back until close. The commit stays in memory, and goes out
+      // with the next successful write-back.
+      this.txDepth--;
+      if (this.txDepth === 0) this.flush();
+      return result;
     };
   }
 
+  /** SQLite's total_changes(): row changes made through this connection since it opened, or since its last export. */
+  private totalChanges(): number {
+    return totalChangesOf(this.db);
+  }
+
   close(): void {
-    this.flush();
-    this.db.close();
+    if (this.closed) return;
+    let first: Error | null = null;
+    try {
+      this.flush("close");
+    } catch (err) {
+      // Nothing is left to retry it: the committed changes not yet on disk are lost. Say so, loudly and by name.
+      const msg =
+        `wasm close: the final write-back was refused, so ${this.unwrittenAtFailure} row change(s) since the last ` +
+        `successful write-back were LOST (schema changes are not counted): ${(err as Error).message}`;
+      log.error(`[db-wasm] ${msg}`);
+      first = new Error(msg);
+    }
+    // The cleanup never throws OVER the loss: its error is attached to the first one.
+    try {
+      this.db.close();
+      this.closed = true;
+    } catch (cleanupErr) {
+      if (first) first.message += ` (closing the handle failed too: ${(cleanupErr as Error).message})`;
+      else first = cleanupErr as Error;
+    }
+    if (first) throw first;
   }
 
   /**
@@ -262,7 +419,9 @@ class WasmDatabase implements CompatDatabase {
    * close() would export() and write the image THROUGH the escaped path.
    */
   discard(): void {
+    if (this.closed) return;
     this.db.close();
+    this.closed = true;
   }
 
   /**
@@ -270,36 +429,78 @@ class WasmDatabase implements CompatDatabase {
    * synchronously from memory with no filesystem touch. Tear-proof by
    * construction (unlike copying the write-back file, whose flush is a bare
    * non-atomic fs.writeFileSync). Backs `snapshotToFile` on the wasm driver.
+   * Its export resets SQLite's change counter, so it goes through the same tally as a write-back.
    */
   serialize(): Uint8Array {
-    return this.db.export();
+    this.assertAlive();
+    return this.exportTallied();
   }
 
-  // v1.11.1: flush propagates REAL errors (fail-closed for disk-write
-  // failures like ENOSPC). Emscripten internal FS errors from db.export()
-  // are caught and retried — sql.js's wasm layer sometimes throws ErrnoError
-  // on export() due to Emscripten virtual filesystem quirks that do not
-  // affect the in-memory data integrity.
-  private flush(): void {
+  /**
+   * sql.js's export(), with the loss tally kept across its counter reset. sql.js closes SQLite BEFORE it reads the
+   * in-memory file, so an export that fails can leave the handle CLOSED: then it is marked dead (every later use
+   * refused by name) and the failure is named with the changes lost. Reopening from the in-memory file needs sql.js
+   * internals it does not expose (a stated residual). Never a silent success.
+   */
+  private exportTallied(): Uint8Array {
+    this.assertAlive();
+    const sinceExport = Math.max(0, this.totalChanges() - this.rolledBackSinceExport);
+    this.exportEpoch++;
     let data: Uint8Array;
     try {
-      data = this.db.export();
-    } catch (err: any) {
-      if (err?.name === "ErrnoError") {
-        // Emscripten FS error — the in-memory DB is still valid. Log but
-        // don't propagate: the data is safe in memory, just not flushed yet.
-        // Next write will retry the export.
-        log.warn("[db-wasm] export() hit Emscripten FS error (non-fatal, data safe in memory):", err);
-        return;
+      data = wasmExport(this.db);
+    } catch (err) {
+      // An export that throws may not have reset the counter: its changes join the count only here, on failure.
+      this.unwrittenAtFailure = this.unwrittenChanges + sinceExport;
+      let alive = true;
+      try {
+        this.db.exec("SELECT 1");
+      } catch {
+        alive = false;
       }
-      throw err;
+      if (!alive) {
+        this.dead = new Error(
+          `wasm DB handle is unusable: an export failed after sql.js had closed the database (${(err as Error).message}); ` +
+            `${this.unwrittenAtFailure} row change(s) since the last successful write-back were LOST. Reopen the database ` +
+            `(restart the relay) to continue from its file.`
+        );
+        (this.db as any).__dead = this.dead;
+        log.error(`[db-wasm] ${this.dead.message}`);
+        throw this.dead;
+      }
+      throw new Error(
+        `wasm write-back failed: export() failed (${(err as Error).message}), so nothing was written; the change stays ` +
+          `in memory and is written with the next successful write-back (it is lost if the process exits first).`
+      );
     }
+    this.unwrittenChanges += sinceExport;
+    this.rolledBackSinceExport = 0;
+    return data;
+  }
+
+  // flush propagates every failure (fail-closed): a disk write (ENOSPC, permissions) and an export alike. An export
+  // error used to be swallowed as "data safe in memory", but sql.js's export() closes SQLite before reading its
+  // in-memory file, so a failed export can leave the handle closed: nothing about it was safe.
+  private flush(cause: "write" | "close" = "write"): void {
+    void cause;
+    const data = this.exportTallied();
+    this.unwrittenAtFailure = this.unwrittenChanges;
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
     // THIS write-to-disk failure IS propagated (disk full, permissions, etc.)
-    fs.writeFileSync(this.dbPath, Buffer.from(data));
+    try {
+      wasmPersistWrite(this.dbPath, Buffer.from(data));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? (err as Error).message;
+      throw new Error(
+        `wasm write-back failed: could not write ${this.dbPath} (${code}). The change stays in memory and is written ` +
+          `with the next successful write-back (it is lost if the process exits first); the file may be partially ` +
+          `written (an in-place write is not atomic).`
+      );
+    }
+    this.unwrittenChanges = 0;
   }
 }
 
@@ -590,10 +791,10 @@ export function discardInitializedDb(): void {
 }
 
 export function closeInitializedDb(): void {
-  if (_initializedDb) {
-    _initializedDb.close();
-    _initializedDb = null;
-    _driverUsed = null;
-    _initPromise = null;
-  }
+  const db = _initializedDb;
+  _initializedDb = null;
+  _driverUsed = null;
+  _initPromise = null;
+  // Cleared FIRST: a close that throws (a refused final write-back, reported by name) never leaves a stale handle.
+  db?.close();
 }

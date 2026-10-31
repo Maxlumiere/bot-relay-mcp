@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Wasm driver: a failed write-back no longer stops every later write-back, and a loss at close is reported
+
+- **Fixed:** under the wasm driver, when writing the database back to its file failed inside a transaction (for example, a full disk), the driver lost count of its open transactions. After that, **no later write was written to disk until the relay closed the database**, and a crash before then lost them all, silently.
+- **Now** a failed write-back keeps the change in memory, and the next successful write-back writes it. The error says so, and that the file may be partially written: the wasm write-back is an in-place write, not an atomic one.
+- **A write-back that fails when the database closes** is reported by name, with the number of row changes that were lost (there is nothing left to retry it). It used to surface as a bare error, or, for an export error from the wasm layer, not at all. An error from closing the handle no longer replaces that report.
+- **A failed export is an error, never a warning.** sql.js's export closes the database before reading it back, so a failed export can leave the handle closed. It is then marked unusable: every later use is refused by name with the changes lost, and you restart the relay to reopen the database from its file.
+- **More writes are written back:**
+  - a script or a statement that fails after committing rows (`INSERT OR FAIL`);
+  - a transaction whose nested savepoint could not start (that used to stop all later write-backs).
+- **Commits made through a read** (`get`, `all` or `iterate` on an `INSERT … RETURNING`) are written back with the next write or at close, not at once: a write-back closes and reopens sql.js's database, which would break any other read still in progress. A read in progress when the database becomes unusable is refused by name.
+
 ### `relay backup` never changes the DB it copies
 
 - **Fixed:** with no DB connection open in the process, `relay backup` opened the DB the way the daemon does, running every migration on it. So a backup could change the DB it was copying (an older DB was upgraded; webhook secrets stored without an encryption prefix were rewritten), and under a broken keyring that migration aborted the backup. Now the export opens the DB **read-only** and runs nothing on it; the manifest records the DB's own schema version. When the relay already has the DB open, the export still snapshots through that connection.
