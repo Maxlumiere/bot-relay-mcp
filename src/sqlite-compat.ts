@@ -73,19 +73,19 @@ export function _resetDriverWarningForTests(): void {
 }
 function getDriverType(): SqliteDriver {
   const { value, configPath, unreadable } = readInstanceSqliteDriver();
-  if (unreadable !== undefined && !driverUnreadableWarned) {
-    driverUnreadableWarned = true;
-    log.warn(
-      `[db] could not read this instance's sqlite_driver from ${configPath} (${unreadable}); using native, as before ` +
-        `this setting existed. Fix or remove that config.json.`
-    );
-  }
   const problem = instanceSqliteDriverProblem(value, configPath);
   if (problem) throw new InvalidConfigError(problem);
   const instanceDriver: SqliteDriver = "native"; // the only instance value accepted in this release
   const raw = process.env.RELAY_SQLITE_DRIVER;
+  const requested: SqliteDriver = !raw ? instanceDriver : raw === "wasm" ? "wasm" : "native";
+  if (unreadable !== undefined && !driverUnreadableWarned) {
+    driverUnreadableWarned = true;
+    log.warn(
+      `[db] could not read this instance's sqlite_driver from ${configPath} (${unreadable}); using ${requested}, as ` +
+        `before this setting existed. Fix or remove that config.json.`
+    );
+  }
   if (!raw) return instanceDriver;
-  const requested: SqliteDriver = raw === "wasm" ? "wasm" : "native";
   if (requested !== instanceDriver && !driverOverrideWarned) {
     driverOverrideWarned = true;
     log.warn(
@@ -804,6 +804,14 @@ export function driverOf(db: CompatDatabase): SqliteDriver {
  */
 export function configuredDriver(): SqliteDriver {
   return getDriverType();
+}
+
+/**
+ * INV-DB-01 slice 1: refuse an instance driver this release does not accept, BEFORE any filesystem effect of a DB open
+ * (db.initializeDb() calls it before it creates the DB's parent directory). Warns as getDriverType() does.
+ */
+export function assertInstanceDriverAccepted(): void {
+  getDriverType();
 }
 
 /**

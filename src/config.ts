@@ -137,7 +137,18 @@ export function readInstanceSqliteDriver(): { value: unknown; configPath: string
   } catch (err) {
     return { value: undefined, configPath: "(the instance config path could not be resolved)", unreadable: (err as Error).message };
   }
-  if (!fs.existsSync(configPath)) return { value: undefined, configPath };
+  // stat FIRST: only an absent file (ENOENT) is "no config", silently, as before. A denied parent (EACCES, EPERM,
+  // ENOTDIR) is named. A path that is not a regular file (a FIFO, a terminal, /dev/stdin, a directory) is never read:
+  // a read could block forever on something that is not a config file.
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(configPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { value: undefined, configPath };
+    return { value: undefined, configPath, unreadable: code ?? (err as Error).message };
+  }
+  if (!st.isFile()) return { value: undefined, configPath, unreadable: "not a regular file, so it was not read" };
   try {
     const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
     return { value: parsed?.sqlite_driver, configPath };
@@ -360,9 +371,19 @@ export function validateConfigAndEnv(config: RelayConfig): void {
     errors.push(err instanceof Error ? err.message : String(err));
   }
 
-  // INV-DB-01 slice 1: the instance's SQLite driver.
-  const driverProblem = instanceSqliteDriverProblem((config as { sqlite_driver?: unknown }).sqlite_driver, getConfigPath());
-  if (driverProblem) errors.push(driverProblem);
+  // INV-DB-01 slice 1: the instance's SQLite driver. The config path is resolved only for a value to refuse, so a
+  // config with no sqlite_driver validates exactly as it did before this field existed.
+  const declaredDriver = (config as { sqlite_driver?: unknown }).sqlite_driver;
+  if (declaredDriver !== undefined && declaredDriver !== "native") {
+    let where: string;
+    try {
+      where = getConfigPath();
+    } catch {
+      where = "the instance config";
+    }
+    const driverProblem = instanceSqliteDriverProblem(declaredDriver, where);
+    if (driverProblem) errors.push(driverProblem);
+  }
 
   // Log level
   const logLevel = (process.env.RELAY_LOG_LEVEL || "").toLowerCase();
