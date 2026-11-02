@@ -137,23 +137,27 @@ export function readInstanceSqliteDriver(): { value: unknown; configPath: string
   } catch (err) {
     return { value: undefined, configPath: "(the instance config path could not be resolved)", unreadable: (err as Error).message };
   }
-  // stat FIRST: only an absent file (ENOENT) is "no config", silently, as before. A denied parent (EACCES, EPERM,
-  // ENOTDIR) is named. A path that is not a regular file (a FIFO, a terminal, /dev/stdin, a directory) is never read:
-  // a read could block forever on something that is not a config file.
-  let st: fs.Stats;
+  // ONE descriptor for the inspection and the read (no stat-then-read race). It is opened NON-BLOCKING, so a FIFO with no
+  // writer (or a terminal) returns at once instead of stalling a DB open that worked before this field existed. Only an
+  // absent file (ENOENT) is "no config", silently, as before; a denied parent (EACCES, EPERM, ENOTDIR) is named; a
+  // descriptor that is not a regular file is never read. A symlinked config is legitimate and followed.
+  // Not addressed (pre-existing, ASSUMED): an open that blocks on a dead network mount.
+  let fd: number;
   try {
-    st = fs.statSync(configPath);
+    fd = fs.openSync(configPath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return { value: undefined, configPath };
     return { value: undefined, configPath, unreadable: code ?? (err as Error).message };
   }
-  if (!st.isFile()) return { value: undefined, configPath, unreadable: "not a regular file, so it was not read" };
   try {
-    const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
+    if (!fs.fstatSync(fd).isFile()) return { value: undefined, configPath, unreadable: "not a regular file, so it was not read" };
+    const parsed = JSON.parse(fs.readFileSync(fd, "utf-8")) as Record<string, unknown> | null;
     return { value: parsed?.sqlite_driver, configPath };
   } catch (err) {
     return { value: undefined, configPath, unreadable: (err as NodeJS.ErrnoException).code ?? (err as Error).message };
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
