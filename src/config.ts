@@ -122,6 +122,42 @@ export function configPathOverride(): string | undefined {
   return process.env.RELAY_CONFIG_PATH || undefined;
 }
 
+/**
+ * INV-DB-01 slice 1: the SQLite driver is a property of the INSTANCE: `sqlite_driver` in its config.json (the one
+ * getConfigPath() resolves), default native. Read straight from the file, so every process that opens the instance's
+ * DB reads the same value. In this release only "native" is accepted: "wasm" is refused as not yet supported (the
+ * single-owner guarantee it needs ships in a later slice), and any other value is refused by name.
+ */
+export function readInstanceSqliteDriver(): { value: unknown; configPath: string; unreadable?: string } {
+  // A config that cannot be read must not break a DB open that worked before this field existed: the caller falls
+  // back to native and says so (unreadable). Only a READABLE value this release refuses is thrown.
+  let configPath: string;
+  try {
+    configPath = getConfigPath();
+  } catch (err) {
+    return { value: undefined, configPath: "(the instance config path could not be resolved)", unreadable: (err as Error).message };
+  }
+  if (!fs.existsSync(configPath)) return { value: undefined, configPath };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
+    return { value: parsed?.sqlite_driver, configPath };
+  } catch (err) {
+    return { value: undefined, configPath, unreadable: (err as NodeJS.ErrnoException).code ?? (err as Error).message };
+  }
+}
+
+/** Why an instance's sqlite_driver value is refused in this release, or null when it is accepted. */
+export function instanceSqliteDriverProblem(value: unknown, configPath: string): string | null {
+  if (value === undefined || value === "native") return null;
+  if (value === "wasm") {
+    return (
+      `sqlite_driver "wasm" is not yet supported for an instance (${configPath}): remove it (native is the default). ` +
+      `To run the wasm driver today, keep RELAY_SQLITE_DRIVER=wasm in the environment.`
+    );
+  }
+  return `sqlite_driver ${JSON.stringify(value)} is not valid (${configPath}): use "native" (the default), or remove it.`;
+}
+
 export class InvalidConfigError extends Error {
   constructor(message: string) {
     super(message);
@@ -323,6 +359,10 @@ export function validateConfigAndEnv(config: RelayConfig): void {
   } catch (err) {
     errors.push(err instanceof Error ? err.message : String(err));
   }
+
+  // INV-DB-01 slice 1: the instance's SQLite driver.
+  const driverProblem = instanceSqliteDriverProblem((config as { sqlite_driver?: unknown }).sqlite_driver, getConfigPath());
+  if (driverProblem) errors.push(driverProblem);
 
   // Log level
   const logLevel = (process.env.RELAY_LOG_LEVEL || "").toLowerCase();

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### The SQLite driver becomes a property of the instance (`sqlite_driver`)
+
+- **Added:** a `sqlite_driver` key in the instance's `config.json` (default `native`), read before any database open and validated at startup.
+- **In this release only `"native"` is accepted.** `"wasm"` is refused by name as not yet supported (the single-owner guarantee a wasm instance needs comes later), and any other value is refused by name.
+- **`RELAY_SQLITE_DRIVER` still works as before.** When it disagrees with the instance's driver, including the default, the relay logs a warning once per process: a later release will require converting the instance (`relay db convert-journal`). Nothing needs doing until then.
+
 ### Wasm driver: a failed write-back no longer stops every later write-back, and a loss at close is reported
 
 - **Fixed:** under the wasm driver, when writing the database back to its file failed inside a transaction (for example, a full disk), the driver lost count of its open transactions. After that, **no later write was written to disk until the relay closed the database**, and a crash before then lost them all, silently.

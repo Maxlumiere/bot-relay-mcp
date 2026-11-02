@@ -51,6 +51,12 @@ RELAY_SQLITE_DRIVER=wasm RELAY_TRANSPORT=http node dist/index.js
 
 That's it. The relay initializes sql.js instead of better-sqlite3, runs the same schema migrations, serves the same 36 tools.
 
+### The instance's driver (`sqlite_driver`)
+
+The driver is becoming a property of the **instance**: a `sqlite_driver` key in the instance's `config.json` (default `native`). In this release only `"native"` is accepted there: `"wasm"` is refused as not yet supported, because the single-owner guarantee a wasm instance needs ships in a later release. Until then, run the wasm driver with `RELAY_SQLITE_DRIVER=wasm` as above.
+
+That environment override still works, but when it disagrees with the instance's driver (including the default `native`), the relay logs a warning once per process: a later release will require the instance to be converted (`relay db convert-journal`). Nothing needs doing until then.
+
 ## How to switch back
 
 ```bash
