@@ -211,6 +211,46 @@ describe("INV-DB-01 slice 1: the driver is an instance property", () => {
     expect(out).toMatch(/OPENED native/);
   }, 30_000);
 
+  it.skipIf(process.platform === "win32")("a config swapped to a FIFO AFTER its check (a stale stat) does not stall a DB open: inspection and read use one descriptor", async () => {
+    const fifo = path.join(caseDir, "swapped.fifo");
+    const regular = path.join(caseDir, "regular.json");
+    fs.writeFileSync(regular, "{}", { mode: 0o600 });
+    const mk = await new Promise<number | null>((res) => spawn("mkfifo", [fifo]).on("exit", res));
+    expect(mk, "mkfifo").toBe(0);
+    // The race, made deterministic: the PATH check (statSync) reports a regular file, while the path IS a FIFO, as if it
+    // was swapped between the check and the read. A read that trusts the check blocks forever (in a child, deadline).
+    const script = path.join(caseDir, "swapped.mjs");
+    fs.writeFileSync(
+      script,
+      `import fs from "fs";\n` +
+        `const real = fs.statSync;\n` +
+        `fs.statSync = (p, o) => (String(p) === ${JSON.stringify(fifo)} ? real(${JSON.stringify(regular)}, o) : real(p, o));\n` +
+        `const c = await import(${JSON.stringify(pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "sqlite-compat.js")).href)});\n` +
+        `await c.initializeDb(":memory:");\n` +
+        `process.stdout.write("OPENED " + c.getActiveDriver() + "\\n");\n` +
+        `process.exit(0);\n`
+    );
+    const child = spawn(process.execPath, [script], {
+      env: { ...process.env, RELAY_CONFIG_PATH: fifo, HOME: caseDir, USERPROFILE: caseDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout!.on("data", (d) => (out += d));
+    child.stderr!.on("data", (d) => (err += d));
+    const finished = await new Promise<boolean>((res) => {
+      const t = setTimeout(() => res(false), 10_000);
+      child.on("close", () => {
+        clearTimeout(t);
+        res(true);
+      });
+    });
+    if (!finished) child.kill("SIGKILL");
+    expect(finished, "the DB open returned (the read did not trust the stale check)").toBe(true);
+    expect(out).toMatch(/OPENED native/);
+    expect(err, "the fallback is named").toMatch(/could not read this instance's sqlite_driver from .*swapped\.fifo .*not a regular file/);
+  }, 30_000);
+
   it("RELAY_SQLITE_DRIVER=native with no instance value: no warning (known-good twin)", async () => {
     process.env.RELAY_SQLITE_DRIVER = "native";
     const warn = vi.spyOn(log, "warn");
