@@ -19,7 +19,10 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
+import { spawn } from "child_process";
+import { pathToFileURL } from "url";
 import * as compat from "../src/sqlite-compat.js";
+import * as db from "../src/db.js";
 import * as config from "../src/config.js";
 import { log } from "../src/logger.js";
 
@@ -43,6 +46,7 @@ beforeEach(() => {
   (compat as unknown as { _resetDriverWarningForTests?: () => void })._resetDriverWarningForTests?.();
 });
 afterEach(() => {
+  db.closeDb();
   compat.closeInitializedDb();
   vi.restoreAllMocks();
   for (const [k, v] of Object.entries(saved)) {
@@ -133,6 +137,79 @@ describe("INV-DB-01 slice 1: the driver is an instance property", () => {
       }
     }
   });
+
+  it.skipIf(!canChmod)("a config.json under a DENIED parent directory (stat EACCES) is not \"missing\": native, with the named warning", async () => {
+    const denied = path.join(caseDir, "denied");
+    writeConfig(path.join(denied, "config.json"), { sqlite_driver: "wasm" });
+    process.env.RELAY_CONFIG_PATH = path.join(denied, "config.json");
+    fs.chmodSync(denied, 0o000);
+    const warn = vi.spyOn(log, "warn");
+    try {
+      await compat.initializeDb(dbPath);
+      expect(compat.getActiveDriver()).toBe("native");
+      expect(driverWarnings(warn).some((m) => /could not read this instance's sqlite_driver from .*(EACCES|EPERM)/.test(m)), "named, never silent").toBe(true);
+    } finally {
+      fs.chmodSync(denied, 0o700);
+    }
+  });
+
+  it("the fallback warning names the EFFECTIVE driver: an unparseable config + RELAY_SQLITE_DRIVER=wasm says wasm", async () => {
+    fs.writeFileSync(process.env.RELAY_CONFIG_PATH!, "{ not json", { mode: 0o600 });
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const warn = vi.spyOn(log, "warn");
+    await compat.initializeDb(dbPath);
+    expect(compat.getActiveDriver()).toBe("wasm");
+    const fallback = driverWarnings(warn).find((m) => /could not read this instance's sqlite_driver/.test(m));
+    expect(fallback, "the fallback warning").toBeTruthy();
+    expect(fallback).toMatch(/using wasm/);
+    expect(fallback).not.toMatch(/using native/);
+  });
+
+  it("db.initializeDb() checks the driver BEFORE creating the DB's parent: a refused config leaves no directory behind", async () => {
+    writeConfig(process.env.RELAY_CONFIG_PATH!, { sqlite_driver: "wasm" });
+    const parent = path.join(caseDir, "missing", "sub");
+    process.env.RELAY_DB_PATH = path.join(parent, "relay.db");
+    db.closeDb();
+    await expect(db.initializeDb()).rejects.toThrow(/not yet supported/);
+    expect(fs.existsSync(path.join(caseDir, "missing")), "the DB's parent was created before the refusal").toBe(false);
+  });
+
+  it("validateConfigAndEnv(DEFAULT_CONFIG) with an instance resolution that FAILS still passes when no sqlite_driver is set (as at the base)", () => {
+    delete process.env.RELAY_CONFIG_PATH;
+    process.env.RELAY_INSTANCE_ID = "bad/id"; // fails INSTANCE_ID_RE: the resolution throws
+    expect(() => config.validateConfigAndEnv(config.DEFAULT_CONFIG)).not.toThrow();
+  });
+
+  it.skipIf(process.platform === "win32")("a config path that BLOCKS on read (a FIFO with no writer) does not stall a DB open: it returns promptly, native", async () => {
+    const fifo = path.join(caseDir, "config.fifo");
+    const mk = await new Promise<number | null>((res) => spawn("mkfifo", [fifo]).on("exit", res));
+    expect(mk, "mkfifo").toBe(0);
+    // In a CHILD process with a deadline: on the old code the read blocks forever, and must not hang this worker.
+    const script = path.join(caseDir, "open.mjs");
+    fs.writeFileSync(
+      script,
+      `const c = await import(${JSON.stringify(pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "sqlite-compat.js")).href)});\n` +
+        `await c.initializeDb(":memory:");\n` +
+        `process.stdout.write("OPENED " + c.getActiveDriver() + "\\n");\n` +
+        `process.exit(0);\n`
+    );
+    const child = spawn(process.execPath, [script], {
+      env: { ...process.env, RELAY_CONFIG_PATH: fifo, HOME: caseDir, USERPROFILE: caseDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout!.on("data", (d) => (out += d));
+    const finished = await new Promise<boolean>((res) => {
+      const t = setTimeout(() => res(false), 10_000);
+      child.on("close", () => {
+        clearTimeout(t);
+        res(true);
+      });
+    });
+    if (!finished) child.kill("SIGKILL");
+    expect(finished, "the DB open returned (it did not block on the FIFO)").toBe(true);
+    expect(out).toMatch(/OPENED native/);
+  }, 30_000);
 
   it("RELAY_SQLITE_DRIVER=native with no instance value: no warning (known-good twin)", async () => {
     process.env.RELAY_SQLITE_DRIVER = "native";
