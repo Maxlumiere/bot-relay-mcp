@@ -8,130 +8,222 @@ on:
   # branch — e.g. a PR stacked on an unmerged arc) NEVER triggered CI and shipped
   # with an EMPTY status rollup that reads as "clean/mergeable" in the UI. That is
   # a silent hole in the pre-merge gate (an auth-adjacent PR ran zero CI). `['**']`
-  # matches any base. NOTE: for `pull_request`, GitHub uses the BASE branch's copy
-  # of this workflow, so this protects every PR whose base branch carries this file
-  # (i.e. any branch cut from main after this lands). The whole workflow — the
-  # `test` job incl. the extension `test:unit` step AND the `smoke` job — runs
-  # under this one trigger, so widening it covers the full gate, not a subset.
+  # matches any base.
+  # ready_for_review / labeled: a draft runs Linux only; marking it ready (or adding the `ci-full` label)
+  # starts the macOS, Windows and timing-bars jobs.
   pull_request:
     branches: ['**']
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  # Nightly on main: the full 3-OS run plus the gate's sequential sweep, as on a push to main.
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch: {}
+
+# A READY pull request cancels its superseded run when a new commit lands. Drafts never cancel (a RED pushed
+# on a draft keeps its run), and neither do pushes to main or the nightly. Those runs each get their OWN group
+# (the run id): a shared group without cancel-in-progress would queue them behind each other and drop the
+# queued middle ones.
+concurrency:
+  group: ci-${{ (github.event_name == 'pull_request' && !github.event.pull_request.draft) && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}
+
+permissions:
+  contents: read
 
 jobs:
-  test:
-    name: Test (Node ${{ matrix.node }})
+  # What this run must cover. full=false on a DRAFT pull request (unless it has the `ci-full` label) and on a
+  # DOCS-ONLY change: then the macOS, Windows and timing-bars jobs (and, for docs-only, the smoke) are SKIPPED
+  # by a job-level `if:`. A job skipped by `if:` reports Success; a workflow skipped by `paths:` would leave
+  # required checks Pending, so there is no workflow-level path filter. The Linux shards ALWAYS run: about 20
+  # test files read Markdown (README, CHANGELOG, docs/), so a docs-only change can still break a test.
+  changes:
+    name: Scope
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.scope.outputs.docs_only }}
+      full: ${{ steps.scope.outputs.full }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Decide the scope
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
+        run: node scripts/ci-scope.mjs >> "$GITHUB_OUTPUT"
+
+  # The Linux suite, split by FILE across 4 runners. "Test (Node 22)" below merges the blob reports and proves
+  # the shards cover the whole suite (no file dropped, none run twice).
+  shard:
+    name: Test shard ${{ matrix.shard }}/4 (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # v2.7.3: Node 18 dropped — vitest@4 requires Node 20+.
-        # #182 (2026-09): Node 20 dropped too. It went EOL 2026-04-30, and
-        # better-sqlite3 13 (a native module) requires Node >=22; engines.node is
-        # now ">=22.0.0". Testing a runtime we no longer support would make green
-        # meaningless. Users on Node 18/20 stay pinned to the last 3.x line.
+        # #182 (2026-09): Node 20 dropped. It went EOL 2026-04-30, and better-sqlite3 13 (a native module)
+        # requires Node >=22; engines.node is ">=22.0.0". Testing a runtime we no longer support would make
+        # green meaningless.
         node: ['22']
+        shard: [1, 2, 3, 4]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
       - name: Setup Node.js ${{ matrix.node }}
         uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: 'npm'
-
       - name: Install dependencies
         run: npm ci
-
       - name: Build
         run: npm run build
+      # The drift-out guards (tests/v2-6-tether-transport-diagnostics.test.ts, tests/v2-7-tether-reconnection-
+      # options.test.ts) read the SHIPPED extensions/vscode/out/extension.js: build the esbuild bundle first.
+      - name: Build VSCode extension bundle (the drift-out guards read the shipped out/extension.js)
+        run: |
+          cd extensions/vscode
+          npm install
+          npm run bundle
+      - name: Run test shard ${{ matrix.shard }}/4
+        # #235: cap workers so the timing-sensitive spawn tests are not CPU-starved on a 4-vCPU runner (they
+        # each spawn a daemon subprocess).
+        # blob: merged by "Test (Node 22)" into the suite's totals; json: the files this shard RAN, for the
+        # parity check there.
+        run: npx vitest run --shard=${{ matrix.shard }}/4 --maxWorkers=2 --reporter=default --reporter=blob --reporter=json --outputFile.json=.vitest-shard/shard-${{ matrix.shard }}.json
+      - name: Upload the shard's reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-shard-${{ matrix.shard }}
+          path: |
+            .vitest-reports/
+            .vitest-shard/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
 
+  # Linux checks that are not the vitest suite: types, the extension's unit suite, the dashboard's suite, audit.
+  checks:
+    name: Checks (Node 22)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Build
+        run: npm run build
       - name: Type check
         run: npx tsc --noEmit
-
-      # v2.7 Tether Phase 6 hotfix — drift-out guards
-      # (tests/v2-6-tether-transport-diagnostics.test.ts +
-      # tests/v2-7-tether-reconnection-options.test.ts) assert against the
-      # compiled VSIX-shipped artifact at extensions/vscode/out/extension.js.
-      # The local pre-publish gate (scripts/pre-publish-check.sh) builds the
-      # extension, but CI's `test` job runs `npx vitest run` directly — without
-      # this, those guards fail with "missing extensions/vscode/out/extension.js".
-      # Position is load-bearing: BEFORE the test steps, AFTER root install.
-      #
-      # v2.15.2 — build the esbuild BUNDLE (`npm run bundle`), not the tsc
-      # per-module compile. The ext unit suite's VSIX/bundle guards
-      # (v0-1-4-vsix-contents V10 + v0-1-4-bundle) inspect the REAL shipped
-      # artifact: a single bundled out/extension.js (+ extension.meta.json).
-      # `npm run compile` (tsc) emits ~32 per-module files with no metafile, so
-      # the VSIX would package 36 files (V10 caps at 10) and the bundle test's
-      # metafile read would throw. `npm run typecheck` preserves ext type safety
-      # that the tsc emit used to provide. The drift-out root guards read this
-      # same bundled out/extension.js (their byte-offset scan handles the
-      # minified bundle).
-      - name: Build VSCode extension bundle (drift-out + ext-unit VSIX/bundle guards need the shipped out/extension.js)
+      # v2.15.2: the esbuild BUNDLE, not the tsc per-module compile: the extension unit suite's VSIX/bundle
+      # guards (v0-1-4-vsix-contents V10 + v0-1-4-bundle) inspect the real shipped artifact. `npm run
+      # typecheck` keeps the extension's type safety.
+      - name: Build VSCode extension bundle
         run: |
           cd extensions/vscode
           npm install
           npm run typecheck
           npm run bundle
-
-      # v2.15.2 — run the VSCode extension unit suite in CI. Previously it ran
-      # ONLY locally (root `npm test` covers tests/, whose vitest config excludes
-      # extensions/vscode/src/*.test.ts), so ext-side regressions (e.g. the
-      # v0.4.1 health-poll status-check) were gated by hand. The ext deps + the
-      # bundle are produced by the step above. Note: the VSIX-content guards
-      # (v0-1-4-vsix-contents) shell out to `vsce package`; if they flake on CI,
-      # add a retry/timeout there rather than dropping this gate.
+      # The extension unit suite (root vitest's include is tests/**, which does not cover it). Its VSIX-content
+      # guards shell out to `vsce package`; if they flake, add a retry there rather than dropping this gate.
       - name: Run VSCode extension unit tests
         run: |
           cd extensions/vscode
           npm run test:unit
-
-      # The external Vercel board (dashboard/) has its own node:test suite with no
-      # dependencies. It never ran in CI, so a regression in the post-deploy verifier —
-      # e.g. its entrypoint check silently skipping every check and exiting 0 when the
-      # checkout path contains a space or a symlink — had no gate that could not be
-      # skipped. Root vitest does not cover it (its include is tests/**/*.test.ts).
+      # The external Vercel board (dashboard/) has its own node:test suite, outside root vitest's include.
       - name: Run dashboard (board) tests
         run: |
           cd dashboard
           node --test test/*.test.mjs
+      - name: npm audit (high+) — via resilience wrapper
+        # Every `npm audit` in a workflow goes through scripts/audit-with-retry.sh (registry flakes):
+        # guarded by tests/v2-4-3-ci-audit-bypass-guard.test.ts.
+        run: bash scripts/audit-with-retry.sh high
 
-      - name: Run test suite
-        # #235: cap workers so the timing-sensitive spawn tests are not CPU-starved
-        # on a 4-vCPU runner (they each spawn a daemon subprocess). Measured: default
-        # file-parallelism oversubscribes and flakes; the pre-publish gate
-        # (--no-file-parallelism) never does. This keeps most parallelism.
-        run: npx vitest run --maxWorkers=2
-
+  # The PR-B timing bars measure LATENCY, so they run ALONE: on their own runner, with no suite beside them (in
+  # parallel with ~300 files the runner's own noise, MEASURED 30-165 ms, exceeds the margins they resolve).
+  # Each run calibrates itself: an A/A control that must pass and a sized negative control that must fail.
+  # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
+  timing-bars:
+    name: Timing bars (Node 22)
+    needs: changes
+    # Fail SAFE: if the scope job itself did not succeed, run (a skipped job would report Success).
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Build
+        run: npm run build
       - name: Timing bars, serial and isolated (failed-auth loop + availability)
-        # The PR-B timing bars measure LATENCY, so they run ALONE after the suite: in parallel with ~300
-        # files the runner's own noise (MEASURED: 30-165 ms) exceeds the margins they resolve. They stay in
-        # the gate. Each run calibrates itself: an A/A control that must pass and a sized negative control
-        # that must fail. The BAR lines are the numbers to report.
-        # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
         run: node scripts/run-timing-bars.mjs
 
-      - name: npm audit (high+) — via resilience wrapper
-        # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high
-        # after GHSA-w5hq-g745-h8pq (uuid <14 buffer bounds, v3/v5/v6+buf).
-        # We use v4() no-args only — not vulnerable. v2.7.3 dropped Node 18
-        # so uuid@14 + vitest@4 can both upgrade cleanly.
-        #
-        # v2.4.3 R1 HIGH 1 (Codex 2026-04-27): all `npm audit` invocations
-        # (CI + pre-publish gate alike) MUST go through scripts/audit-with-
-        # retry.sh. Calling raw `npm audit` here was the original v2.4.0
-        # CI-red-on-flake bug Codex caught — fixed in pre-publish but the
-        # CI step itself stayed raw, leaving the public main badge exposed
-        # to the same registry endpoint flakes the wrapper exists to absorb.
-        # Guarded by tests/v2-4-3-ci-audit-bypass-guard.test.ts.
-        run: bash scripts/audit-with-retry.sh high
+  # REQUIRED CHECK (branch protection names it). The Linux verdict: every shard green, the checks green, the
+  # timing bars green or skipped by scope, AND the shards together ran exactly the suite. `always()`: a job whose
+  # `needs` failed is otherwise SKIPPED, and a skipped job reports Success to a required check.
+  test:
+    name: Test (Node 22)
+    needs: [changes, shard, checks, timing-bars]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every Linux job passed
+        env:
+          SCOPE: ${{ needs.changes.result }}
+          SHARD: ${{ needs.shard.result }}
+          CHECKS: ${{ needs.checks.result }}
+          BARS: ${{ needs.timing-bars.result }}
+        run: |
+          echo "scope=$SCOPE shards=$SHARD checks=$CHECKS timing-bars=$BARS"
+          [ "$SCOPE" = success ] && [ "$SHARD" = success ] && [ "$CHECKS" = success ] && { [ "$BARS" = success ] || [ "$BARS" = skipped ]; }
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Download the shards' reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vitest-shard-*
+          path: .
+          merge-multiple: true
+      - name: The 4 shards are disjoint and together are the whole suite
+        run: node scripts/ci-shard-parity.mjs 4 .vitest-shard
+      - name: Merge the shard reports (the suite's totals)
+        run: npx vitest --merge-reports --reporter=default
 
   # Windows parity for the registration secret and the relay's private files (ruling efb48600 Q12). SCOPED to
   # the registration-secret tests plus the owner-only ACL check, which is checked by SID (icacls output and
   # account names are localized). The rest of the suite has never run on Windows; breakage there is reported,
-  # not fixed in this job.
+  # not fixed in this job. Same scoped set on pull requests, main and nightly.
   test-windows:
     name: Test (Windows — registration secret + ACLs)
+    needs: changes
+    # Fail SAFE: if the scope job itself did not succeed, run (a skipped job would report Success).
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true') }}
     # windows-2022, not windows-latest: MEASURED, the latest image ships Visual Studio 18, which the node-gyp
     # bundled with Node 22 does not recognise ("unknown version ... Visual Studio\18"), so better-sqlite3's
     # native build failed in npm ci and NOTHING ran. Revisit when node-gyp supports it.
@@ -163,15 +255,18 @@ jobs:
       - name: SEC-24 structural bound + the sandbox env allowlist (Windows parity)
         run: npx vitest run tests/sec-24-structural-bound.test.ts tests/sandbox-env-node-options.test.ts
 
-  # macOS launchd side-effect guard. The Ubuntu `test` job structurally CANNOT
-  # catch a test that shells to real `launchctl` — init.ts's daemon bootstrap is
-  # darwin-gated, so a `runInit` test that forgets RELAY_SKIP_DAEMON silently
-  # installs a real launchd KeepAlive service + a :3777 daemon on a contributor's
-  # Mac under `npm test` (the exact bug this job exists to prevent recurring).
-  # This runs the suite on macOS and then ASSERTS no bot-relay launchd service
-  # leaked, so a future unguarded runInit caller fails HERE instead of on a Mac.
+  # REQUIRED CHECK. macOS launchd side-effect guard. The Ubuntu jobs structurally CANNOT catch a test that shells
+  # to real `launchctl` — init.ts's daemon bootstrap is darwin-gated, so a `runInit` test that forgets
+  # RELAY_SKIP_DAEMON silently installs a real launchd KeepAlive service + a :3777 daemon on a contributor's Mac
+  # under `npm test`. This runs tests on macOS and then ASSERTS no bot-relay launchd service leaked.
+  # On a PULL REQUEST it runs the macOS subset (scripts/ci-macos-pr-subset.mjs: hooks, darwin/launchctl/
+  # osascript, the runInit/launchd modules, chosen at CI time); on main and nightly the FULL suite. RESIDUAL: a
+  # test that reaches real launchctl without matching the subset's patterns is caught on main, not on its PR.
   test-macos:
     name: Test (macOS — launchd side-effect guard)
+    needs: changes
+    # Fail SAFE: if the scope job itself did not succeed, run (a skipped job would report Success).
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true') }}
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -189,8 +284,7 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Same as the Ubuntu job: the drift-out + ext-unit guards read the shipped
-      # extensions/vscode/out/extension.js, so build it before the suite runs.
+      # The drift-out + ext-unit guards read the shipped extensions/vscode/out/extension.js.
       - name: Build VSCode extension bundle
         run: |
           cd extensions/vscode
@@ -204,19 +298,21 @@ jobs:
             echo "Unexpected: a bot-relay launchd service already exists on the runner"; exit 1
           fi
 
-      - name: Run test suite
-        # #235: cap workers so the timing-sensitive spawn tests are not CPU-starved
-        # on a 4-vCPU runner (they each spawn a daemon subprocess). Measured: default
-        # file-parallelism oversubscribes and flakes; the pre-publish gate
-        # (--no-file-parallelism) never does. This keeps most parallelism.
+      - name: Run the macOS PR subset (hooks, darwin/launchctl, runInit/launchd)
+        if: github.event_name == 'pull_request'
+        # #235: cap workers (timing-sensitive spawn tests).
+        run: |
+          files=()
+          while IFS= read -r f; do files+=("$f"); done < <(node scripts/ci-macos-pr-subset.mjs)
+          echo "macOS PR subset: ${#files[@]} test files"
+          npx vitest run --maxWorkers=2 "${files[@]}"
+
+      - name: Run the full test suite (main and nightly)
+        if: github.event_name != 'pull_request'
         run: npx vitest run --maxWorkers=2
 
       - name: Timing bars, serial and isolated (failed-auth loop + availability)
-        # The PR-B timing bars measure LATENCY, so they run ALONE after the suite: in parallel with ~300
-        # files the runner's own noise (MEASURED: 30-165 ms) exceeds the margins they resolve. They stay in
-        # the gate. Each run calibrates itself: an A/A control that must pass and a sized negative control
-        # that must fail. The BAR lines are the numbers to report.
-        # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
+        # Latency bars run ALONE after the tests; scripts/run-timing-bars.mjs asserts the EXACT set ran and passed.
         run: node scripts/run-timing-bars.mjs
 
       - name: Assert the suite installed NO real launchd service
@@ -229,10 +325,18 @@ jobs:
           fi
           echo "OK: no bot-relay launchd service leaked"
 
+  # REQUIRED CHECK. The pre-publish gate, run from a FRESH CLONE (no pre-build), in parallel with the tests.
+  # On a PULL REQUEST it skips the gate's two suite steps (RELAY_SMOKE_SKIP_SUITE=1): the suite runs in the
+  # shards above and the bars in "Timing bars"; every other gate step (the guards, the 25-tool smoke, the
+  # release security gate, the pack and re-pack checks) still runs. On main and nightly the gate runs its
+  # sequential sweep and the bars too. A publish always runs them: the skip is never honoured under
+  # prepublishOnly (scripts/pre-publish-check.sh, tests/ci-smoke-skip-suite.test.ts).
   smoke:
     name: 25-tool smoke (Node 22)
+    needs: changes
+    # Fail SAFE, as above: an unknown scope runs the smoke.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true') }}
     runs-on: ubuntu-latest
-    needs: test
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -268,3 +372,27 @@ jobs:
         run: bash scripts/pre-publish-check.sh
         env:
           RELAY_SMOKE_ONLY: '1'
+          RELAY_SMOKE_SKIP_SUITE: ${{ github.event_name == 'pull_request' && '1' || '' }}
+
+  # The ONE check to require once branch protection is switched to it (Maxime's settings change, listed in the
+  # PR): green only when every job above succeeded or was skipped BY SCOPE. `always()` so that it reports even
+  # when a job it needs failed (a skipped aggregate would read as Success).
+  ci-ok:
+    name: ci-ok
+    needs: [changes, shard, checks, timing-bars, test, test-windows, test-macos, smoke]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job succeeded or was skipped by scope
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | node -e '
+            const needs = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            const bad = Object.entries(needs).filter(([, v]) => !["success", "skipped"].includes(v.result));
+            for (const [k, v] of Object.entries(needs)) console.log(`${k}: ${v.result}`);
+            if (needs.changes.result !== "success" || needs.shard.result !== "success" || needs.test.result !== "success") {
+              console.log("FAIL: scope, the shards and Test (Node 22) must SUCCEED, never be skipped"); process.exit(1);
+            }
+            if (bad.length) { console.log("FAIL: " + bad.map(([k, v]) => `${k}=${v.result}`).join(", ")); process.exit(1); }
+            console.log("ci-ok");'
