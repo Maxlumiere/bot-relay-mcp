@@ -386,7 +386,12 @@ describe("SEC-23 R1: the needed-key scan sees every key id, in every column, cou
     db.closeDb();
     const { openReadOnly } = await import("../src/sqlite-compat.js");
     const { scanCiphertextKeyIds } = await import("../src/backup-secrets.js");
-    const wasm = await openReadOnly(DB_PATH, "wasm");
+    // INV-DB-01 slice 2a: this fixture is written by a NATIVE relay init (so its header is stamped native) and read by the
+    // wasm driver in the same process, where native loads: the header now refuses that (the measured mix). The row
+    // models the case wasm-on-native is still allowed for, a process where the native driver cannot load.
+    const header = await import("../src/db-header.js");
+    header._setNativeProbeForTests(() => ({ ok: false, reason: "test: a wasm-only install" }));
+    const wasm = await openReadOnly(DB_PATH, "wasm").finally(() => header._setNativeProbeForTests(null));
     const native = await openReadOnly(DB_PATH, "native");
     try {
       const stmt = wasm.prepare("SELECT name FROM agents ORDER BY name") as ReturnType<typeof wasm.prepare> & { iterate?: () => Iterable<unknown> };

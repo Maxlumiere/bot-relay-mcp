@@ -110,11 +110,33 @@ describe("#171 backup/restore on the wasm driver + cross-driver interop", () => 
   }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
 
   it("a NATIVE-made archive restores under WASM (interop: consumer switches to wasm post-npm-12)", async () => {
-    const archive = await seedAndBackup("native");
-    const { agents, hasMessage } = await restoreAndRead(archive, "wasm");
-    expect(agents).toEqual(["wbr-alpha", "wbr-beta"]);
-    expect(hasMessage).toBe(true);
+    // INV-DB-01 slice 2a: this fixture is written by a NATIVE relay init (so its header is stamped native) and read by the
+    // wasm driver in the same process, where native loads: the header now refuses that (the measured mix). The row
+    // models the case wasm-on-native is still allowed for, a process where the native driver cannot load.
+    const header = await import("../src/db-header.js");
+    header._setNativeProbeForTests(() => ({ ok: false, reason: "test: a wasm-only install (npm 12, scripts off)" }));
+    try {
+      const archive = await seedAndBackup("native");
+      const { agents, hasMessage } = await restoreAndRead(archive, "wasm");
+      expect(agents).toEqual(["wbr-alpha", "wbr-beta"]);
+      expect(hasMessage).toBe(true);
+    } finally {
+      header._setNativeProbeForTests(null);
+    }
   }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
+
+  it("INV-DB-01 slice 2a twin, WITHOUT the seam: native loads here, so a wasm restore of a native-made archive is REFUSED by the header (named, with the remedy), and the live DB is untouched", async () => {
+    const archive = await seedAndBackup("native");
+    const liveDb = (await import("../src/db.js")).getDbPath();
+    expect(fs.readFileSync(liveDb).readInt32BE(68), "precondition: the live DB is stamped native").toBe(0x524c594e);
+    const before = fs.readFileSync(liveDb);
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    closeDb();
+    const err = (await importRelayState(archive, { force: true }).then(() => null, (e: Error) => e)) as Error | null;
+    expect(err?.name).toBe("DbHeaderRefusedError");
+    expect(err?.message).toMatch(/REFUSING the wasm driver .*Unset RELAY_SQLITE_DRIVER .*run native: the file is native\./);
+    expect(fs.readFileSync(liveDb).equals(before), "the live DB is byte-identical").toBe(true);
+  }, 60000);
 
   it("a WASM-made archive restores under NATIVE (interop: consumer switches back)", async () => {
     const archive = await seedAndBackup("wasm");

@@ -23,6 +23,7 @@ import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
 import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver } from "./config.js";
+import { assertDriverHeaderAllows } from "./db-header.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -638,6 +639,7 @@ async function openReadOnlyUnchecked(dbPath: string, driver: SqliteDriver): Prom
   if (!fs.existsSync(dbPath)) {
     throw new Error(`openReadOnly: file not found at '${dbPath}'`);
   }
+  assertDriverHeaderAllows(dbPath, driver); // INV-DB-01 slice 2a: by path too
   if (driver === "wasm") return openWasmFromBytes(fs.readFileSync(dbPath), dbPath);
   const { default: Database } = await import("better-sqlite3");
   return new Database(dbPath, { readonly: true }) as unknown as CompatDatabase;
@@ -655,6 +657,7 @@ export async function openExportSource(
   dbPath: string,
   driver: SqliteDriver
 ): Promise<{ db: CompatDatabase; release: () => void; loadedSha256: string | null }> {
+  assertDriverHeaderAllows(dbPath, driver); // INV-DB-01 slice 2a: the source's header decides, before any read
   if (driver === "wasm") assertWasmSourceReadable(dbPath);
   let db: CompatDatabase | null = null;
   let loadedSha256: string | null = null;
@@ -758,6 +761,8 @@ export function initializeDb(dbPath: string): Promise<CompatDatabase> {
 
   _initPromise = (async () => {
     const driver = getDriverType();
+    // INV-DB-01 slice 2a: the DB file's header decides, before the open (refused, or warned, by name).
+    assertDriverHeaderAllows(dbPath, driver);
     log.info(`[db] Initializing SQLite driver: ${driver}`);
 
     if (driver === "wasm") {
@@ -807,11 +812,12 @@ export function configuredDriver(): SqliteDriver {
 }
 
 /**
- * INV-DB-01 slice 1: refuse an instance driver this release does not accept, BEFORE any filesystem effect of a DB open
- * (db.initializeDb() calls it before it creates the DB's parent directory). Warns as getDriverType() does.
+ * INV-DB-01 slices 1 and 2a: refuse an instance driver this release does not accept, and a DB whose header refuses
+ * that driver, BEFORE any filesystem effect of a DB open (db.initializeDb() calls it before it creates the DB's parent
+ * directory). Warns as getDriverType() and the header check do.
  */
-export function assertInstanceDriverAccepted(): void {
-  getDriverType();
+export function assertInstanceDriverAccepted(dbPath: string): void {
+  assertDriverHeaderAllows(dbPath, getDriverType());
 }
 
 /**

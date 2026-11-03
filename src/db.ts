@@ -61,7 +61,9 @@ import {
   getInitializedDb,
   closeInitializedDb,
   discardInitializedDb,
+  driverOf,
 } from "./sqlite-compat.js";
+import { assertDriverHeaderAllows, stampNativeHeader } from "./db-header.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile, privacyFaults, restrictToOwnerWindows } from "./fs-perms.js";
 import { resolveInstance } from "./instance.js";
@@ -335,7 +337,7 @@ export async function initializeDb(): Promise<void> {
 
   const dbPath = getDbPath();
   // INV-DB-01 slice 1: an instance driver this release refuses is refused BEFORE anything below touches the disk.
-  assertInstanceDriverAccepted();
+  assertInstanceDriverAccepted(dbPath);
   // v2.1 Phase 4c.4: a NEW directory is created 0700 before the open, so there is
   // no window where a fresh DB lives under a 0755 parent. An existing directory is
   // narrowed only after the re-check below (ADR-0048: never chmod through an
@@ -364,6 +366,8 @@ export async function initializeDb(): Promise<void> {
   // finalize + purge). Shared with getDb()'s native fallback so the two paths
   // cannot drift; see applySchemaSetup below.
   applySchemaSetup(_db);
+  // INV-DB-01 slice 2a: a native init stamps the DB's header (in its main file); a wasm one never does.
+  if (driverOf(_db) === "native") stampNativeHeader(_db, dbPath);
 }
 
 /**
@@ -392,6 +396,8 @@ export function getDb(): CompatDatabase {
   if (_db) return _db;
 
   const dbPath = getDbPath();
+  // INV-DB-01 slice 2a: this fallback is native only, so the DB's header must allow native, before anything is made.
+  assertDriverHeaderAllows(dbPath, "native");
   const dir = path.dirname(dbPath);
   // v2.1 Phase 4c.4: same dir + file perm narrowing as the eager init path
   // (the existing directory is narrowed only after the re-check).
@@ -428,6 +434,7 @@ export function getDb(): CompatDatabase {
   // #171 — same single-sourced schema setup the eager initializeDb() path runs.
   // A new migration is added ONCE in applySchemaSetup, never copy-pasted here.
   applySchemaSetup(_db);
+  stampNativeHeader(_db, dbPath); // INV-DB-01 slice 2a: native, as the eager init
 
   return _db;
 }

@@ -33,6 +33,10 @@ export async function openRawRelayDb(
   dbPath: string,
   opts: { readonly: boolean },
 ): Promise<import("../sqlite-compat.js").CompatDatabase> {
+  // INV-DB-01 slice 2a: a raw open is native, so the DB's header must allow native (a wasm-owned or foreign file is
+  // refused by name, before the open).
+  const { assertDriverHeaderAllows } = await import("../db-header.js");
+  assertDriverHeaderAllows(dbPath, "native");
   const Better = (await import("better-sqlite3")).default;
   const db = new Better(dbPath, { readonly: opts.readonly, fileMustExist: true });
   try {
