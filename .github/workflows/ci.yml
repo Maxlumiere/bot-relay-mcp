@@ -32,10 +32,12 @@ permissions:
 
 jobs:
   # What this run must cover. full=false on a DRAFT pull request (unless it has the `ci-full` label) and on a
-  # DOCS-ONLY change: then the macOS, Windows and timing-bars jobs (and, for docs-only, the smoke) are SKIPPED
-  # by a job-level `if:`. A job skipped by `if:` reports Success; a workflow skipped by `paths:` would leave
-  # required checks Pending, so there is no workflow-level path filter. The Linux shards ALWAYS run: about 20
-  # test files read Markdown (README, CHANGELOG, docs/), so a docs-only change can still break a test.
+  # DOCS-ONLY pull request: then the macOS, Windows and timing-bars jobs are SKIPPED by a job-level `if:`. Never on
+  # a push to main, the nightly or a dispatch: main always runs everything. A job skipped by `if:` reports Success;
+  # a workflow skipped by `paths:` would leave required checks Pending, so there is no workflow-level path filter.
+  # The aggregates accept a skip only for a job this Scope excluded (scripts/ci-verdict.mjs). The Linux shards and
+  # the smoke ALWAYS run: about 20 test files read Markdown (README, CHANGELOG, docs/), and the gate the smoke runs
+  # holds the README/docs guards, so a docs-only change can still break either.
   changes:
     name: Scope
     runs-on: ubuntu-latest
@@ -53,8 +55,6 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          PUSH_BEFORE: ${{ github.event.before }}
-          PUSH_AFTER: ${{ github.sha }}
           DRAFT: ${{ github.event.pull_request.draft }}
           CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
         run: node scripts/ci-scope.mjs >> "$GITHUB_OUTPUT"
@@ -191,17 +191,13 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Every Linux job passed
-        env:
-          SCOPE: ${{ needs.changes.result }}
-          SHARD: ${{ needs.shard.result }}
-          CHECKS: ${{ needs.checks.result }}
-          BARS: ${{ needs.timing-bars.result }}
-        run: |
-          echo "scope=$SCOPE shards=$SHARD checks=$CHECKS timing-bars=$BARS"
-          [ "$SCOPE" = success ] && [ "$SHARD" = success ] && [ "$CHECKS" = success ] && { [ "$BARS" = success ] || [ "$BARS" = skipped ]; }
       - name: Checkout
         uses: actions/checkout@v7
+      # A skip is accepted only for a job the Scope excluded (scripts/ci-verdict.mjs).
+      - name: Every Linux job passed, as the Scope required
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: printf '%s' "$NEEDS" | node scripts/ci-verdict.mjs linux
       - name: Setup Node.js 22
         uses: actions/setup-node@v7
         with:
@@ -339,8 +335,9 @@ jobs:
   smoke:
     name: 25-tool smoke (Node 22)
     needs: changes
-    # Fail SAFE, as above: an unknown scope runs the smoke.
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true') }}
+    # EVERY pull request, docs-only included: the gate holds the README/docs guards (e.g. the masthead and
+    # '(current)' version guard). On a PR it takes ~1-1.5 min.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -380,24 +377,18 @@ jobs:
           RELAY_SMOKE_SKIP_SUITE: ${{ github.event_name == 'pull_request' && '1' || '' }}
 
   # The ONE check to require once branch protection is switched to it (a repository settings change, listed in the
-  # PR): green only when every job above succeeded or was skipped BY SCOPE. `always()` so that it reports even
-  # when a job it needs failed (a skipped aggregate would read as Success).
+  # PR): green only when every job above succeeded, or was skipped because the Scope excluded it. `always()` so
+  # that it reports even when a job it needs failed (a skipped aggregate would read as Success).
   ci-ok:
     name: ci-ok
     needs: [changes, shard, checks, timing-bars, test, test-windows, test-macos, smoke]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Every job succeeded or was skipped by scope
+      - name: Checkout
+        uses: actions/checkout@v7
+      # A skip is accepted only for a job the Scope excluded; the smoke and the Linux jobs must always succeed.
+      - name: Every job succeeded, or was skipped because the Scope excluded it
         env:
-          RESULTS: ${{ toJSON(needs) }}
-        run: |
-          echo "$RESULTS" | node -e '
-            const needs = JSON.parse(require("fs").readFileSync(0, "utf8"));
-            const bad = Object.entries(needs).filter(([, v]) => !["success", "skipped"].includes(v.result));
-            for (const [k, v] of Object.entries(needs)) console.log(`${k}: ${v.result}`);
-            if (needs.changes.result !== "success" || needs.shard.result !== "success" || needs.test.result !== "success") {
-              console.log("FAIL: scope, the shards and Test (Node 22) must SUCCEED, never be skipped"); process.exit(1);
-            }
-            if (bad.length) { console.log("FAIL: " + bad.map(([k, v]) => `${k}=${v.result}`).join(", ")); process.exit(1); }
-            console.log("ci-ok");'
+          NEEDS: ${{ toJSON(needs) }}
+        run: printf '%s' "$NEEDS" | node scripts/ci-verdict.mjs all

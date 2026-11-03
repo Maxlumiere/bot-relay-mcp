@@ -5,32 +5,42 @@
 // See LICENSE for full terms.
 
 /**
- * ci.yml's aggregate verdicts, from the `needs` context (toJSON(needs) on stdin).
- *   linux  "Test (Node 22)": Scope, the shards and Checks succeeded; the timing bars succeeded or were skipped.
- *   all    "ci-ok": every job succeeded or was skipped.
+ * ci.yml's aggregate verdicts, from the `needs` context (toJSON(needs) on stdin). Every SKIP is checked against
+ * the Scope job's outputs: a job the Scope required must SUCCEED; a skip is accepted only for a job the Scope
+ * excluded (full=false: macOS, Windows, timing bars). A skipped job otherwise reports Success to a required
+ * check, so "skipped" is never accepted on its own.
+ *   linux  "Test (Node 22)": Scope, the shards and Checks succeeded; the timing bars as the Scope requires.
+ *   all    "ci-ok": the same, plus Test (Node 22), the smoke (never scoped out), macOS and Windows.
  * usage: echo "$NEEDS" | node scripts/ci-verdict.mjs <linux|all>   (exit 0 = green)
  */
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
-const ok = (r) => r === "success";
-const okOrSkipped = (r) => r === "success" || r === "skipped";
+/** The jobs the Scope may exclude (full=false); everything else must always succeed. */
+export const SCOPED = ["timing-bars", "test-windows", "test-macos"];
+const ALWAYS = { linux: ["changes", "shard", "checks"], all: ["changes", "shard", "checks", "test", "smoke"] };
+const SCOPED_IN = { linux: ["timing-bars"], all: SCOPED };
 
 /** Pure: { ok, problems } for a needs object ({ <job>: { result, outputs } }). */
 export function verdict(needs, which) {
   const problems = [];
+  if (!ALWAYS[which]) return { ok: false, problems: [`unknown verdict "${which}"`] };
   const res = (j) => (needs[j] ? needs[j].result : "missing");
-  const must = (j) => { if (!ok(res(j))) problems.push(`${j}=${res(j)} (must succeed)`); };
-  const may = (j) => { if (!okOrSkipped(res(j))) problems.push(`${j}=${res(j)}`); };
-  if (which === "linux") {
-    for (const j of ["changes", "shard", "checks"]) must(j);
-    may("timing-bars");
-  } else if (which === "all") {
-    for (const j of ["changes", "shard", "test"]) must(j);
-    for (const j of Object.keys(needs)) if (!["changes", "shard", "test"].includes(j)) may(j);
-  } else {
-    problems.push(`unknown verdict "${which}"`);
+  for (const j of ALWAYS[which]) if (res(j) !== "success") problems.push(`${j}=${res(j)} (must succeed)`);
+  // Without a successful Scope there is nothing to excuse a skip with: every scoped job must then succeed.
+  const full = res("changes") !== "success" || needs.changes.outputs?.full !== "false";
+  for (const j of SCOPED_IN[which]) {
+    const r = res(j);
+    if (r === "success") continue;
+    if (r === "skipped" && !full) continue;
+    problems.push(`${j}=${r} (${full ? "the Scope required it" : "only success or a scope skip is accepted"})`);
+  }
+  // ci-ok needs every job: one it does not know is judged strictly.
+  if (which === "all") {
+    for (const j of Object.keys(needs)) {
+      if (!ALWAYS.all.includes(j) && !SCOPED.includes(j) && res(j) !== "success") problems.push(`${j}=${res(j)} (must succeed)`);
+    }
   }
   return { ok: problems.length === 0, problems };
 }

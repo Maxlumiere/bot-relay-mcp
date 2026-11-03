@@ -179,7 +179,9 @@ describe("ci.yml keeps the safety properties", () => {
     expect(needs).toEqual(Object.keys(J).filter((k) => k !== "ci-ok").sort());
   });
   it("no scoped job can be skipped by a FAILED scope job (it fails safe and runs)", () => {
-    for (const id of ["timing-bars", "test-windows", "test-macos", "smoke"]) expect(J[id], id).toMatch(/needs\.changes\.result != 'success' \|\|/);
+    for (const id of ["timing-bars", "test-windows", "test-macos"]) expect(J[id], id).toMatch(/needs\.changes\.result != 'success' \|\|/);
+    // The smoke is not scoped at all: it runs unless the run is cancelled.
+    expect(J.smoke).toMatch(/^    if: \$\{\{ !cancelled\(\) \}\}$/m);
   });
   it("there is no workflow-level paths filter (it would leave required checks Pending)", () => {
     expect(CI).not.toMatch(/^\s+paths(-ignore)?:/m);

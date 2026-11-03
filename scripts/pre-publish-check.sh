@@ -305,10 +305,11 @@ step "v2.8 state-machine fast smoke (tests/v2-8-*.test.ts)" extension_state_mach
 # sharded "Test (Node 22)" and the bars in its "Timing bars" job, and this sequential sweep alone was ~20 of
 # the smoke's ~24 minutes (MEASURED, CI run 41573122313). The skip needs BOTH the CI smoke
 # (_relay_is_ci_smoke, which is never true during a publish) AND RELAY_SMOKE_SKIP_SUITE=1, which only the PR
-# smoke sets. A publish, a local run and the main/nightly smoke always run both steps
+# smoke sets, AND no --full. A publish, a --full run, a local run and the main/nightly smoke always run both steps
 # (tests/ci-smoke-skip-suite.test.ts).
 _relay_ci_skips_suite() {
-  _relay_is_ci_smoke && [ "${RELAY_SMOKE_SKIP_SUITE:-}" = "1" ]
+  # --full (and so every publish, which forces FULL_MODE=1) always runs the suite, whatever the environment.
+  [ "${FULL_MODE:-0}" != "1" ] && _relay_is_ci_smoke && [ "${RELAY_SMOKE_SKIP_SUITE:-}" = "1" ]
 }
 suite_sweep() {
   if _relay_ci_skips_suite; then
