@@ -36,6 +36,7 @@ import path from "path";
 import zlib from "zlib";
 import { pipeline } from "stream/promises";
 import { Transform } from "stream";
+import { assertNotHeldNatively } from "./db-header.js";
 
 export const EXPECTED_MEMBERS = ["relay.db", "manifest.json", "config.json"] as const;
 export type ExpectedMember = (typeof EXPECTED_MEMBERS)[number];
@@ -68,6 +69,7 @@ export class ArchiveRefused extends Error {
  * never held in memory. Returns the decompressed size.
  */
 export async function gunzipToFile(src: string, dest: string, cap: number = MAX_DECOMPRESSED_BYTES): Promise<number> {
+  assertNotHeldNatively(src, "read the archive"); // an archive path that IS a held DB (or a sidecar) is refused
   const fd = fs.openSync(src, "r");
   try {
     const magic = Buffer.alloc(2);
@@ -181,6 +183,7 @@ export interface ExtractResult {
  * files in `outDir`, which the caller removes with it.
  */
 export function extractBackupTar(tarPath: string, outDir: string): ExtractResult {
+  assertNotHeldNatively(tarPath, "read the archive");
   const fd = fs.openSync(tarPath, "r");
   const extracted: ExpectedMember[] = [];
   const skipped: string[] = [];

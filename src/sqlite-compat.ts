@@ -23,7 +23,7 @@ import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
 import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver } from "./config.js";
-import { assertDriverHeaderAllows, assertNotHeldNatively, type DriverHeader } from "./db-header.js";
+import { assertDriverHeaderAllows, assertNotHeldNatively, openNativeDb, type DriverHeader } from "./db-header.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -100,9 +100,8 @@ function getDriverType(): SqliteDriver {
 
 // --- Native driver (better-sqlite3 passthrough) ---
 
-async function createNativeDb(dbPath: string): Promise<CompatDatabase> {
-  const { default: Database } = await import("better-sqlite3");
-  return new Database(dbPath) as unknown as CompatDatabase;
+async function createNativeDb(dbPath: string, verdict: DriverHeader): Promise<CompatDatabase> {
+  return openNativeDb(dbPath, {}, verdict) as unknown as CompatDatabase; // held from construction (db-header.ts)
 }
 
 // --- Wasm driver (sql.js adapter) ---
@@ -645,13 +644,12 @@ async function openReadOnlyUnchecked(dbPath: string, driver: SqliteDriver): Prom
   if (!fs.existsSync(dbPath)) {
     throw new Error(`openReadOnly: file not found at '${dbPath}'`);
   }
-  assertDriverHeaderAllows(dbPath, driver); // INV-DB-01 slice 2a: by path too
+  const header = assertDriverHeaderAllows(dbPath, driver); // INV-DB-01 slice 2a: by path too
   if (driver === "wasm") {
     assertNotHeldNatively(dbPath, "read the DB");
     return openWasmFromBytes(fs.readFileSync(dbPath), dbPath);
   }
-  const { default: Database } = await import("better-sqlite3");
-  return new Database(dbPath, { readonly: true }) as unknown as CompatDatabase;
+  return openNativeDb(dbPath, { readonly: true }, header) as unknown as CompatDatabase; // held from construction
 }
 
 /**
@@ -770,23 +768,27 @@ export function initializeDb(dbPath: string): Promise<CompatDatabase> {
   if (_initializedDb) return Promise.resolve(_initializedDb);
   if (_initPromise) return _initPromise;
 
-  _initPromise = (async () => {
+  const p = (async () => {
     const driver = getDriverType();
     // INV-DB-01 slice 2a: the DB file's header decides, before the open (refused, or warned, by name).
-    assertDriverHeaderAllows(dbPath, driver);
+    const header = assertDriverHeaderAllows(dbPath, driver);
     log.info(`[db] Initializing SQLite driver: ${driver}`);
 
     if (driver === "wasm") {
       _initializedDb = await createWasmDb(dbPath);
     } else {
-      _initializedDb = await createNativeDb(dbPath);
+      _initializedDb = await createNativeDb(dbPath, header);
     }
 
     _driverUsed = driver;
     return _initializedDb;
   })();
-
-  return _initPromise;
+  _initPromise = p;
+  // A refused (or failed) init is not cached: the next call re-evaluates (Codex #380 R1 P2-6).
+  p.catch(() => {
+    if (_initPromise === p) _initPromise = null;
+  });
+  return p;
 }
 
 /**
