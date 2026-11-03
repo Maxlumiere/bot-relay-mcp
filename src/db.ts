@@ -57,6 +57,7 @@ import { truncatedPreview } from "./preview.js";
 import {
   type CompatDatabase,
   initializeDb as initDriver,
+  assertInstanceDriverAccepted,
   getInitializedDb,
   closeInitializedDb,
   discardInitializedDb,
@@ -333,6 +334,8 @@ export async function initializeDb(): Promise<void> {
   if (_db) return;
 
   const dbPath = getDbPath();
+  // INV-DB-01 slice 1: an instance driver this release refuses is refused BEFORE anything below touches the disk.
+  assertInstanceDriverAccepted();
   // v2.1 Phase 4c.4: a NEW directory is created 0700 before the open, so there is
   // no window where a fresh DB lives under a 0755 parent. An existing directory is
   // narrowed only after the re-check below (ADR-0048: never chmod through an

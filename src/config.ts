@@ -122,6 +122,57 @@ export function configPathOverride(): string | undefined {
   return process.env.RELAY_CONFIG_PATH || undefined;
 }
 
+/**
+ * INV-DB-01 slice 1: the SQLite driver is a property of the INSTANCE: `sqlite_driver` in its config.json (the one
+ * getConfigPath() resolves), default native. Read straight from the file, so every process that opens the instance's
+ * DB reads the same value. In this release only "native" is accepted: "wasm" is refused as not yet supported (the
+ * single-owner guarantee it needs ships in a later slice), and any other value is refused by name.
+ */
+export function readInstanceSqliteDriver(): { value: unknown; configPath: string; unreadable?: string } {
+  // A config that cannot be read must not break a DB open that worked before this field existed: the caller falls
+  // back to native and says so (unreadable). Only a READABLE value this release refuses is thrown.
+  let configPath: string;
+  try {
+    configPath = getConfigPath();
+  } catch (err) {
+    return { value: undefined, configPath: "(the instance config path could not be resolved)", unreadable: (err as Error).message };
+  }
+  // ONE descriptor for the inspection and the read (no stat-then-read race). It is opened NON-BLOCKING, so a FIFO with no
+  // writer (or a terminal) returns at once instead of stalling a DB open that worked before this field existed. Only an
+  // absent file (ENOENT) is "no config", silently, as before; a denied parent (EACCES, EPERM, ENOTDIR) is named; a
+  // descriptor that is not a regular file is never read. A symlinked config is legitimate and followed.
+  // Not addressed (pre-existing, ASSUMED): an open that blocks on a dead network mount.
+  let fd: number;
+  try {
+    fd = fs.openSync(configPath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { value: undefined, configPath };
+    return { value: undefined, configPath, unreadable: code ?? (err as Error).message };
+  }
+  try {
+    if (!fs.fstatSync(fd).isFile()) return { value: undefined, configPath, unreadable: "not a regular file, so it was not read" };
+    const parsed = JSON.parse(fs.readFileSync(fd, "utf-8")) as Record<string, unknown> | null;
+    return { value: parsed?.sqlite_driver, configPath };
+  } catch (err) {
+    return { value: undefined, configPath, unreadable: (err as NodeJS.ErrnoException).code ?? (err as Error).message };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Why an instance's sqlite_driver value is refused in this release, or null when it is accepted. */
+export function instanceSqliteDriverProblem(value: unknown, configPath: string): string | null {
+  if (value === undefined || value === "native") return null;
+  if (value === "wasm") {
+    return (
+      `sqlite_driver "wasm" is not yet supported for an instance (${configPath}): remove it (native is the default). ` +
+      `To run the wasm driver today, keep RELAY_SQLITE_DRIVER=wasm in the environment.`
+    );
+  }
+  return `sqlite_driver ${JSON.stringify(value)} is not valid (${configPath}): use "native" (the default), or remove it.`;
+}
+
 export class InvalidConfigError extends Error {
   constructor(message: string) {
     super(message);
@@ -322,6 +373,20 @@ export function validateConfigAndEnv(config: RelayConfig): void {
     validateKeyringStrict();
   } catch (err) {
     errors.push(err instanceof Error ? err.message : String(err));
+  }
+
+  // INV-DB-01 slice 1: the instance's SQLite driver. The config path is resolved only for a value to refuse, so a
+  // config with no sqlite_driver validates exactly as it did before this field existed.
+  const declaredDriver = (config as { sqlite_driver?: unknown }).sqlite_driver;
+  if (declaredDriver !== undefined && declaredDriver !== "native") {
+    let where: string;
+    try {
+      where = getConfigPath();
+    } catch {
+      where = "the instance config";
+    }
+    const driverProblem = instanceSqliteDriverProblem(declaredDriver, where);
+    if (driverProblem) errors.push(driverProblem);
   }
 
   // Log level

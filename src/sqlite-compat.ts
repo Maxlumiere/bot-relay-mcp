@@ -22,6 +22,7 @@ import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
+import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver } from "./config.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -57,10 +58,43 @@ export type SqliteDriver = "native" | "wasm";
  * instead — keeping this module-private makes the wrong primitive unreachable
  * from them by construction, not by remembering to avoid it.
  */
+/**
+ * INV-DB-01 slice 1: the INSTANCE's driver (its config's `sqlite_driver`, default native) comes first. A value this
+ * release does not accept ("wasm", or an invalid one) is refused by name before any file is opened or created. The
+ * RELAY_SQLITE_DRIVER env override still wins, as before, but one that disagrees with the instance driver (including
+ * the implicit native) is warned once per process: a later release refuses it, once `relay db convert-journal` ships.
+ */
+let driverOverrideWarned = false;
+let driverUnreadableWarned = false;
+/** Test-only: forget that this process already warned about the driver. */
+export function _resetDriverWarningForTests(): void {
+  driverOverrideWarned = false;
+  driverUnreadableWarned = false;
+}
 function getDriverType(): SqliteDriver {
-  const raw = process.env.RELAY_SQLITE_DRIVER || "native";
-  if (raw === "wasm") return "wasm";
-  return "native";
+  const { value, configPath, unreadable } = readInstanceSqliteDriver();
+  const problem = instanceSqliteDriverProblem(value, configPath);
+  if (problem) throw new InvalidConfigError(problem);
+  const instanceDriver: SqliteDriver = "native"; // the only instance value accepted in this release
+  const raw = process.env.RELAY_SQLITE_DRIVER;
+  const requested: SqliteDriver = !raw ? instanceDriver : raw === "wasm" ? "wasm" : "native";
+  if (unreadable !== undefined && !driverUnreadableWarned) {
+    driverUnreadableWarned = true;
+    log.warn(
+      `[db] could not read this instance's sqlite_driver from ${configPath} (${unreadable}); using ${requested}, as ` +
+        `before this setting existed. Fix or remove that config.json.`
+    );
+  }
+  if (!raw) return instanceDriver;
+  if (requested !== instanceDriver && !driverOverrideWarned) {
+    driverOverrideWarned = true;
+    log.warn(
+      `[db] RELAY_SQLITE_DRIVER=${raw} is set, but this instance's sqlite_driver is ${instanceDriver} ` +
+        `(${value === undefined ? "the default" : "set"} in ${configPath}). The environment wins for now, but a later ` +
+        `release will require the instance to be converted (\`relay db convert-journal\`); nothing to do until then.`
+    );
+  }
+  return requested;
 }
 
 // --- Native driver (better-sqlite3 passthrough) ---
@@ -770,6 +804,14 @@ export function driverOf(db: CompatDatabase): SqliteDriver {
  */
 export function configuredDriver(): SqliteDriver {
   return getDriverType();
+}
+
+/**
+ * INV-DB-01 slice 1: refuse an instance driver this release does not accept, BEFORE any filesystem effect of a DB open
+ * (db.initializeDb() calls it before it creates the DB's parent directory). Warns as getDriverType() does.
+ */
+export function assertInstanceDriverAccepted(): void {
+  getDriverType();
 }
 
 /**
