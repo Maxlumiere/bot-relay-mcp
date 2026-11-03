@@ -43,7 +43,9 @@ export type DriverHeader =
   /** A SQLite database whose application_id is not the relay's. */
   | { kind: "foreign"; id: number }
   /** Not readable as a SQLite header (not a regular file, too short, no SQLite magic, or unreadable): SQLite decides. */
-  | { kind: "unrecognised"; reason: string };
+  | { kind: "unrecognised"; reason: string }
+  /** This process already holds a native connection to the file: judged when that one opened, never re-read. */
+  | { kind: "held" };
 
 /**
  * The DB files this process holds a native SQLite connection to, keyed by the FILE (device + inode, from a stat, which
@@ -75,10 +77,13 @@ export function noteNativeClosed(hold: string | null): void {
  * Throw when this process holds a native connection to the file at `p` (by any name): an fs open of it here, and the
  * close that follows, would drop that connection's POSIX locks. Every fs read or write of a DB file goes through it.
  */
-export function assertNotHeldNatively(p: string, doing: string): void {
-  if (nativeOpen.size === 0) return;
+function heldNatively(p: string): boolean {
+  if (nativeOpen.size === 0) return false;
   const k = fileKey(p);
-  if (k !== null && nativeOpen.has(k)) {
+  return k !== null && nativeOpen.has(k);
+}
+export function assertNotHeldNatively(p: string, doing: string): void {
+  if (heldNatively(p)) {
     throw new Error(
       `internal: refusing to ${doing} '${p}' through a new descriptor while this process holds a native ` +
         `SQLite connection to that file: closing that descriptor would drop the connection's POSIX locks.`
@@ -201,8 +206,20 @@ export function _resetHeaderWarningsForTests(): void {
   warnedPaths.clear();
 }
 
-/** Read the header of the DB at `dbPath`; throw (named) when it refuses `driver`, warn once when it warns. */
+/**
+ * Read the header of the DB at `dbPath`; throw (named) when it refuses `driver`, warn once when it warns. When this
+ * process already holds a native connection to the file, the header was judged when that connection opened and is
+ * NOT re-read (that would drop the connection's locks): another native connection is allowed (SQLite shares lock
+ * state between connections in one process), and a wasm one is a driver mix, refused by name.
+ */
 export function assertDriverHeaderAllows(dbPath: string, driver: SqliteDriver): DriverHeader {
+  if (heldNatively(dbPath)) {
+    if (driver === "native") return { kind: "held" };
+    throw new DbHeaderRefusedError(
+      `REFUSING the wasm driver on the DB at '${dbPath}': this process already holds a native connection to that file, ` +
+        `and mixing the two drivers on one file loses commits.`
+    );
+  }
   const header = readDriverHeader(dbPath);
   const verdict = driverHeaderVerdict(dbPath, header, driver);
   if (verdict && "refuse" in verdict) throw new DbHeaderRefusedError(verdict.refuse);

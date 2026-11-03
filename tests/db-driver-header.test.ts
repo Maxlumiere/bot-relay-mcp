@@ -243,7 +243,7 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
       fs.linkSync(dbPath, alias);
       expect(() => header.readDriverHeader(alias), "the header read").toThrow(/internal: refusing to read/);
       expect(() => compat.fileSha256(alias), "the export's torn-read hash").toThrow(/internal: refusing to read/);
-      await expect(compat.openExportSource(alias, "wasm"), "a wasm read of the source").rejects.toThrow(/internal: refusing to read/);
+      await expect(compat.openExportSource(alias, "wasm"), "a wasm read of the source").rejects.toThrow(/already holds a native connection to that file/);
     } finally {
       raw.close();
     }
