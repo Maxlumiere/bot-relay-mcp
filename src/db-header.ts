@@ -14,10 +14,15 @@
  * Any other value belongs to another application, and the relay refuses to open (and stamp) it.
  *
  * The header is read BEFORE any open, with one non-blocking descriptor (a FIFO or a device at the DB path never
- * blocks the read). The config and the env are declarations only: where they disagree with a stamped header, the
+ * blocks the read). NEVER while this process holds a native connection to the file: closing ANY descriptor to a file
+ * drops every POSIX lock the process holds on it (SQLite's documented hazard), so the connection would lose the
+ * SHARED lock that keeps another process from checkpointing and deleting the WAL under it (MEASURED: an fcntl probe
+ * from another process is DENIED before such a close and GRANTED after). A read on a path this process holds open
+ * natively is therefore refused, and the stamp is decided from the header read before the open. The config and the env are declarations only: where they disagree with a stamped header, the
  * header wins or the open is refused, never silently mixed.
  */
 import fs from "fs";
+import path from "path";
 import { createRequire } from "module";
 import type { CompatDatabase, SqliteDriver } from "./sqlite-compat.js";
 import { log } from "./logger.js";
@@ -41,8 +46,34 @@ export type DriverHeader =
   /** Not readable as a SQLite header (not a regular file, too short, no SQLite magic, or unreadable): SQLite decides. */
   | { kind: "unrecognised"; reason: string };
 
-/** Read the driver stamp from the main file of the DB at `dbPath`, before any open. Never throws, never blocks. */
+/** The DB files this process holds a native SQLite connection to (resolved path → open handles). */
+const nativeOpen = new Map<string, number>();
+const keyOf = (dbPath: string) => path.resolve(dbPath);
+/** Record that this process opened a native connection to `dbPath` (its header may not be read until it is closed). */
+export function noteNativeOpen(dbPath: string): void {
+  const k = keyOf(dbPath);
+  nativeOpen.set(k, (nativeOpen.get(k) ?? 0) + 1);
+}
+/** Record that a native connection to `dbPath` was closed. */
+export function noteNativeClosed(dbPath: string): void {
+  const k = keyOf(dbPath);
+  const n = (nativeOpen.get(k) ?? 0) - 1;
+  if (n > 0) nativeOpen.set(k, n);
+  else nativeOpen.delete(k);
+}
+
+/**
+ * Read the driver stamp from the main file of the DB at `dbPath`, before any open. Never blocks. Throws only when this
+ * process holds a native connection to that path (see the module comment): that is a bug in the caller, never a
+ * verdict about the file. (A path reaching the same file by another name, e.g. a symlink, is not recognised.)
+ */
 export function readDriverHeader(dbPath: string): DriverHeader {
+  if (nativeOpen.has(keyOf(dbPath))) {
+    throw new Error(
+      `internal: refusing to read the header of '${dbPath}' through a new descriptor while this process holds a native ` +
+        `SQLite connection to it: closing that descriptor would drop the connection's POSIX locks. Read it before the open.`
+    );
+  }
   let fd: number;
   try {
     fd = fs.openSync(dbPath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
@@ -164,16 +195,17 @@ export function assertDriverHeaderAllows(dbPath: string, driver: SqliteDriver): 
 }
 
 /**
- * A native init stamps a legacy (0) DB "RLYN", then checkpoints (TRUNCATE) so the stamp is in the main file. A DB
- * already stamped in its main file is not written at all. Never on a wasm connection, never on a read-only one, and
- * never by an export. When another connection keeps the checkpoint from completing, the stamp stays in the WAL until
- * a later checkpoint carries it: that is warned, not fatal, and the header reads as legacy until then.
+ * A native init stamps a legacy (0) or new DB "RLYN", then checkpoints (TRUNCATE) so the stamp is in the main file.
+ * `before` is the header read BEFORE the open: the file is never read again here, since this process now holds a
+ * native connection to it (see the module comment). A DB stamped before the open is not written at all. Never on a
+ * wasm connection, never on a read-only one, never by an export. When another connection keeps the checkpoint from
+ * completing (SQLite reports it busy), the stamp stays in the WAL until a later checkpoint carries it: warned, not fatal.
  */
-export function stampNativeHeader(db: CompatDatabase, dbPath: string): void {
-  if (readDriverHeader(dbPath).kind !== "legacy") return; // stamped already, or not a file (an in-memory DB)
+export function stampNativeHeader(db: CompatDatabase, dbPath: string, before: DriverHeader): void {
+  if (before.kind !== "legacy" && before.kind !== "absent") return;
   db.pragma(`application_id = ${RELAY_APP_ID_NATIVE}`);
-  db.pragma("wal_checkpoint(TRUNCATE)");
-  if (readDriverHeader(dbPath).kind !== "native") {
+  const rows = db.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy?: number }> | undefined;
+  if (Array.isArray(rows) && rows[0] && rows[0].busy !== 0) {
     log.warn(
       `[db] stamped the DB at '${dbPath}' as native, but the stamp is not in its main file yet (another connection ` +
         `kept the checkpoint from completing). A later checkpoint carries it; until then its header reads as legacy.`

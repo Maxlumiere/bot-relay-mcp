@@ -63,7 +63,7 @@ import {
   discardInitializedDb,
   driverOf,
 } from "./sqlite-compat.js";
-import { assertDriverHeaderAllows, stampNativeHeader } from "./db-header.js";
+import { assertDriverHeaderAllows, stampNativeHeader, noteNativeOpen, noteNativeClosed } from "./db-header.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile, privacyFaults, restrictToOwnerWindows } from "./fs-perms.js";
 import { resolveInstance } from "./instance.js";
@@ -323,6 +323,17 @@ function toAgentWithStatus(
 }
 
 let _db: CompatDatabase | null = null;
+/** INV-DB-01 slice 2a: the path of `_db` when it is a NATIVE connection (its header may not be re-read while open). */
+let _dbNativePath: string | null = null;
+function noteOpened(db: CompatDatabase, dbPath: string): void {
+  if (driverOf(db) !== "native") return;
+  noteNativeOpen(dbPath);
+  _dbNativePath = dbPath;
+}
+function noteClosed(): void {
+  if (_dbNativePath !== null) noteNativeClosed(_dbNativePath);
+  _dbNativePath = null;
+}
 
 /**
  * Initialize the database. Call once at process startup. For native driver
@@ -337,13 +348,14 @@ export async function initializeDb(): Promise<void> {
 
   const dbPath = getDbPath();
   // INV-DB-01 slice 1: an instance driver this release refuses is refused BEFORE anything below touches the disk.
-  assertInstanceDriverAccepted(dbPath);
+  const before = assertInstanceDriverAccepted(dbPath);
   // v2.1 Phase 4c.4: a NEW directory is created 0700 before the open, so there is
   // no window where a fresh DB lives under a 0755 parent. An existing directory is
   // narrowed only after the re-check below (ADR-0048: never chmod through an
   // unverified path).
   createDbDir(path.dirname(dbPath));
   _db = await initDriver(dbPath);
+  noteOpened(_db, dbPath);
   // Re-check BEFORE anything else touches the file: on a refusal the handle is
   // DISCARDED (a WASM close() would flush its image through the escaped path),
   // and the chmod below never follows an escaped path.
@@ -352,6 +364,7 @@ export async function initializeDb(): Promise<void> {
   } catch (err) {
     discardInitializedDb();
     _db = null;
+    noteClosed();
     throw err;
   }
   // Verified: narrow the directory and the DB file itself.
@@ -367,7 +380,7 @@ export async function initializeDb(): Promise<void> {
   // cannot drift; see applySchemaSetup below.
   applySchemaSetup(_db);
   // INV-DB-01 slice 2a: a native init stamps the DB's header (in its main file); a wasm one never does.
-  if (driverOf(_db) === "native") stampNativeHeader(_db, dbPath);
+  if (driverOf(_db) === "native") stampNativeHeader(_db, dbPath, before);
 }
 
 /**
@@ -397,7 +410,7 @@ export function getDb(): CompatDatabase {
 
   const dbPath = getDbPath();
   // INV-DB-01 slice 2a: this fallback is native only, so the DB's header must allow native, before anything is made.
-  assertDriverHeaderAllows(dbPath, "native");
+  const before = assertDriverHeaderAllows(dbPath, "native");
   const dir = path.dirname(dbPath);
   // v2.1 Phase 4c.4: same dir + file perm narrowing as the eager init path
   // (the existing directory is narrowed only after the re-check).
@@ -415,6 +428,7 @@ export function getDb(): CompatDatabase {
   const req = createRequire(import.meta.url);
   const Database = req("better-sqlite3");
   _db = new Database(dbPath) as unknown as CompatDatabase;
+  noteOpened(_db, dbPath);
   try {
     assertStillContained(dbPath);
   } catch (err) {
@@ -424,6 +438,7 @@ export function getDb(): CompatDatabase {
       /* closing a refused handle is best-effort */
     }
     _db = null;
+    noteClosed();
     throw err;
   }
   ensureSecureDir(dir, 0o700);
@@ -434,7 +449,7 @@ export function getDb(): CompatDatabase {
   // #171 — same single-sourced schema setup the eager initializeDb() path runs.
   // A new migration is added ONCE in applySchemaSetup, never copy-pasted here.
   applySchemaSetup(_db);
-  stampNativeHeader(_db, dbPath); // INV-DB-01 slice 2a: native, as the eager init
+  stampNativeHeader(_db, dbPath, before); // INV-DB-01 slice 2a: native, as the eager init
 
   return _db;
 }
@@ -515,6 +530,7 @@ export function closeDb(): void {
     // A close can throw (a refused final write-back under wasm, reported by name); the handles are cleared regardless.
     db?.close();
   } finally {
+    noteClosed();
     closeInitializedDb();
   }
 }

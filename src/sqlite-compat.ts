@@ -23,7 +23,7 @@ import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
 import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver } from "./config.js";
-import { assertDriverHeaderAllows } from "./db-header.js";
+import { assertDriverHeaderAllows, type DriverHeader } from "./db-header.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -816,8 +816,8 @@ export function configuredDriver(): SqliteDriver {
  * that driver, BEFORE any filesystem effect of a DB open (db.initializeDb() calls it before it creates the DB's parent
  * directory). Warns as getDriverType() and the header check do.
  */
-export function assertInstanceDriverAccepted(dbPath: string): void {
-  assertDriverHeaderAllows(dbPath, getDriverType());
+export function assertInstanceDriverAccepted(dbPath: string): DriverHeader {
+  return assertDriverHeaderAllows(dbPath, getDriverType());
 }
 
 /**
