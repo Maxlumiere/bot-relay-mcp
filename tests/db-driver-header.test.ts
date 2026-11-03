@@ -249,6 +249,21 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
     }
   });
 
+  it("a SECOND native connection in the same process opens (the doorbell's case): judged at the first open, never re-read; a wasm open of it is refused by name", async () => {
+    await db.initializeDb();
+    const second = await openRawRelayDb(dbPath, { readonly: true });
+    try {
+      expect(second.prepare("SELECT count(*) AS n FROM agents").get()).toEqual({ n: 0 });
+      if (process.platform !== "win32") expect(otherProcessCanLockExclusive(dbPath), "both connections' locks held").toBe("DENIED");
+    } finally {
+      second.close();
+    }
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    await expect(compat.openExportSource(dbPath, "wasm")).rejects.toThrow(
+      /REFUSING the wasm driver .*this process already holds a native connection to that file/
+    );
+  });
+
   it("twin: a LEGACY DB under the wasm driver opens as before (slice 1's warning) and is NOT stamped", async () => {
     makeDb(dbPath, 0);
     process.env.RELAY_SQLITE_DRIVER = "wasm";
