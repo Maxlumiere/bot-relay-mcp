@@ -176,8 +176,16 @@ step() {
   fi
   echo ""
   echo "=== pre-publish: ${label} ==="
+  RELAY_STEP_SKIPPED=0
   if "$@"; then
-    STEPS+=("PASS  ${label}")
+    # A step whose command DECIDED not to run its check sets RELAY_STEP_SKIPPED=1: the summary
+    # then says SKIP, never PASS (only the PR smoke's suite steps do this; see suite_sweep).
+    if [ "${RELAY_STEP_SKIPPED:-0}" = "1" ]; then
+      STEPS+=("SKIP  ${label}")
+      RELAY_SUITE_SKIPPED=1
+    else
+      STEPS+=("PASS  ${label}")
+    fi
     return 0
   else
     STEPS+=("FAIL  ${label}")
@@ -292,11 +300,37 @@ step "v2.8 state-machine fast smoke (tests/v2-8-*.test.ts)" extension_state_mach
 # noise per run. Single-file parallelism via `vitest run <file>` still
 # uses pool parallelism within a file (which is safe — per-test isolate
 # is at function level).
-step "vitest run" npx vitest run --pool=forks --no-file-parallelism || exit 1
+#
+# The PR smoke (ci.yml) does not run these two suite steps: on a pull request the suite runs in ci.yml's
+# sharded "Test (Node 22)" and the bars in its "Timing bars" job, and this sequential sweep alone was ~20 of
+# the smoke's ~24 minutes (MEASURED, CI run 41573122313). The skip needs BOTH the CI smoke
+# (_relay_is_ci_smoke, which is never true during a publish) AND RELAY_SMOKE_SKIP_SUITE=1, which only the PR
+# smoke sets. A publish, a local run and the main/nightly smoke always run both steps
+# (tests/ci-smoke-skip-suite.test.ts).
+_relay_ci_skips_suite() {
+  _relay_is_ci_smoke && [ "${RELAY_SMOKE_SKIP_SUITE:-}" = "1" ]
+}
+suite_sweep() {
+  if _relay_ci_skips_suite; then
+    echo "  SKIP  the sequential sweep: on this PR the suite runs in ci.yml's sharded \"Test (Node 22)\"; main, nightly and every publish run this sweep."
+    RELAY_STEP_SKIPPED=1
+    return 0
+  fi
+  npx vitest run --pool=forks --no-file-parallelism
+}
+timing_bars_step() {
+  if _relay_ci_skips_suite; then
+    echo "  SKIP  the timing bars: on this PR they run in ci.yml's \"Timing bars\" job; main, nightly and every publish run them here."
+    RELAY_STEP_SKIPPED=1
+    return 0
+  fi
+  node "$PROJECT_ROOT/scripts/run-timing-bars.mjs"
+}
+step "vitest run" suite_sweep || exit 1
 
 # PR-B timing bars: latency measurements, so they run ALONE after the suite (the suite skips them unless
 # RELAY_TIMING_BARS=1). Same step as CI's; each run calibrates itself (A/A control + sized negative control).
-step "timing bars (serial, isolated; the exact set must run)" node "$PROJECT_ROOT/scripts/run-timing-bars.mjs" || exit 1
+step "timing bars (serial, isolated; the exact set must run)" timing_bars_step || exit 1
 
 # --- 3. npm audit (fail on high+) ---
 # v2.3.0 patch round (2026-04-23): threshold bumped moderate → high after
@@ -1153,7 +1187,11 @@ for s in "${STEPS[@]}"; do echo "  $s"; done
 if [ "$FAIL" -eq 0 ]; then
   if [ "$LIST_STEPS_MODE" != "1" ]; then release_verdict; fi
   echo ""
-  echo "pre-publish: PASS (safe to npm publish)"
+  if [ "${RELAY_SUITE_SKIPPED:-0}" = "1" ]; then
+    echo "pre-publish: PASS for the PR smoke only (the suite steps were SKIPPED; this is not a publish verdict)"
+  else
+    echo "pre-publish: PASS (safe to npm publish)"
+  fi
   exit 0
 else
   echo ""
