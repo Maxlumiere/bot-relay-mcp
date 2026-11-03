@@ -75,7 +75,7 @@ describe("shard parity", () => {
     expect(shardParity(4, [{ files: suite, tests: 1 }], suite).problems.join()).toMatch(/expected 4 shard reports, found 1/);
   });
   it("paths from any runner's checkout compare as repo-relative", () => {
-    expect(repoRelative("/home/runner/work/bot-relay-mcp/bot-relay-mcp/tests/a.test.ts")).toBe("tests/a.test.ts");
+    expect(repoRelative("/ci/checkout/bot-relay-mcp/tests/a.test.ts")).toBe("tests/a.test.ts");
     expect(repoRelative("C:\\a\\b\\tests\\x.test.ts".split("\\").join(path.sep))).toBe("tests/x.test.ts");
   });
 });
