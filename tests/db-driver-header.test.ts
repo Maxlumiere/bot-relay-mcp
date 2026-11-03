@@ -26,7 +26,7 @@ import * as compat from "../src/sqlite-compat.js";
 import * as db from "../src/db.js";
 import * as header from "../src/db-header.js";
 import { openRawRelayDb } from "../src/cli/_instance-db.js";
-import { exportRelayState } from "../src/backup.js";
+import { exportRelayState, importRelayState } from "../src/backup.js";
 import { log } from "../src/logger.js";
 
 const NATIVE = 0x524c594e;
@@ -109,6 +109,15 @@ function makeDb(file: string, appId: number): void {
   d.close();
   expect(appIdOf(file)).toBe(appId);
 }
+/** The same, in WAL mode: a connection to it then holds SQLite's SHARED lock on the main file for its whole life. */
+function makeWalDb(file: string, appId: number): void {
+  const d = new Database(file);
+  d.pragma("journal_mode = WAL");
+  if (appId !== 0) d.pragma(`application_id = ${appId}`);
+  d.exec("CREATE TABLE kept (v TEXT); INSERT INTO kept VALUES ('row-1');");
+  d.close();
+}
+const POSIX = process.platform !== "win32";
 const sideFiles = (file: string) => ["-wal", "-shm", "-journal"].filter((s) => fs.existsSync(file + s));
 const warnings = (spy: { mock: { calls: unknown[][] } }): string[] => spy.mock.calls.map((c) => c.map(String).join(" "));
 
@@ -262,6 +271,115 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
     await expect(compat.openExportSource(dbPath, "wasm")).rejects.toThrow(
       /REFUSING the wasm driver .*this process already holds a native connection to that file/
     );
+  });
+
+  describe("Codex #380 R1", () => {
+    it.each([
+      ["openReadOnly (native)", () => compat.openReadOnly(dbPath, "native")],
+      ["openExportSource (native)", async () => (await compat.openExportSource(dbPath, "native")).db],
+      ["the compat initializer", () => compat.initializeDb(dbPath)],
+    ] as const)("P1-1: a native handle from %s is held from its construction: a header read is refused and the lock stays", async (_name, open) => {
+      makeWalDb(dbPath, NATIVE);
+      const h = await open();
+      try {
+        expect(h.prepare("SELECT v FROM kept").get()).toEqual({ v: "row-1" });
+        expect(() => header.readDriverHeader(dbPath)).toThrow(/internal: refusing to read the header/);
+        if (POSIX) expect(otherProcessCanLockExclusive(dbPath)).toBe("DENIED");
+      } finally {
+        h.close();
+      }
+      expect(header.readDriverHeader(dbPath), "released by its close").toEqual({ kind: "native" });
+    });
+
+    it("P1-2: the hold covers the FAMILY: a restore whose archive path is the held DB, or its -shm, is refused by name; so is a hash of the -shm", async () => {
+      await db.initializeDb();
+      db.getDb().prepare("SELECT count(*) FROM agents").get();
+      expect(fs.existsSync(dbPath + "-shm"), "precondition: a -shm").toBe(true);
+      await expect(importRelayState(dbPath, { force: true })).rejects.toThrow(/internal: refusing to read the archive/);
+      await expect(importRelayState(dbPath + "-shm", { force: true })).rejects.toThrow(/internal: refusing to read the archive/);
+      expect(() => compat.fileSha256(dbPath + "-shm")).toThrow(/internal: refusing to read/);
+      if (POSIX) expect(otherProcessCanLockExclusive(dbPath), "the connection's lock").toBe("DENIED");
+    });
+
+    it("P1-3: a close that FAILS (a busy iterator) keeps the hold; the close that succeeds releases it", async () => {
+      makeWalDb(dbPath, NATIVE);
+      const raw = await openRawRelayDb(dbPath, { readonly: true });
+      const it = raw.prepare("SELECT v FROM kept").iterate() as IterableIterator<unknown>;
+      it.next();
+      expect(() => raw.close(), "better-sqlite3 refuses to close a busy connection").toThrow(/busy/);
+      expect(() => header.readDriverHeader(dbPath), "still held").toThrow(/internal: refusing to read the header/);
+      if (POSIX) expect(otherProcessCanLockExclusive(dbPath)).toBe("DENIED");
+      it.return?.();
+      raw.close();
+      expect(header.readDriverHeader(dbPath)).toEqual({ kind: "native" });
+    });
+
+    it("P1-3 (db.ts): a failed closeDb() keeps the hold too", async () => {
+      makeWalDb(dbPath, NATIVE);
+      await db.initializeDb();
+      const it = db.getDb().prepare("SELECT v FROM kept").iterate() as IterableIterator<unknown>;
+      it.next();
+      expect(() => db.closeDb()).toThrow(/busy/);
+      expect(() => header.readDriverHeader(dbPath)).toThrow(/internal: refusing to read the header/);
+      it.return?.();
+    });
+
+    it("P2-4: concurrent initializeDb() registers ONE hold: after closeDb() the header reads again, and a wasm open is judged by the header, not as a mix", async () => {
+      await Promise.all([db.initializeDb(), db.initializeDb()]);
+      db.closeDb();
+      expect(header.readDriverHeader(dbPath)).toEqual({ kind: "native" });
+      await expect(compat.openExportSource(dbPath, "wasm")).rejects.toThrow(/its header says it is a native relay database/);
+    });
+
+    it("P2-5: a held LEGACY file is still stamped by a native init (the hold keeps the first open's verdict)", async () => {
+      makeWalDb(dbPath, 0);
+      const raw = await openRawRelayDb(dbPath, { readonly: true });
+      await db.initializeDb();
+      raw.close();
+      db.closeDb();
+      expect(appIdOf(dbPath)).toBe(NATIVE);
+    });
+
+    it("P2-6: a refused compat init is not cached: a retry with the driver fixed re-evaluates", async () => {
+      makeDb(dbPath, NATIVE);
+      process.env.RELAY_SQLITE_DRIVER = "wasm";
+      await expect(compat.initializeDb(dbPath)).rejects.toThrow(/run native: the file is native/);
+      delete process.env.RELAY_SQLITE_DRIVER;
+      const opened = await compat.initializeDb(dbPath);
+      expect(compat.driverOf(opened)).toBe("native");
+    });
+
+    it("a refused cold export creates NOTHING (the header is checked before the backups directory is made)", async () => {
+      makeDb(dbPath, WASM);
+      await expect(exportRelayState({ destinationPath: path.join(caseDir, "x.tar.gz") })).rejects.toThrow(/owned by the wasm driver/);
+      expect(fs.existsSync(path.join(caseDir, "backups")), "no backups directory").toBe(false);
+    });
+
+    it("a restore while ANOTHER native handle on the live DB is open in this process is refused by name; the live DB is untouched", async () => {
+      await db.initializeDb();
+      db.registerAgent("before-restore", "r", []);
+      const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "a.tar.gz") })).archive_path;
+      const raw = await openRawRelayDb(dbPath, { readonly: true });
+      try {
+        db.closeDb();
+        const before = sha(dbPath);
+        await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused: this process still holds a native connection/);
+        expect(sha(dbPath)).toBe(before);
+      } finally {
+        raw.close();
+      }
+    });
+
+    it("the probe seam is test-only: outside a test runner it throws", () => {
+      const saved = process.env.VITEST;
+      delete process.env.VITEST;
+      try {
+        expect(() => header._setNativeProbeForTests(() => ({ ok: true }))).toThrow(/test-only/);
+      } finally {
+        process.env.VITEST = saved;
+        header._setNativeProbeForTests(null);
+      }
+    });
   });
 
   it("twin: a LEGACY DB under the wasm driver opens as before (slice 1's warning) and is NOT stamped", async () => {
