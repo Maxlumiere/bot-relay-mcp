@@ -328,7 +328,8 @@ describe("VERDICT BY CONSTRUCTION — exactly one verdict on every run", () => {
     fs.chmodSync(path.join(binDir, "node"), 0o755);
     try {
       const out = runHook({ RELAY_DB_PATH: instanceDb(), PATH: `${binDir}:${process.env.PATH ?? ""}` });
-      expect(verdictOf(out)).toBe("DEGRADED");
+      // The hook's whole output on a wrong verdict: a flake must name its reason (tests/hook-subshell-trap.test.ts).
+      expect(verdictOf(out), out).toBe("DEGRADED");
       // The reason names the TRUE cause (node crashed), never an unreadable DB.
       expect(out).toMatch(/VERDICT=DEGRADED reason="relay unreadable: node crashed/);
     } finally { fs.rmSync(binDir, { recursive: true, force: true }); }
@@ -339,7 +340,7 @@ describe("VERDICT BY CONSTRUCTION — exactly one verdict on every run", () => {
     // Nothing special-cases this now — it simply never earns a HEALTHY upgrade.
     linkInstance(); writeConfig(DEAD);
     const out = runHook({ RELAY_DB_PATH: instanceDb(), PATH: "/usr/bin:/bin" });
-    expect(verdictOf(out)).toBe("DEGRADED");
+    expect(verdictOf(out), out).toBe("DEGRADED");
     // The reason names the TRUE cause (node not found), never an unreadable DB.
     expect(out).toMatch(/VERDICT=DEGRADED reason="relay unreadable: node not found/);
   });
