@@ -23,7 +23,16 @@ import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
 import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver } from "./config.js";
-import { assertDriverHeaderAllows, assertNotHeldNatively, openNativeDb, type DriverHeader } from "./db-header.js";
+import { createRequire } from "module";
+import type BetterSqlite3 from "better-sqlite3";
+import {
+  assertDriverHeaderAllows,
+  assertNotHeldNatively,
+  registerNativeHold,
+  releaseNativeHold,
+  _installNativeProbe,
+  type DriverHeader,
+} from "./db-header.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -100,8 +109,40 @@ function getDriverType(): SqliteDriver {
 
 // --- Native driver (better-sqlite3 passthrough) ---
 
+const loadNative = () => createRequire(import.meta.url)("better-sqlite3") as typeof BetterSqlite3;
+
+/**
+ * INV-DB-01 slice 2a: THE one construction of a native handle on a relay DB (the compat initializer, openReadOnly and
+ * the export source, getDb()'s fallback, the raw CLI open). It registers the handle's hold on the DB's file family
+ * (db-header.ts) and releases it only when a close actually closed the handle: better-sqlite3 refuses to close a busy
+ * connection, and that handle stays open and held. `verdict` is the header read before the open.
+ */
+export function openNativeDb(dbPath: string, options: BetterSqlite3.Options, verdict: DriverHeader): BetterSqlite3.Database {
+  const db = new (loadNative())(dbPath, options);
+  const hold = registerNativeHold(dbPath, verdict);
+  const close = db.close.bind(db);
+  db.close = () => {
+    try {
+      return close();
+    } finally {
+      if (!db.open) releaseNativeHold(hold);
+    }
+  };
+  return db;
+}
+
+// The header check's "can native load HERE" probe: an in-memory open, closed at once (never a DB file).
+_installNativeProbe(() => {
+  try {
+    new (loadNative())(":memory:").close();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message.split("\n")[0] };
+  }
+});
+
 async function createNativeDb(dbPath: string, verdict: DriverHeader): Promise<CompatDatabase> {
-  return openNativeDb(dbPath, {}, verdict) as unknown as CompatDatabase; // held from construction (db-header.ts)
+  return openNativeDb(dbPath, {}, verdict) as unknown as CompatDatabase; // held from construction
 }
 
 // --- Wasm driver (sql.js adapter) ---
@@ -647,7 +688,11 @@ async function openReadOnlyUnchecked(dbPath: string, driver: SqliteDriver): Prom
   const header = assertDriverHeaderAllows(dbPath, driver); // INV-DB-01 slice 2a: by path too
   if (driver === "wasm") {
     assertNotHeldNatively(dbPath, "read the DB");
-    return openWasmFromBytes(fs.readFileSync(dbPath), dbPath);
+    const w = (await openWasmFromBytes(fs.readFileSync(dbPath), dbPath)) as WasmDatabase;
+    // A READ-ONLY open never writes the file: its close discards the image (a write-back could clobber a file that
+    // another connection changed meanwhile, or drop a native handle's locks on it).
+    w.close = () => w.discard();
+    return w;
   }
   return openNativeDb(dbPath, { readonly: true }, header) as unknown as CompatDatabase; // held from construction
 }

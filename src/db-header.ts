@@ -20,15 +20,15 @@
  * from another process is DENIED before such a close and GRANTED after). A read on a path this process holds open
  * natively is therefore refused, and the stamp is decided from the header read before the open. A hold covers the
  * DB's whole FILE FAMILY (the main file, -wal, -shm, -journal: SQLite keeps its WAL locks in -shm), is registered where
- * the native handle is CONSTRUCTED (openNativeDb, the one place), and is released only by a close that succeeded.
+ * the native handle is CONSTRUCTED (sqlite-compat.ts openNativeDb, the one place), and is released only by a close
+ * that succeeded. This module never loads a driver itself (the ADR-0048 tripwire): the construction and the in-memory
+ * probe live in the driver layer, which installs the probe here.
  *
  * The config and the env are declarations only: where they disagree with a stamped header, the header wins or the
  * open is refused, never silently mixed.
  */
 import fs from "fs";
 import path from "path";
-import { createRequire } from "module";
-import type BetterSqlite3 from "better-sqlite3";
 import type { CompatDatabase, SqliteDriver } from "./sqlite-compat.js";
 import { log } from "./logger.js";
 
@@ -114,29 +114,24 @@ export function nativeHoldCount(p: string): number {
   return n;
 }
 
+/** An opaque hold, from registerNativeHold, for releaseNativeHold. */
+export type NativeHold = object;
 /**
- * THE one construction of a native handle on a relay DB: opens it, registers its hold, and releases the hold only when
- * a close actually closed it (better-sqlite3 refuses to close a busy connection, and that handle stays open and held).
+ * Register the hold of a native handle just constructed on `dbPath` (sqlite-compat.ts openNativeDb, the one caller).
  * `verdict` is the header read before the open (a "held" verdict passes on the first open's).
  */
-export function openNativeDb(dbPath: string, options: BetterSqlite3.Options, verdict: DriverHeader): BetterSqlite3.Database {
-  const Database = createRequire(import.meta.url)("better-sqlite3") as typeof BetterSqlite3;
-  const db = new Database(dbPath, options);
+export function registerNativeHold(dbPath: string, verdict: DriverHeader): NativeHold {
   const hold: Hold = {
     base: familyBase(dbPath),
     mainKey: fileKey(dbPath),
     verdict: verdict.kind === "held" ? verdict.verdict : verdict,
   };
   holds.add(hold);
-  const close = db.close.bind(db);
-  db.close = () => {
-    try {
-      return close();
-    } finally {
-      if (!db.open) holds.delete(hold);
-    }
-  };
-  return db;
+  return hold;
+}
+/** Release a hold: only once its handle is actually closed. Idempotent. */
+export function releaseNativeHold(hold: NativeHold): void {
+  holds.delete(hold as Hold);
 }
 
 /**
@@ -195,24 +190,26 @@ export class DbHeaderRefusedError extends Error {
   }
 }
 
+type ProbeResult = { ok: true } | { ok: false; reason: string };
 /**
- * Can THIS process load the native driver? An in-memory open, closed at once: it never touches a DB file. Run only on
- * the native-header + wasm path, where it decides whether "run native" is a remedy this process can follow.
+ * Can THIS process load the native driver? Installed by the driver layer (an in-memory open, closed at once: it never
+ * touches a DB file). Run only on the native-header + wasm path, where it decides whether "run native" is a remedy
+ * this process can follow.
  */
-function nativeDriverLoads(): { ok: true } | { ok: false; reason: string } {
-  try {
-    const Database = createRequire(import.meta.url)("better-sqlite3");
-    new Database(":memory:").close();
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, reason: (err as Error).message.split("\n")[0] };
-  }
+let installedProbe: (() => ProbeResult) | null = null;
+let testProbe: (() => ProbeResult) | null = null;
+export function _installNativeProbe(fn: () => ProbeResult): void {
+  installedProbe = fn;
 }
-let nativeProbe: () => { ok: true } | { ok: false; reason: string } = nativeDriverLoads;
 /** Test-only: replace the native-driver probe (null restores the real one). Throws outside a test runner (VITEST). */
-export function _setNativeProbeForTests(fn: (() => { ok: true } | { ok: false; reason: string }) | null): void {
+export function _setNativeProbeForTests(fn: (() => ProbeResult) | null): void {
   if (!process.env.VITEST) throw new Error("_setNativeProbeForTests is test-only: VITEST is not set");
-  nativeProbe = fn ?? nativeDriverLoads;
+  testProbe = fn;
+}
+function nativeProbe(): ProbeResult {
+  const fn = testProbe ?? installedProbe;
+  if (!fn) throw new Error("internal: no native-driver probe is installed (src/sqlite-compat.ts installs it when loaded)");
+  return fn();
 }
 
 export type HeaderVerdict = { refuse: string } | { warn: string } | null;

@@ -60,8 +60,9 @@ import {
   closeInitializedDb,
   discardInitializedDb,
   driverOf,
+  openNativeDb,
 } from "./sqlite-compat.js";
-import { assertDriverHeaderAllows, stampNativeHeader, openNativeDb } from "./db-header.js";
+import { assertDriverHeaderAllows, stampNativeHeader } from "./db-header.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile, privacyFaults, restrictToOwnerWindows } from "./fs-perms.js";
 import { resolveInstance } from "./instance.js";
@@ -408,7 +409,7 @@ export function getDb(): CompatDatabase {
   // load — so RELAY_SQLITE_DRIVER=wasm callers MUST go through initializeDb().
   // A bare `require(...)` is undefined in this "type":"module" build (the "require is not defined" bug, which only
   // fired in a real ESM runtime, on this pre-init path): openNativeDb loads better-sqlite3 through createRequire.
-  // INV-DB-01 slice 2a: the one native construction (db-header.ts openNativeDb), held from here until a real close.
+  // INV-DB-01 slice 2a: the one native construction (sqlite-compat.ts openNativeDb), held until a real close.
   _db = openNativeDb(dbPath, {}, before) as unknown as CompatDatabase;
   try {
     assertStillContained(dbPath);
