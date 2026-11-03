@@ -19,7 +19,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import crypto from "crypto";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
 import Database from "better-sqlite3";
 import * as compat from "../src/sqlite-compat.js";
@@ -65,8 +65,40 @@ afterEach(() => {
 });
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
-/** The application_id in the MAIN file's header, read as bytes (never through SQLite). */
-const appIdOf = (file: string) => fs.readFileSync(file).readInt32BE(68);
+/**
+ * The application_id in the MAIN file's header, read as bytes (never through SQLite), by ANOTHER process: a read in
+ * this process would open and close a descriptor to the file, which drops this process's SQLite locks on it.
+ */
+const READ_APP_ID = path.join(ROOT, "read-app-id.cjs");
+fs.writeFileSync(READ_APP_ID, `process.stdout.write(String(require("fs").readFileSync(process.argv[2]).readInt32BE(68)));\n`);
+const appIdOf = (file: string) => {
+  const r = spawnSync(process.execPath, [READ_APP_ID, file], { encoding: "utf8" });
+  expect(r.status, `the header read: ${r.stderr}`).toBe(0);
+  return Number(r.stdout);
+};
+/**
+ * From ANOTHER process: can it take an exclusive POSIX lock on SQLite's SHARED byte range of the file? A native
+ * connection holds a read lock there for its whole life; while it does, the answer must be no ("DENIED").
+ */
+const TRY_LOCK = path.join(ROOT, "try-lock.py");
+fs.writeFileSync(
+  TRY_LOCK,
+  [
+    "import fcntl, os, sys",
+    "fd = os.open(sys.argv[1], os.O_RDWR)",
+    "try:",
+    "    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 510, 0x40000002, os.SEEK_SET)",
+    "    print('GRANTED')",
+    "except OSError:",
+    "    print('DENIED')",
+    "",
+  ].join("\n")
+);
+const otherProcessCanLockExclusive = (file: string) => {
+  const r = spawnSync("python3", ["-I", TRY_LOCK, file], { encoding: "utf8" });
+  expect(r.status, `the lock probe ran (python3): ${r.stderr}`).toBe(0);
+  return r.stdout.trim();
+};
 const sha = (file: string) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 /** A rollback-journal SQLite file with one row, stamped `appId` (0 = legacy), made without the relay. */
 function makeDb(file: string, appId: number): void {
@@ -166,6 +198,34 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
     await expect(openRawRelayDb(dbPath, { readonly: false })).rejects.toThrow(/not the relay's/);
     expect(sha(dbPath)).toBe(before);
     expect(sideFiles(dbPath)).toEqual([]);
+  });
+
+  it.skipIf(process.platform === "win32")("a native init keeps this process's SQLite lock on the DB file: another process cannot take it exclusively (stamping never re-reads the open file)", async () => {
+    makeDb(dbPath, 0);
+    await db.initializeDb();
+    expect(appIdOf(dbPath), "stamped").toBe(NATIVE);
+    expect(otherProcessCanLockExclusive(dbPath), "the connection's SHARED lock is still held").toBe("DENIED");
+  });
+
+  it.skipIf(process.platform === "win32")("the same for getDb()'s synchronous native fallback", () => {
+    makeDb(dbPath, 0);
+    db.getDb();
+    expect(otherProcessCanLockExclusive(dbPath)).toBe("DENIED");
+  });
+
+  it("a header read of a DB this process holds natively is REFUSED by name (it would drop the connection's locks); after the close it reads again", async () => {
+    await db.initializeDb();
+    expect(() => header.readDriverHeader(dbPath)).toThrow(/internal: refusing to read the header .* while this process holds a native SQLite connection/);
+    db.closeDb();
+    expect(header.readDriverHeader(dbPath)).toEqual({ kind: "native" });
+  });
+
+  it("the same while a raw CLI handle is open, and again after it is closed", async () => {
+    makeDb(dbPath, NATIVE);
+    const raw = await openRawRelayDb(dbPath, { readonly: true });
+    expect(() => header.readDriverHeader(dbPath)).toThrow(/internal: refusing to read the header/);
+    raw.close();
+    expect(header.readDriverHeader(dbPath)).toEqual({ kind: "native" });
   });
 
   it("twin: a LEGACY DB under the wasm driver opens as before (slice 1's warning) and is NOT stamped", async () => {
