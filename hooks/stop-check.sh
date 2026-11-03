@@ -435,13 +435,16 @@ if ! command -v node >/dev/null 2>&1; then
 elif [ ! -f "$RELAY_CLI" ]; then
   F1_ERR="no relay CLI beside this hook ($RELAY_CLI)"
 else
+  # The read's files are removed on EVERY exit, each one as soon as it exists (a second mktemp
+  # failing can never leak the first), then the verdict is emitted. An empty name removes nothing.
+  _f1_outf=""
+  _f1_errf=""
+  trap 'relay_in_main_shell || exit; rm -f ${_f1_outf:+"$_f1_outf" "$_f1_outf.timedout"} ${_f1_errf:+"$_f1_errf"} 2>/dev/null; relay_emit_verdict' EXIT
   _f1_outf="$(mktemp 2>/dev/null || printf '')"
   _f1_errf="$(mktemp 2>/dev/null || printf '')"
   if [ -z "$_f1_outf" ] || [ -z "$_f1_errf" ]; then
     F1_ERR="could not create a private temp file for the read"
   else
-    # The read's files are removed on EVERY exit, then the verdict is emitted.
-    trap 'relay_in_main_shell || exit; rm -f "$_f1_outf" "$_f1_errf" "$_f1_outf.timedout" 2>/dev/null; relay_emit_verdict' EXIT
     # node runs DIRECTLY into files under a watchdog, inside this hook's installed
     # budget (relay_run_pending / relay_pending_deadline in _vault-helpers.sh).
     if relay_budget_for "the mail read" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" margin; then

@@ -718,12 +718,15 @@ relay_deliver_pending_mail() {
   elif [ ! -f "$bin" ]; then
     why="no relay CLI beside this hook ($bin)"
   else
+    # Each temp file is registered for the exit cleanup THE MOMENT it exists, so a second
+    # mktemp failing can never leak the first.
     outf="$(mktemp 2>/dev/null || printf '')"
+    [ -n "$outf" ] && relay_tmp_register "$outf" "$outf.timedout"
     errf="$(mktemp 2>/dev/null || printf '')"
+    [ -n "$errf" ] && relay_tmp_register "$errf"
     if [ -z "$outf" ] || [ -z "$errf" ]; then
       why="could not create a private temp file for the read"
     else
-      relay_tmp_register "$outf" "$errf" "$outf.timedout"
       # node runs DIRECTLY into files under a watchdog, inside what is LEFT of this
       # hook's installed budget (relay_run_pending / relay_pending_deadline).
       if relay_budget_for "the mail read" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" margin; then
@@ -1254,9 +1257,14 @@ if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
   RELAY_BIND_OUT=""
   RELAY_BIND_ERR=""
   RELAY_BIND_RC=1
+  # Registered for the exit cleanup THE MOMENT each exists: every branch below (no CLI, no node, a
+  # failed allocation) then leaves none of them behind, not only the ones that remove them by hand.
   RELAY_BIND_ERRFILE="$(mktemp 2>/dev/null || printf '')"
+  [ -n "$RELAY_BIND_ERRFILE" ] && relay_tmp_register "$RELAY_BIND_ERRFILE"
   RELAY_BIND_INFILE="$(mktemp 2>/dev/null || printf '')"
+  [ -n "$RELAY_BIND_INFILE" ] && relay_tmp_register "$RELAY_BIND_INFILE"
   RELAY_BIND_OUTFILE="$(mktemp 2>/dev/null || printf '')"
+  [ -n "$RELAY_BIND_OUTFILE" ] && relay_tmp_register "$RELAY_BIND_OUTFILE" "$RELAY_BIND_OUTFILE.timedout"
   if [ -f "$RELAY_BIND_BIN" ] && command -v node >/dev/null 2>&1 && [ -n "$RELAY_BIND_ERRFILE" ] && [ -n "$RELAY_BIND_INFILE" ] && [ -n "$RELAY_BIND_OUTFILE" ]; then
     if relay_budget_for "the window bind" 3; then
       # Bounded like every pre-mail step: the payload goes in through a private
