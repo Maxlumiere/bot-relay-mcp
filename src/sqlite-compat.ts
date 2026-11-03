@@ -23,7 +23,7 @@ import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
 import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver } from "./config.js";
-import { assertDriverHeaderAllows, type DriverHeader } from "./db-header.js";
+import { assertDriverHeaderAllows, assertNotHeldNatively, type DriverHeader } from "./db-header.js";
 
 // Type subset of better-sqlite3 that src/db.ts actually uses.
 export interface CompatStatement {
@@ -249,10 +249,15 @@ class WasmStatement implements CompatStatement {
   }
 }
 
-let wasmPersistWrite: (dbPath: string, bytes: Buffer) => void = (dbPath, bytes) => fs.writeFileSync(dbPath, bytes);
+/** The wasm write-back. Never of a file this process holds natively (the write's close would drop that handle's locks). */
+const persistWrite = (dbPath: string, bytes: Buffer) => {
+  assertNotHeldNatively(dbPath, "write back the DB");
+  fs.writeFileSync(dbPath, bytes);
+};
+let wasmPersistWrite: (dbPath: string, bytes: Buffer) => void = persistWrite;
 /** Test-only: replaces the wasm write-back's file write (e.g. with one that fails, like a full disk). */
 export function _setWasmPersistWriteForTests(fn: ((dbPath: string, bytes: Buffer) => void) | null): void {
-  wasmPersistWrite = fn ?? ((dbPath, bytes) => fs.writeFileSync(dbPath, bytes));
+  wasmPersistWrite = fn ?? persistWrite;
 }
 let wasmExport: (rawDb: any) => Uint8Array = (rawDb) => rawDb.export();
 /**
@@ -555,6 +560,7 @@ async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
 
   let rawDb: any;
   if (fs.existsSync(dbPath)) {
+    assertNotHeldNatively(dbPath, "read the DB");
     const fileData = fs.readFileSync(dbPath);
     rawDb = new SQL.Database(fileData);
   } else {
@@ -640,7 +646,10 @@ async function openReadOnlyUnchecked(dbPath: string, driver: SqliteDriver): Prom
     throw new Error(`openReadOnly: file not found at '${dbPath}'`);
   }
   assertDriverHeaderAllows(dbPath, driver); // INV-DB-01 slice 2a: by path too
-  if (driver === "wasm") return openWasmFromBytes(fs.readFileSync(dbPath), dbPath);
+  if (driver === "wasm") {
+    assertNotHeldNatively(dbPath, "read the DB");
+    return openWasmFromBytes(fs.readFileSync(dbPath), dbPath);
+  }
   const { default: Database } = await import("better-sqlite3");
   return new Database(dbPath, { readonly: true }) as unknown as CompatDatabase;
 }
@@ -664,6 +673,7 @@ export async function openExportSource(
   try {
     if (driver === "wasm") {
       // The EXACT bytes the image is built from, hashed, so the caller can tell a read that raced a writer.
+      assertNotHeldNatively(dbPath, "read the DB");
       const bytes = fs.readFileSync(dbPath);
       loadedSha256 = crypto.createHash("sha256").update(bytes).digest("hex");
       db = await openWasmFromBytes(bytes, dbPath);
@@ -704,6 +714,7 @@ export async function openExportSource(
 
 /** The SHA-256 of a file's current bytes (the torn-read guard's after-read). */
 export function fileSha256(p: string): string {
+  assertNotHeldNatively(p, "read (to hash) the file");
   return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
 }
 

@@ -40,14 +40,14 @@ export async function openRawRelayDb(
   const Better = (await import("better-sqlite3")).default;
   const db = new Better(dbPath, { readonly: opts.readonly, fileMustExist: true });
   // While it is open, this process must not re-read the file's header (that would drop the handle's POSIX locks).
-  noteNativeOpen(dbPath);
+  const hold = noteNativeOpen(dbPath);
   const close = db.close.bind(db);
   let closed = false;
   db.close = () => {
     try {
       return close();
     } finally {
-      if (!closed) noteNativeClosed(dbPath);
+      if (!closed) noteNativeClosed(hold);
       closed = true;
     }
   };

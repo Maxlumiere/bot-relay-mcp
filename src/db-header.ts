@@ -22,7 +22,6 @@
  * header wins or the open is refused, never silently mixed.
  */
 import fs from "fs";
-import path from "path";
 import { createRequire } from "module";
 import type { CompatDatabase, SqliteDriver } from "./sqlite-compat.js";
 import { log } from "./logger.js";
@@ -46,34 +45,54 @@ export type DriverHeader =
   /** Not readable as a SQLite header (not a regular file, too short, no SQLite magic, or unreadable): SQLite decides. */
   | { kind: "unrecognised"; reason: string };
 
-/** The DB files this process holds a native SQLite connection to (resolved path → open handles). */
+/**
+ * The DB files this process holds a native SQLite connection to, keyed by the FILE (device + inode, from a stat, which
+ * opens no descriptor), so a symlink or a hard link to a held file is recognised too. The count is per open handle.
+ */
 const nativeOpen = new Map<string, number>();
-const keyOf = (dbPath: string) => path.resolve(dbPath);
-/** Record that this process opened a native connection to `dbPath` (its header may not be read until it is closed). */
-export function noteNativeOpen(dbPath: string): void {
-  const k = keyOf(dbPath);
-  nativeOpen.set(k, (nativeOpen.get(k) ?? 0) + 1);
+function fileKey(p: string): string | null {
+  try {
+    const st = fs.statSync(p, { bigint: true });
+    return `${st.dev}:${st.ino}`;
+  } catch {
+    return null;
+  }
 }
-/** Record that a native connection to `dbPath` was closed. */
-export function noteNativeClosed(dbPath: string): void {
-  const k = keyOf(dbPath);
-  const n = (nativeOpen.get(k) ?? 0) - 1;
-  if (n > 0) nativeOpen.set(k, n);
-  else nativeOpen.delete(k);
+/** Record that this process opened a native connection to `dbPath`. Returns the hold, for noteNativeClosed. */
+export function noteNativeOpen(dbPath: string): string | null {
+  const k = fileKey(dbPath);
+  if (k !== null) nativeOpen.set(k, (nativeOpen.get(k) ?? 0) + 1);
+  return k;
+}
+/** Record that the native connection behind `hold` (from noteNativeOpen) was closed. */
+export function noteNativeClosed(hold: string | null): void {
+  if (hold === null) return;
+  const n = (nativeOpen.get(hold) ?? 0) - 1;
+  if (n > 0) nativeOpen.set(hold, n);
+  else nativeOpen.delete(hold);
+}
+/**
+ * Throw when this process holds a native connection to the file at `p` (by any name): an fs open of it here, and the
+ * close that follows, would drop that connection's POSIX locks. Every fs read or write of a DB file goes through it.
+ */
+export function assertNotHeldNatively(p: string, doing: string): void {
+  if (nativeOpen.size === 0) return;
+  const k = fileKey(p);
+  if (k !== null && nativeOpen.has(k)) {
+    throw new Error(
+      `internal: refusing to ${doing} '${p}' through a new descriptor while this process holds a native ` +
+        `SQLite connection to that file: closing that descriptor would drop the connection's POSIX locks.`
+    );
+  }
 }
 
 /**
  * Read the driver stamp from the main file of the DB at `dbPath`, before any open. Never blocks. Throws only when this
- * process holds a native connection to that path (see the module comment): that is a bug in the caller, never a
- * verdict about the file. (A path reaching the same file by another name, e.g. a symlink, is not recognised.)
+ * process holds a native connection to that file (see the module comment): that is a bug in the caller, never a
+ * verdict about the file.
  */
 export function readDriverHeader(dbPath: string): DriverHeader {
-  if (nativeOpen.has(keyOf(dbPath))) {
-    throw new Error(
-      `internal: refusing to read the header of '${dbPath}' through a new descriptor while this process holds a native ` +
-        `SQLite connection to it: closing that descriptor would drop the connection's POSIX locks. Read it before the open.`
-    );
-  }
+  assertNotHeldNatively(dbPath, "read the header of");
   let fd: number;
   try {
     fd = fs.openSync(dbPath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));

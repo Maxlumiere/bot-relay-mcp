@@ -323,16 +323,15 @@ function toAgentWithStatus(
 }
 
 let _db: CompatDatabase | null = null;
-/** INV-DB-01 slice 2a: the path of `_db` when it is a NATIVE connection (its header may not be re-read while open). */
-let _dbNativePath: string | null = null;
+/** INV-DB-01 slice 2a: the hold on `_db`'s file when it is a NATIVE connection (no fs read of that file while open). */
+let _dbNativeHold: string | null = null;
 function noteOpened(db: CompatDatabase, dbPath: string): void {
   if (driverOf(db) !== "native") return;
-  noteNativeOpen(dbPath);
-  _dbNativePath = dbPath;
+  _dbNativeHold = noteNativeOpen(dbPath);
 }
 function noteClosed(): void {
-  if (_dbNativePath !== null) noteNativeClosed(_dbNativePath);
-  _dbNativePath = null;
+  noteNativeClosed(_dbNativeHold);
+  _dbNativeHold = null;
 }
 
 /**
