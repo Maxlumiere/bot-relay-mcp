@@ -97,13 +97,18 @@ jobs:
         # blob: merged by "Test (Node 22)" into the suite's totals; json: the files this shard RAN, for the
         # parity check there.
         run: npx vitest run --shard=${{ matrix.shard }}/4 --maxWorkers=2 --reporter=default --reporter=blob --reporter=json --outputFile.json=.vitest-shard/shard-${{ matrix.shard }}.json
+      # vitest 5 writes the blob report to .vitest/blob/ (MEASURED: --merge-reports read that default path and
+      # .vitest-reports/ did not exist). Both reports must be there: the step fails otherwise.
+      - name: Check the shard wrote both reports
+        if: ${{ !cancelled() }}
+        run: test -n "$(ls -A .vitest/blob 2>/dev/null)" && ls -l .vitest/blob .vitest-shard/shard-${{ matrix.shard }}.json
       - name: Upload the shard's reports
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: vitest-shard-${{ matrix.shard }}
           path: |
-            .vitest-reports/
+            .vitest/blob/
             .vitest-shard/
           include-hidden-files: true
           if-no-files-found: error

@@ -117,6 +117,9 @@ describe("ci.yml keeps the safety properties", () => {
     expect(J.shard).toMatch(/--shard=\$\{\{ matrix\.shard \}\}\/4 /);
     expect(J.shard).toMatch(/--outputFile\.json=\.vitest-shard\/shard-\$\{\{ matrix\.shard \}\}\.json/);
     expect(J.test).toMatch(/node scripts\/ci-shard-parity\.mjs 4 \.vitest-shard/);
+    // vitest 5's blob reporter writes .vitest/blob/ (the path --merge-reports reads by default).
+    expect(J.shard).toMatch(/^\s+\.vitest\/blob\/$/m);
+    expect(J.test).toMatch(/npx vitest --merge-reports --reporter=default/);
   });
   it("a READY pull request cancels its superseded run; drafts, main and nightly never cancel", () => {
     expect(CI).toMatch(/cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' && !github\.event\.pull_request\.draft \}\}/);
