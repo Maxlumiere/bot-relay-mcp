@@ -61,6 +61,7 @@ import {
   discardInitializedDb,
   driverOf,
   openNativeDb,
+  isOpenNative,
 } from "./sqlite-compat.js";
 import { assertDriverHeaderAllows, stampNativeHeader } from "./db-header.js";
 import { log } from "./logger.js";
@@ -506,13 +507,19 @@ function migrateSchemaToV1_7(db: CompatDatabase): void {
 
 export function closeDb(): void {
   const db = _db;
-  _db = null;
   try {
-    // A close can throw (a refused final write-back under wasm, reported by name); the handles are cleared regardless.
+    // A close can throw: a refused final write-back under wasm (reported by name), whose handles are cleared
+    // regardless; or a busy NATIVE connection, which is still open and held, so its reference is KEPT and a retry
+    // closes it and releases its hold (Codex #380 R2).
     db?.close();
-  } finally {
+  } catch (err) {
+    if (db && isOpenNative(db)) throw err;
+    _db = null;
     closeInitializedDb();
+    throw err;
   }
+  _db = null;
+  closeInitializedDb();
 }
 
 function initSchema(db: CompatDatabase): void {

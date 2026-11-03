@@ -119,7 +119,7 @@ const loadNative = () => createRequire(import.meta.url)("better-sqlite3") as typ
  */
 export function openNativeDb(dbPath: string, options: BetterSqlite3.Options, verdict: DriverHeader): BetterSqlite3.Database {
   const db = new (loadNative())(dbPath, options);
-  const hold = registerNativeHold(dbPath, verdict);
+  const hold = registerNativeHold(dbPath, verdict, db);
   const close = db.close.bind(db);
   db.close = () => {
     try {
@@ -898,9 +898,24 @@ export function discardInitializedDb(): void {
 
 export function closeInitializedDb(): void {
   const db = _initializedDb;
+  try {
+    db?.close();
+  } catch (err) {
+    // A NATIVE handle whose close failed (better-sqlite3 refuses a busy connection) is still open and held: keep the
+    // reference, so a retry closes it and releases its hold (Codex #380 R2). Any other failed close (a refused wasm
+    // write-back, reported by name) clears the handle as before: it never leaves a stale one.
+    if (db && isOpenNative(db)) throw err;
+    clearInitialized();
+    throw err;
+  }
+  clearInitialized();
+}
+function clearInitialized(): void {
   _initializedDb = null;
   _driverUsed = null;
   _initPromise = null;
-  // Cleared FIRST: a close that throws (a refused final write-back, reported by name) never leaves a stale handle.
-  db?.close();
+}
+/** A native handle still open (its close failed). */
+export function isOpenNative(db: CompatDatabase): boolean {
+  return !(db instanceof WasmDatabase) && (db as unknown as { open?: boolean }).open === true;
 }

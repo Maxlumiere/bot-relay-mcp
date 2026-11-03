@@ -55,12 +55,17 @@ export type DriverHeader =
 
 /** One native handle's hold on a DB's file family. */
 interface Hold {
-  /** The canonical path of the main file (its sidecars are this plus -wal, -shm, -journal). */
-  base: string;
+  /** The canonical path of the main file, UNCHANGED (never a suffix stripped: a DB may be named "x-wal"). */
+  main: string;
   /** The main file's device + inode when the handle opened (an alias of the old file after a swap still matches). */
   mainKey: string | null;
   /** The header the FIRST open of this family read (a later open in this process inherits it). */
   verdict: DriverHeader;
+  /**
+   * A STRONG reference to the handle: a held handle can never be garbage-collected (and closed by its finalizer)
+   * while it is counted. A handle abandoned without close() stays open, its locks stay, and the registry stays true.
+   */
+  handle: object;
 }
 const holds = new Set<Hold>();
 const SIDECARS = ["-wal", "-shm", "-journal"] as const;
@@ -85,32 +90,35 @@ function canonical(p: string): string {
     }
   }
 }
-/** The main file a path belongs to: itself, or the DB whose sidecar it names. */
-function familyBase(p: string): string {
-  const c = canonical(p);
-  for (const s of SIDECARS) if (c.endsWith(s)) return c.slice(0, -s.length);
-  return c;
+/** The members of a hold's family: the main file and the three sidecar names SQLite appends to it. */
+const familyOf = (h: Hold): string[] => [h.main, ...SIDECARS.map((s) => h.main + s)];
+/**
+ * Is a candidate (its canonical path `c`, its device + inode `k`) in a hold's family? Iff it IS the main file or one
+ * of its appended sidecars by name, or a device + inode alias of the main file (then or now) or of an existing
+ * sidecar. A suffix is never stripped from the candidate to guess its main file.
+ */
+function inFamily(c: string, k: string | null, h: Hold): boolean {
+  const members = familyOf(h);
+  if (members.includes(c)) return true;
+  if (k === null) return false;
+  if (k === h.mainKey) return true;
+  return members.some((m) => fileKey(m) === k);
 }
-/** The hold whose family `p` belongs to (by name, or as an alias of any member that exists), or null. */
+/** The first hold whose family `p` belongs to, or null. */
 function heldBy(p: string): Hold | null {
   if (holds.size === 0) return null;
-  const base = familyBase(p);
+  const c = canonical(p);
   const k = fileKey(p);
-  for (const h of holds) {
-    if (h.base === base) return h;
-    if (k === null) continue;
-    if (k === h.mainKey || k === fileKey(h.base)) return h;
-    for (const s of SIDECARS) if (fileKey(h.base + s) === k) return h;
-  }
+  for (const h of holds) if (inFamily(c, k, h)) return h;
   return null;
 }
-/** How many native handles this process holds on the family of `p`. */
+/** How many native handles this process holds on the family of `p`, across every alias of it. */
 export function nativeHoldCount(p: string): number {
   if (holds.size === 0) return 0;
-  const first = heldBy(p);
-  if (!first) return 0;
+  const c = canonical(p);
+  const k = fileKey(p);
   let n = 0;
-  for (const h of holds) if (h.base === first.base) n++;
+  for (const h of holds) if (inFamily(c, k, h)) n++;
   return n;
 }
 
@@ -118,13 +126,15 @@ export function nativeHoldCount(p: string): number {
 export type NativeHold = object;
 /**
  * Register the hold of a native handle just constructed on `dbPath` (sqlite-compat.ts openNativeDb, the one caller).
- * `verdict` is the header read before the open (a "held" verdict passes on the first open's).
+ * `verdict` is the header read before the open (a "held" verdict passes on the first open's). The hold keeps `handle`
+ * alive until it is released.
  */
-export function registerNativeHold(dbPath: string, verdict: DriverHeader): NativeHold {
+export function registerNativeHold(dbPath: string, verdict: DriverHeader, handle: object): NativeHold {
   const hold: Hold = {
-    base: familyBase(dbPath),
+    main: canonical(dbPath),
     mainKey: fileKey(dbPath),
     verdict: verdict.kind === "held" ? verdict.verdict : verdict,
+    handle,
   };
   holds.add(hold);
   return hold;
@@ -305,9 +315,10 @@ export function stampNativeHeader(db: CompatDatabase, dbPath: string, before: Dr
   const rows = db.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy?: number }> | undefined;
   const landed = !(Array.isArray(rows) && rows[0] && rows[0].busy !== 0);
   if (landed) {
-    // Every hold on this family now knows the file is native (a later open in this process does not stamp again).
-    const base = familyBase(dbPath);
-    for (const h of holds) if (h.base === base) h.verdict = { kind: "native" };
+    // Every hold on this file now knows it is native (a later open in this process does not stamp again).
+    const c = canonical(dbPath);
+    const k = fileKey(dbPath);
+    for (const h of holds) if (inFamily(c, k, h)) h.verdict = { kind: "native" };
   } else {
     log.warn(
       `[db] stamped the DB at '${dbPath}' as native, but the stamp is not in its main file yet (another connection ` +
