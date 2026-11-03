@@ -228,6 +228,27 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
     expect(header.readDriverHeader(dbPath)).toEqual({ kind: "native" });
   });
 
+  it.skipIf(process.platform === "win32")("a SYMLINK alias of a DB this process holds natively is refused too (the hold is keyed by the file, not its name)", async () => {
+    await db.initializeDb();
+    const alias = path.join(caseDir, "alias.db");
+    fs.symlinkSync(dbPath, alias);
+    expect(() => header.readDriverHeader(alias)).toThrow(/internal: refusing to read the header/);
+  });
+
+  it("a HARD-LINK alias of a held DB is refused too, and every other fs read of a held DB file is refused by the same guard", async () => {
+    makeDb(dbPath, 0);
+    const raw = await openRawRelayDb(dbPath, { readonly: true });
+    try {
+      const alias = path.join(caseDir, "hard.db");
+      fs.linkSync(dbPath, alias);
+      expect(() => header.readDriverHeader(alias), "the header read").toThrow(/internal: refusing to read/);
+      expect(() => compat.fileSha256(alias), "the export's torn-read hash").toThrow(/internal: refusing to read/);
+      await expect(compat.openExportSource(alias, "wasm"), "a wasm read of the source").rejects.toThrow(/internal: refusing to read/);
+    } finally {
+      raw.close();
+    }
+  });
+
   it("twin: a LEGACY DB under the wasm driver opens as before (slice 1's warning) and is NOT stamped", async () => {
     makeDb(dbPath, 0);
     process.env.RELAY_SQLITE_DRIVER = "wasm";
