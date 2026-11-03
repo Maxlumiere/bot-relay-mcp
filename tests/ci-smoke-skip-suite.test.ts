@@ -45,14 +45,14 @@ afterEach(() => fs.rmSync(sandbox, { recursive: true, force: true }));
 function runSteps(env: Record<string, string>): { code: number; out: string; calls: string[]; steps: string[] } {
   const fns = ["step", "_relay_is_ci_smoke", "_relay_ci_skips_suite", "suite_sweep", "timing_bars_step"];
   const harness =
-    `PROJECT_ROOT="${REPO_ROOT}"\nLIST_STEPS_MODE=0\nFAIL=0\nSTEPS=()\n` +
+    `PROJECT_ROOT="${REPO_ROOT}"\nLIST_STEPS_MODE=0\nFAIL=0\nSTEPS=()\nFULL_MODE="\${FULL_MODE:-0}"\n` +
     fns.map((f) => shellFunctionSource(GATE, f)).join("\n") +
     `\nstep "vitest run" suite_sweep || exit 1\n` +
     `step "timing bars (serial, isolated; the exact set must run)" timing_bars_step || exit 1\n` +
     `for s in "\${STEPS[@]}"; do echo "STEPS: $s"; done\n`;
   const r = spawnSync("bash", ["-c", harness], {
     encoding: "utf8",
-    env: { PATH: `${binDir}:${process.env.PATH}`, RAN_LOG: ran, RELAY_SMOKE_ONLY: "", RELAY_SMOKE_SKIP_SUITE: "", npm_lifecycle_event: "", ...env },
+    env: { PATH: `${binDir}:${process.env.PATH}`, RAN_LOG: ran, RELAY_SMOKE_ONLY: "", RELAY_SMOKE_SKIP_SUITE: "", npm_lifecycle_event: "", FULL_MODE: "", ...env },
   });
   const out = (r.stdout ?? "") + (r.stderr ?? "");
   return {
@@ -78,6 +78,7 @@ describe("the PR smoke skips the gate's suite steps; nothing else does", () => {
 
   for (const [name, env] of [
     ["a PUBLISH (prepublishOnly) even with both flags set", { RELAY_SMOKE_ONLY: "1", RELAY_SMOKE_SKIP_SUITE: "1", npm_lifecycle_event: "prepublishOnly" }],
+    ["a --full run (FULL_MODE=1) even with both flags set", { RELAY_SMOKE_ONLY: "1", RELAY_SMOKE_SKIP_SUITE: "1", FULL_MODE: "1" }],
     ["RELAY_SMOKE_SKIP_SUITE=1 outside the CI smoke", { RELAY_SMOKE_SKIP_SUITE: "1" }],
     ["the main/nightly CI smoke (RELAY_SMOKE_ONLY alone)", { RELAY_SMOKE_ONLY: "1" }],
     ["a plain gate run (no flags)", {}],

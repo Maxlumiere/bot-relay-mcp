@@ -21,6 +21,7 @@ import { fileURLToPath } from "url";
 import { scope, isDocPath } from "../scripts/ci-scope.mjs";
 import { shardParity, repoRelative } from "../scripts/ci-shard-parity.mjs";
 import { macosPrSubset, MACOS_PR_PATTERNS } from "../scripts/ci-macos-pr-subset.mjs";
+import { verdict } from "../scripts/ci-verdict.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CI = fs.readFileSync(path.join(ROOT, ".github", "workflows", "ci.yml"), "utf8");
@@ -57,8 +58,12 @@ describe("scope: docs-only and full", () => {
     expect(pr({ changed: null })).toEqual({ docsOnly: false, full: true });
     expect(pr({ changed: [] })).toEqual({ docsOnly: false, full: true });
     expect(scope({ event: "push", draft: false, ciFull: false, changed: ["src/a.ts"] })).toEqual({ docsOnly: false, full: true });
-    expect(scope({ event: "push", draft: false, ciFull: false, changed: ["CHANGELOG.md"] })).toEqual({ docsOnly: true, full: false });
-    for (const event of ["schedule", "workflow_dispatch"]) expect(scope({ event, draft: false, ciFull: false, changed: null })).toEqual({ docsOnly: false, full: true });
+    // A push to main (and the nightly, and a dispatch) NEVER takes the docs-only path: main always runs the full scope.
+    expect(scope({ event: "push", draft: false, ciFull: false, changed: ["CHANGELOG.md"] })).toEqual({ docsOnly: false, full: true });
+    for (const event of ["schedule", "workflow_dispatch"]) {
+      expect(scope({ event, draft: false, ciFull: false, changed: null })).toEqual({ docsOnly: false, full: true });
+      expect(scope({ event, draft: false, ciFull: false, changed: ["README.md"] })).toEqual({ docsOnly: false, full: true });
+    }
   });
 });
 
@@ -74,6 +79,13 @@ describe("shard parity", () => {
     expect(shardParity(1, [{ files: [...suite, "tests/z.test.ts"], tests: 1 }], suite).problems.join()).toMatch(/not in the suite \(1\): tests\/z\.test\.ts/);
     expect(shardParity(4, [{ files: suite, tests: 1 }], suite).problems.join()).toMatch(/expected 4 shard reports, found 1/);
   });
+  it("FAILS when a file that has tests ran NONE in its shard (membership is not execution)", () => {
+    const shards = [{ files: suite, tests: 3, results: { "tests/a.test.ts": 2, "tests/b.test.ts": 0, "tests/c.test.ts": 1 } }];
+    const counts = new Map([["tests/a.test.ts", 2], ["tests/b.test.ts", 4], ["tests/c.test.ts", 1]]);
+    expect(shardParity(1, shards, suite, counts).problems.join()).toMatch(/tests\/b\.test\.ts .*ran 0 tests/);
+    // A file the static list shows with no test titles is not judged (its tests may be generated at runtime).
+    expect(shardParity(1, shards, suite, new Map([["tests/b.test.ts", 0]])).ok).toBe(true);
+  });
   it("paths from any runner's checkout compare as repo-relative", () => {
     expect(repoRelative("/ci/checkout/bot-relay-mcp/tests/a.test.ts")).toBe("tests/a.test.ts");
     expect(repoRelative("C:\\a\\b\\tests\\x.test.ts".split("\\").join(path.sep))).toBe("tests/x.test.ts");
@@ -85,10 +97,42 @@ describe("the macOS pull-request subset", () => {
   it("is chosen from the test sources, is not empty, and holds the hook, launchd and runInit tests", () => {
     expect(subset.length).toBeGreaterThan(20);
     for (const f of ["tests/hook-mute-diagnostics.test.ts", "tests/v2-4-0-instance-cli.test.ts"]) expect(subset, f).toContain(f);
+    // OS behaviour reached through a dependency (liveness.ts runs ioreg/ps on darwin), not named in the test.
+    expect(subset).toContain("tests/doorbell-pr7-supervisor.test.ts");
   });
   it("every pattern selects at least one test (none is dead)", () => {
     const srcs = subset.map((f) => fs.readFileSync(path.join(ROOT, f), "utf8"));
     for (const re of MACOS_PR_PATTERNS) expect(srcs.some((s) => re.test(s)), String(re)).toBe(true);
+  });
+});
+
+describe("the aggregate verdicts check every skip against the Scope", () => {
+  const needs = (full: boolean, over: Record<string, string> = {}) => {
+    const base: Record<string, string> = {
+      changes: "success", shard: "success", checks: "success", test: "success", smoke: "success",
+      "timing-bars": full ? "success" : "skipped", "test-windows": full ? "success" : "skipped", "test-macos": full ? "success" : "skipped",
+    };
+    const o = { ...base, ...over };
+    return Object.fromEntries(Object.entries(o).map(([k, r]) => [k, { result: r, outputs: k === "changes" ? { full: String(full), docs_only: "false" } : {} }]));
+  };
+  it("full scope: a SKIPPED macOS, Windows or timing-bars job FAILS ci-ok (the job was required)", () => {
+    for (const j of ["test-macos", "test-windows", "timing-bars"]) expect(verdict(needs(true, { [j]: "skipped" }), "all").ok, j).toBe(false);
+  });
+  it("full scope: a SKIPPED timing-bars job FAILS the Linux verdict", () => {
+    expect(verdict(needs(true, { "timing-bars": "skipped" }), "linux").ok).toBe(false);
+  });
+  it("reduced scope (a draft): those jobs may be skipped, and may also have run", () => {
+    expect(verdict(needs(false), "all").ok).toBe(true);
+    expect(verdict(needs(false), "linux").ok).toBe(true);
+    expect(verdict(needs(false, { "test-macos": "success" }), "all").ok).toBe(true);
+  });
+  it("the smoke must ALWAYS succeed (it is never scoped out), and Scope must succeed", () => {
+    expect(verdict(needs(false, { smoke: "skipped" }), "all").ok).toBe(false);
+    expect(verdict(needs(true, { changes: "failure" }), "all").ok).toBe(false);
+    expect(verdict(needs(true, { changes: "failure" }), "linux").ok).toBe(false);
+  });
+  it("a failure or a cancellation anywhere FAILS", () => {
+    for (const r of ["failure", "cancelled"]) for (const j of ["shard", "checks", "test-macos", "smoke"]) expect(verdict(needs(true, { [j]: r }), "all").ok, `${j}=${r}`).toBe(false);
   });
 });
 
@@ -99,6 +143,8 @@ describe("ci.yml keeps the safety properties", () => {
   });
   it("the smoke no longer waits for the tests, and skips the gate's suite steps ONLY on pull requests", () => {
     expect(J.smoke).toMatch(/^    needs: changes$/m);
+    // The smoke runs on EVERY pull request, docs-only included: its gate holds the README/docs guards.
+    expect(J.smoke).not.toMatch(/docs_only/);
     expect(J.smoke).toMatch(/RELAY_SMOKE_ONLY: '1'/);
     expect(J.smoke).toMatch(/RELAY_SMOKE_SKIP_SUITE: \$\{\{ github\.event_name == 'pull_request' && '1' \|\| '' \}\}/);
     expect(J.smoke).toMatch(/run: bash scripts\/pre-publish-check\.sh/);
@@ -125,8 +171,10 @@ describe("ci.yml keeps the safety properties", () => {
     expect(CI).toMatch(/cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' && !github\.event\.pull_request\.draft \}\}/);
     expect(CI).toMatch(/group: ci-\$\{\{ \(github\.event_name == 'pull_request' && !github\.event\.pull_request\.draft\) && format\('pr-\{0\}', github\.event\.pull_request\.number\) \|\| github\.run_id \}\}/);
   });
-  it("the aggregates run always() and check results explicitly; ci-ok needs every other job", () => {
+  it("the aggregates run always() and check results against the Scope (scripts/ci-verdict.mjs); ci-ok needs every other job", () => {
     for (const id of ["test", "ci-ok"]) expect(J[id], id).toMatch(/^    if: always\(\)$/m);
+    expect(J.test).toMatch(/node scripts\/ci-verdict\.mjs linux/);
+    expect(J["ci-ok"]).toMatch(/node scripts\/ci-verdict\.mjs all/);
     const needs = (J["ci-ok"].match(/^    needs: \[([^\]]*)\]/m) ?? [])[1]?.split(",").map((s) => s.trim()).sort();
     expect(needs).toEqual(Object.keys(J).filter((k) => k !== "ci-ok").sort());
   });
