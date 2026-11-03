@@ -86,16 +86,20 @@ fs.writeFileSync(
   [
     "import fcntl, os, sys",
     "fd = os.open(sys.argv[1], os.O_RDWR)",
+    "start, length = int(sys.argv[2]), int(sys.argv[3])",
     "try:",
-    "    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 510, 0x40000002, os.SEEK_SET)",
+    "    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, length, start, os.SEEK_SET)",
     "    print('GRANTED')",
     "except OSError:",
     "    print('DENIED')",
     "",
   ].join("\n")
 );
-const otherProcessCanLockExclusive = (file: string) => {
-  const r = spawnSync("python3", ["-I", TRY_LOCK, file], { encoding: "utf8" });
+/** SQLite's SHARED range on the main file (PENDING_BYTE + 2, 510 bytes), and its -shm dead-man-switch byte (128). */
+const MAIN_SHARED: [number, number] = [0x40000002, 510];
+const SHM_DMS: [number, number] = [128, 1];
+const otherProcessCanLockExclusive = (file: string, [start, length]: [number, number] = MAIN_SHARED) => {
+  const r = spawnSync("python3", ["-I", TRY_LOCK, file, String(start), String(length)], { encoding: "utf8" });
   expect(r.status, `the lock probe ran (python3): ${r.stderr}`).toBe(0);
   return r.stdout.trim();
 };
@@ -299,6 +303,7 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
       await expect(importRelayState(dbPath + "-shm", { force: true })).rejects.toThrow(/internal: refusing to read the archive/);
       expect(() => compat.fileSha256(dbPath + "-shm")).toThrow(/internal: refusing to read/);
       if (POSIX) expect(otherProcessCanLockExclusive(dbPath), "the connection's lock").toBe("DENIED");
+      if (POSIX) expect(otherProcessCanLockExclusive(dbPath + "-shm", SHM_DMS), "its -shm lock byte").toBe("DENIED");
     });
 
     it("P1-3: a close that FAILS (a busy iterator) keeps the hold; the close that succeeds releases it", async () => {
@@ -378,6 +383,85 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
       } finally {
         process.env.VITEST = saved;
         header._setNativeProbeForTests(null);
+      }
+    });
+  });
+
+  describe("Codex #380 R2", () => {
+    it("P1: a DB whose own NAME ends in -wal keeps its real sidecar protected (no suffix is stripped from the main path)", async () => {
+      const p = path.join(caseDir, "suffix-wal");
+      makeWalDb(p, NATIVE);
+      const raw = await openRawRelayDb(p, { readonly: true });
+      try {
+        raw.prepare("SELECT v FROM kept").get();
+        expect(fs.existsSync(p + "-shm"), "precondition: its -shm").toBe(true);
+        expect(() => compat.fileSha256(p + "-shm")).toThrow(/internal: refusing to read/);
+        if (POSIX) expect(otherProcessCanLockExclusive(p + "-shm", SHM_DMS), "its -shm lock byte").toBe("DENIED");
+      } finally {
+        raw.close();
+      }
+    });
+
+    it("P1: two unrelated DBs named x-wal and x-shm are NOT one family: the second is judged by its own header", async () => {
+      const a = path.join(caseDir, "unrelated-wal");
+      const b = path.join(caseDir, "unrelated-shm");
+      makeWalDb(a, NATIVE);
+      makeDb(b, FOREIGN);
+      const raw = await openRawRelayDb(a, { readonly: true });
+      try {
+        await expect(compat.openReadOnly(b, "native")).rejects.toThrow(/application_id is 0x12345678, which is not the relay's/);
+      } finally {
+        raw.close();
+      }
+    });
+
+    it("P2: a failed closeDb() keeps its reference, so a retry closes the handle and releases the hold", async () => {
+      makeWalDb(dbPath, NATIVE);
+      await db.initializeDb();
+      const it = db.getDb().prepare("SELECT v FROM kept").iterate() as IterableIterator<unknown>;
+      it.next();
+      expect(() => db.closeDb()).toThrow(/busy/);
+      it.return?.();
+      db.closeDb();
+      expect(header.readDriverHeader(dbPath), "released by the retry").toEqual({ kind: "native" });
+    });
+
+    it.skipIf(!POSIX)("P2: an ABANDONED native handle is kept alive by its hold (never GC-closed while counted): still held, still locked", async () => {
+      makeWalDb(dbPath, NATIVE);
+      const v8 = await import("v8");
+      const vm = await import("vm");
+      v8.setFlagsFromString("--expose_gc");
+      const gc = vm.runInNewContext("gc") as () => void;
+      let ref: WeakRef<object>;
+      await (async () => {
+        const h = await compat.openReadOnly(dbPath, "native");
+        h.prepare("SELECT v FROM kept").get();
+        ref = new WeakRef(h);
+      })();
+      for (let i = 0; i < 5; i++) {
+        gc();
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(() => header.readDriverHeader(dbPath)).toThrow(/internal: refusing to read the header/);
+      expect(otherProcessCanLockExclusive(dbPath), "the abandoned handle's lock is still held").toBe("DENIED");
+      (ref!.deref() as { close?: () => void } | undefined)?.close?.();
+    });
+
+    it("P3: a restore counts handles across ALIASES of the live DB: a raw handle through a hard link is refused BEFORE the safety backup and closeDb()", async () => {
+      await db.initializeDb();
+      db.registerAgent("before-restore", "r", []);
+      const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "a.tar.gz") })).archive_path;
+      const alias = path.join(caseDir, "alias.db");
+      fs.linkSync(dbPath, alias);
+      const raw = await openRawRelayDb(alias, { readonly: true });
+      try {
+        await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused: this process still holds a native connection/);
+        const backups = path.join(caseDir, "backups");
+        const pre = fs.existsSync(backups) ? fs.readdirSync(backups).filter((f) => f.startsWith("pre-restore-")) : [];
+        expect(pre, "no safety backup was made").toEqual([]);
+        expect(db.peekDb(), "the relay's own connection was not closed").not.toBeNull();
+      } finally {
+        raw.close();
       }
     });
   });
