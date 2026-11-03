@@ -374,7 +374,7 @@ jobs:
           RELAY_SMOKE_ONLY: '1'
           RELAY_SMOKE_SKIP_SUITE: ${{ github.event_name == 'pull_request' && '1' || '' }}
 
-  # The ONE check to require once branch protection is switched to it (Maxime's settings change, listed in the
+  # The ONE check to require once branch protection is switched to it (a repository settings change, listed in the
   # PR): green only when every job above succeeded or was skipped BY SCOPE. `always()` so that it reports even
   # when a job it needs failed (a skipped aggregate would read as Success).
   ci-ok:
