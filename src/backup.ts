@@ -42,7 +42,7 @@ import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
 import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
 import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
-import { assertDriverHeaderAllows, nativeHandleCount, isDbFamilyMember } from "./db-header.js";
+import { assertDriverHeaderAllows, nativeHandleCount, isDbFamilyMember, isInHeldNativeFamily, beginWasmUse, endWasmUse, assertNoNativeHandle } from "./db-header.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
@@ -298,27 +298,36 @@ async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<
     return d;
   }
   const d = configuredDriver();
-  for (let attempt = 1; ; attempt++) {
-    const source = await openExportSource(srcDbPath, d);
-    try {
-      snapshotToFile(source.db, snapshotDbPath);
-      exportReadHook?.();
-      if (d !== "wasm") return d;
-      assertWasmSourceReadable(srcDbPath);
-      if (fileSha256(srcDbPath) === source.loadedSha256) {
-        assertImageIntact(source.db, srcDbPath);
-        return d;
+  // INV-DB-01 2b-i (Codex #383 R1): a cold WASM export reads the live file with fs (the image, then its torn-read
+  // hash), across awaits. Its claim is recorded first, so a native open of the file in this process meanwhile is
+  // refused by name, and it is re-checked synchronously right before the hash.
+  const claim = d === "wasm" ? beginWasmUse(srcDbPath) : null;
+  try {
+    for (let attempt = 1; ; attempt++) {
+      const source = await openExportSource(srcDbPath, d);
+      try {
+        snapshotToFile(source.db, snapshotDbPath);
+        exportReadHook?.();
+        if (d !== "wasm") return d;
+        assertWasmSourceReadable(srcDbPath);
+        assertNoNativeHandle(srcDbPath);
+        if (fileSha256(srcDbPath) === source.loadedSha256) {
+          assertImageIntact(source.db, srcDbPath);
+          return d;
+        }
+      } finally {
+        source.release(); // never written back
       }
-    } finally {
-      source.release(); // never written back
+      fs.rmSync(snapshotDbPath, { force: true });
+      if (attempt >= 2) {
+        throw new Error(
+          `backup refused (wasm driver): the DB at '${srcDbPath}' changed while it was being read, on the first read and ` +
+            `on the retry, so the copy could be torn. Back up when no other process is writing it, or with the native driver.`
+        );
+      }
     }
-    fs.rmSync(snapshotDbPath, { force: true });
-    if (attempt >= 2) {
-      throw new Error(
-        `backup refused (wasm driver): the DB at '${srcDbPath}' changed while it was being read, on the first read and ` +
-          `on the retry, so the copy could be torn. Back up when no other process is writing it, or with the native driver.`
-      );
-    }
+  } finally {
+    if (claim) endWasmUse(claim);
   }
 }
 
@@ -603,6 +612,12 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       throw new Error(
         `backup archive refused: '${resolvedArchive}' is the live relay database (or one of its side files). Pass a ` +
           `backup archive (relay backup writes one), never the database itself.`
+      );
+    }
+    if (isInHeldNativeFamily(resolvedArchive)) {
+      throw new Error(
+        `backup archive refused: '${resolvedArchive}' belongs to a database this process holds open natively (the DB ` +
+          `or one of its side files): reading it here would drop that connection's locks. Pass a backup archive.`
       );
     }
     const plainTar = path.join(stagingDir, ".archive.tar");

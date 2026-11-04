@@ -14,50 +14,72 @@
  */
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
+import { fileURLToPath } from "node:url";
 import { afterEach } from "vitest";
 import * as header from "../../src/db-header.js";
 
 const OPENERS = [
   "openSync", "readFileSync", "writeFileSync", "appendFileSync", "createReadStream", "createWriteStream",
-  "copyFileSync", "cpSync", "truncateSync", "open", "readFile", "writeFile", "appendFile", "copyFile", "truncate",
+  "copyFileSync", "cpSync", "truncateSync", "open", "readFile", "writeFile", "appendFile", "copyFile", "cp",
+  "truncate", "watch", "watchFile", "openAsBlob",
 ] as const;
 const PROMISE_OPENERS = ["open", "readFile", "writeFile", "appendFile", "copyFile", "truncate", "cp"] as const;
-const SIDECARS = ["-wal", "-shm", "-journal"];
 
-/** How many native handles this process holds on the DB at `p` (the slice's counter; 2a's registry before it). */
-const heldCount = (p: string): number => {
-  const h = header as unknown as { nativeHandleCount?: (p: string) => number; nativeHoldCount?: (p: string) => number };
-  return (h.nativeHandleCount ?? h.nativeHoldCount ?? (() => 0))(p);
-};
-/** Is `p` the DB, or a sidecar of a DB, that this process holds natively? (Over-inclusive by design: a test check.) */
-function heldDbFamily(p: unknown): string | null {
-  if (typeof p !== "string" && !(p instanceof URL) && !Buffer.isBuffer(p)) return null; // a descriptor: not a path open
-  const s = p instanceof URL ? p.pathname : String(p);
-  if (heldCount(s) > 0) return s;
-  for (const side of SIDECARS) if (s.endsWith(side) && heldCount(s.slice(0, -side.length)) > 0) return s;
-  return null;
+/** Every PATH operand of a call (a copy has two), decoded: a file URL through fileURLToPath (so %20 is a space). */
+function pathOperands(args: unknown[]): string[] {
+  const out: string[] = [];
+  for (const a of args) {
+    if (typeof a === "string") out.push(a);
+    else if (a instanceof URL && a.protocol === "file:") out.push(fileURLToPath(a));
+    else if (Buffer.isBuffer(a)) out.push(a.toString());
+  }
+  return out;
 }
+/**
+ * Is `p` a member of the family of a DB this process holds natively? By identity and by the names SQLite appends
+ * (db-header.ts, whose registry lives on globalThis, so a vi.resetModules() copy of the module shares it).
+ */
+const heldFamily = (p: string): boolean => {
+  try {
+    return header.isInHeldNativeFamily(p);
+  } catch {
+    return false;
+  }
+};
 
 const violations: string[] = [];
 /** Only the OUTERMOST wrapped call is judged: node's readFileSync calls fs.openSync itself (one read, one record). */
 let depth = 0;
+const record = (name: string, hits: string[], stack: string | undefined) =>
+  violations.push(`fs.${name}(${hits.join(", ")}) while this process holds a native handle on that DB:\n${stack?.split("\n").slice(2, 7).join("\n")}`);
 const wrap = <T extends (...a: unknown[]) => unknown>(name: string, orig: T): T =>
   function (this: unknown, ...args: unknown[]) {
-    if (depth === 0) {
+    const outer = depth === 0;
+    let hits: string[] = [];
+    let stack: string | undefined;
+    if (outer) {
       depth++;
       try {
-        const hit = heldDbFamily(args[0]);
-        if (hit) violations.push(`fs.${name}(${hit}) while this process holds a native handle on that DB:\n${new Error().stack?.split("\n").slice(2, 7).join("\n")}`);
+        hits = pathOperands(args).filter(heldFamily);
+        if (hits.length > 0) stack = new Error().stack;
       } finally {
         depth--;
       }
     }
     depth++;
+    let result: unknown;
     try {
-      return orig.apply(this, args);
+      result = orig.apply(this, args);
     } finally {
       depth--;
     }
+    // Recorded only once the open SUCCEEDED (a refused or failed open dropped no lock): a sync call that returned, a
+    // promise that resolved.
+    if (hits.length > 0) {
+      if (result instanceof Promise) result.then(() => record(name, hits, stack), () => {});
+      else record(name, hits, stack);
+    }
+    return result;
   } as T;
 
 const anyFs = fs as unknown as Record<string, (...a: unknown[]) => unknown>;

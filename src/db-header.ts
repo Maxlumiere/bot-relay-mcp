@@ -76,15 +76,23 @@ function canonical(p: string): string {
   }
 }
 
-/** A connection this process holds on a DB file: its canonical path, its device + inode then, and the handle. */
+/** A connection (or a wasm claim) this process holds on a DB file: its canonical path, device + inode then, handle. */
 interface Held {
   main: string;
   key: string | null;
   /** A STRONG reference: a counted handle is never garbage-collected (and closed by its finalizer) while counted. */
-  handle: { pragma(source: string, options?: { simple?: boolean }): unknown };
+  handle: { pragma(source: string, options?: { simple?: boolean }): unknown } | null;
 }
-const nativeHandles = new Set<Held>();
-const wasmWriters = new Set<Held>();
+/**
+ * The registry lives on globalThis (one per process), so every copy of this module (a test's vi.resetModules(), a
+ * second import path) registers and reads the SAME handles.
+ */
+const REGISTRY = Symbol.for("bot-relay.inv-db-01.handles");
+const registry: { native: Set<Held>; wasm: Set<Held> } = ((globalThis as Record<symbol, unknown>)[REGISTRY] ??= {
+  native: new Set<Held>(),
+  wasm: new Set<Held>(),
+}) as { native: Set<Held>; wasm: Set<Held> };
+const SIDECARS = ["-wal", "-shm", "-journal"] as const;
 /** Is `p` the file `h` was opened on (its canonical path, or its device + inode then or now)? */
 function sameFile(p: string, h: Held): boolean {
   if (canonical(p) === h.main) return true;
@@ -95,7 +103,12 @@ function heldIn(set: Set<Held>, p: string): Held[] {
   if (set.size === 0) return [];
   return [...set].filter((h) => sameFile(p, h));
 }
-const SIDECARS = ["-wal", "-shm", "-journal"] as const;
+/** Is `p` a SIDE FILE (-wal / -shm / -journal) of `h`'s DB: by the name SQLite appends, or as an alias of one? */
+function sideFileOf(p: string, h: Held): boolean {
+  const c = canonical(p);
+  const k = fileKey(p);
+  return SIDECARS.some((s) => c === h.main + s || (k !== null && fileKey(h.main + s) === k));
+}
 /**
  * Is `candidate` a member of the family of the DB at `dbPath` (the DB, -wal, -shm, -journal: by canonical name, or as
  * a device + inode alias of a member that exists)? Stats only, no descriptor. A suffix is never stripped from the
@@ -108,31 +121,60 @@ export function isDbFamilyMember(candidate: string, dbPath: string): boolean {
   const k = fileKey(candidate);
   return k !== null && members.some((m) => fileKey(m) === k);
 }
+/** Is `p` a member of the family of ANY DB this process holds natively (the DB itself, or one of its side files)? */
+export function isInHeldNativeFamily(p: string): boolean {
+  if (registry.native.size === 0) return false;
+  return [...registry.native].some((h) => sameFile(p, h) || sideFileOf(p, h));
+}
 
 /** How many native handles this process holds on the DB at `p` (by any name of the same file). */
 export function nativeHandleCount(p: string): number {
-  return heldIn(nativeHandles, p).length;
+  return heldIn(registry.native, p).length;
 }
-/** An opaque registration, for noteNativeHandleClosed / noteWasmWriterClosed. */
+/** An opaque registration, for noteNativeHandleClosed / endWasmUse. */
 export type HandleToken = object;
 /** The one native construction (sqlite-compat.ts openNativeDb) records a handle it opened. */
-export function noteNativeHandleOpened(dbPath: string, handle: Held["handle"]): HandleToken {
+export function noteNativeHandleOpened(dbPath: string, handle: NonNullable<Held["handle"]>): HandleToken {
   const h: Held = { main: canonical(dbPath), key: fileKey(dbPath), handle };
-  nativeHandles.add(h);
+  registry.native.add(h);
   return h;
 }
 /** ...and its successful close. Idempotent. */
 export function noteNativeHandleClosed(token: HandleToken): void {
-  nativeHandles.delete(token as Held);
+  registry.native.delete(token as Held);
 }
-/** A writable wasm connection (the compat initializer's) records itself, so a native open of its file is refused. */
-export function noteWasmWriterOpened(dbPath: string, handle: Held["handle"]): HandleToken {
-  const h: Held = { main: canonical(dbPath), key: fileKey(dbPath), handle };
-  wasmWriters.add(h);
+/**
+ * A wasm use of a file: a writable wasm connection, or a wasm init or cold export still between its awaits. While it
+ * is recorded, a native open of that file in this process is refused (a wasm read or write-back would drop the
+ * native handle's locks). Recorded BEFORE the first await; ended once its last fs operation is done (or it failed).
+ */
+export function beginWasmUse(dbPath: string): HandleToken {
+  const h: Held = { main: canonical(dbPath), key: fileKey(dbPath), handle: null };
+  registry.wasm.add(h);
   return h;
 }
-export function noteWasmWriterClosed(token: HandleToken): void {
-  wasmWriters.delete(token as Held);
+export function endWasmUse(token: HandleToken): void {
+  registry.wasm.delete(token as Held);
+}
+/** A wasm use of `dbPath` is recorded in this process. */
+export function wasmUseRecorded(dbPath: string): boolean {
+  return heldIn(registry.wasm, dbPath).length > 0;
+}
+export const WASM_USE_REFUSAL = (dbPath: string) =>
+  `REFUSING the native driver on the DB at '${dbPath}': a wasm connection to that file is open, or opening, in this ` +
+  `process, and mixing the two drivers on one file loses commits (a wasm read or write-back would drop the native ` +
+  `handle's locks).`;
+/**
+ * The synchronous re-check a wasm use makes AFTER its awaits, right before its fs read: a native handle opened in
+ * this process meanwhile (an opener that does not go through the header check) refuses it by name.
+ */
+export function assertNoNativeHandle(dbPath: string): void {
+  if (nativeHandleCount(dbPath) > 0 || isInHeldNativeFamily(dbPath)) {
+    throw new DbHeaderRefusedError(
+      `REFUSING the wasm driver on the DB at '${dbPath}': this process opened a native connection to that file ` +
+        `while the wasm open was loading, and mixing the two drivers on one file loses commits.`
+    );
+  }
 }
 
 function classify(id: number): DriverHeader {
@@ -147,8 +189,31 @@ function classify(id: number): DriverHeader {
  * (3) none → one synchronous fs read of the main file (readHeaderBytes). Never blocks.
  */
 export function readDriverHeader(dbPath: string): DriverHeader {
-  const held = heldIn(nativeHandles, dbPath)[0];
-  if (held) return classify(Number(held.handle.pragma("application_id", { simple: true })) | 0);
+  // A side file of a DB this process holds natively is never a database, and an fs read of it would drop locks.
+  const owner = [...registry.native].find((h) => !sameFile(dbPath, h) && sideFileOf(dbPath, h));
+  if (owner) {
+    throw new DbHeaderRefusedError(
+      `REFUSING '${dbPath}' as a database: it is a side file of a database this process holds natively ` +
+        `('${owner.main}'), never a database itself, and opening it here would drop that connection's locks.`
+    );
+  }
+  const held = heldIn(registry.native, dbPath);
+  if (held.length > 0) {
+    // Source (1): the first held handle that is free to run a statement. Busy ones (an open iterator) are skipped;
+    // when every one is busy, the header cannot be read without an fs open, so the read is refused (retryable).
+    for (const h of held) {
+      try {
+        return classify(Number(h.handle!.pragma("application_id", { simple: true })) | 0);
+      } catch {
+        /* busy: try the next held handle */
+      }
+    }
+    throw new DbHeaderBusyError(
+      `the header of the DB at '${dbPath}' cannot be read now: every native connection this process holds on it is ` +
+        `busy (an open statement), and reading the file directly would drop their locks. Close or finish the open ` +
+        `statement, then retry.`
+    );
+  }
   return readHeaderBytes(dbPath);
 }
 
@@ -186,6 +251,14 @@ export class DbHeaderRefusedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DbHeaderRefusedError";
+  }
+}
+/** The header could not be read because every held native handle is busy: retry once the open statement is done. */
+export class DbHeaderBusyError extends Error {
+  readonly retryable = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "DbHeaderBusyError";
   }
 }
 
@@ -277,12 +350,7 @@ export function assertDriverHeaderAllows(dbPath: string, driver: SqliteDriver): 
         `and mixing the two drivers on one file loses commits.`
     );
   }
-  if (driver === "native" && heldIn(wasmWriters, dbPath).length > 0) {
-    throw new DbHeaderRefusedError(
-      `REFUSING the native driver on the DB at '${dbPath}': this process holds a writable wasm connection to that file, ` +
-        `and mixing the two drivers on one file loses commits (the wasm write-back would drop the native handle's locks).`
-    );
-  }
+  if (driver === "native" && wasmUseRecorded(dbPath)) throw new DbHeaderRefusedError(WASM_USE_REFUSAL(dbPath));
   const header = readDriverHeader(dbPath);
   const verdict = driverHeaderVerdict(dbPath, header, driver);
   if (verdict && "refuse" in verdict) throw new DbHeaderRefusedError(verdict.refuse);

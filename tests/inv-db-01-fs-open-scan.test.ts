@@ -9,7 +9,8 @@
  * relay DB (or its -wal / -shm / -journal) in a process holding a native SQLite connection to it releases that
  * connection's locks, and another process can then checkpoint and delete the WAL under it (MEASURED in #380).
  *
- * Every reference in src/ to an fs function that opens a descriptor on a path is a SITE, keyed by
+ * Every reference in src/ to an fs function that opens a FILE descriptor on a path is a SITE (directory openers are out
+ * of scope: closing a directory's descriptor releases no lock on a file), keyed by
  * (module, enclosing top-level function, call kind) with its COUNT pinned (tests/_helpers/fs-open-sites.ts). Each
  * key is listed below with the SOURCE of its path. A new or moved site fails until it is listed.
  * - "DB" sites open a DB-family file. They are allowed only where no native connection to that file can be held:
@@ -34,14 +35,14 @@ type Entry = { n: number; db?: true; source: string };
 const INVENTORY: Record<string, Entry> = {
   // --- DB-family sites (allowed only where no native handle on the file can be held) ---
   "src/db-header.ts::readHeaderBytes::openSync": { n: 1, db: true, source: "the DB path, read ONLY when this process holds no native handle on it (source 3 of the header; source 1 is the held connection's PRAGMA)" },
-  "src/sqlite-compat.ts::createWasmDb::readFileSync": { n: 1, db: true, source: "the DB path, loaded by the wasm driver (sql.js holds no fcntl locks; refused when this process holds a native handle on it)" },
+  "src/sqlite-compat.ts::createWasmDb::readFileSync": { n: 1, db: true, source: "the DB path, loaded by the wasm driver under its wasm claim (recorded before its first await, so a native open meanwhile is refused; re-checked synchronously before the read)" },
   "src/sqlite-compat.ts::persistWrite::writeFileSync": { n: 1, db: true, source: "the DB path, the wasm driver's write-back (a native open of a file a writable wasm connection holds is refused)" },
   "src/sqlite-compat.ts::openReadOnlyUnchecked::readFileSync": { n: 1, db: true, source: "a staged DB (backup/restore staging) or an export source, read by the wasm driver (refused when this process holds a native handle on it)" },
   "src/sqlite-compat.ts::openExportSource::readFileSync": { n: 1, db: true, source: "the export source, read by the wasm driver (refused when this process holds a native handle on it)" },
-  "src/sqlite-compat.ts::fileSha256::readFileSync": { n: 1, db: true, source: "the wasm cold export's source (its torn-read hash): only on the wasm path, whose open was refused if a native handle is held" },
+  "src/sqlite-compat.ts::fileSha256::readFileSync": { n: 1, db: true, source: "the wasm cold export's source (its torn-read hash): under the export's wasm claim (a native open meanwhile is refused) and a synchronous re-check right before it" },
   "src/sqlite-compat.ts::snapshotToFile::writeFileSync": { n: 1, db: true, source: "the snapshot's destination in a fresh staging directory (never the live DB)" },
   "src/backup.ts::importRelayState::copyFileSync": { n: 2, db: true, source: "the staged archive DB onto `<live DB>.new`, then (Windows fallback) onto the live DB: after closeDb() and only when this process holds no native handle on it" },
-  "src/backup-archive.ts::gunzipToFile::openSync": { n: 1, db: true, source: "the archive path a restore is given: refused when it is a member of the live DB's family (a stat identity)" },
+  "src/backup-archive.ts::gunzipToFile::openSync": { n: 1, db: true, source: "the archive path a restore is given: refused when it is a member of the live DB's family, or of ANY DB this process holds natively (identity)" },
   "src/backup-archive.ts::gunzipToFile::createReadStream": { n: 1, db: true, source: "the same archive path (after the same refusal)" },
   // --- staging and archives (not the DB family) ---
   "src/backup-archive.ts::gunzipToFile::createWriteStream": { n: 1, source: "a new file in the private staging directory" },

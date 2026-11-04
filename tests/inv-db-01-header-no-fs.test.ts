@@ -172,7 +172,7 @@ describe("INV-DB-01 2b-i: a native process never fs-opens a DB-family file", () 
     process.env.RELAY_SQLITE_DRIVER = "wasm";
     await compat.initializeDb(dbPath);
     await expect(openRawRelayDb(dbPath, { readonly: true })).rejects.toThrow(
-      /REFUSING the native driver on the DB at .*this process holds a writable wasm connection to that file/
+      /REFUSING the native driver on the DB at .*a wasm connection to that file is open, or opening, in this process/
     );
   });
 

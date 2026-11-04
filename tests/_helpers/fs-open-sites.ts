@@ -5,7 +5,7 @@
 
 /**
  * INV-DB-01 slice 2b-i's scanner (the SEC-22 pattern, ruling e6e1b44e Q3): every REFERENCE in a program's files to
- * a node fs function that OPENS A DESCRIPTOR on a path (resolved through import aliases and namespaces by the pinned
+ * a node fs function that opens a FILE descriptor on a path (resolved through import aliases and namespaces by the pinned
  * typescript-legacy checker, never matched by name). Closing any descriptor to a file drops every POSIX lock the
  * process holds on it, so an fs open of a DB-family file in a process holding a native connection to it is the
  * lock-drop hazard; the inventory (tests/inv-db-01-fs-open-scan.test.ts) names every site and the SOURCE of its path.
@@ -21,7 +21,11 @@
 import ts from "typescript-legacy";
 import { resolveBinding, topLevelName } from "./ts-binding.js";
 
-/** The fs functions that open a descriptor on a PATH (stat, exists, mkdir, chmod, rename, unlink do not). */
+/**
+ * The fs functions that open a FILE descriptor on a path (stat, exists, mkdir, chmod, rename, unlink do not). Out of
+ * scope by design: DIRECTORY openers (opendir, readdir). POSIX record locks belong to a (process, inode) pair, so
+ * closing a descriptor on a directory releases only locks on that directory, never the DB file's or its -shm's.
+ */
 const OPENERS = [
   "open", "openSync", "readFile", "readFileSync", "writeFile", "writeFileSync", "appendFile", "appendFileSync",
   "createReadStream", "createWriteStream", "copyFile", "copyFileSync", "cp", "cpSync", "truncate", "truncateSync",

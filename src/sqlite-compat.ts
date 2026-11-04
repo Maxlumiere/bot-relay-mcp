@@ -29,8 +29,12 @@ import {
   assertDriverHeaderAllows,
   noteNativeHandleOpened,
   noteNativeHandleClosed,
-  noteWasmWriterOpened,
-  noteWasmWriterClosed,
+  beginWasmUse,
+  endWasmUse,
+  wasmUseRecorded,
+  assertNoNativeHandle,
+  WASM_USE_REFUSAL,
+  DbHeaderRefusedError,
   _installNativeProbe,
   type DriverHeader,
 } from "./db-header.js";
@@ -120,6 +124,9 @@ const loadNative = () => createRequire(import.meta.url)("better-sqlite3") as typ
  * strong reference, so a counted handle is never garbage-collected. `_verdict` is the header read before the open.
  */
 export function openNativeDb(dbPath: string, options: BetterSqlite3.Options, _verdict: DriverHeader): BetterSqlite3.Database {
+  // The one construction enforces the in-process mix itself (Codex #383 R1): a wasm use of this file, open or still
+  // between its awaits, refuses it by name.
+  if (wasmUseRecorded(dbPath)) throw new DbHeaderRefusedError(WASM_USE_REFUSAL(dbPath));
   const db = new (loadNative())(dbPath, options);
   const token = noteNativeHandleOpened(dbPath, db);
   const close = db.close.bind(db);
@@ -590,37 +597,45 @@ class WasmDatabase implements CompatDatabase {
 }
 
 async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
-  let initSqlJs: any;
+  // INV-DB-01 2b-i (Codex #383 R1): the claim is recorded BEFORE the first await, so a native open of this file in
+  // this process while sql.js loads is refused by name; it becomes the writable connection's record, and ends when
+  // that connection closes (or when this open fails).
+  const token = beginWasmUse(dbPath);
   try {
-    const mod = await import("sql.js");
-    initSqlJs = mod.default;
-  } catch {
-    throw new Error(
-      "sql.js is not installed. RELAY_SQLITE_DRIVER=wasm requires sql.js. " +
-      "Install it with: npm install sql.js"
-    );
-  }
-
-  const SQL = await initSqlJs();
-
-  let rawDb: any;
-  if (fs.existsSync(dbPath)) {
-    const fileData = fs.readFileSync(dbPath);
-    rawDb = new SQL.Database(fileData);
-  } else {
-    const dir = path.dirname(dbPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    let initSqlJs: any;
+    try {
+      const mod = await import("sql.js");
+      initSqlJs = mod.default;
+    } catch {
+      throw new Error(
+        "sql.js is not installed. RELAY_SQLITE_DRIVER=wasm requires sql.js. " +
+        "Install it with: npm install sql.js"
+      );
     }
-    rawDb = new SQL.Database();
-  }
 
-  const w = new WasmDatabase(rawDb, dbPath);
-  // INV-DB-01 2b-i: a WRITABLE wasm connection is recorded, so a native open of its file in this process is refused
-  // (the wasm write-back's close would drop the native handle's locks).
-  const token = noteWasmWriterOpened(dbPath, w);
-  w.onClosed = () => noteWasmWriterClosed(token);
-  return w;
+    const SQL = await initSqlJs();
+
+    // From here to the record's handover: ONE synchronous sequence (the re-check, the read, the construction).
+    assertNoNativeHandle(dbPath);
+    let rawDb: any;
+    if (fs.existsSync(dbPath)) {
+      const fileData = fs.readFileSync(dbPath);
+      rawDb = new SQL.Database(fileData);
+    } else {
+      const dir = path.dirname(dbPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      rawDb = new SQL.Database();
+    }
+
+    const w = new WasmDatabase(rawDb, dbPath);
+    w.onClosed = () => endWasmUse(token);
+    return w;
+  } catch (err) {
+    endWasmUse(token);
+    throw err;
+  }
 }
 
 // --- #171: driver-aware DB-file operations for backup/restore ---
