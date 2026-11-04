@@ -44,6 +44,21 @@
 case "${BASH_XTRACEFD:-}" in '' | *[!0-9]*) ;; *) [ "$((10#$BASH_XTRACEFD))" -le 2 ] || unset BASH_XTRACEFD ;; esac
 
 RELAY_VERDICT_STREAM=stdout
+# THE EXIT TRAP BELONGS TO THIS (MAIN) SHELL. relay_run_bounded ends its watchdog subshell with SIGTERM,
+# and a TERM that lands right after the fork, before the child has reset the inherited traps and applied
+# its redirect, makes bash run THIS shell's EXIT trap in the child, on the hook's real output (MEASURED,
+# bash 5.2: a running subshell never did; the fork window did, every time from a subshell). The child then
+# printed a second, stale verdict and removed the mail read's temp files before this shell read them, so
+# pending mail went undelivered. Every finalizer below starts with relay_in_main_shell. Self-contained, like
+# the fallback verdict: it must hold even when the shared helper does not load. BASHPID is bash >= 4;
+# BASH_SUBSHELL also covers bash 3.2 (macOS). Both are compared with this shell's own, so a hook that is
+# itself run inside a subshell still emits.
+RELAY_MAIN_SUBSHELL="${BASH_SUBSHELL:-0}"
+RELAY_MAIN_BASHPID="${BASHPID:-}"
+relay_in_main_shell() {
+  [ "${BASH_SUBSHELL:-0}" = "$RELAY_MAIN_SUBSHELL" ] || return 1
+  [ -z "$RELAY_MAIN_BASHPID" ] || [ "${BASHPID:-}" = "$RELAY_MAIN_BASHPID" ]
+}
 # FALLBACK VERDICT — installed BEFORE the shared helper is sourced, and this
 # ordering is the whole point. A SHARED PRIMITIVE CANNOT GUARANTEE ITS OWN
 # LOADER: if _verdict.sh is missing or unparseable, sourcing it fails and every
@@ -57,6 +72,7 @@ RELAY_VERDICT="CANNOT-JUDGE"
 RELAY_VERDICT_REASON="verdict helper did not load"
 RELAY_VERDICT_DETAIL=""
 relay_emit_verdict() {
+  relay_in_main_shell || return 0
   _l="[RELAY] VERDICT=${RELAY_VERDICT} reason=\"${RELAY_VERDICT_REASON}\"${RELAY_VERDICT_DETAIL}"
   if [ "${RELAY_VERDICT_STREAM:-stdout}" = "stderr" ]; then echo "$_l" >&2; else echo "$_l"; fi
 }
@@ -82,6 +98,7 @@ relay_tmp_register() {
   done
 }
 relay_finalize_verdict() {
+  relay_in_main_shell || return 0
   if [ -n "$RELAY_TMP_FILES" ]; then
     # Split on newlines only, with globbing off: each entry is removed as the one path it is.
     local f IFS='
@@ -701,12 +718,15 @@ relay_deliver_pending_mail() {
   elif [ ! -f "$bin" ]; then
     why="no relay CLI beside this hook ($bin)"
   else
+    # Each temp file is registered for the exit cleanup THE MOMENT it exists, so a second
+    # mktemp failing can never leak the first.
     outf="$(mktemp 2>/dev/null || printf '')"
+    [ -n "$outf" ] && relay_tmp_register "$outf" "$outf.timedout"
     errf="$(mktemp 2>/dev/null || printf '')"
+    [ -n "$errf" ] && relay_tmp_register "$errf"
     if [ -z "$outf" ] || [ -z "$errf" ]; then
       why="could not create a private temp file for the read"
     else
-      relay_tmp_register "$outf" "$errf" "$outf.timedout"
       # node runs DIRECTLY into files under a watchdog, inside what is LEFT of this
       # hook's installed budget (relay_run_pending / relay_pending_deadline).
       if relay_budget_for "the mail read" "$(relay_pending_deadline "$RELAY_HOOK_BUDGET_SECS")" margin; then
@@ -1237,9 +1257,14 @@ if [ -n "$RELAY_HOOK_PAYLOAD" ]; then
   RELAY_BIND_OUT=""
   RELAY_BIND_ERR=""
   RELAY_BIND_RC=1
+  # Registered for the exit cleanup THE MOMENT each exists: every branch below (no CLI, no node, a
+  # failed allocation) then leaves none of them behind, not only the ones that remove them by hand.
   RELAY_BIND_ERRFILE="$(mktemp 2>/dev/null || printf '')"
+  [ -n "$RELAY_BIND_ERRFILE" ] && relay_tmp_register "$RELAY_BIND_ERRFILE"
   RELAY_BIND_INFILE="$(mktemp 2>/dev/null || printf '')"
+  [ -n "$RELAY_BIND_INFILE" ] && relay_tmp_register "$RELAY_BIND_INFILE"
   RELAY_BIND_OUTFILE="$(mktemp 2>/dev/null || printf '')"
+  [ -n "$RELAY_BIND_OUTFILE" ] && relay_tmp_register "$RELAY_BIND_OUTFILE" "$RELAY_BIND_OUTFILE.timedout"
   if [ -f "$RELAY_BIND_BIN" ] && command -v node >/dev/null 2>&1 && [ -n "$RELAY_BIND_ERRFILE" ] && [ -n "$RELAY_BIND_INFILE" ] && [ -n "$RELAY_BIND_OUTFILE" ]; then
     if relay_budget_for "the window bind" 3; then
       # Bounded like every pre-mail step: the payload goes in through a private
