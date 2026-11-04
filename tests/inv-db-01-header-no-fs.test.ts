@@ -27,6 +27,7 @@ import * as header from "../src/db-header.js";
 import { openRawRelayDb } from "../src/cli/_instance-db.js";
 import { exportRelayState, importRelayState } from "../src/backup.js";
 import { _takeFsSpyViolations } from "./_setup/no-fs-on-held-db.js";
+import { pathToFileURL } from "url";
 
 const NATIVE = 0x524c594e;
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -61,6 +62,23 @@ afterEach(() => {
 });
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 
+/** In ANOTHER process: can it take an exclusive POSIX lock on [start, start+length) of `file`? (DENIED while held.) */
+function otherProcessLock(file: string, start: number, length: number): string {
+  const script = path.join(ROOT, "try-lock.py");
+  if (!fs.existsSync(script)) {
+    fs.writeFileSync(script, ["import fcntl, os, sys", "fd = os.open(sys.argv[1], os.O_RDWR)", "try:", "    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, int(sys.argv[3]), int(sys.argv[2]), os.SEEK_SET); print('GRANTED')", "except OSError:", "    print('DENIED')", ""].join("\n"));
+  }
+  return spawnSync("python3", ["-I", script, file, String(start), String(length)], { encoding: "utf8" }).stdout.trim();
+}
+const SHM_DMS = 128;
+const POSIX = process.platform !== "win32";
+function makeRollbackDb(file: string, appId: number): void {
+  const d = new Database(file);
+  d.pragma("journal_mode = DELETE");
+  if (appId !== 0) d.pragma(`application_id = ${appId}`);
+  d.exec("CREATE TABLE kept (v TEXT); INSERT INTO kept VALUES ('row-1');");
+  d.close();
+}
 function makeWalDb(file: string, appId: number): void {
   const d = new Database(file);
   d.pragma("journal_mode = WAL");
@@ -182,5 +200,131 @@ describe("INV-DB-01 2b-i: a native process never fs-opens a DB-family file", () 
     const seen = _takeFsSpyViolations();
     expect(seen).toHaveLength(1);
     expect(seen[0]).toMatch(/fs\.readFileSync\(.*relay\.db\) while this process holds a native handle on that DB/);
+  });
+
+  describe("Codex #383 R1", () => {
+    it("P1-1: a SIDE FILE of a held DB passed as a database (its -shm, or a hard link to it) is refused by name, never fs-opened; the -shm lock stays", async () => {
+      makeWalDb(dbPath, NATIVE);
+      const raw = await openRawRelayDb(dbPath, { readonly: true });
+      try {
+        raw.prepare("SELECT v FROM kept").get();
+        const shm = `${dbPath}-shm`;
+        const alias = path.join(caseDir, "shm-alias");
+        fs.linkSync(shm, alias);
+        for (const p of [shm, alias]) {
+          const { opens } = familyOpensDuring(dbPath, () => expect(() => header.readDriverHeader(p), p).toThrow(/is a side file of a database this process holds natively/));
+          expect(opens, p).toEqual([]);
+        }
+        if (POSIX) expect(otherProcessLock(shm, SHM_DMS, 1), "the -shm lock byte").toBe("DENIED");
+      } finally {
+        raw.close();
+      }
+    });
+
+    it("P1-2: a native open while a WASM init is between its awaits is refused by name (the init holds its claim from before its first await)", async () => {
+      makeRollbackDb(dbPath, 0);
+      process.env.RELAY_SQLITE_DRIVER = "wasm";
+      const init = compat.initializeDb(dbPath); // not awaited: it is now inside its awaits
+      expect(() => compat.openNativeDb(dbPath, { readonly: true }, { kind: "legacy" })).toThrow(/a wasm connection to that file is open, or opening, in this process/);
+      const w = await init;
+      expect(compat.driverOf(w)).toBe("wasm");
+      expect(header.nativeHandleCount(dbPath)).toBe(0);
+    });
+
+    it("P1-3: a native open DURING a cold wasm export (before its torn-read hash) is refused by name; the export completes", async () => {
+      makeRollbackDb(dbPath, 0);
+      process.env.RELAY_SQLITE_DRIVER = "wasm";
+      const backup = await import("../src/backup.js");
+      let refused = "";
+      backup._setExportReadHookForTests(() => {
+        try {
+          compat.openNativeDb(dbPath, { readonly: true }, { kind: "legacy" }).close();
+        } catch (e) {
+          refused = (e as Error).message;
+        }
+      });
+      try {
+        await exportRelayState({ destinationPath: path.join(caseDir, "cold-wasm.tar.gz") });
+      } finally {
+        backup._setExportReadHookForTests(null);
+      }
+      expect(refused).toMatch(/a wasm connection to that file is open, or opening, in this process/);
+    });
+
+    it("P1-4: a restore whose archive path is ANY database this process holds natively (not only the live one) is refused by name, never fs-opened", async () => {
+      await db.initializeDb(); // the live DB (A)
+      const other = path.join(caseDir, "other.db"); // B
+      makeWalDb(other, NATIVE);
+      const raw = await openRawRelayDb(other, { readonly: true });
+      try {
+        raw.prepare("SELECT v FROM kept").get();
+        for (const p of [other, `${other}-shm`]) {
+          await expect(importRelayState(p, { force: true }), p).rejects.toThrow(/belongs to a database this process holds open natively/);
+        }
+      } finally {
+        raw.close();
+      }
+    });
+
+    it("P2-5: a BUSY held handle (an open iterator) does not break the header read: a free held handle answers; all busy → a named, retryable refusal, never an fs read", async () => {
+      makeWalDb(dbPath, NATIVE);
+      const a = await openRawRelayDb(dbPath, { readonly: true });
+      const b = await openRawRelayDb(dbPath, { readonly: true });
+      const itA = a.prepare("SELECT v FROM kept").iterate() as IterableIterator<unknown>;
+      itA.next();
+      let itB: IterableIterator<unknown> | null = null;
+      try {
+        expect(header.readDriverHeader(dbPath), "the free handle answers").toEqual({ kind: "native" });
+        itB = b.prepare("SELECT v FROM kept").iterate() as IterableIterator<unknown>;
+        itB.next();
+        const { opens } = familyOpensDuring(dbPath, () => expect(() => header.readDriverHeader(dbPath)).toThrow(/every native connection this process holds on it is busy .* retry/));
+        expect(opens, "never an fs read").toEqual([]);
+        await expect(openRawRelayDb(dbPath, { readonly: true }), "a native open meanwhile: the same named refusal").rejects.toThrow(/is busy .* retry/);
+      } finally {
+        itA.return?.();
+        itB?.return?.();
+        a.close();
+        b.close();
+      }
+      expect(header.readDriverHeader(dbPath), "once free, it answers").toEqual({ kind: "native" });
+    });
+
+    it("P2-6: module copies share one count (vi.resetModules + a fresh import still register where every copy reads)", async () => {
+      makeWalDb(dbPath, NATIVE);
+      vi.resetModules();
+      const fresh = await import("../src/cli/_instance-db.js");
+      const raw = await fresh.openRawRelayDb(dbPath, { readonly: true });
+      try {
+        expect(header.nativeHandleCount(dbPath), "the original module copy sees it").toBe(1);
+      } finally {
+        raw.close();
+      }
+    });
+
+    it.each([
+      ["a copy DESTINATION", (p: string) => fs.copyFileSync(path.join(ROOT, "staged.bin"), p)],
+      ["a hard link to the held -shm", (p: string) => fs.readFileSync(path.join(path.dirname(p), "shm-link"))],
+      ["a file URL with an encoded space", (p: string) => fs.readFileSync(pathToFileURL(p))],
+    ] as const)("P2-7: the spy records %s", async (_label, act) => {
+      const spaced = path.join(caseDir, "with space");
+      fs.mkdirSync(spaced);
+      const p = path.join(spaced, "relay.db");
+      makeWalDb(p, NATIVE);
+      fs.writeFileSync(path.join(ROOT, "staged.bin"), "x");
+      const raw = await openRawRelayDb(p, { readonly: true });
+      try {
+        raw.prepare("SELECT v FROM kept").get();
+        fs.linkSync(`${p}-shm`, path.join(spaced, "shm-link"));
+        _takeFsSpyViolations();
+        try {
+          act(p);
+        } catch {
+          /* the spy's record is what is under test */
+        }
+        expect(_takeFsSpyViolations().length).toBeGreaterThan(0);
+      } finally {
+        raw.close();
+      }
+    });
   });
 });
