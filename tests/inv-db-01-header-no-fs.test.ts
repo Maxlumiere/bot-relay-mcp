@@ -327,4 +327,86 @@ describe("INV-DB-01 2b-i: a native process never fs-opens a DB-family file", () 
       }
     });
   });
+
+  describe("Codex #383 R2", () => {
+    it.skipIf(!POSIX)("P2-1: the spy records an fd acquisition even when the outer operation then FAILS (a read through an append-only fd: EBADF), and does NOT record an open that failed (ENOENT)", async () => {
+      makeWalDb(dbPath, NATIVE);
+      const raw = await openRawRelayDb(dbPath, { readonly: true });
+      try {
+        raw.prepare("SELECT v FROM kept").get();
+        _takeFsSpyViolations();
+        expect(() => fs.readFileSync(`${dbPath}-shm`, { flag: "a" }), "the read fails after the open succeeded").toThrow(/EBADF/);
+        expect(_takeFsSpyViolations().length, "the open was recorded").toBeGreaterThan(0);
+        await new Promise<void>((res) => fs.open(`${dbPath}-journal`, "r", () => res()));
+        expect(_takeFsSpyViolations(), "an open that failed (ENOENT) is not recorded").toEqual([]);
+      } finally {
+        raw.close();
+      }
+    });
+
+    it("P2-2: a NON-busy PRAGMA failure on a held handle (not a database) surfaces as itself, never as a retryable busy error", async () => {
+      const p = path.join(caseDir, "garbage.db");
+      fs.writeFileSync(p, Buffer.alloc(4096, 0x5a));
+      const raw = await openRawRelayDb(p, { readonly: true });
+      try {
+        let err: Error | null = null;
+        try {
+          header.readDriverHeader(p);
+        } catch (e) {
+          err = e as Error;
+        }
+        expect(err?.name, String(err)).not.toBe("DbHeaderBusyError");
+        expect(String(err?.message)).toMatch(/not a database|SQLITE_NOTADB/);
+      } finally {
+        raw.close();
+      }
+    });
+
+    it("P3: the spy reads PATH arguments only: a write whose PAYLOAD is a held DB's path (a string or a Buffer) is not a violation", async () => {
+      makeWalDb(dbPath, NATIVE);
+      const raw = await openRawRelayDb(dbPath, { readonly: true });
+      try {
+        _takeFsSpyViolations();
+        fs.writeFileSync(path.join(caseDir, "pointer.txt"), dbPath);
+        fs.writeFileSync(path.join(caseDir, "pointer.bin"), Buffer.from(dbPath));
+        expect(_takeFsSpyViolations()).toEqual([]);
+      } finally {
+        raw.close();
+      }
+    });
+
+    it.each(["close", "discard"] as const)("inherited: a wasm %s whose underlying close THROWS after closing still releases the claim (the handle is dead): a native open then works", async (how) => {
+      makeRollbackDb(dbPath, 0);
+      process.env.RELAY_SQLITE_DRIVER = "wasm";
+      const w = await compat.initializeDb(dbPath);
+      const rawWasm = (w as unknown as { db: { close(): void } }).db;
+      const orig = rawWasm.close.bind(rawWasm);
+      rawWasm.close = () => {
+        orig();
+        throw new Error("injected: closed, then threw");
+      };
+      try {
+        if (how === "close") compat.closeInitializedDb();
+        else compat.discardInitializedDb();
+      } catch {
+        /* the injected failure */
+      }
+      const n = compat.openNativeDb(dbPath, { readonly: true }, { kind: "legacy" });
+      n.close();
+    });
+
+    it("inherited: the doorbell's lock DB refuses a path that aliases a relay DB this process has claimed (a hard link under the lock's name)", async () => {
+      makeRollbackDb(dbPath, 0);
+      const stateDir = path.join(caseDir, "state");
+      fs.mkdirSync(stateDir, { mode: 0o700 });
+      fs.linkSync(dbPath, path.join(stateDir, "doorbell.lock.db"));
+      process.env.RELAY_SQLITE_DRIVER = "wasm";
+      const init = compat.initializeDb(dbPath); // its claim is recorded before its first await
+      const { acquireInstanceLock } = await import("../src/doorbell-lock.js");
+      expect(() => acquireInstanceLock(stateDir, { pid: process.pid, proc_start: null, host_id: null })).toThrow(
+        /refusing to open it as a lock: it is .* relay database this process has open/
+      );
+      await init;
+    });
+  });
 });
