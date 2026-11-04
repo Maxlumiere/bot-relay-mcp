@@ -396,7 +396,8 @@ describe("INV-DB-01 2b-i: a native process never fs-opens a DB-family file", () 
       n.close();
     });
 
-    it("inherited: the doorbell's lock DB refuses a path that aliases a relay DB this process has claimed (a hard link under the lock's name)", async () => {
+    // POSIX-only, as the doorbell itself: its state dir must be private (mode 0700), which Windows cannot express.
+    it.skipIf(!POSIX)("inherited: the doorbell's lock DB refuses a path that aliases a relay DB this process has claimed (a hard link under the lock's name)", async () => {
       makeRollbackDb(dbPath, 0);
       const stateDir = path.join(caseDir, "state");
       fs.mkdirSync(stateDir, { mode: 0o700 });
