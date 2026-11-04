@@ -43,6 +43,7 @@ import fs from "fs";
 import path from "path";
 import Database from "better-sqlite3";
 import { ensurePrivateDir } from "./doorbell-log.js";
+import { isInClaimedFamily } from "./db-header.js";
 
 export const LOCK_DB_FILENAME = "doorbell.lock.db";
 /** PR 7 (§v6, ruling ffcaf608 D2): a watch generation's lock file name (src/watch-wake.ts: watchLockFile). */
@@ -55,6 +56,11 @@ export const isLockFileName = (name: string): boolean => name === LOCK_DB_FILENA
 /** The module's ONE driver construction. Refuses any path whose name is not a lock file name. */
 function openLockFile(lockPath: string): InstanceType<typeof Database> {
   if (!isLockFileName(path.basename(lockPath))) throw new Error(`${lockPath} is not a lock file (${LOCK_DB_FILENAME} or watch.lock.<generation>.db): refusing to open it`);
+  // INV-DB-01 2b-i: this native construction sits outside openNativeDb, so it checks the claims itself: a lock path
+  // that aliases (by identity) a relay DB this process has open, natively or through wasm, is never opened.
+  if (isInClaimedFamily(lockPath)) {
+    throw new Error(`${lockPath}: refusing to open it as a lock: it is (an alias of) a relay database this process has open, natively or through wasm`);
+  }
   return new Database(lockPath, { timeout: 0, fileMustExist: true });
 }
 export const HOLDER_FILENAME = "doorbell.lock.holder.json";

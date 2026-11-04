@@ -151,9 +151,12 @@ describe("ADR-0048 PR B — TRIPWIRE: no module opens a SQLite driver handle exc
 
   it("the doorbell-lock exception opens exactly ONE driver handle, on a lock file (never the relay DB)", () => {
     const src = fs.readFileSync(path.join(REPO_ROOT, "src", "doorbell-lock.ts"), "utf-8");
-    // Exactly one construction, inside openLockFile, right after its name check...
+    // Exactly one construction, inside openLockFile, right after its name check and (INV-DB-01 2b-i) its claim check:
+    // a lock path that aliases a relay DB this process has open is refused before the driver opens it...
     expect(src.match(/\bnew\s+Database\s*\(/g) ?? []).toHaveLength(1);
-    expect(src).toMatch(/function openLockFile\(lockPath: string\)[^{]*\{\s*if \(!isLockFileName\(path\.basename\(lockPath\)\)\) throw [^\n]*\n\s*return new Database\(lockPath, /);
+    expect(src).toMatch(
+      /function openLockFile\(lockPath: string\)[^{]*\{\s*if \(!isLockFileName\(path\.basename\(lockPath\)\)\) throw [^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*if \(isInClaimedFamily\(lockPath\)\) \{\n[\s\S]*?\n\s*\}\n\s*return new Database\(lockPath, /
+    );
     // ...and the names it admits are lock files only (PR 7 adds the watch's per-generation lock).
     expect(src).toMatch(/export const isLockFileName = \(name: string\): boolean => name === LOCK_DB_FILENAME \|\| WATCH_LOCK_DB_PATTERN\.test\(name\);/);
     expect(src).toMatch(/\bexport\s+const\s+LOCK_DB_FILENAME\s*=\s*"doorbell\.lock\.db"/);

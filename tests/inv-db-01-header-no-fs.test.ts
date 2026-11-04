@@ -199,7 +199,8 @@ describe("INV-DB-01 2b-i: a native process never fs-opens a DB-family file", () 
     fs.readFileSync(dbPath); // the hazard itself, on purpose: the lock is lost for this row only
     const seen = _takeFsSpyViolations();
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatch(/fs\.readFileSync\(.*relay\.db\) while this process holds a native handle on that DB/);
+    // Recorded at the fd level (Codex #383 R2): readFileSync acquires its descriptor through fs.openSync.
+    expect(seen[0]).toMatch(/fs\.openSync\(.*relay\.db\) while this process holds a native handle on that DB/);
   });
 
   describe("Codex #383 R1", () => {

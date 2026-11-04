@@ -495,13 +495,26 @@ class WasmDatabase implements CompatDatabase {
     // The cleanup never throws OVER the loss: its error is attached to the first one.
     try {
       this.db.close();
-      this.closed = true;
-      this.onClosed?.();
     } catch (cleanupErr) {
       if (first) first.message += ` (closing the handle failed too: ${(cleanupErr as Error).message})`;
       else first = cleanupErr as Error;
+    } finally {
+      this.retire();
     }
     if (first) throw first;
+  }
+
+  /**
+   * After a close or discard, whatever the underlying close did (it may close and then throw): the handle is DEAD
+   * (no further write-back or use), and its in-process wasm claim is released (Codex #383 R2), so a stranded claim
+   * never refuses a legitimate native open.
+   */
+  private retire(): void {
+    this.closed = true;
+    if (!this.dead) this.dead = new Error("this wasm connection was closed: it can no longer be used");
+    (this.db as any).__dead = this.dead;
+    this.onClosed?.();
+    this.onClosed = null;
   }
 
   /**
@@ -511,9 +524,11 @@ class WasmDatabase implements CompatDatabase {
    */
   discard(): void {
     if (this.closed) return;
-    this.db.close();
-    this.closed = true;
-    this.onClosed?.();
+    try {
+      this.db.close();
+    } finally {
+      this.retire();
+    }
   }
 
   /**

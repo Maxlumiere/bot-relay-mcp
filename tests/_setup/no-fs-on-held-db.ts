@@ -18,17 +18,25 @@ import { fileURLToPath } from "node:url";
 import { afterEach } from "vitest";
 import * as header from "../../src/db-header.js";
 
-const OPENERS = [
-  "openSync", "readFileSync", "writeFileSync", "appendFileSync", "createReadStream", "createWriteStream",
-  "copyFileSync", "cpSync", "truncateSync", "open", "readFile", "writeFile", "appendFile", "copyFile", "cp",
-  "truncate", "watch", "watchFile", "openAsBlob",
-] as const;
-const PROMISE_OPENERS = ["open", "readFile", "writeFile", "appendFile", "copyFile", "truncate", "cp"] as const;
+/**
+ * WHERE a descriptor is acquired, and which arguments are paths (never a payload):
+ * - fd level: openSync (returns an fd), callback open (an fd in its callback), promises.open (resolves to a handle).
+ *   Node's readFileSync / writeFileSync / appendFileSync / truncateSync and the streams open through these, so an
+ *   operation that fails AFTER its open (a read through an append-only fd: EBADF) is still recorded;
+ * - call level, for the APIs whose open bypasses the exported fs.open (natively implemented copies, callback
+ *   readFile, the promise readers, watches, openAsBlob): recorded unless they failed with ENOENT (no fd acquired).
+ */
+const CALL_LEVEL: Record<string, number[]> = {
+  copyFileSync: [0, 1], copyFile: [0, 1], cpSync: [0, 1], cp: [0, 1],
+  readFile: [0], writeFile: [0], appendFile: [0], truncate: [0], watch: [0], watchFile: [0], openAsBlob: [0],
+};
+const PROMISE_CALL_LEVEL: Record<string, number[]> = { readFile: [0], writeFile: [0], appendFile: [0], truncate: [0], copyFile: [0, 1], cp: [0, 1] };
 
-/** Every PATH operand of a call (a copy has two), decoded: a file URL through fileURLToPath (so %20 is a space). */
-function pathOperands(args: unknown[]): string[] {
+/** The PATH operand(s) at `positions`, decoded: a file URL through fileURLToPath (so %20 is a space). */
+function pathOperands(args: unknown[], positions: number[]): string[] {
   const out: string[] = [];
-  for (const a of args) {
+  for (const i of positions) {
+    const a = args[i];
     if (typeof a === "string") out.push(a);
     else if (a instanceof URL && a.protocol === "file:") out.push(fileURLToPath(a));
     else if (Buffer.isBuffer(a)) out.push(a.toString());
@@ -48,44 +56,88 @@ const heldFamily = (p: string): boolean => {
 };
 
 const violations: string[] = [];
-/** Only the OUTERMOST wrapped call is judged: node's readFileSync calls fs.openSync itself (one read, one record). */
-let depth = 0;
 const record = (name: string, hits: string[], stack: string | undefined) =>
-  violations.push(`fs.${name}(${hits.join(", ")}) while this process holds a native handle on that DB:\n${stack?.split("\n").slice(2, 7).join("\n")}`);
-const wrap = <T extends (...a: unknown[]) => unknown>(name: string, orig: T): T =>
-  function (this: unknown, ...args: unknown[]) {
-    const outer = depth === 0;
-    let hits: string[] = [];
-    let stack: string | undefined;
-    if (outer) {
-      depth++;
-      try {
-        hits = pathOperands(args).filter(heldFamily);
-        if (hits.length > 0) stack = new Error().stack;
-      } finally {
-        depth--;
-      }
-    }
-    depth++;
-    let result: unknown;
-    try {
-      result = orig.apply(this, args);
-    } finally {
-      depth--;
-    }
-    // Recorded only once the open SUCCEEDED (a refused or failed open dropped no lock): a sync call that returned, a
-    // promise that resolved.
-    if (hits.length > 0) {
-      if (result instanceof Promise) result.then(() => record(name, hits, stack), () => {});
-      else record(name, hits, stack);
-    }
-    return result;
-  } as T;
+  violations.push(`fs.${name}(${hits.join(", ")}) while this process holds a native handle on that DB:\n${stack?.split("\n").slice(2, 8).join("\n")}`);
+const hitsOf = (args: unknown[], positions: number[]): string[] => pathOperands(args, positions).filter(heldFamily);
+const noFd = (err: unknown) => (err as { code?: string } | null)?.code === "ENOENT";
 
 const anyFs = fs as unknown as Record<string, (...a: unknown[]) => unknown>;
-for (const name of OPENERS) if (typeof anyFs[name] === "function") anyFs[name] = wrap(name, anyFs[name]);
+// fd level
+{
+  const orig = anyFs.openSync!;
+  anyFs.openSync = function (this: unknown, ...args: unknown[]) {
+    const hits = hitsOf(args, [0]);
+    const fd = orig.apply(this, args);
+    if (hits.length > 0) record("openSync", hits, new Error().stack); // an fd was acquired (it returned)
+    return fd;
+  };
+}
+{
+  const orig = anyFs.open!;
+  anyFs.open = function (this: unknown, ...args: unknown[]) {
+    const hits = hitsOf(args, [0]);
+    const cb = args[args.length - 1];
+    if (hits.length > 0 && typeof cb === "function") {
+      const stack = new Error().stack;
+      args[args.length - 1] = function (this: unknown, err: unknown, ...rest: unknown[]) {
+        if (!err) record("open", hits, stack); // only an fd that was acquired
+        return (cb as (...a: unknown[]) => unknown).call(this, err, ...rest);
+      };
+    }
+    return orig.apply(this, args);
+  };
+}
+// call level
+for (const [name, positions] of Object.entries(CALL_LEVEL)) {
+  const orig = anyFs[name];
+  if (typeof orig !== "function") continue;
+  anyFs[name] = function (this: unknown, ...args: unknown[]) {
+    const hits = hitsOf(args, positions);
+    if (hits.length === 0) return orig.apply(this, args);
+    const stack = new Error().stack;
+    const cb = args[args.length - 1];
+    if (typeof cb === "function" && !["watch", "watchFile"].includes(name)) {
+      args[args.length - 1] = function (this: unknown, err: unknown, ...rest: unknown[]) {
+        if (!noFd(err)) record(name, hits, stack);
+        return (cb as (...a: unknown[]) => unknown).call(this, err, ...rest);
+      };
+      return orig.apply(this, args);
+    }
+    try {
+      const r = orig.apply(this, args);
+      if (r instanceof Promise) r.then(() => record(name, hits, stack), (e) => { if (!noFd(e)) record(name, hits, stack); });
+      else record(name, hits, stack);
+      return r;
+    } catch (e) {
+      if (!noFd(e)) record(name, hits, stack);
+      throw e;
+    }
+  };
+}
 const anyPromises = fs.promises as unknown as Record<string, (...a: unknown[]) => unknown>;
-for (const name of PROMISE_OPENERS) if (typeof anyPromises[name] === "function") anyPromises[name] = wrap(`promises.${name}`, anyPromises[name]);
+{
+  const orig = anyPromises.open!;
+  anyPromises.open = function (this: unknown, ...args: unknown[]) {
+    const hits = hitsOf(args, [0]);
+    const stack = hits.length > 0 ? new Error().stack : undefined;
+    const p = orig.apply(this, args) as Promise<unknown>;
+    if (hits.length > 0) p.then(() => record("promises.open", hits, stack), () => {});
+    return p;
+  };
+}
+for (const [name, positions] of Object.entries(PROMISE_CALL_LEVEL)) {
+  const orig = anyPromises[name];
+  if (typeof orig !== "function") continue;
+  anyPromises[name] = function (this: unknown, ...args: unknown[]) {
+    const hits = hitsOf(args, positions);
+    const p = orig.apply(this, args) as Promise<unknown>;
+    if (hits.length > 0) {
+      const stack = new Error().stack;
+      p.then(() => record(`promises.${name}`, hits, stack), (e) => { if (!noFd(e)) record(`promises.${name}`, hits, stack); });
+    }
+    return p;
+  };
+}
 syncBuiltinESMExports();
 
 afterEach(() => {

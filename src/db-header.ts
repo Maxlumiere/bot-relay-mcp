@@ -121,6 +121,21 @@ export function isDbFamilyMember(candidate: string, dbPath: string): boolean {
   const k = fileKey(candidate);
   return k !== null && members.some((m) => fileKey(m) === k);
 }
+/** A held handle that cannot run a statement now: better-sqlite3's "busy executing a query", or SQLITE_BUSY. */
+function isBusy(err: unknown): boolean {
+  const e = err as { code?: string; message?: string };
+  return e?.code === "SQLITE_BUSY" || /busy executing a query/i.test(String(e?.message ?? ""));
+}
+/**
+ * Is `p` a member of the family of any DB this process has CLAIMED: held natively, or with a wasm use recorded (the
+ * DB itself, or one of its side files, by name or by identity)? For a native construction outside openNativeDb (the
+ * doorbell's lock DB), which must never open such a file.
+ */
+export function isInClaimedFamily(p: string): boolean {
+  if (registry.native.size === 0 && registry.wasm.size === 0) return false;
+  return [...registry.native, ...registry.wasm].some((h) => sameFile(p, h) || sideFileOf(p, h));
+}
+
 /** Is `p` a member of the family of ANY DB this process holds natively (the DB itself, or one of its side files)? */
 export function isInHeldNativeFamily(p: string): boolean {
   if (registry.native.size === 0) return false;
@@ -199,15 +214,18 @@ export function readDriverHeader(dbPath: string): DriverHeader {
   }
   const held = heldIn(registry.native, dbPath);
   if (held.length > 0) {
-    // Source (1): the first held handle that is free to run a statement. Busy ones (an open iterator) are skipped;
-    // when every one is busy, the header cannot be read without an fs open, so the read is refused (retryable).
+    // Source (1): the first held handle that answers. A BUSY one (an open iterator, or SQLITE_BUSY) is skipped; when
+    // every one is busy, the header cannot be read without an fs open, so the read is refused (retryable). Any other
+    // failure (e.g. SQLITE_NOTADB: the file is not a database) is the answer itself and is rethrown, never "busy".
+    let other: unknown = null;
     for (const h of held) {
       try {
         return classify(Number(h.handle!.pragma("application_id", { simple: true })) | 0);
-      } catch {
-        /* busy: try the next held handle */
+      } catch (err) {
+        if (!isBusy(err)) other ??= err;
       }
     }
+    if (other) throw other;
     throw new DbHeaderBusyError(
       `the header of the DB at '${dbPath}' cannot be read now: every native connection this process holds on it is ` +
         `busy (an open statement), and reading the file directly would drop their locks. Close or finish the open ` +
