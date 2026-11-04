@@ -42,6 +42,7 @@ import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
 import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
 import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
+import { assertDriverHeaderAllows, nativeHoldCount } from "./db-header.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
@@ -103,6 +104,16 @@ function assertPrivateStaging(dir: string): void {
  * rule as an explicit destination: a symlinked backups dir pointing outside the
  * approved roots is refused before anything is created, chmod'ed or written.
  */
+/** Refuse a restore while this process holds more native handles on the live DB than `own` (the relay's own). */
+function assertNoOtherNativeHold(dbPath: string, own: number): void {
+  if (nativeHoldCount(dbPath) > own) {
+    throw new Error(
+      `restore refused: this process still holds a native connection to the DB at '${dbPath}' (other than the relay's ` +
+        `own, e.g. a raw CLI handle), which would keep reading the OLD file after the swap. Close it, then restore.`
+    );
+  }
+}
+
 function getBackupsDir(): string {
   return assertSafePath(path.join(path.dirname(getDbPath()), "backups"), "backups directory");
 }
@@ -345,6 +356,9 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
     // INV-BACKUP-01: an export never creates its source either.
     throw new Error(`no relay database at ${srcDbPath}; nothing to back up. Start the relay once, or set RELAY_DB_PATH to the database's location.`);
   }
+  // INV-DB-01 slice 2a: the source's header refuses (or allows) the driver that will read it BEFORE anything is made.
+  const liveForHeader = peekDb();
+  assertDriverHeaderAllows(srcDbPath, liveForHeader ? driverOf(liveForHeader) : configuredDriver());
 
   const backupsDir = getBackupsDir();
   // v2.1 Phase 4c.4: the backups directory lives inside ~/.bot-relay so it
@@ -648,6 +662,10 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // --- Step 2: the safety backup, only now that the archive is fully validated ---
     let previousBackupPath = "";
     const srcDbPath = getDbPath();
+    // INV-DB-01 slice 2a (Codex #380 R1): a native handle on the live DB other than the relay's own (a raw CLI handle)
+    // would survive the swap on the OLD file. Refused by name before any mutation, and again after closeDb().
+    const liveNow = peekDb();
+    assertNoOtherNativeHold(srcDbPath, liveNow && driverOf(liveNow) === "native" ? 1 : 0);
     if (fs.existsSync(srcDbPath)) {
       const backupsDir = getBackupsDir();
       // v2.1 Phase 4c.4: ensureSecureDir (vs bare mkdirSync) — same pattern as
@@ -661,6 +679,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
 
     // --- Step 3: close our DB handle so the swap can rename the file ---
     closeDb();
+    assertNoOtherNativeHold(srcDbPath, 0);
 
     // --- Step 4: atomic swap (v2.1 Phase 4q MED #5) ---
     // POSIX `rename(2)` atomically replaces the destination without a window

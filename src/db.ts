@@ -10,8 +10,6 @@ import os from "os";
 import { createHash } from "crypto";
 // ESM-safe synchronous require for the native driver. The package is
 // "type":"module", so a bare `require(...)` is undefined at runtime — importing
-// createRequire from "module" is the supported way to do a sync require in ESM.
-import { createRequire } from "module";
 import {
   getOwnHostId,
   agentProcessState,
@@ -61,7 +59,11 @@ import {
   getInitializedDb,
   closeInitializedDb,
   discardInitializedDb,
+  driverOf,
+  openNativeDb,
+  isOpenNative,
 } from "./sqlite-compat.js";
+import { assertDriverHeaderAllows, stampNativeHeader } from "./db-header.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile, privacyFaults, restrictToOwnerWindows } from "./fs-perms.js";
 import { resolveInstance } from "./instance.js";
@@ -335,7 +337,7 @@ export async function initializeDb(): Promise<void> {
 
   const dbPath = getDbPath();
   // INV-DB-01 slice 1: an instance driver this release refuses is refused BEFORE anything below touches the disk.
-  assertInstanceDriverAccepted();
+  const before = assertInstanceDriverAccepted(dbPath);
   // v2.1 Phase 4c.4: a NEW directory is created 0700 before the open, so there is
   // no window where a fresh DB lives under a 0755 parent. An existing directory is
   // narrowed only after the re-check below (ADR-0048: never chmod through an
@@ -364,6 +366,8 @@ export async function initializeDb(): Promise<void> {
   // finalize + purge). Shared with getDb()'s native fallback so the two paths
   // cannot drift; see applySchemaSetup below.
   applySchemaSetup(_db);
+  // INV-DB-01 slice 2a: a native init stamps the DB's header (in its main file); a wasm one never does.
+  if (driverOf(_db) === "native") stampNativeHeader(_db, dbPath, before);
 }
 
 /**
@@ -392,6 +396,8 @@ export function getDb(): CompatDatabase {
   if (_db) return _db;
 
   const dbPath = getDbPath();
+  // INV-DB-01 slice 2a: this fallback is native only, so the DB's header must allow native, before anything is made.
+  const before = assertDriverHeaderAllows(dbPath, "native");
   const dir = path.dirname(dbPath);
   // v2.1 Phase 4c.4: same dir + file perm narrowing as the eager init path
   // (the existing directory is narrowed only after the re-check).
@@ -402,13 +408,10 @@ export function getDb(): CompatDatabase {
   // first; only some tests skip it and rely on this path). It is native-only by
   // nature — a *synchronous* accessor cannot perform the wasm driver's async
   // load — so RELAY_SQLITE_DRIVER=wasm callers MUST go through initializeDb().
-  // createRequire is imported at top-of-file: a bare `require(...)` is undefined
-  // in this "type":"module" build, which is the "require is not defined" bug
-  // this replaces (it only ever fired in a real ESM runtime, not under vitest,
-  // and only on this pre-init path — the server never hits it).
-  const req = createRequire(import.meta.url);
-  const Database = req("better-sqlite3");
-  _db = new Database(dbPath) as unknown as CompatDatabase;
+  // A bare `require(...)` is undefined in this "type":"module" build (the "require is not defined" bug, which only
+  // fired in a real ESM runtime, on this pre-init path): openNativeDb loads better-sqlite3 through createRequire.
+  // INV-DB-01 slice 2a: the one native construction (sqlite-compat.ts openNativeDb), held until a real close.
+  _db = openNativeDb(dbPath, {}, before) as unknown as CompatDatabase;
   try {
     assertStillContained(dbPath);
   } catch (err) {
@@ -428,6 +431,7 @@ export function getDb(): CompatDatabase {
   // #171 — same single-sourced schema setup the eager initializeDb() path runs.
   // A new migration is added ONCE in applySchemaSetup, never copy-pasted here.
   applySchemaSetup(_db);
+  stampNativeHeader(_db, dbPath, before); // INV-DB-01 slice 2a: native, as the eager init
 
   return _db;
 }
@@ -503,13 +507,19 @@ function migrateSchemaToV1_7(db: CompatDatabase): void {
 
 export function closeDb(): void {
   const db = _db;
-  _db = null;
   try {
-    // A close can throw (a refused final write-back under wasm, reported by name); the handles are cleared regardless.
+    // A close can throw: a refused final write-back under wasm (reported by name), whose handles are cleared
+    // regardless; or a busy NATIVE connection, which is still open and held, so its reference is KEPT and a retry
+    // closes it and releases its hold (Codex #380 R2).
     db?.close();
-  } finally {
+  } catch (err) {
+    if (db && isOpenNative(db)) throw err;
+    _db = null;
     closeInitializedDb();
+    throw err;
   }
+  _db = null;
+  closeInitializedDb();
 }
 
 function initSchema(db: CompatDatabase): void {

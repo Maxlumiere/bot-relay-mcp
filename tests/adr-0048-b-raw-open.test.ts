@@ -117,9 +117,10 @@ describe("ADR-0048 PR B — TRIPWIRE: no module opens a SQLite driver handle exc
   /**
    * src/-wide (Codex #288 R2 #2): a driver import (better-sqlite3 or sql.js, any
    * spelling: import(), from, require(), createRequire's req()) appears ONLY in
-   *   - src/sqlite-compat.ts  (the driver layer; openReadOnly re-checks privately),
-   *   - src/db.ts             (initializeDb/getDb re-check assertStillContained),
-   *   - src/cli/_instance-db.ts (openRawRelayDb, the verbs' raw handle),
+   *   - src/sqlite-compat.ts  (the driver layer; openReadOnly re-checks privately). Since INV-DB-01 slice 2a it holds
+   *     THE one native construction (openNativeDb), through which db.ts (initializeDb/getDb, which re-check
+   *     assertStillContained) and src/cli/_instance-db.ts (openRawRelayDb, the verbs' raw handle, which re-checks too)
+   *     now open their handles, so neither imports a driver any more (a narrower set, the same re-checks),
    * plus ONE named exception that never opens the relay DB:
    *   - src/doorbell-lock.ts  (the doorbell's kernel-held instance lock: its OWN file,
    *     `<state dir>/doorbell.lock.db`; pinned by the next test). Why: a kernel lock needs
@@ -129,7 +130,7 @@ describe("ADR-0048 PR B — TRIPWIRE: no module opens a SQLite driver handle exc
    *     tests/doorbell-pr5-heartbeat.test.ts ("the lock lives in the RESOLVED instance's state dir").
    * Type declarations (.d.ts) are not code.
    */
-  it("the SQLite driver is referenced in src/ ONLY by the three checked modules", () => {
+  it("the SQLite driver is referenced in src/ ONLY by the checked driver layer (and the doorbell-lock exception)", () => {
     const hits: string[] = [];
     const walk = (dir: string) => {
       for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -145,7 +146,7 @@ describe("ADR-0048 PR B — TRIPWIRE: no module opens a SQLite driver handle exc
       }
     };
     walk(path.join(REPO_ROOT, "src"));
-    expect(hits.sort()).toEqual(["src/cli/_instance-db.ts", "src/db.ts", "src/doorbell-lock.ts", "src/sqlite-compat.ts"]);
+    expect(hits.sort()).toEqual(["src/doorbell-lock.ts", "src/sqlite-compat.ts"]);
   });
 
   it("the doorbell-lock exception opens exactly ONE driver handle, on a lock file (never the relay DB)", () => {

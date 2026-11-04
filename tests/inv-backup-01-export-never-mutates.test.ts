@@ -211,9 +211,31 @@ describe("INV-BACKUP-01: an export never mutates its source DB", () => {
 });
 
 describe("INV-BACKUP-01: the wasm export refuses what it cannot read completely, and never writes the source", () => {
+  beforeEach(async () => {
+    // INV-DB-01 slice 2a: this fixture is written by a NATIVE relay init (so its header is stamped native) and read by the
+    // wasm driver in the same process, where native loads: the header now refuses that (the measured mix). The rows
+    // model the case wasm-on-native is still allowed for, a process where the native driver cannot load.
+    (await import("../src/db-header.js"))._setNativeProbeForTests(() => ({ ok: false, reason: "test: a wasm-only install" }));
+  });
   afterEach(async () => {
+    (await import("../src/db-header.js"))._setNativeProbeForTests(null);
     // Optional: before the hook existed (the RED baseline), its absence must not fail every row here.
     (await import("../src/backup.js") as { _setExportReadHookForTests?: (f: null) => void })._setExportReadHookForTests?.(null);
+  });
+
+  it("INV-DB-01 slice 2a twin, WITHOUT the seam: native loads here, so a wasm export of a native-stamped DB is REFUSED by the header (named, with the remedy), and nothing is written", async () => {
+    (await import("../src/db-header.js"))._setNativeProbeForTests(null); // the real probe: native loads in this process
+    await makeSourceDb({ webhookSecret: "plain-secret-6" });
+    expect(fs.readFileSync(dbPath).readInt32BE(68), "precondition: stamped native").toBe(0x524c594e);
+    const before = statOf(dbPath);
+    const dest = path.join(root, "refused.tar.gz");
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const { exportRelayState } = await import("../src/backup.js");
+    const err = (await exportRelayState({ destinationPath: dest }).then(() => null, (e: Error) => e)) as Error | null;
+    expect(err?.name).toBe("DbHeaderRefusedError");
+    expect(err?.message).toMatch(/REFUSING the wasm driver .*Unset RELAY_SQLITE_DRIVER .*run native: the file is native\./);
+    expect(fs.existsSync(dest), "no archive").toBe(false);
+    expect(statOf(dbPath), "the source's bytes and mtime unchanged").toEqual(before);
   });
 
   it("a cleanly CLOSED native DB (a WAL header, no side files) exports under wasm: the main file holds every commit (ruled: the header alone is no refusal)", async () => {
