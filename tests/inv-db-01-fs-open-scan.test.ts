@@ -33,7 +33,7 @@ type Entry = { n: number; db?: true; source: string };
 /** key → how many sites, whether they open a DB-family file, and the SOURCE of the path. */
 const INVENTORY: Record<string, Entry> = {
   // --- DB-family sites (allowed only where no native handle on the file can be held) ---
-  "src/db-header.ts::readDriverHeader::openSync": { n: 1, db: true, source: "the DB path, read ONLY when this process holds no native handle on it (source 3 of the header; source 1 is the held connection's PRAGMA)" },
+  "src/db-header.ts::readHeaderBytes::openSync": { n: 1, db: true, source: "the DB path, read ONLY when this process holds no native handle on it (source 3 of the header; source 1 is the held connection's PRAGMA)" },
   "src/sqlite-compat.ts::createWasmDb::readFileSync": { n: 1, db: true, source: "the DB path, loaded by the wasm driver (sql.js holds no fcntl locks; refused when this process holds a native handle on it)" },
   "src/sqlite-compat.ts::persistWrite::writeFileSync": { n: 1, db: true, source: "the DB path, the wasm driver's write-back (a native open of a file a writable wasm connection holds is refused)" },
   "src/sqlite-compat.ts::openReadOnlyUnchecked::readFileSync": { n: 1, db: true, source: "a staged DB (backup/restore staging) or an export source, read by the wasm driver (refused when this process holds a native handle on it)" },

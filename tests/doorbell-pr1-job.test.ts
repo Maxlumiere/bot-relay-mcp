@@ -25,6 +25,29 @@ import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { startToken } from "./helpers/start-token.js";
 
+/**
+ * Byte reads and a hostile sidecar swap, done by ANOTHER process: this test process holds a native connection to the
+ * relay DB, and an fs open of its family here would drop that connection's POSIX locks (INV-DB-01 2b-i; the
+ * suite-wide spy enforces it). Another process is also what the swap stands for.
+ */
+const ELSEWHERE = path.join(os.tmpdir(), `doorbell-pr1-job-io-${process.pid}.cjs`);
+fs.writeFileSync(
+  ELSEWHERE,
+  `const fs = require("fs"); const [op, a, b] = process.argv.slice(2);\n` +
+    `if (op === "read") process.stdout.write(fs.readFileSync(a).toString("base64"));\n` +
+    `else { fs.copyFileSync(a, b); fs.renameSync(b, a); }\n`
+);
+const readElsewhere = (f: string): Buffer => {
+  const r = spawnSync(process.execPath, [ELSEWHERE, "read", f], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error(`reading ${f} elsewhere failed: ${r.stderr}`);
+  return Buffer.from(r.stdout, "base64");
+};
+/** Replace `f` by a copy of itself (same bytes, a NEW inode), in another process. */
+const replaceElsewhere = (f: string): void => {
+  const r = spawnSync(process.execPath, [ELSEWHERE, "swap", f, `${f}.swap`], { encoding: "utf8" });
+  if (r.status !== 0) throw new Error(`replacing ${f} elsewhere failed: ${r.stderr}`);
+};
+
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = path.join(REPO_ROOT, "dist", "doorbell.js");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "doorbell-pr1-job-")));
@@ -102,12 +125,12 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
   it("PRODUCTION (ruling 1a8fc7c4 (1)): the real job forms NO intent (no actuating driver); it boards no_driver(watch_absent); the header carries LOADED_BUILD, the install and the resolution; the relay DB is byte-identical", () => {
     send("db-alice");
     // The test's own connection stays open: the WAL sidecars exist (ruling 8c83e4ce D-1).
-    const before = fs.readFileSync(DB);
-    const walBefore = fs.readFileSync(`${DB}-wal`);
+    const before = readElsewhere(DB);
+    const walBefore = readElsewhere(`${DB}-wal`);
     const r = once();
     expect(r.status, r.stderr).toBe(0);
-    expect(fs.readFileSync(DB).equals(before)).toBe(true); // V1 restated: the main file is never written
-    expect(fs.readFileSync(`${DB}-wal`).equals(walBefore)).toBe(true); // ...and neither is -wal
+    expect(readElsewhere(DB).equals(before)).toBe(true); // V1 restated: the main file is never written
+    expect(readElsewhere(`${DB}-wal`).equals(walBefore)).toBe(true); // ...and neither is -wal
     const recs = records();
     expect(recs[0]).toMatchObject({ type: "header", install_dir: fs.realpathSync(REPO_ROOT), resolution: { kind: "explicit-db" } });
     expect(recs[0].build?.build_id).toMatch(/^([0-9a-f]{64}|unbuilt)$/);
@@ -220,11 +243,7 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
   it("D-1: a sidecar REPLACED while the DB was being opened → the handle is closed at once, waiting; no intent", async () => {
     send("db-alice");
     const r = await inProcess(["--once"], {
-      afterDbOpen: () => {
-        const shm = `${DB}-shm`;
-        fs.copyFileSync(shm, `${shm}.swap`);
-        fs.renameSync(`${shm}.swap`, shm); // same bytes, a NEW inode
-      },
+      afterDbOpen: () => replaceElsewhere(`${DB}-shm`), // same bytes, a NEW inode
     });
     expect([r.code, r.stderr]).toEqual([0, expect.stringMatching(/a WAL sidecar changed while the relay DB was being opened/)]);
     expect(intents()).toEqual([]);
