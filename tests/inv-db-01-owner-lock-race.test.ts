@@ -21,7 +21,7 @@
  * The racers run from FILES (an eval'd module breaks worker pools), under a SANDBOX HOME; every recorded child is
  * checked exited at the end.
  */
-import { describe, it, expect, afterAll } from "vitest";
+import { describe, it, expect, afterAll, vi } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -95,6 +95,17 @@ fs.writeFileSync(
     `await acquirePrimitive(process.argv[2], { initialBytes: new Uint8Array() });\n` +
     `const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true }); c.unref();\n` +
     `process.stdout.write("HELD " + process.pid + " " + c.pid + "\\n"); setInterval(() => {}, 1000);\n`
+);
+// Ruling 75be90fa (4): a SECOND open + close of the lock file in the owner's own process must not release the lock
+// (a flock belongs to its open file; an fcntl lock would be dropped by that close).
+const HOLDER_REOPENS = path.join(ROOT, "holder-reopens.mjs");
+fs.writeFileSync(
+  HOLDER_REOPENS,
+  `const { acquirePrimitive, lockFilePath } = await import(${JSON.stringify(LOCK_JS)});\n` +
+    `const fs = await import("fs");\n` +
+    `await acquirePrimitive(process.argv[2], { initialBytes: new Uint8Array() });\n` +
+    `fs.closeSync(fs.openSync(lockFilePath(process.argv[2]), "r"));\n` +
+    `process.stdout.write("HELD\\n"); setInterval(() => {}, 1000);\n`
 );
 const ACQUIRER = path.join(ROOT, "acquirer.mjs");
 fs.writeFileSync(
@@ -186,6 +197,61 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
       }
     }
   }, 60_000);
+
+  it.skipIf(process.platform === "win32")("a second open + close of the lock file in the OWNER's process does not release it: a racer still loses", async () => {
+    const db = path.join(ROOT, "reopen.db");
+    const h = run(HOLDER_REOPENS, [db]);
+    await new Promise<void>((res, rej) => {
+      const t = setTimeout(() => rej(new Error(`precondition: the holder did not hold within 30 s\n${h.stderr()}`)), 30_000);
+      h.child.stdout!.on("data", (d) => String(d).includes("HELD") && (clearTimeout(t), res()));
+    });
+    try {
+      expect(await oneTry(db), "still held after the owner's own open + close").toMatch(/^LOST OwnerLockError .*held by another process/);
+    } finally {
+      h.child.kill("SIGKILL");
+      await h.out;
+    }
+  }, 60_000);
+
+  // Non-vacuity twin: the SAME probe on an fcntl lock (python's lockf) does see the release (the hazard ruled out above).
+  const hasPy = process.platform !== "win32" && spawnSync("python3", ["-c", "import fcntl"]).status === 0;
+  it.skipIf(!hasPy)("twin: the same open + close DOES drop an fcntl (lockf) lock, and the probe sees it", async () => {
+    const f = path.join(ROOT, "fcntl-twin.lock");
+    fs.writeFileSync(f, "");
+    const holder = spawn("python3", ["-c", [
+      "import fcntl, os, sys, time",
+      "fd = os.open(sys.argv[1], os.O_RDWR)",
+      "fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+      "os.close(os.open(sys.argv[1], os.O_RDONLY))",
+      "print('HELD', flush=True)",
+      "time.sleep(60)",
+    ].join("\n"), f], { stdio: ["ignore", "pipe", "pipe"] });
+    recorded.push(holder);
+    await new Promise<void>((res) => holder.stdout!.on("data", (d) => String(d).includes("HELD") && res()));
+    try {
+      const probe = spawnSync("python3", ["-c", [
+        "import fcntl, os, sys",
+        "fd = os.open(sys.argv[1], os.O_RDWR)",
+        "try:\n  fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); print('OWNER')\nexcept OSError: print('LOST')",
+      ].join("\n"), f], { encoding: "utf8" });
+      expect(probe.stdout.trim(), "the fcntl lock was dropped by its holder's own open + close").toBe("OWNER");
+    } finally {
+      holder.kill("SIGKILL");
+    }
+  }, 60_000);
+
+  it.skipIf(process.platform !== "linux")("Linux: a DB on a NETWORK filesystem (statfs says NFS) is refused owner mode, by name, before anything is locked", async () => {
+    const m = (await import("../dist/db-owner-lock.js")) as unknown as { acquirePrimitive: (p: string, o?: { initialBytes?: Uint8Array }) => Promise<{ release(): void }> };
+    const db = path.join(ROOT, "on-nfs.db");
+    const real = fs.statfsSync;
+    const spy = vi.spyOn(fs, "statfsSync").mockImplementation(((p: fs.PathLike, o?: unknown) => ({ ...(real as (...a: unknown[]) => fs.StatsFs)(p, o), type: 0x6969 })) as typeof fs.statfsSync);
+    try {
+      await expect(m.acquirePrimitive(db, { initialBytes: new Uint8Array() })).rejects.toThrow(/network filesystem .*(NFS|0x6969)/i);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.existsSync(db), "nothing was materialized").toBe(false);
+  });
 
   it("MEASURED: the key is stable across a rename persist (tmp + rename gives the DB a NEW inode, its directory keeps its own)", async () => {
     const { lockKey } = (await import("../dist/db-owner-lock.js")) as { lockKey: (p: string) => string };

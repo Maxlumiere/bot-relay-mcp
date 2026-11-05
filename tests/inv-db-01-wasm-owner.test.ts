@@ -105,6 +105,13 @@ fs.writeFileSync(
     `} });\n` +
     `setInterval(() => {}, 1000);\n`
 );
+/** A child that takes ONLY the single-owner lock of a DB (no DB open, no write), prints HELD, then idles. */
+const LOCK_ONLY = path.join(ROOT, "lock-only.mjs");
+fs.writeFileSync(
+  LOCK_ONLY,
+  `const { acquireOwnerLock } = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "db-owner-lock.js")).href)});\n` +
+    `await acquireOwnerLock(process.argv[2]); process.stdout.write("HELD\\n"); setInterval(() => {}, 1000);\n`
+);
 /** The next stdout line from an owner child after `cmd` (e.g. "write <name>"), bounded. */
 function ask(child: ChildProcess, cmd: string): Promise<string> {
   return new Promise((res) => {
@@ -497,15 +504,25 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     const a = startOwner();
     expect(await a.first).toBe("READY");
     fs.rmSync(path.join(fs.realpathSync.native(caseDir), ".relay.db.relay-owner"));
-    const b = startOwner();
-    expect(await b.first, "precondition: the second process acquires the new lock file").toBe("READY");
-    const theirs = sha(dbPath);
-    expect(await ask(a.child, "write a-after"), "the first owner stops writing").toMatch(/^WRITE-REFUSED .*(removed|replaced)/);
-    expect(sha(dbPath), "the second owner's bytes survive").toBe(theirs);
-    expect(await ask(b.child, "write b-after")).toBe("WROTE");
+    // The second process takes ONLY the lock (a new lock file), and writes nothing: a relay opening the DB writes at
+    // its open (its migrations), which the first owner's identity check would catch on its own. Here nothing changed
+    // the DB, so only the lock-file guard can stop the first owner from writing beside a second lock holder.
+    const b = spawn(process.execPath, [LOCK_ONLY, dbPath], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    children.push(b);
+    expect(
+      await new Promise<string>((res) => {
+        const t = setTimeout(() => res("TIMEOUT"), 20_000);
+        b.stdout!.on("data", (d) => String(d).includes("HELD") && (clearTimeout(t), res("HELD")));
+        b.on("exit", (c) => (clearTimeout(t), res(`EXIT ${c}`)));
+      }),
+      "precondition: a second process holds the NEW lock file"
+    ).toBe("HELD");
+    const before = sha(dbPath);
+    expect(await ask(a.child, "write a-after"), "the first owner stops writing").toMatch(/^WRITE-REFUSED .*owner lock file .* (removed|replaced) while this process held it/);
+    expect(sha(dbPath), "the file is untouched by the first owner").toBe(before);
     a.child.stdin!.write("exit\n");
-    b.child.stdin!.write("exit\n");
-    await Promise.all([waitExitOf(a.child), waitExitOf(b.child)]);
+    b.kill("SIGKILL");
+    await Promise.all([waitExitOf(a.child), waitExitOf(b)]);
   }, 60_000);
 
   it("restore's owner check only READS the header: a LIVE legacy wasm connection + env switched to native → the restore is not refused", async () => {
