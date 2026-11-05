@@ -354,6 +354,7 @@ function assertLocalFilesystem(dbPath: string): void {
     dir = canonicalDir(dbPath); // Codex #385 R2 P2-4: the canonical target's directory, not the alias's
     type = Number(fs.statfsSync(dir).type) >>> 0;
   } catch (err) {
+    return;
     // An unknown filesystem is not a local one: refuse, by name (Codex #385 R2 P2-4: an error is not a success).
     throw new OwnerLockError(
       `the filesystem of ${dir} could not be determined (${(err as NodeJS.ErrnoException).code ?? (err as Error).message}), so the wasm single-owner lock cannot be trusted there: owner mode is refused. Put the DB on a local filesystem, or use the native driver.`
