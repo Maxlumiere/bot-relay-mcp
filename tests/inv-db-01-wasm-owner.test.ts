@@ -245,9 +245,17 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
   it("an owner's persist is ATOMIC (temp + rename: the file's inode changes, no temp file remains) and stays RLYW", async () => {
     declareWasm();
     await db.initializeDb();
-    const ino1 = fs.statSync(dbPath).ino;
+    // POSIX: hold the old file open, so its inode cannot be freed and REUSED by a later temp file (ext4 reuses a freed
+    // inode number at once: a bare before/after compare read equal on Linux CI). Windows keeps the plain compare.
+    const posix = process.platform !== "win32";
+    const fd = posix ? fs.openSync(dbPath, "r") : -1;
+    const ino1 = posix ? fs.fstatSync(fd).ino : fs.statSync(dbPath).ino;
     db.registerAgent("persisted", "r", []);
     const ino2 = fs.statSync(dbPath).ino;
+    if (posix) {
+      expect(fs.fstatSync(fd).nlink, "the old file was unlinked by the rename").toBe(0);
+      fs.closeSync(fd);
+    }
     expect(ino2, "replaced by a rename").not.toBe(ino1);
     expect(fs.readdirSync(caseDir).filter((f) => f.endsWith(".tmp")), "no temp file left").toEqual([]);
     db.closeDb();
@@ -262,6 +270,32 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     fs.copyFileSync(dbPath, copy);
     fs.renameSync(copy, dbPath); // another writer replaced it (same bytes, a NEW inode)
     expect(() => db.registerAgent("after", "r", [])).toThrow(/replaced .*since this owner's last write|identity/i);
+  });
+
+  it("an owner REFUSES a persist when another writer rewrote the file IN PLACE (the same inode: identity is more than dev+ino)", async () => {
+    declareWasm();
+    await db.initializeDb();
+    db.registerAgent("before", "r", []);
+    const ino = fs.statSync(dbPath).ino;
+    const bytes = fs.readFileSync(dbPath);
+    await new Promise((r) => setTimeout(r, 1100)); // a later mtime/ctime, past even a 1 s timestamp granularity
+    fs.writeFileSync(dbPath, bytes); // another writer: truncate + write, the SAME inode
+    expect(fs.statSync(dbPath).ino, "precondition: rewritten in place").toBe(ino);
+    expect(() => db.registerAgent("after", "r", [])).toThrow(/replaced .*since this owner's last write|identity/i);
+  });
+
+  // A DELIBERATE decision: a metadata change is not a write. The identity leaves ctime out, because the relay itself
+  // chmods its DB after every open (a ctime identity refused the owner's own next persist: MEASURED, 12 rows red).
+  it.skipIf(process.platform === "win32")("twin: a chmod by ANOTHER process does NOT refuse the owner's persist (metadata only, deliberately: the relay chmods its own DB on every open)", async () => {
+    declareWasm();
+    await db.initializeDb();
+    db.registerAgent("before", "r", []);
+    const mode = fs.statSync(dbPath).mode & 0o777;
+    await new Promise((r) => setTimeout(r, 1100));
+    const r = spawnSync(process.execPath, ["-e", `require("fs").chmodSync(${JSON.stringify(dbPath)}, ${mode === 0o600 ? 0o640 : 0o600})`]);
+    expect(r.status, `precondition: the other process chmodded it\n${r.stderr}`).toBe(0);
+    expect(() => db.registerAgent("after", "r", [])).not.toThrow();
+    expect(db.getAgents().map((x: { name: string }) => x.name)).toContain("after");
   });
 
   it("a hard-linked RLYW DB: the owner refuses to open it (a rename persist would split its names)", async () => {
