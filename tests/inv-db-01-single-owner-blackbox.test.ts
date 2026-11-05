@@ -228,8 +228,10 @@ function makeSandbox(label: string): Sandbox {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `inv-db-01-bb-${label}-`));
   roots.push(root);
   const home = path.join(root, "home");
-  const dir = path.join(root, "instance");
-  const plainDir = path.join(root, "plain");
+  // INSIDE the sandbox HOME: the relay approves a DB path under HOME or a shared temp root, and Windows has no shared
+  // root, so a DB beside HOME is refused there ("outside the approved roots"; MEASURED on windows-2022).
+  const dir = path.join(home, "instance");
+  const plainDir = path.join(home, "plain");
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(plainDir, { recursive: true, mode: 0o700 });

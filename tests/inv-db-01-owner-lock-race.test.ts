@@ -70,7 +70,7 @@ fs.writeFileSync(
     `const [db, go, hold] = process.argv.slice(2);\n` +
     `while (!fs.existsSync(go)) await new Promise((r) => setTimeout(r, 2));\n` +
     `try { await acquirePrimitive(db, { attempts: 1, initialBytes: new Uint8Array() }); process.stdout.write("OWNER\\n"); await new Promise((r) => setTimeout(r, Number(hold))); }\n` +
-    `catch (e) { process.stdout.write("LOST " + (e.name || e.code) + " " + String(e && e.message || "").split("\\n")[0].slice(0, 200) + "\\n"); }\n` +
+    `catch (e) { process.stdout.write("LOST " + (e.name || e.code) + " " + String(e && e.message || "").split("\\n")[0].slice(0, 1000) + "\\n"); }\n` +
     `process.exit(0);\n`
 );
 const HOLDER = path.join(ROOT, "holder.mjs");
