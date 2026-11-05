@@ -22,6 +22,10 @@ import path from "path";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
 import Database from "better-sqlite3";
+import crypto from "crypto";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import * as lockMod from "../src/db-owner-lock.js";
 import * as compat from "../src/sqlite-compat.js";
 import * as db from "../src/db.js";
 import * as header from "../src/db-header.js";
@@ -94,12 +98,37 @@ fs.writeFileSync(
   `const db = await import(${JSON.stringify(DIST_DB)});\n` +
     `try { await db.initializeDb(); db.registerAgent("child-" + process.pid, "r", []); process.stdout.write("READY\\n"); }\n` +
     `catch (e) { process.stdout.write("REFUSED " + String(e && e.message || e).split("\\n")[0] + "\\n"); process.exit(3); }\n` +
-    `process.stdin.on("data", (d) => { if (String(d).includes("exit")) { db.closeDb(); process.exit(0); } });\n` +
+    `process.stdin.on("data", (d) => { for (const line of String(d).split("\\n")) {\n` +
+    `  if (line === "exit") { db.closeDb(); process.exit(0); }\n` +
+    `  const w = /^write (\\S+)$/.exec(line);\n` +
+    `  if (w) { try { db.registerAgent(w[1], "r", []); process.stdout.write("WROTE\\n"); } catch (e) { process.stdout.write("WRITE-REFUSED " + String(e && e.message || e).split("\\n")[0] + "\\n"); } }\n` +
+    `} });\n` +
     `setInterval(() => {}, 1000);\n`
 );
+/** The next stdout line from an owner child after `cmd` (e.g. "write <name>"), bounded. */
+function ask(child: ChildProcess, cmd: string): Promise<string> {
+  return new Promise((res) => {
+    let out = "";
+    const t = setTimeout(() => res(`TIMEOUT ${out}`), 20_000);
+    const on = (d: Buffer) => {
+      out += d;
+      if (/\n/.test(out)) {
+        clearTimeout(t);
+        child.stdout!.off("data", on);
+        res(out.split("\n")[0]!);
+      }
+    };
+    child.stdout!.on("data", on);
+    child.stdin!.write(`${cmd}\n`);
+  });
+}
+const sha = (f: string) => crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
+const waitExitOf = (c: ChildProcess) => (c.exitCode !== null || c.signalCode !== null ? Promise.resolve() : new Promise((r) => c.once("exit", r)));
 function startOwner(env: Record<string, string | undefined> = {}): { child: ChildProcess; first: Promise<string> } {
+  const merged: NodeJS.ProcessEnv = { ...process.env, ...env };
+  for (const k of Object.keys(merged)) if (merged[k] === undefined) delete merged[k]; // undefined = unset, never "undefined"
   const child = spawn(process.execPath, [OWNER], {
-    env: { ...process.env, ...env },
+    env: merged,
     stdio: ["pipe", "pipe", "pipe"],
   });
   children.push(child);
@@ -149,7 +178,9 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     const a = startOwner();
     expect(await a.first).toBe("READY");
     const b = startOwner();
-    expect(await b.first).toMatch(/^REFUSED .*(owned|lock)/i);
+    // The OPEN-time refusal, by its own words (not a later persist refusal, which also names the lock).
+    expect(await b.first).toMatch(/^REFUSED .*owned by another relay process/);
+    expect(await ask(a.child, "write after-b"), "the first owner keeps working: a later write is acknowledged").toBe("WROTE");
     a.child.stdin!.write("exit\n");
   }, 60_000);
 
@@ -192,14 +223,31 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     expect(r.stderr).toMatch(/"type": ?"http"/);
   }, 30_000);
 
-  it("twin: a LEGACY (0) DB under env-wasm keeps working over stdio, as today (no lock, unstamped)", async () => {
+  it("twin: a LEGACY (0) DB under env-wasm keeps working over stdio, as today (no lock, unstamped): two REAL stdio servers each acknowledge a tool call", async () => {
     makeDb(dbPath, 0);
-    const a = startOwner({ RELAY_SQLITE_DRIVER: "wasm" });
-    const b = startOwner({ RELAY_SQLITE_DRIVER: "wasm" });
-    expect([await a.first, await b.first]).toEqual(["READY", "READY"]);
-    a.child.stdin!.write("exit\n");
-    b.child.stdin!.write("exit\n");
-    await Promise.all([new Promise((r) => a.child.once("exit", r)), new Promise((r) => b.child.once("exit", r))]);
+    const connect = async (tag: string) => {
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [DIST_INDEX],
+        env: { PATH: process.env.PATH ?? "", HOME: caseDir, USERPROFILE: caseDir, RELAY_DB_PATH: dbPath, RELAY_CONFIG_PATH: cfgPath, RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "1", RELAY_SQLITE_DRIVER: "wasm", ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
+        stderr: "pipe",
+      });
+      const client = new Client({ name: `legacy-${tag}`, version: "0" }, { capabilities: {} });
+      await client.connect(transport);
+      return client;
+    };
+    const [a, b] = [await connect("a"), await connect("b")];
+    try {
+      for (const [c, name] of [[a, "legacy-a"], [b, "legacy-b"]] as const) {
+        const r = (await c.callTool({ name: "register_agent", arguments: { name, role: "r", capabilities: [] } })) as { isError?: boolean; content?: Array<{ text?: string }> };
+        expect(r.isError, `${name}: ${JSON.stringify(r.content)}`).not.toBe(true);
+      }
+      const later = (await a.callTool({ name: "health_check", arguments: {} })) as { isError?: boolean };
+      expect(later.isError, "a later call is acknowledged too").not.toBe(true);
+    } finally {
+      await a.close();
+      await b.close();
+    }
     expect(idOf(dbPath), "never stamped").toBe("0");
   }, 60_000);
 
@@ -302,7 +350,7 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     makeDb(dbPath, WASM);
     fs.linkSync(dbPath, path.join(caseDir, "alias.db"));
     declareWasm();
-    await expect(db.initializeDb()).rejects.toThrow(/hard links/);
+    await expect(db.initializeDb()).rejects.toThrow(/wasm open refused: .*hard links/); // the OPEN refuses, before any write
   });
 
   it("maintenance on an RLYW DB with NO owner live: a cold export runs under the lock and succeeds", async () => {
@@ -318,6 +366,146 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     fs.rmSync(cfgPath);
     await expect(exportRelayState({ destinationPath: path.join(caseDir, "x.tar.gz") })).rejects.toThrow(/owned by .*(relay|daemon|process)/i);
     a.child.stdin!.write("exit\n");
+  }, 60_000);
+
+  // --- Codex #385 R1, each a RED on the 2b-ii source it reviewed ---
+
+  it("P1-1: a LEGACY (env-only) open that awaits sql.js while another process OWNS the file meanwhile does not become an unlocked writer", async () => {
+    process.env.RELAY_SQLITE_DRIVER = "wasm"; // legacy: no declaration in this process's config
+    const cfgB = path.join(caseDir, "owner-b.json");
+    fs.writeFileSync(cfgB, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    let b: ReturnType<typeof startOwner> | null = null;
+    compat._setAfterSqlJsLoadForTests(async () => {
+      b = startOwner({ RELAY_CONFIG_PATH: cfgB, RELAY_SQLITE_DRIVER: undefined });
+      expect(await b.first, "precondition: B owns the file while A waits").toBe("READY");
+    });
+    try {
+      await expect(compat.initializeDb(dbPath)).rejects.toThrow(/owned by another relay process/);
+    } finally {
+      compat._setAfterSqlJsLoadForTests(null);
+    }
+    expect(await ask(b!.child, "write b-after"), "B's ownership is intact").toBe("WROTE");
+    b!.child.stdin!.write("exit\n");
+  }, 60_000);
+
+  it.each([
+    ["native-stamped (RLYN)", NATIVE, /native/i],
+    ["FOREIGN", 0x12345678, /not the relay's/],
+  ])("P1-3: a %s DB that appears while the owner lock is taken gets the normal refusal, never an unlocked wasm connection", async (_label, appId, refusal) => {
+    declareWasm();
+    const other = path.join(caseDir, "other.db");
+    lockMod._setAfterAcquireHookForTests(() => {
+      makeDb(other, appId);
+      fs.renameSync(other, dbPath);
+    });
+    try {
+      await expect(compat.initializeDb(dbPath)).rejects.toThrow(refusal);
+    } finally {
+      lockMod._setAfterAcquireHookForTests(null);
+    }
+    expect(idOf(dbPath), "the file is untouched").toBe(String(appId));
+  });
+
+  it("P1-4: a writer that replaces the DB right AFTER the owner's rename is not adopted as the owner's own: the next persist is refused and the replacement survives", async () => {
+    declareWasm();
+    await db.initializeDb();
+    db.registerAgent("before", "r", []);
+    const other = path.join(caseDir, "replacement.db");
+    let theirs = "";
+    compat._setPersistRenameForTests((from, to) => {
+      fs.renameSync(from, to);
+      fs.copyFileSync(to, other);
+      fs.appendFileSync(other, Buffer.alloc(4096)); // another writer's (bigger) file
+      fs.renameSync(other, to);
+      theirs = sha(to);
+      compat._setPersistRenameForTests(null);
+    });
+    try {
+      db.registerAgent("written", "r", []); // its own later write-back (if any) meets the replacement too
+    } catch {
+      /* refused there already: also the property */
+    }
+    expect(theirs, "precondition: the replacement happened").not.toBe("");
+    expect(() => db.registerAgent("after", "r", [])).toThrow(/identity|replaced/i);
+    expect(sha(dbPath), "the replacement survives byte for byte").toBe(theirs);
+  });
+
+  it.skipIf(process.platform === "win32")("P2-5: a persist through a SYMLINKED DB path writes the real DB and leaves the link a link", async () => {
+    const realDir = path.join(caseDir, "real");
+    const aliasDir = path.join(caseDir, "alias");
+    fs.mkdirSync(realDir);
+    fs.mkdirSync(aliasDir);
+    const real = path.join(realDir, "relay.db");
+    const alias = path.join(aliasDir, "relay.db");
+    makeDb(real, WASM);
+    fs.symlinkSync(real, alias);
+    process.env.RELAY_DB_PATH = alias;
+    declareWasm();
+    const before = sha(real);
+    await db.initializeDb();
+    db.registerAgent("via-alias", "r", []);
+    db.closeDb();
+    expect(fs.lstatSync(alias).isSymbolicLink(), "the link is still a link").toBe(true);
+    expect(sha(real), "the REAL DB was written").not.toBe(before);
+  });
+
+  it("P2-6: a materialize killed between its link and its temp removal leaves a second name; the next owner open removes THAT name (same file, temp pattern) and opens", async () => {
+    makeDb(dbPath, WASM);
+    const leftover = path.join(caseDir, ".relay.db.12345.abcdefabcdef.new");
+    fs.linkSync(dbPath, leftover);
+    declareWasm();
+    await db.initializeDb();
+    expect(fs.existsSync(leftover), "the leftover name is gone").toBe(false);
+    expect(fs.statSync(dbPath).nlink).toBe(1);
+  });
+
+  it.skipIf(process.platform === "win32")("P2-7: a lock-file name that is a HARD LINK (here to a DB a native handle holds) is refused BEFORE it is opened", async () => {
+    const heldPath = path.join(caseDir, "held.db");
+    makeDb(heldPath, NATIVE);
+    const held = await compat.openReadOnly(heldPath, "native");
+    try {
+      makeDb(dbPath, WASM);
+      fs.linkSync(heldPath, path.join(caseDir, ".relay.db.relay-owner"));
+      _takeFsSpyViolations();
+      await expect(compat.holdOwnerForMaintenance(dbPath, "backup")).rejects.toThrow(/links/);
+      expect(_takeFsSpyViolations(), "no fs open of the held DB through the lock-file name").toEqual([]);
+    } finally {
+      held.close();
+    }
+  });
+
+  it("P3-8: a first image whose write FAILS after the exclusive create (ENOSPC) leaves no temp file behind", () => {
+    const target = path.join(caseDir, "new.db");
+    const real = fs.writeFileSync;
+    const spy = vi.spyOn(fs, "writeFileSync").mockImplementation(((p: fs.PathOrFileDescriptor, d: unknown, o?: unknown) => {
+      if (String(p).endsWith(".new")) {
+        fs.closeSync(fs.openSync(p as string, "wx", 0o600));
+        throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+      }
+      return (real as (...a: unknown[]) => void)(p, d, o);
+    }) as typeof fs.writeFileSync);
+    try {
+      expect(() => lockMod.materializeDb(target, new Uint8Array([1, 2, 3]))).toThrow(/ENOSPC/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.readdirSync(caseDir).filter((f) => f.endsWith(".new")), "no partial temp left").toEqual([]);
+  });
+
+  it.skipIf(process.platform === "win32")("the lock file UNLINKED while its owner lives: a second process owns a NEW one, and the first owner's next write is REFUSED; the second's bytes survive", async () => {
+    declareWasm();
+    const a = startOwner();
+    expect(await a.first).toBe("READY");
+    fs.rmSync(path.join(fs.realpathSync.native(caseDir), ".relay.db.relay-owner"));
+    const b = startOwner();
+    expect(await b.first, "precondition: the second process acquires the new lock file").toBe("READY");
+    const theirs = sha(dbPath);
+    expect(await ask(a.child, "write a-after"), "the first owner stops writing").toMatch(/^WRITE-REFUSED .*(removed|replaced)/);
+    expect(sha(dbPath), "the second owner's bytes survive").toBe(theirs);
+    expect(await ask(b.child, "write b-after")).toBe("WROTE");
+    a.child.stdin!.write("exit\n");
+    b.child.stdin!.write("exit\n");
+    await Promise.all([waitExitOf(a.child), waitExitOf(b.child)]);
   }, 60_000);
 
   it("restore's owner check only READS the header: a LIVE legacy wasm connection + env switched to native → the restore is not refused", async () => {

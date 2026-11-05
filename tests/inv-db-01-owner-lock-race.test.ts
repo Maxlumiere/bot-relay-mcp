@@ -70,7 +70,7 @@ fs.writeFileSync(
     `const [db, go, hold] = process.argv.slice(2);\n` +
     `while (!fs.existsSync(go)) await new Promise((r) => setTimeout(r, 2));\n` +
     `try { await acquirePrimitive(db, { attempts: 1, initialBytes: new Uint8Array() }); process.stdout.write("OWNER\\n"); await new Promise((r) => setTimeout(r, Number(hold))); }\n` +
-    `catch (e) { process.stdout.write("LOST " + (e.name || e.code) + "\\n"); }\n` +
+    `catch (e) { process.stdout.write("LOST " + (e.name || e.code) + " " + String(e && e.message || "").split("\\n")[0].slice(0, 200) + "\\n"); }\n` +
     `process.exit(0);\n`
 );
 const HOLDER = path.join(ROOT, "holder.mjs");
@@ -78,6 +78,12 @@ fs.writeFileSync(
   HOLDER,
   `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
     `await acquirePrimitive(process.argv[2], { initialBytes: new Uint8Array() }); process.stdout.write("HELD\\n"); setInterval(() => {}, 1000);\n`
+);
+const HOLDER_PID = path.join(ROOT, "holder-pid.mjs");
+fs.writeFileSync(
+  HOLDER_PID,
+  `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
+    `await acquirePrimitive(process.argv[2], { initialBytes: new Uint8Array() }); process.stdout.write("HELD " + process.pid + "\\n"); setInterval(() => {}, 1000);\n`
 );
 const ACQUIRER = path.join(ROOT, "acquirer.mjs");
 fs.writeFileSync(
@@ -90,8 +96,11 @@ fs.writeFileSync(
 );
 const env = { ...process.env, HOME, USERPROFILE: HOME };
 
-function run(file: string, args: string[], envFor: NodeJS.ProcessEnv = env): { child: ChildProcess; out: Promise<string>; stderr: () => string } {
-  const child = spawn(process.execPath, [file, ...args], { env: envFor, stdio: ["ignore", "pipe", "pipe"] });
+function run(file: string, args: string[], envFor: NodeJS.ProcessEnv = env, asCommand = false): { child: ChildProcess; out: Promise<string>; stderr: () => string } {
+  // asCommand: `file` is the program itself (e.g. sudo), not a script for this node.
+  const child = asCommand
+    ? spawn(file, args, { env: envFor, stdio: ["ignore", "pipe", "pipe"] })
+    : spawn(process.execPath, [file, ...args], { env: envFor, stdio: ["ignore", "pipe", "pipe"] });
   recorded.push(child);
   let buf = "";
   let errBuf = "";
@@ -163,15 +172,28 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
       fs.symlinkSync(db, link);
       spellings.push(link);
     }
+    // The case variant is the SAME FILE when stat says so (dev + ino), judged independently of realpath: the lock must
+    // then collapse it, whatever spelling realpath gives (Codex #385 R1: a realpath-conditioned row proves nothing).
     const caseVariant = path.join(dir, "ALIAS.DB");
-    const folds = fs.existsSync(caseVariant) && fs.realpathSync.native(caseVariant) === fs.realpathSync.native(db);
-    if (folds) spellings.push(caseVariant);
+    const same = (a: string, b: string) => {
+      try {
+        const x = fs.statSync(a, { bigint: true });
+        const y = fs.statSync(b, { bigint: true });
+        return x.dev === y.dev && x.ino === y.ino;
+      } catch {
+        return false;
+      }
+    };
+    if (same(caseVariant, db)) spellings.push(caseVariant);
     const h = await holding(db);
     try {
-      for (const s of spellings) expect(await oneTry(s), `${s} is the same owner`).toMatch(/LOST/);
+      // The SPECIFIC contention refusal (not any caught error).
+      for (const s of spellings) expect(await oneTry(s), `${s} is the same owner`).toMatch(/^LOST OwnerLockError .*held by another process/);
     } finally {
       await h.kill();
     }
+    // Twin: with no holder, every spelling ACQUIRES (the refusals above were the lock, not a broken spelling).
+    for (const s of spellings) expect(await oneTry(s), `${s} acquires when unlocked`).toMatch(/^OWNER/);
     expect(spellings.length, "the spellings judged (the case variant only where the volume folds case)").toBeGreaterThanOrEqual(process.platform === "win32" ? 1 : 2);
   }, 60_000);
 
@@ -311,6 +333,61 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     expect(spawnSync("sudo", ["-n", "chown", "0", lf]).status, "chown to root").toBe(0);
     await expect(m.acquirePrimitive(db, { attempts: 1 })).rejects.toThrow(/owner lock file .* is not private/);
   }, 60_000);
+
+  // Ruling 594ca4cc (Codex #385 R1 P1-2): on Linux the lock must hold ACROSS network namespaces (two containers sharing
+  // the DB's directory). Each racer runs in its OWN new network namespace (sudo unshare -n), dropped back to this
+  // user (setpriv), on one shared directory: exactly ONE owner per round. An abstract socket fails this (per netns).
+  const canNetns = process.platform === "linux" && !!process.env.CI && spawnSync("sudo", ["-n", "true"]).status === 0 &&
+    spawnSync("sudo", ["-n", "unshare", "-n", "true"]).status === 0 && spawnSync("setpriv", ["--version"]).status === 0;
+  const inNetns = (file: string, args: string[]) => {
+    const uid = String(process.getuid!());
+    const gid = String(process.getgid!());
+    return run("sudo", ["-n", "unshare", "-n", "setpriv", `--reuid=${uid}`, `--regid=${gid}`, "--clear-groups", "env", `HOME=${HOME}`, `USERPROFILE=${HOME}`, `PATH=${process.env.PATH}`, process.execPath, file, ...args], undefined, true);
+  };
+  it.skipIf(!canNetns)(`Linux CI: racers each in their OWN network namespace on one shared dir: exactly ONE owner in each of ${ROUNDS} rounds`, async () => {
+    const db = path.join(ROOT, "netns.db");
+    fs.writeFileSync(db, "");
+    const owners: number[] = [];
+    for (let r = 0; r < ROUNDS; r++) {
+      const go = path.join(ROOT, `go-netns-${r}`);
+      const racers = Array.from({ length: 4 }, () => inNetns(RACER, [db, go, "400"]));
+      await new Promise((res) => setTimeout(res, 300));
+      fs.writeFileSync(go, "");
+      const outs = await Promise.all(racers.map((x) => x.out));
+      owners.push(outs.filter((o) => o.includes("OWNER")).length);
+    }
+    expect(owners, "owners per round, across network namespaces").toEqual(Array(ROUNDS).fill(1));
+  }, 240_000);
+
+  it.skipIf(!canNetns)("Linux CI: a holder in one network namespace killed -9 releases within 2 s to a racer in another; no holder process is left", async () => {
+    const db = path.join(ROOT, "netns-kill.db");
+    fs.writeFileSync(db, "");
+    fs.writeFileSync(path.join(ROOT, "go-now"), ""); // the racers below start at once
+    const h = inNetns(HOLDER_PID, [db]);
+    const pid = await new Promise<number>((res, rej) => {
+      const t = setTimeout(() => rej(new Error(`precondition: the holder did not hold within 30 s\n${h.stderr()}`)), 30_000);
+      h.child.stdout!.on("data", (d) => {
+        const m = /HELD (\d+)/.exec(String(d));
+        if (m) {
+          clearTimeout(t);
+          res(Number(m[1]));
+        }
+      });
+    });
+    expect(await inNetns(RACER, [db, path.join(ROOT, "go-now"), "0"]).out, "precondition: held across namespaces").toMatch(/^LOST .*held by another process/);
+    process.kill(pid, "SIGKILL"); // the recorded pid of the holder itself (this user's process after setpriv)
+    await h.out;
+    const t0 = Date.now();
+    let got = "";
+    while (Date.now() - t0 < 2000) {
+      got = await inNetns(RACER, [db, path.join(ROOT, "go-now"), "0"]).out;
+      if (got.startsWith("OWNER")) break;
+    }
+    expect(got, "a racer in another namespace owns it within 2 s of the kill").toMatch(/^OWNER/);
+    expect(() => process.kill(pid, 0), "the holder is gone").toThrow();
+    const left = spawnSync("pgrep", ["-u", String(process.getuid!()), "-x", "flock"], { encoding: "utf8" }).stdout.trim();
+    expect(left, "no flock process is left behind").toBe("");
+  }, 120_000);
 
   const canBindMount = process.platform === "linux" && !!process.env.CI && spawnSync("sudo", ["-n", "true"]).status === 0;
   it.skipIf(!canBindMount)("Linux CI: a BIND MOUNT of the DB's directory names ONE owner (the parent directory's identity collapses it)", async () => {
