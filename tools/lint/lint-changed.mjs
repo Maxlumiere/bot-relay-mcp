@@ -11,12 +11,17 @@
  *   --canary                  lint tools/lint/canary/: every `// expect: <rule>` line must be reported by exactly that
  *                             rule, and nothing else may be reported. A rule that went silent (switched off, renamed,
  *                             broken by an upgrade) FAILS this, so the gate never runs blind. Exit 0 = every rule live.
- *   --changed <base> <head>   BLOCKING: lint the files the change touched (LINT_SCOPE) and report only findings on
- *                             lines the change ADDED (`git diff -U0 base...head`). Exit 1 on any.
+ *   --pr <base> <head>        BLOCKING: lint the files the change touched (in the lint scope) and report only findings
+ *   --push <before> <after>   on lines it ADDED. A pull request is judged from the merge base (what GitHub shows); a
+ *                             push directly from `before` (a force-push back to an ancestor still differs). A push
+ *                             that creates the branch is REFUSED. `head`/`after` must be the checked-out HEAD, since
+ *                             the files are linted from the working tree. Exit 1 on any finding, and on any changed
+ *                             file whose added lines cannot be mapped or that ESLint did not lint.
  *   --all                     REPORT ONLY: every finding in LINT_SCOPE across the tree, counted by rule. Exit 0.
  *   --plant-check             CI ONLY (refuses elsewhere: it commits into the checkout): commit the floating-promise
- *                             canary as a new file under tests/, run --changed on that commit, and REQUIRE it to block
- *                             with no-floating-promises; then reset. Proves diff -> lint -> line filter -> block.
+ *                             canary under a hostile name (a space, a tab, non-ASCII) and marked `-diff`, run --push on
+ *                             that commit, and REQUIRE it to block with no-floating-promises on that file; then reset.
+ *                             Proves names -> diff -> lint -> line filter -> block for a file built to slip past them.
  * Findings print as GitHub annotations, and a summary goes to $GITHUB_STEP_SUMMARY when set.
  */
 import fs from "fs";
@@ -26,7 +31,7 @@ import { fileURLToPath } from "url";
 // A STATIC import, resolved from tools/lint/node_modules (the pinned toolchain). This file lives here, outside the
 // scripts/ and tests/ the parser-pin guard scans, because loading ESLint from scripts/ needs a computed import.
 import { ESLint } from "eslint";
-import { inLintScope, parseAddedLines, onAddedLines, canaryExpectations } from "../../scripts/ci-lint-lib.mjs";
+import { inLintScope, changeRange, changedFiles, addedLinesBetween, onAddedLines, canaryExpectations, gateGit, ghData, ghProperty } from "../../scripts/ci-lint-lib.mjs";
 
 const TOOLS = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(TOOLS, "..", "..");
@@ -34,7 +39,8 @@ const ROOT = path.resolve(TOOLS, "..", "..");
 async function eslint() {
   // cwd = the repo root: with the tools directory as cwd every repo file was "outside of base path" and IGNORED,
   // with no line number, so a line filter would have passed every pull request having linted nothing (MEASURED).
-  return new ESLint({ cwd: ROOT, overrideConfigFile: path.join(TOOLS, "eslint.config.mjs"), errorOnUnmatchedPattern: false });
+  // globInputPaths: false, so a file name is never read as a glob pattern (`[`, `*`, `{` are legal in names).
+  return new ESLint({ cwd: ROOT, overrideConfigFile: path.join(TOOLS, "eslint.config.mjs"), errorOnUnmatchedPattern: false, globInputPaths: false });
 }
 
 function summary(lines) {
@@ -42,7 +48,7 @@ function summary(lines) {
 }
 
 function annotate(f, level = "error") {
-  console.log(`::${level} file=${f.file},line=${f.line}::${f.rule}: ${f.message.replace(/\r?\n/g, " ")}`);
+  console.log(`::${level} file=${ghProperty(f.file)},line=${f.line}::${ghData(`${f.rule}: ${f.message}`)}`);
 }
 
 async function canary() {
@@ -58,28 +64,39 @@ async function canary() {
   const unexpected = got.filter((g) => !expKeys.has(key(g)));
   const rules = [...new Set(expected.map((e) => e.rule))].sort();
   console.log(`lint canary: ${expected.length} expected findings over ${rules.length} rules (${rules.join(", ")}); ${got.length} reported`);
-  for (const m of missing) console.log(`FAIL: ${m.file}:${m.line} expected ${m.rule}, which did NOT fire (the rule is off or broken: the gate would run blind)`);
-  for (const u of unexpected) console.log(`FAIL: ${u.file}:${u.line} unexpected ${u.rule}: ${u.message}`);
+  for (const m of missing) console.log(ghData(`FAIL: ${m.file}:${m.line} expected ${m.rule}, which did NOT fire (the rule is off or broken: the gate would run blind)`));
+  for (const u of unexpected) console.log(ghData(`FAIL: ${u.file}:${u.line} unexpected ${u.rule}: ${u.message}`));
   if (missing.length || unexpected.length) process.exit(1);
   console.log("OK: every bug rule fired exactly where its canary says, and the clean canary is clean");
 }
 
-async function changed(base, head) {
-  const names = execFileSync("git", ["diff", "--name-only", "--diff-filter=AMR", `${base}...${head}`], { cwd: ROOT, encoding: "utf8" })
-    .split("\n").filter(Boolean).filter(inLintScope).filter((f) => fs.existsSync(path.join(ROOT, f)));
-  if (names.length === 0) {
-    console.log("lint: no changed file in the lint scope");
+async function changed(kind, a, b) {
+  let range;
+  try {
+    range = changeRange(ROOT, kind, a, b);
+    const head = gateGit(ROOT, ["rev-parse", "HEAD"]).trim();
+    const to = gateGit(ROOT, ["rev-parse", `${range.to}^{commit}`]).trim();
+    if (to !== head) throw new Error(`the judged commit ${to} is not the checked-out HEAD ${head}: the files on disk are not that change`);
+  } catch (e) {
+    console.log(`lint: REFUSED: ${e.message}`);
+    summary(["### Lint (bug rules, changed lines)", `REFUSED: ${e.message}`]);
+    process.exit(1);
+  }
+  const files = changedFiles(ROOT, range.from, range.to).filter((f) => f.status !== "D" && inLintScope(f.to));
+  if (files.length === 0) {
+    console.log(`lint: no changed file in the lint scope (${range.from.slice(0, 7)}..${range.to.slice(0, 7)})`);
     summary(["### Lint (bug rules, changed lines)", "No changed file in the lint scope."]);
     return;
   }
-  const diff = execFileSync("git", ["diff", "--unified=0", "--no-color", `${base}...${head}`, "--", ...names], { cwd: ROOT, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
-  const added = parseAddedLines(diff);
+  const { added, unmapped } = addedLinesBetween(ROOT, range.from, range.to, files);
+  const names = files.map((f) => f.to);
   const results = await (await eslint()).lintFiles(names.map((f) => path.join(ROOT, f)));
   const kept = onAddedLines(results, added);
+  for (const f of unmapped) kept.push({ file: f, line: 1, rule: "not-linted", message: "its content changed but git gave no textual hunk, so its added lines are unknown" });
   const linted = new Set(results.map((r) => path.relative(ROOT, r.filePath).split(path.sep).join("/")));
   for (const f of names) if (!linted.has(f)) kept.push({ file: f, line: 1, rule: "not-linted", message: "ESLint returned no result for this file" });
-  const addedCount = [...added.values()].reduce((a, s) => a + s.size, 0);
-  console.log(`lint: ${names.length} changed file(s), ${addedCount} added line(s), ${kept.length} finding(s) on them`);
+  const addedCount = [...added.values()].reduce((n, set) => n + set.size, 0);
+  console.log(`lint: ${range.from.slice(0, 7)}..${range.to.slice(0, 7)}: ${names.length} changed file(s), ${addedCount} added line(s), ${kept.length} finding(s) on them`);
   kept.forEach((f) => annotate(f));
   summary([
     "### Lint (bug rules, changed lines)",
@@ -96,7 +113,7 @@ async function all() {
   const byRule = {};
   for (const f of found) byRule[f.rule] = (byRule[f.rule] ?? 0) + 1;
   console.log(`lint (report only): ${names.length} files, ${found.length} finding(s): ${JSON.stringify(byRule)}`);
-  for (const f of found) console.log(`${f.file}:${f.line} ${f.rule}: ${f.message}`);
+  for (const f of found) console.log(ghData(`${f.file}:${f.line} ${f.rule}: ${f.message}`));
   summary(["### Lint debt (report only, whole tree)", `${names.length} files, ${found.length} finding(s)`, ...Object.entries(byRule).map(([k, v]) => `- ${k}: ${v}`)]);
 }
 
@@ -105,34 +122,39 @@ function plantCheck() {
     console.error("--plant-check runs only in GitHub Actions: it commits into the checkout");
     process.exit(2);
   }
-  const git = (...args) => execFileSync("git", ["-c", "user.email=ci@example.invalid", "-c", "user.name=ci", ...args], { cwd: ROOT, encoding: "utf8" });
-  const planted = "tests/zz-planted-floating-promise.ts";
+  const git = (...args) => execFileSync("git", ["-c", "user.email=ci@example.invalid", "-c", "user.name=ci", "-c", "commit.gpgsign=false", ...args], { cwd: ROOT, encoding: "utf8" });
+  // A name built to slip past a diff reader (a space, a tab, non-ASCII: git quotes or tab-suffixes it in patch
+  // headers), marked `-diff` so a plain diff of it is "Binary files differ".
+  const planted = "tests/zz-planted floating\tpromise \u00fc.ts";
+  const start = git("rev-parse", "HEAD").trim();
   fs.copyFileSync(path.join(TOOLS, "canary", "floating-promise.ts"), path.join(ROOT, planted));
-  git("add", planted);
-  git("commit", "-q", "-m", "planted: a floating promise on an added line");
+  fs.appendFileSync(path.join(ROOT, ".gitattributes"), "tests/zz-planted* -diff\n");
+  git("add", "--", planted, ".gitattributes");
+  git("commit", "-q", "-m", "planted: a floating promise in a hostile file");
   let out = "";
   let blocked = false;
   try {
-    out = execFileSync(process.execPath, [fileURLToPath(import.meta.url), "--changed", "HEAD~1", "HEAD"], { cwd: ROOT, encoding: "utf8", env: { ...process.env, GITHUB_STEP_SUMMARY: "" } });
+    out = execFileSync(process.execPath, [fileURLToPath(import.meta.url), "--push", start, "HEAD"], { cwd: ROOT, encoding: "utf8", env: { ...process.env, GITHUB_STEP_SUMMARY: "" } });
   } catch (e) {
     blocked = e.status === 1;
     out = String(e.stdout ?? "");
   } finally {
-    git("reset", "-q", "--hard", "HEAD~1");
+    git("reset", "-q", "--hard", start);
   }
   process.stdout.write(out);
-  if (!blocked || !out.includes("@typescript-eslint/no-floating-promises")) {
-    console.log("FAIL: the planted floating promise on an added line did NOT block the lint gate");
+  const onPlanted = out.split("\n").some((l) => l.includes(`file=${ghProperty(planted)},`) && l.includes("@typescript-eslint/no-floating-promises"));
+  if (!blocked || !onPlanted) {
+    console.log("FAIL: the planted floating promise in a hostile file (space, tab, non-ASCII name; -diff) did NOT block the lint gate on that file");
     process.exit(1);
   }
-  console.log("OK: the planted floating promise on an added line blocked the lint gate (exit 1)");
+  console.log("OK: the planted floating promise in a hostile file (space, tab, non-ASCII name; -diff) blocked the lint gate (exit 1)");
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [mode, a, b] = process.argv.slice(2);
   if (mode === "--canary") await canary();
   else if (mode === "--plant-check") plantCheck();
-  else if (mode === "--changed" && a && b) await changed(a, b);
+  else if ((mode === "--pr" || mode === "--push") && b) await changed(mode.slice(2), a, b);
   else if (mode === "--all") await all();
-  else { console.error("usage: lint-changed.mjs --canary | --changed <base> <head> | --all | --plant-check"); process.exit(2); }
+  else { console.error("usage: lint-changed.mjs --canary | --pr <base> <head> | --push <before> <after> | --all | --plant-check"); process.exit(2); }
 }
