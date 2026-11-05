@@ -1,0 +1,11 @@
+{
+  "name": "bot-relay-lint-tools",
+  "private": true,
+  "description": "CI-only lint toolchain (exact versions; the lockfile's integrity hashes pin every package). Not part of the published package.",
+  "type": "module",
+  "devDependencies": {
+    "eslint": "10.13.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.0"
+  }
+}

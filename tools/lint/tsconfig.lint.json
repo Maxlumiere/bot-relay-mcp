@@ -1,0 +1,17 @@
+{
+  "//": "Type information for the lint gate only (tools/lint/eslint.config.mjs). Never used to build.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true
+  },
+  "include": ["../../src/**/*.ts", "../../tests/**/*.ts", "../../scripts/**/*.mjs", "canary/**/*.ts"],
+  "exclude": ["../../node_modules", "../../dist"]
+}
