@@ -527,7 +527,7 @@ export async function acquirePrimitive(dbPath: string, opts: AcquireOptions = {}
   const attempts = opts.attempts ?? Number.POSITIVE_INFINITY;
   const base = opts.baseMs ?? 20;
   const deadline = Date.now() + (opts.budgetMs ?? ACQUIRE_BUDGET_MS);
-  assertLocalFilesystem(dbPath); // before anything is materialized or locked
+
   let lastReason = "held by another process";
   for (let i = 0; i < attempts; i++) {
     if (opts.initialBytes) materializeDb(dbPath, opts.initialBytes, opts.verifyCreated);
