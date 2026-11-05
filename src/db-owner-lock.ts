@@ -438,7 +438,7 @@ function tryPrimitiveOnce(key: string, dbPath: string): Promise<Primitive | null
     }
     try {
       assertPrivateLockFile(fd, file);
-      if (lockScheme === "flock" && !flockFd(fd, file)) {
+      if (false) {
         fs.closeSync(fd);
         return Promise.resolve(null);
       }
