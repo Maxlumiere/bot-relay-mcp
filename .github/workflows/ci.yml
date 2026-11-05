@@ -157,6 +157,106 @@ jobs:
         # guarded by tests/v2-4-3-ci-audit-bypass-guard.test.ts.
         run: bash scripts/audit-with-retry.sh high
 
+  # BLOCKING secrets gate: gitleaks, one exact release verified by its SHA-256 (scripts/ci-gitleaks.sh), never a
+  # floating tag. A canary built at runtime must be caught first, or the gate refuses to run blind. Then the commits
+  # this event adds are scanned (--redact: a finding names rule, file, line and commit, never the secret). On main
+  # and nightly the whole history is also scanned, REPORT ONLY.
+  secrets:
+    name: Secrets scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks (pinned by SHA-256)
+        run: bash scripts/ci-gitleaks.sh install
+      - name: Canary (a runtime-built fake credential must be caught)
+        run: bash scripts/ci-gitleaks.sh canary
+      - name: Planted check (a fake credential committed here must BLOCK the scan; then reset)
+        run: bash scripts/ci-gitleaks.sh plant-check
+      - name: Scan this change's commits (blocking)
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: bash scripts/ci-gitleaks.sh scan-event
+      - name: Whole-history baseline (report only)
+        if: github.event_name != 'pull_request'
+        run: bash scripts/ci-gitleaks.sh baseline
+
+  # BLOCKING bug lint on the lines a change ADDS (scripts/ci-lint-changed.mjs; rules: tools/lint/eslint.config.mjs:
+  # floating and misused promises, loose equality except `== null`, unused variables; nothing stylistic). The
+  # toolchain is tools/lint's lockfile (exact versions, integrity hashes). Every rule is proven live by its canary
+  # first. A pull request is linted at its HEAD commit, so the line numbers match the diff.
+  lint:
+    name: Lint changed lines (bug rules)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history, the PR head)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            tools/lint/package-lock.json
+      - name: Install dependencies (the types the rules read)
+        run: npm ci
+      - name: Install the pinned lint toolchain
+        run: npm ci --prefix tools/lint
+      - name: Canary (every bug rule must fire where its canary says)
+        run: node scripts/ci-lint-changed.mjs --canary
+      - name: Planted check (a floating promise on an added line must BLOCK; then reset)
+        run: node scripts/ci-lint-changed.mjs --plant-check
+      - name: Lint the added lines (blocking)
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            node scripts/ci-lint-changed.mjs --changed "$PR_BASE" "$PR_HEAD"
+          elif [ "$EVENT" = push ] && [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            node scripts/ci-lint-changed.mjs --changed "$PUSH_BEFORE" "$PUSH_AFTER"
+          else
+            echo "lint: no change range on a $EVENT event"
+          fi
+
+  # REPORT ONLY (never blocks, never part of ci-ok): the bug rules over the WHOLE tree, counted by rule, so the
+  # existing debt is visible without gating anyone on it. Complexity, duplication, unused exports and coverage are
+  # follow-ups.
+  quality-report:
+    name: Quality report (report only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            tools/lint/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Install the pinned lint toolchain
+        run: npm ci --prefix tools/lint
+      - name: Bug-rule debt over the whole tree (report only)
+        run: node scripts/ci-lint-changed.mjs --all
+
   # The PR-B timing bars measure LATENCY, so they run ALONE: on their own runner, with no suite beside them (in
   # parallel with ~300 files the runner's own noise, MEASURED 30-165 ms, exceeds the margins they resolve).
   # Each run calibrates itself: an A/A control that must pass and a sized negative control that must fail.
@@ -381,7 +481,7 @@ jobs:
   # that it reports even when a job it needs failed (a skipped aggregate would read as Success).
   ci-ok:
     name: ci-ok
-    needs: [changes, shard, checks, timing-bars, test, test-windows, test-macos, smoke]
+    needs: [changes, shard, checks, timing-bars, test, test-windows, test-macos, smoke, secrets, lint]
     if: always()
     runs-on: ubuntu-latest
     steps:
