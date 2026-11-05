@@ -234,7 +234,12 @@ function openLockFile(file: string, flags: number, mode?: number): number {
   }
 }
 
-/** A held primitive: how to drop it, and for a lock FILE, its path and open fd (the identity re-checked while held). */
+/**
+ * A held primitive: how to drop it, and for a lock FILE, its path and open fd (the identity re-checked while held).
+ * Ruling 75be90fa (1): the fd is a NUMERIC descriptor from fs.openSync, never an fs.promises FileHandle (one is closed
+ * when collected, which would drop the lock), held here, in HELD, for as long as the lock is. libuv opens it O_CLOEXEC,
+ * so no other child of this process inherits it (a child holding it would keep the lock after this process dies).
+ */
 interface Primitive {
   drop: () => void;
   lockFile?: string;
@@ -251,6 +256,41 @@ export interface OwnerLock {
 
 function primitiveName(key: string): string {
   return process.platform === "win32" ? `\\\\.\\pipe\\bot-relay-${key}` : `\0bot-relay-${key}`;
+}
+
+/**
+ * Linux network filesystems, by statfs magic (linux/magic.h): flock there is emulated (NFS maps it to fcntl locks) or
+ * not shared between clients, so a lock taken on one host does not exclude another. Ruling 75be90fa (3): owner mode
+ * is refused there, by name. macOS is not checked (Node's statfs gives a per-boot index there, not a type): a wasm DB
+ * must live on a local filesystem (stated in the docs).
+ */
+const LINUX_NETWORK_FS: ReadonlyMap<number, string> = new Map([
+  [0x6969, "NFS"],
+  [0xff534d42, "CIFS"],
+  [0xfe534d42, "SMB2"],
+  [0x517b, "SMB"],
+  [0x5346414f, "AFS"],
+  [0x00c36400, "Ceph"],
+  [0x01021997, "9p (v9fs)"],
+  [0x013111a8, "IBRIX"],
+  [0x47504653, "GPFS"],
+  [0x0bd00bd0, "Lustre"],
+  [0x65735546, "FUSE (e.g. sshfs)"],
+]);
+function assertLocalFilesystem(dbPath: string): void {
+  if (process.platform !== "linux") return;
+  let type: number;
+  try {
+    type = Number(fs.statfsSync(path.dirname(path.resolve(dbPath))).type) >>> 0;
+  } catch {
+    return; // the directory is absent: the open fails on its own
+  }
+  const name = LINUX_NETWORK_FS.get(type);
+  if (name) {
+    throw new OwnerLockError(
+      `the DB at ${dbPath} is on a network filesystem (${name}, statfs type 0x${type.toString(16)}): the wasm single-owner lock cannot exclude another host there, so owner mode is refused. Put the DB on a local filesystem, or use the native driver.`
+    );
+  }
 }
 
 /** flock's exit status for "held by another" (`-E`), distinct from its own failures. */
@@ -284,6 +324,8 @@ export function _setLinuxSchemeForTests(scheme: "flock" | "socket" | null): void
 
 /** Lock the open lock file `fd` with the system flock (Linux): true = held by THIS open file, false = held by another. */
 function flockFd(fd: number, file: string): boolean {
+  // Ruling 75be90fa (2): exit 0 = acquired; FLOCK_CONFLICT = held by another (retried); ANY other status or a signal
+  // (a flock without -E, e.g. BusyBox, a crash) = NOT acquired, a named refusal: fail closed.
   const r = spawnSystem("flock", ["-n", "-x", "-E", String(FLOCK_CONFLICT), "3"], {
     stdio: ["ignore", "ignore", "pipe", fd],
     encoding: "utf-8",
@@ -400,6 +442,7 @@ export async function acquirePrimitive(dbPath: string, opts: AcquireOptions = {}
   const attempts = opts.attempts ?? Number.POSITIVE_INFINITY;
   const base = opts.baseMs ?? 20;
   const deadline = Date.now() + (opts.budgetMs ?? ACQUIRE_BUDGET_MS);
+  assertLocalFilesystem(dbPath); // before anything is materialized or locked
   let lastReason = "held by another process";
   for (let i = 0; i < attempts; i++) {
     if (opts.initialBytes) materializeDb(dbPath, opts.initialBytes, opts.verifyCreated);
