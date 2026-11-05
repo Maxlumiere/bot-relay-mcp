@@ -198,6 +198,14 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     }
   }, 60_000);
 
+  it.skipIf(process.platform === "win32")("a flock run that FAILS (here: it cannot even start on a bad descriptor) is a named refusal, never an acquire (ruling 75be90fa: fail closed)", async () => {
+    const m = (await import("../dist/db-owner-lock.js")) as unknown as { _flockFdForTests: (fd: number, file: string) => boolean };
+    const f = path.join(ROOT, "flock-fails.lock");
+    const fd = fs.openSync(f, "w");
+    fs.closeSync(fd); // a descriptor number that no longer names an open file
+    expect(() => m._flockFdForTests(fd, f)).toThrow(/could not be locked: the system flock failed/);
+  });
+
   it.skipIf(process.platform === "win32")("the DB's canonical path MOVES while the lock is taken: the acquire re-derives the key and ends holding the lock of the path's CURRENT file", async () => {
     const m = (await import("../dist/db-owner-lock.js")) as unknown as {
       acquirePrimitive: (p: string, o?: { attempts?: number }) => Promise<{ release(): void }>;

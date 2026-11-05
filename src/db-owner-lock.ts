@@ -338,6 +338,9 @@ function flockFd(fd: number, file: string): boolean {
   );
 }
 
+/** Test-only: the flock step itself, so a flock run that fails (fails to start, a bad fd) is shown to be a refusal. */
+export const _flockFdForTests = (fd: number, file: string): boolean => flockFd(fd, file);
+
 function tryPrimitiveOnce(key: string, dbPath: string): Promise<Primitive | null> {
   const lockScheme = process.platform === "darwin" ? "darwin" : process.platform === "linux" ? linuxScheme() : null;
   if (lockScheme === "darwin" || lockScheme === "flock") {
