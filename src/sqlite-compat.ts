@@ -971,14 +971,10 @@ async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
 
     // From here to the record's handover: ONE synchronous sequence (the re-check, the read, the construction).
     assertNoNativeHandle(dbPath);
-    // Codex #385 R1 P1-1: an owner may have MATERIALIZED this file (stamped RLYW) while sql.js loaded. The header decides
-    // again, now: an owned file goes to the owner protocol (its lock, or a refusal), never to an unlocked connection;
-    // the normal verdict refuses a native-stamped or foreign file that appeared meanwhile.
-    const now = assertDriverHeaderAllows(dbPath, "wasm");
-    if (now.kind === "wasm") {
-      endWasmUse(token);
-      return createOwnedWasmDb(dbPath, now);
-    }
+    // Codex #385 R1 P1-1: another process may have created this file while sql.js loaded. The normal verdict, again,
+    // now (a native-stamped or foreign file is refused by name); and the BYTES read below decide ownership: an owned
+    // (RLYW) file goes to the owner protocol (its lock, or a refusal), never to an unlocked connection.
+    assertDriverHeaderAllows(dbPath, "wasm");
     let rawDb: any;
     if (fs.existsSync(dbPath)) {
       const fileData = fs.readFileSync(dbPath);

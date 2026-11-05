@@ -385,6 +385,33 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     db.registerAgent("still-owner", "r", []); // and this owner still writes
   }, 60_000);
 
+  it("a LEGACY connection never writes onto a file that became OWNED after it opened (stamped RLYW by an owner): refused, the owner's file untouched", async () => {
+    makeDb(dbPath, 0);
+    process.env.RELAY_SQLITE_DRIVER = "wasm"; // legacy: env-only
+    await db.initializeDb();
+    expect(compat.getActiveDriver(), "precondition: a legacy wasm connection").toBe("wasm");
+    const other = path.join(caseDir, "owned.db");
+    makeDb(other, WASM);
+    fs.renameSync(other, dbPath); // an owner's file now sits at the name
+    const theirs = sha(dbPath);
+    expect(() => db.registerAgent("legacy-after", "r", [])).toThrow(/now owned by the wasm driver's single owner/);
+    expect(sha(dbPath), "the owner's file is untouched").toBe(theirs);
+  });
+
+  it("a RESTORE of an owned DB while ANOTHER process owns it is refused by name, and the owner's file is untouched", async () => {
+    makeDb(dbPath, WASM);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path; // no owner yet
+    declareWasm();
+    const a = startOwner();
+    expect(await a.first).toBe("READY");
+    const theirs = sha(dbPath);
+    fs.rmSync(cfgPath); // this process: no declaration; the header (RLYW) still makes it owned
+    await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused: .*owned by a live relay process/);
+    expect(sha(dbPath), "the owner's file is untouched").toBe(theirs);
+    a.child.stdin!.write("exit\n");
+    await waitExitOf(a.child);
+  }, 60_000);
+
   // --- Codex #385 R1, each a RED on the 2b-ii source it reviewed ---
 
   it("P1-1: a LEGACY (env-only) open that awaits sql.js while another process OWNS the file meanwhile does not become an unlocked writer", async () => {
@@ -404,6 +431,16 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     expect(await ask(b!.child, "write b-after"), "B's ownership is intact").toBe("WROTE");
     b!.child.stdin!.write("exit\n");
   }, 60_000);
+
+  it("P1-1 twin: a FOREIGN DB that appears while a legacy open awaits sql.js gets the normal refusal (the verdict is re-applied after the load)", async () => {
+    process.env.RELAY_SQLITE_DRIVER = "wasm"; // legacy
+    compat._setAfterSqlJsLoadForTests(() => makeDb(dbPath, 0x12345678));
+    try {
+      await expect(compat.initializeDb(dbPath)).rejects.toThrow(/not the relay's/);
+    } finally {
+      compat._setAfterSqlJsLoadForTests(null);
+    }
+  });
 
   it.each([
     ["native-stamped (RLYN)", NATIVE, /native/i],
