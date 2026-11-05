@@ -586,6 +586,12 @@ async function probeDaemonRunning(): Promise<boolean> {
  * DB first; if that safety-backup fails the import aborts and the current
  * DB is left untouched.
  */
+/** Test-only: awaited right before a restore replaces the live DB (another process may take ownership meanwhile). */
+let beforeRestoreSwapHook: ((dbPath: string) => void | Promise<void>) | null = null;
+export function _setBeforeRestoreSwapForTests(fn: ((dbPath: string) => void | Promise<void>) | null): void {
+  beforeRestoreSwapHook = fn;
+}
+
 export async function importRelayState(archivePath: string, options: ImportOptions = {}): Promise<ImportResult> {
   assertTarLocatable(); // before the safety backup, the staging dir, or closing the live DB
   const resolvedArchive = path.resolve(archivePath);
@@ -727,6 +733,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // destination already exists. Fall back to copy-then-unlink — NOT
     // atomic on Windows, but documented and the best POSIX-API equivalent
     // we can offer without shelling out to MoveFileExW.
+    await beforeRestoreSwapHook?.(srcDbPath);
     const newPath = srcDbPath + ".new";
     fs.copyFileSync(extractedDbPath, newPath);
     try {
