@@ -123,9 +123,10 @@ function plantCheck() {
     process.exit(2);
   }
   const git = (...args) => execFileSync("git", ["-c", "user.email=ci@example.invalid", "-c", "user.name=ci", "-c", "commit.gpgsign=false", ...args], { cwd: ROOT, encoding: "utf8" });
-  // A name built to slip past a diff reader (a space, a tab, non-ASCII: git quotes or tab-suffixes it in patch
-  // headers), marked `-diff` so a plain diff of it is "Binary files differ".
-  const planted = "tests/zz-planted floating\tpromise \u00fc.ts";
+  // A name built to slip past a diff reader and the scope filter (a space, a tab, non-ASCII, a newline, U+2028: git
+  // quotes or tab-suffixes such names in patch headers, and `.` in a regex does not match a line terminator), marked
+  // `-diff` so a plain diff of it is "Binary files differ".
+  const planted = "tests/zz-planted floating\tpromise \u00fc\nline\u2028sep.ts";
   const start = git("rev-parse", "HEAD").trim();
   fs.copyFileSync(path.join(TOOLS, "canary", "floating-promise.ts"), path.join(ROOT, planted));
   fs.appendFileSync(path.join(ROOT, ".gitattributes"), "tests/zz-planted* -diff\n");
@@ -144,10 +145,10 @@ function plantCheck() {
   process.stdout.write(out);
   const onPlanted = out.split("\n").some((l) => l.includes(`file=${ghProperty(planted)},`) && l.includes("@typescript-eslint/no-floating-promises"));
   if (!blocked || !onPlanted) {
-    console.log("FAIL: the planted floating promise in a hostile file (space, tab, non-ASCII name; -diff) did NOT block the lint gate on that file");
+    console.log("FAIL: the planted floating promise in a hostile file (space, tab, non-ASCII, newline, U+2028 in its name; -diff) did NOT block the lint gate on that file");
     process.exit(1);
   }
-  console.log("OK: the planted floating promise in a hostile file (space, tab, non-ASCII name; -diff) blocked the lint gate (exit 1)");
+  console.log("OK: the planted floating promise in a hostile file (space, tab, non-ASCII, newline, U+2028 in its name; -diff) blocked the lint gate (exit 1)");
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

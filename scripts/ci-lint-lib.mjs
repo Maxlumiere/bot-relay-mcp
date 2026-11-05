@@ -15,10 +15,16 @@ import { fileURLToPath } from "url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-/** The files the gate lints: the root package's TypeScript and the scripts. Fixtures may hold bad code on purpose. */
+/**
+ * The files the gate lints: the root package's TypeScript and the scripts. Fixtures may hold bad code on purpose.
+ * Prefix and suffix checks, never `.`: a name may hold any byte but NUL, and `.` does not match a line terminator
+ * (LF, CR, U+2028, U+2029), so a regex `.+` dropped such a file from the gate unlinted.
+ */
 export function inLintScope(file) {
-  if (/^tests\/fixtures\//.test(file)) return false;
-  return /^src\/.+\.(ts|mts)$/.test(file) || /^tests\/.+\.(ts|mts)$/.test(file) || /^scripts\/.+\.mjs$/.test(file);
+  // `dir` + at least one character + `ext`, as the old `^dir.+ext$` meant, with no character class deciding it.
+  const is = (dir, ...exts) => file.startsWith(dir) && exts.some((e) => file.endsWith(e) && file.length > dir.length + e.length);
+  if (file.startsWith("tests/fixtures/")) return false;
+  return is("src/", ".ts", ".mts") || is("tests/", ".ts", ".mts") || is("scripts/", ".mjs");
 }
 
 export const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
@@ -106,11 +112,13 @@ export function addedLinesBetween(root, from, to, files, diffOf = (paths) => gat
 
 /**
  * GitHub workflow-command escaping. A file name is attacker-controlled (a pull request names its files): unescaped, a
- * newline in it would end the annotation and start a NEW workflow command line. `ghProperty` is for `file=...`
+ * newline in it would end the annotation and start a NEW workflow command line, and a legacy `##[...]` command is
+ * recognised anywhere in a line. `ghProperty` is for `file=...`
  * (also `:` and `,`, which end a property), `ghData` for the message and any plain log line that prints a name.
  */
 export function ghData(s) {
-  return String(s).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+  // `##[` is the runner's LEGACY command form, recognised anywhere in a line; `%5B` keeps it readable and inert.
+  return String(s).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/##\[/g, "##%5B");
 }
 export function ghProperty(s) {
   return ghData(s).replace(/:/g, "%3A").replace(/,/g, "%2C");

@@ -71,11 +71,12 @@ trusted_ignore() {
 summary() { if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; fi; }
 
 # Print a redacted JSON report as one line per finding (rule, file:line, commit), plus a count by rule. A file name
-# is attacker-controlled: %, CR and LF are escaped as in a workflow command, so a newline in a name cannot start one.
+# is attacker-controlled: %, CR and LF are escaped as in a workflow command, so a newline in a name cannot start one,
+# and `##[` (the runner's legacy command form, recognised anywhere in a line) becomes `##%5B`.
 report() {
   node -e '
     const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8") || "[]");
-    const esc = (s) => String(s).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+    const esc = (s) => String(s).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/##\[/g, "##%5B");
     const by = {};
     for (const f of r) { by[f.RuleID] = (by[f.RuleID] || 0) + 1; console.log(esc(`${f.RuleID} ${f.File}:${f.StartLine} commit ${String(f.Commit || "").slice(0, 7)}`)); }
     console.log(`findings: ${r.length} ${JSON.stringify(by)}`);

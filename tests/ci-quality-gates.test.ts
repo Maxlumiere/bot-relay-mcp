@@ -67,6 +67,21 @@ describe("the added-line filter", () => {
     expect(ghProperty("src/a,b:c.ts")).toBe("src/a%2Cb%3Ac.ts");
     expect(ghData("a\n::x")).not.toMatch(/\n/);
   });
+  it("nor the runner's LEGACY `##[...]` form, which it recognises anywhere in a line", () => {
+    expect(ghData("src/##[stop-commands]pause.ts")).toBe("src/##%5Bstop-commands]pause.ts");
+    expect(ghProperty("src/##[set-env name=X;]1.ts")).not.toContain("##[");
+    expect(ghData("##[group]a ##[endgroup]")).not.toContain("##[");
+  });
+  it("the scope sees names with ANY line terminator (LF, CR, U+2028, U+2029): no `.` decides it", () => {
+    for (const t of ["\n", "\r", "\u2028", "\u2029"]) {
+      expect(inLintScope(`src/a${t}b.ts`), JSON.stringify(t)).toBe(true);
+      expect(inLintScope(`tests/a${t}b.ts`), JSON.stringify(t)).toBe(true);
+      expect(inLintScope(`scripts/a${t}b.mjs`), JSON.stringify(t)).toBe(true);
+      expect(inLintScope(`tests/fixtures/a${t}b.ts`), JSON.stringify(t)).toBe(false);
+      expect(inLintScope(`src/a.ts${t}`), JSON.stringify(t)).toBe(false);
+    }
+    for (const f of ["src/", "src/.ts", "tests/.mts", "scripts/.mjs", "src.ts", "srcx/a.ts"]) expect(inLintScope(f), f).toBe(false);
+  });
 });
 
 /**
@@ -105,13 +120,15 @@ describe("the changed-lines reader, on real git repos", () => {
   const THREE = "export const a = 1;\nexport const b = 2;\nexport const c = 3;\n";
 
   const names = ["src/has space.ts", "src/ünï.ts", 'src/quo"te.ts', "src/[glob]{x}.ts"];
-  if (process.platform !== "win32") names.push("src/has\ttab.ts", "src/star*.ts");
-  it.each(names)("a file named %j: listed verbatim, every added line mapped", (name) => {
+  names.push("src/line\u2028sep.ts", "src/para\u2029sep.ts");
+  if (process.platform !== "win32") names.push("src/has\ttab.ts", "src/star*.ts", "src/new\nline.ts", "src/carriage\rreturn.ts");
+  it.each(names)("a file named %j: listed verbatim, IN SCOPE, every added line mapped", (name) => {
     const d = repo();
     const base = git(d, "rev-parse", "HEAD");
     const head = commit(d, { [name]: THREE });
     const { files, added, unmapped } = changes(d, base, head);
-    expect(files.map((f) => f.to)).toEqual([name]);
+    // The same filter the gate applies before mapping: a name it drops is never linted.
+    expect(files.filter((f) => inLintScope(f.to)).map((f) => f.to)).toEqual([name]);
     expect([...added.get(name)!]).toEqual([1, 2, 3]);
     expect(unmapped).toEqual([]);
   });
@@ -255,6 +272,8 @@ describe("the gates' pins and wiring", () => {
     // A push that creates the branch scans what no other ref holds; never just the tip.
     expect(sh).not.toMatch(/range="-1 /);
     expect(sh).toContain('--not --exclude=origin/${PUSH_REF_NAME:?} --remotes --tags"');
+    // The report escapes a file name like the lint gate (ghData): %, CR, LF, and the legacy `##[` command form.
+    expect(sh).toContain('.replace(/%/g, "%25").replace(/\\r/g, "%0D").replace(/\\n/g, "%0A").replace(/##\\[/g, "##%5B")');
     // The six planted cases, and the canary in the paths upstream's allowlist skips and behind both self-exemptions.
     for (const c of ["setup_plain", "setup_merge", "setup_attr", "setup_zero zero", "setup_inline", "setup_selfignore"]) expect(sh).toMatch(new RegExp(`^  plant_one .* ${c}$`, "m"));
     for (const f of ["package-lock.json", "icon.svg", "node_modules/x/index.js", "my.gitleaks.toml", "inline.js", "selfignored.js"]) expect(sh).toContain(f);
