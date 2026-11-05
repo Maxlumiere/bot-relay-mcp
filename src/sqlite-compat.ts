@@ -735,10 +735,18 @@ function replaceWithRetry(tmp: string, target: string): void {
     }
   }
 }
+/**
+ * The DB file's identity for the owner's per-persist check: more than dev+ino, which misses another writer that
+ * rewrites the file IN PLACE (the same inode) and a replacement landing on a REUSED inode number (ext4 reuses a freed
+ * one at once). Size and the nanosecond mtime change with any such write; the owner reads it right after its own
+ * rename. NOT ctime: a metadata change is not a write, and the relay itself chmods (and, on Windows, re-ACLs) its DB
+ * after every open (db.ts ensureSecureFile), which would refuse its own next persist. On a coarse-timestamp filesystem
+ * (HFS+ 1 s, FAT/exFAT 2 s) a same-size in-place rewrite within the granularity is not seen.
+ */
 const identityOf = (p: string): string | null => {
   try {
     const st = fs.statSync(p, { bigint: true });
-    return `${st.dev}:${st.ino}`;
+    return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
   } catch {
     return null;
   }
@@ -761,8 +769,9 @@ function ownerPersist(w: WasmDatabase, data: Buffer): void {
   assertSingleLink(target);
   if (identityOf(target) !== w.lastIdentity) {
     throw new OwnerLockError(
-      `wasm persist refused: the DB file at ${target} was replaced since this owner's last write (its identity ` +
-        `changed), so another writer touched it. Nothing was written; stop the other writer and restart this process.`
+      `wasm persist refused: the DB file at ${target} was replaced or changed by another process since this owner's ` +
+        `last write (its identity changed: inode, size or mtime), so another writer may have ` +
+        `touched it. Nothing was written; stop the other writer and restart this process.`
     );
   }
   const now = readDriverHeader(target);
