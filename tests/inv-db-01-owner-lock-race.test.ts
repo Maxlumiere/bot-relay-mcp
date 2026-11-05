@@ -85,6 +85,17 @@ fs.writeFileSync(
   `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
     `await acquirePrimitive(process.argv[2], { initialBytes: new Uint8Array() }); process.stdout.write("HELD " + process.pid + "\\n"); setInterval(() => {}, 1000);\n`
 );
+// A holder that, AFTER taking the lock, spawns an UNRELATED long-lived child (no stdio passed): the lock's descriptor
+// must not be inherited by it (O_CLOEXEC), or that child would keep the lock after the holder dies.
+const HOLDER_SPAWNS = path.join(ROOT, "holder-spawns.mjs");
+fs.writeFileSync(
+  HOLDER_SPAWNS,
+  `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
+    `const { spawn } = await import("child_process");\n` +
+    `await acquirePrimitive(process.argv[2], { initialBytes: new Uint8Array() });\n` +
+    `const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true }); c.unref();\n` +
+    `process.stdout.write("HELD " + process.pid + " " + c.pid + "\\n"); setInterval(() => {}, 1000);\n`
+);
 const ACQUIRER = path.join(ROOT, "acquirer.mjs");
 fs.writeFileSync(
   ACQUIRER,
@@ -141,6 +152,40 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     }
     expect(owners, "owners per round").toEqual(Array(ROUNDS).fill(1));
   }, 240_000);
+
+  it.skipIf(process.platform === "win32")("the lock is NEVER inherited by another child of the owner: the owner killed -9, its unrelated child still alive, a racer owns it within 2 s", async () => {
+    const db = path.join(ROOT, "no-inherit.db");
+    const h = run(HOLDER_SPAWNS, [db]);
+    const [holderPid, childPid] = await new Promise<[number, number]>((res, rej) => {
+      const t = setTimeout(() => rej(new Error(`precondition: the holder did not hold within 30 s\n${h.stderr()}`)), 30_000);
+      h.child.stdout!.on("data", (d) => {
+        const m = /HELD (\d+) (\d+)/.exec(String(d));
+        if (m) {
+          clearTimeout(t);
+          res([Number(m[1]), Number(m[2])]);
+        }
+      });
+    });
+    try {
+      expect(await oneTry(db), "precondition: held").toMatch(/^LOST OwnerLockError .*held by another process/);
+      process.kill(holderPid, "SIGKILL");
+      await h.out;
+      expect(() => process.kill(childPid, 0), "precondition: the unrelated child is still alive").not.toThrow();
+      const t0 = Date.now();
+      let got = "";
+      while (Date.now() - t0 < 2000) {
+        got = await oneTry(db);
+        if (got.startsWith("OWNER")) break;
+      }
+      expect(got, "the lock went with the owner, not with its child").toMatch(/^OWNER/);
+    } finally {
+      try {
+        process.kill(childPid, "SIGKILL"); // the recorded pid
+      } catch {
+        /* already gone */
+      }
+    }
+  }, 60_000);
 
   it("MEASURED: the key is stable across a rename persist (tmp + rename gives the DB a NEW inode, its directory keeps its own)", async () => {
     const { lockKey } = (await import("../dist/db-owner-lock.js")) as { lockKey: (p: string) => string };
