@@ -1,0 +1,14 @@
+# Secrets-scan exceptions, by gitleaks fingerprint (commit:file:rule:line), never the value. The scan reads this file
+# only from the TRUSTED side (a pull request's base, a push's before, main for the baseline): a change cannot add
+# an exception for itself.
+#
+# One documentation example in the v2.1.0 release, removed from the docs on 2026-07-22. The second commit is the
+# same release before a history rewrite, still reachable through old pull-request refs.
+# historical, verified not live on the local relay 2026-11-05
+f814f98aa29d621495cdd7f997caa94ec9784a51:docs/multi-machine-deployment.md:generic-api-key:133
+# historical, verified not live on the local relay 2026-11-05
+f814f98aa29d621495cdd7f997caa94ec9784a51:docs/multi-machine-deployment.md:generic-api-key:149
+# historical, verified not live on the local relay 2026-11-05
+1f788ecdfa828e76be2160031783ec995930e0f6:docs/multi-machine-deployment.md:generic-api-key:133
+# historical, verified not live on the local relay 2026-11-05
+1f788ecdfa828e76be2160031783ec995930e0f6:docs/multi-machine-deployment.md:generic-api-key:149
