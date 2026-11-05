@@ -25,7 +25,7 @@ import { checkPrivatePath } from "./approved-roots.js";
 import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver } from "./config.js";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
-import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
+import { acquireOwnerLock, assertLockIntact, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
 import {
   assertDriverHeaderAllows,
   noteNativeHandleOpened,
@@ -407,6 +407,8 @@ class WasmDatabase implements CompatDatabase {
   canonicalPath: string | null = null;
   /** The main file's device + inode after this owner's last write: a persist onto a file replaced since is refused. */
   lastIdentity: string | null = null;
+  /** Set when the owner's lock file was found removed or replaced: no later persist of this connection is attempted. */
+  ownerLost = false;
   private db: any;
   private dbPath: string;
   private txDepth = 0;
@@ -688,6 +690,15 @@ class WasmDatabase implements CompatDatabase {
       this.unwrittenChanges = 0;
       return;
     }
+    // INV-DB-01 2b-ii (Codex #385 R1 P1-1): a legacy (unowned) wasm connection NEVER writes onto an OWNED file: one an
+    // owner materialized after this connection opened. Its write would replace the owner's database unlocked.
+    if (readDriverHeader(this.dbPath).kind === "wasm") {
+      throw new Error(
+        `wasm write-back refused: the DB at ${this.dbPath} is now owned by the wasm driver's single owner (stamped RLYW ` +
+          `since this legacy connection opened), so this connection does not write it. Nothing was written; reach it ` +
+          `through its owner over HTTP (${httpClientHint()}).`
+      );
+    }
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -743,10 +754,10 @@ function replaceWithRetry(tmp: string, target: string): void {
  * after every open (db.ts ensureSecureFile), which would refuse its own next persist. On a coarse-timestamp filesystem
  * (HFS+ 1 s, FAT/exFAT 2 s) a same-size in-place rewrite within the granularity is not seen.
  */
+const identityFrom = (st: fs.BigIntStats): string => `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
 const identityOf = (p: string): string | null => {
   try {
-    const st = fs.statSync(p, { bigint: true });
-    return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
+    return identityFrom(fs.statSync(p, { bigint: true }));
   } catch {
     return null;
   }
@@ -760,7 +771,7 @@ const identityOf = (p: string): string | null => {
 function ownerPersist(w: WasmDatabase, data: Buffer): void {
   const lock = w.ownerLock!;
   const target = w.canonicalPath!;
-  if (!holdsOwnerLock(target) || lockKey(target) !== lock.key) {
+  if (w.ownerLost || !holdsOwnerLock(target) || lockKey(target) !== lock.key) {
     throw new OwnerLockError(
       `wasm persist refused: this process no longer holds the single-owner lock for ${target}, so another process may ` +
         `own it. Nothing was written.`
@@ -779,14 +790,26 @@ function ownerPersist(w: WasmDatabase, data: Buffer): void {
     throw new OwnerLockError(`wasm persist refused: the DB file at ${target} is no longer stamped RLYW (${now.kind}). Nothing was written.`);
   }
   const tmp = `${target}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+  let wrote: string;
   try {
     fs.writeFileSync(tmp, data, { mode: 0o600, flag: "wx" });
+    // Codex #385 R1 P1-4: the identity of the file THIS persist wrote (a rename keeps its inode, size and mtime), never
+    // whatever sits at the name after the rename (another writer's replacement would be adopted as the owner's own).
+    // Read after the write is closed (a filesystem may settle timestamps at close).
+    wrote = identityFrom(fs.statSync(tmp, { bigint: true }));
+    try {
+      assertLockIntact(target); // immediately before the rename: a removed or replaced lock file stops the owner
+    } catch (err) {
+      log.error(`[db-wasm] ${(err as Error).message}`);
+      w.ownerLost = true;
+      throw err;
+    }
     replaceWithRetry(tmp, target);
   } catch (err) {
     fs.rmSync(tmp, { force: true });
     throw err;
   }
-  w.lastIdentity = identityOf(target);
+  w.lastIdentity = wrote;
 }
 
 /** sql.js, loaded (a named refusal when it is not installed). */
@@ -834,16 +857,41 @@ async function createOwnedWasmDb(dbPath: string, header: DriverHeader): Promise<
       const now = readDriverHeader(dbPath);
       if (now.kind !== "wasm") {
         lock.release();
-        log.warn(`[db] the DB at '${dbPath}' is not RLYW (${now.kind}): it is NOT adopted by a single owner; it opens in the legacy wasm mode.`);
+        // Codex #385 R1 P1-3: ONLY a true legacy (0) file falls back to the legacy mode; anything else that appeared
+        // here (a native-stamped or a foreign DB, a file gone) gets the SAME verdict as any wasm open, by name.
+        const verdict = assertDriverHeaderAllows(dbPath, "wasm");
+        if (verdict.kind !== "legacy") {
+          throw new OwnerLockError(`the DB at ${dbPath} changed while its owner lock was taken (${verdict.kind}); not opened.`);
+        }
+        log.warn(`[db] the DB at '${dbPath}' is not RLYW (legacy): it is NOT adopted by a single owner; it opens in the legacy wasm mode.`);
         return finishLegacyWasm(SQL, dbPath, token);
       }
       assertWasmSourceReadable(dbPath, "wasm open refused");
-      assertSingleLink(dbPath);
+      try {
+        assertSingleLink(dbPath); // after the lock, before the first write (and before the read)
+      } catch (err) {
+        if (err instanceof OwnerLockError) throw new OwnerLockError(`wasm open refused: ${err.message}`);
+        throw err;
+      }
       assertNoNativeHandle(dbPath);
-      const w = new WasmDatabase(new SQL.Database(fs.readFileSync(dbPath)), dbPath);
+      // Codex #385 R1 P1-4: the bytes and the identity come from ONE open file (its fstat), never a later path lookup.
+      const canonical = canonicalReplaceTarget(dbPath);
+      const fd = fs.openSync(canonical, "r");
+      let bytes: Buffer;
+      let readIdentity: string;
+      try {
+        readIdentity = identityFrom(fs.fstatSync(fd, { bigint: true }));
+        bytes = fs.readFileSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      if (bytes.length < 72 || bytes.readUInt32BE(68) !== RELAY_APP_ID_WASM) {
+        throw new OwnerLockError(`the DB at ${dbPath} changed while it was being opened (it is no longer stamped RLYW); not opened.`);
+      }
+      const w = new WasmDatabase(new SQL.Database(bytes), dbPath);
       w.ownerLock = lock;
-      w.canonicalPath = canonicalReplaceTarget(dbPath);
-      w.lastIdentity = identityOf(w.canonicalPath);
+      w.canonicalPath = canonical;
+      w.lastIdentity = readIdentity;
       w.onClosed = () => endWasmUse(token);
       return w;
     } catch (err) {
@@ -879,8 +927,13 @@ export async function holdOwnerForMaintenance(dbPath: string, what: string): Pro
 function finishLegacyWasm(SQL: any, dbPath: string, token: object): CompatDatabase {
   assertNoNativeHandle(dbPath);
   let rawDb: any;
-  if (fs.existsSync(dbPath)) rawDb = new SQL.Database(fs.readFileSync(dbPath));
-  else {
+  if (fs.existsSync(dbPath)) {
+    const bytes = fs.readFileSync(dbPath);
+    if (bytes.length >= 72 && bytes.readUInt32BE(68) === RELAY_APP_ID_WASM) {
+      throw new OwnerLockError(`the DB at ${dbPath} became owned (stamped RLYW) while it was being opened; not opened unlocked. Retry the open.`);
+    }
+    rawDb = new SQL.Database(bytes);
+  } else {
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     rawDb = new SQL.Database();
@@ -918,9 +971,21 @@ async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
 
     // From here to the record's handover: ONE synchronous sequence (the re-check, the read, the construction).
     assertNoNativeHandle(dbPath);
+    // Codex #385 R1 P1-1: an owner may have MATERIALIZED this file (stamped RLYW) while sql.js loaded. The header decides
+    // again, now: an owned file goes to the owner protocol (its lock, or a refusal), never to an unlocked connection;
+    // the normal verdict refuses a native-stamped or foreign file that appeared meanwhile.
+    const now = assertDriverHeaderAllows(dbPath, "wasm");
+    if (now.kind === "wasm") {
+      endWasmUse(token);
+      return createOwnedWasmDb(dbPath, now);
+    }
     let rawDb: any;
     if (fs.existsSync(dbPath)) {
       const fileData = fs.readFileSync(dbPath);
+      if (fileData.length >= 72 && fileData.readUInt32BE(68) === RELAY_APP_ID_WASM) {
+        endWasmUse(token); // owned between the check above and this read
+        return createOwnedWasmDb(dbPath, { kind: "wasm" });
+      }
       rawDb = new SQL.Database(fileData);
     } else {
       const dir = path.dirname(dbPath);

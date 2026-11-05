@@ -57,8 +57,15 @@ The driver is a property of the **instance**: a `sqlite_driver` key in the insta
 
 **`"wasm"` puts the instance in owner mode.** Its database is owned by ONE process, the relay daemon:
 - **A new database** is created already stamped for its owner (`application_id` RLYW).
-- **The owner holds a single-owner lock**, which the kernel releases when it exits: a private `.<name>.relay-owner` dotfile beside the database on macOS, a socket on Linux, a named pipe on Windows.
-- **Every write is atomic** (a temp file, then a rename), made under that lock.
+- **The owner holds a single-owner lock**, which the kernel releases when it exits:
+  - macOS and Linux: a flock-class lock on a private `.<name>.relay-owner` file beside the database. Linux takes it with the system `flock` (util-linux). **Never delete that file**: a relay that finds its lock file removed or replaced stops writing.
+  - Linux without a trusted system `flock`: an abstract socket, which excludes only processes in the **same network namespace**. Keep each wasm database to one container there; the relay warns once at startup.
+  - Windows: a named pipe, also one session namespace (one container) per database.
+- **Every write is atomic** (a temp file, then a rename), made under that lock. Before each write, the owner checks that the file is still the one it last wrote (its inode, size and modification time) and refuses to write over a file another process replaced or rewrote.
+  - A metadata change, such as a `chmod`, is deliberately not treated as a write (the relay itself tightens its database's mode on every open).
+  - On a filesystem with coarse timestamps (HFS+ 1 s, FAT/exFAT 2 s), a same-size rewrite within that granularity is not seen. APFS, ext4 and NTFS are fine-grained.
+  - The check DETECTS another writer before the owner's next write; it does not prevent a write landing between the check and the rename.
+  - There is no `fsync`: the atomic replace protects against a crash of the relay, not against a power loss.
 - **Other processes** reach the database through the daemon over HTTP:
   - a second process that tries to open it is refused by name;
   - so is a stdio MCP server, with the client config to use instead: `{ "type": "http", "url": "http://127.0.0.1:3777/mcp" }`;

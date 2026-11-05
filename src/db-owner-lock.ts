@@ -8,17 +8,30 @@
  * of its single-owner lock. Ported from the INV-DB-01 single-owner draft at its last reviewed state, scoped to owned
  * DBs: native processes do not probe (an RLYW header refuses them), so the probe is not part of this module.
  *
- * The owner holds ONE exclusive KERNEL primitive per platform, released by the kernel when the owner dies (no pid, no
- * lock file judged for staleness):
- * - macOS/BSD: open(<the DB's real parent dir>/.<canonical basename>.relay-owner,
- *   O_RDWR|O_CREAT|O_NONBLOCK|O_NOFOLLOW|O_EXLOCK, 0600), RULED: beside the DB, never under HOME, so every process on
- *   the DB contends for the same file whatever its HOME (two users, a launchd daemon). O_EXLOCK is 0x20 there (Node
- *   has no constant; libuv passes the flag through, MEASURED). A flock-style lock on its OWN file, so the wasm driver's
- *   opens and closes of the DB file never drop it. The leading "." keeps it out of SQLite's side-file names and the
- *   backup's destination-name rule; it is never archived. A lock file that is not private (another owner, a wider
- *   mode, a symlink) is a named refusal. It is never deleted (an unlink would race a contender).
- * - Linux: a listening ABSTRACT-namespace socket ("\0bot-relay-<key>"): no file, so no stale state.
- * - Windows: a listening named pipe (\\.\pipe\bot-relay-<key>); a second listener fails.
+ * The owner holds ONE exclusive KERNEL lock per platform, released by the kernel when the owner dies (no pid, no lock
+ * file judged for staleness; a pid file is not consulted either, since a reused pid would make it lie):
+ * - POSIX (ruling 594ca4cc: ONE scheme): a flock-class exclusive lock on <the DB's real parent dir>/.<canonical
+ *   basename>.relay-owner (0600, O_NOFOLLOW), beside the DB, never under HOME, so every process on the DB contends for
+ *   the same file whatever its HOME or its network namespace (two users, a launchd daemon, two containers sharing the
+ *   directory). A flock lock belongs to the open file, not to the process, so the wasm driver's opens and closes of
+ *   the DB file never drop it.
+ *   - macOS: open(... O_RDWR|O_CREAT|O_NONBLOCK|O_NOFOLLOW|O_EXLOCK). O_EXLOCK is 0x20 there (Node has no constant;
+ *     libuv passes the flag through, MEASURED).
+ *   - Linux: Node core has no flock (MEASURED, v24: no fs.flock/flockSync), and the wasm owner cannot rely on a native
+ *     addon. This process opens the lock file itself and runs the system `flock -n 3` (SEC-22: its trusted absolute
+ *     path, a clean env) with that open file as the child's fd 3: the child locks the SHARED open file and exits, and
+ *     the lock stays with this process's descriptor until it closes or dies. No holder process is left behind.
+ *   - Linux with no trusted `flock` (a non-FHS host): the listening ABSTRACT-namespace socket ("\0bot-relay-<key>").
+ *     STATED LIMIT, warned once per process: abstract sockets are per network namespace, so that fallback excludes
+ *     only processes in the SAME network namespace (one container per DB).
+ *   The leading "." keeps the lock file out of SQLite's side-file names and the backup's destination-name rule; it is
+ *   never archived and NEVER deleted (an unlink would let a contender lock a new file: two owners). A lock file that
+ *   is not private (another owner, a wider mode, a symlink) or that has more than one link (a hard link to anything,
+ *   e.g. a DB a native handle holds: opening it would drop that handle's locks) is refused by name, the link count
+ *   BEFORE it is opened. While held, its identity is re-checked before every owner write (assertLockIntact): a lock
+ *   file removed or replaced under the owner stops the owner's writes.
+ * - Windows: a listening named pipe (\\.\pipe\bot-relay-<key>); a second listener fails. STATED LIMIT: per session
+ *   namespace (one container per DB).
  *
  * THE KEY (ruled): the PARENT directory's (dev, ino), as bigint, plus the DB's canonical basename
  * (path.basename(fs.realpathSync.native(db))), hashed. Never the DB file's own (dev, ino): the wasm persist is tmp +
@@ -41,14 +54,18 @@ import crypto from "crypto";
 import fs from "fs";
 import net from "net";
 import path from "path";
+import { log } from "./logger.js";
+import { spawnSystem, systemBinary } from "./system-binary.js";
 
 /**
  * The platforms whose lock CI has measured green: the racer harness (exactly one owner in every round, the key stable
  * across a rename persist, alias spellings one owner; on Linux a bind mount one owner too) AND the behavioural
  * single-owner rows.
  * - macOS: the primitive at f3bba84 (job 123434320925); the behaviour at 48f24d5 (job 123461087379).
- * - Linux: the primitive at f3bba84 (jobs 123434321139 and 123434320394, where the bind-mount row ran); the behaviour
- *   at 48f24d5 (jobs 123461087219 and 123461086526).
+ * - Linux: the ABSTRACT-SOCKET primitive (now only the no-flock fallback) at f3bba84 (jobs 123434321139 and
+ *   123434320394, where the bind-mount row ran); the behaviour at 48f24d5 (jobs 123461087219 and 123461086526). The
+ *   FLOCK-FILE scheme (ruling 594ca4cc) is measured by the same harness plus its two-network-namespace rows in the CI
+ *   of the PR that introduced it (its job ids are recorded there).
  * - Windows: the primitive at f3bba84 (job 123434321133); the behaviour at 8820fa2 (job 123848369286: every
  *   behavioural single-owner row passed, none refused by ADR-0048).
  */
@@ -73,16 +90,18 @@ export function _setAfterMaterializeHookForTests(fn: (() => void) | null): void 
  * Create the DB at `dbPath` if it is absent, with `initialBytes` (its first image, already stamped), ATOMICALLY: the
  * bytes go to a temp file in the same directory, which is then LINKED to the DB's name (link fails when the name
  * exists: a racer's file is kept, never overwritten), and the temp name is removed. When THIS call created it,
- * `verifyCreated` runs (e.g. the caller's containment re-check); a refusal removes the DB only when it is PROVABLY the
+ * `verifyCreated` runs (no production caller passes one in this slice; the racer harness exercises it); a refusal
+ * removes the DB only when it is PROVABLY the
  * one just created (the same dev + ino as the temp file's, the same size). Residual (stated): the name can still be
  * re-pointed between that comparison and the unlink.
  */
 export function materializeDb(dbPath: string, initialBytes: Uint8Array, verifyCreated?: (dbPath: string) => void): void {
   if (fs.existsSync(dbPath)) return;
   const tmp = path.join(path.dirname(dbPath), `.${path.basename(dbPath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.new`);
-  fs.writeFileSync(tmp, initialBytes, { mode: 0o600, flag: "wx" });
   let created = false;
   try {
+    // Inside the cleanup scope: a write that fails after the exclusive create (ENOSPC) leaves no partial temp behind.
+    fs.writeFileSync(tmp, initialBytes, { mode: 0o600, flag: "wx" });
     try {
       fs.linkSync(tmp, dbPath);
       created = true;
@@ -137,12 +156,13 @@ export function assertSingleLink(dbPath: string): void {
 }
 
 /**
- * The name a persist (or a restore swap) replaces: the caller's DIRECTORY with the DB's CANONICAL basename (the OS's own
- * spelling). Replacing the caller's basename would, on a case-insensitive volume, give the file that spelling, so its
- * lock key would drift. The directory is left as the caller spelled it (renaming into a directory never renames it).
+ * The name a persist (or a restore swap) replaces: the DB's CANONICAL path, fully resolved (every directory and the
+ * file itself). Renaming onto a symlinked DB path would replace the LINK, leaving the real DB unchanged and a second
+ * DB at the link's name; renaming onto the caller's basename would, on a case-insensitive volume, give the file that
+ * spelling, so its lock key would drift.
  */
 export function canonicalReplaceTarget(dbPath: string): string {
-  return path.join(path.dirname(dbPath), path.basename(fs.realpathSync.native(dbPath)));
+  return fs.realpathSync.native(dbPath);
 }
 
 /** macOS: the owner's lock file, a private dotfile beside the DB's canonical file (RULED). */
@@ -157,11 +177,18 @@ const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
 function assertPrivateLockFile(fd: number, file: string): void {
   const st = fs.fstatSync(fd);
   const uid = typeof process.getuid === "function" ? process.getuid() : st.uid;
+  if (st.nlink !== 1) throw hardLinkedLockFile(file, st.nlink);
   if (!st.isFile() || st.uid !== uid || (st.mode & 0o077) !== 0) {
     throw new OwnerLockError(
       `the owner lock file ${file} is not private to this user (owner uid ${st.uid}, mode ${(st.mode & 0o777).toString(8)}), so it is not trusted. If no relay process uses the DB, remove it.`
     );
   }
+}
+
+function hardLinkedLockFile(file: string, nlink: number | bigint): OwnerLockError {
+  return new OwnerLockError(
+    `the owner lock file ${file} has ${nlink} links, so it is not this relay's (it never links it) and is not opened: it may be another file, even a database another process holds. Remove that name if no relay process uses the DB.`
+  );
 }
 
 /**
@@ -170,6 +197,15 @@ function assertPrivateLockFile(fd: number, file: string): void {
  * read-only DB directory) says so, and where.
  */
 function openLockFile(file: string, flags: number, mode?: number): number {
+  // BEFORE the open: a name with more than one link is never this relay's lock file, and opening (then closing) a
+  // hard link to a DB a native handle holds would drop that handle's POSIX locks (INV-DB-01).
+  let pre: fs.Stats | null = null;
+  try {
+    pre = fs.lstatSync(file);
+  } catch {
+    /* absent: it is created below */
+  }
+  if (pre && pre.isFile() && pre.nlink > 1) throw hardLinkedLockFile(file, pre.nlink);
   try {
     return fs.openSync(file, flags | O_NOFOLLOW, mode);
   } catch (err) {
@@ -198,8 +234,14 @@ function openLockFile(file: string, flags: number, mode?: number): number {
   }
 }
 
+/** A held primitive: how to drop it, and for a lock FILE, its path and open fd (the identity re-checked while held). */
+interface Primitive {
+  drop: () => void;
+  lockFile?: string;
+  fd?: number;
+}
 /** Every primitive this process holds, by key, PINNED (a collected handle must never drop a lock). */
-const HELD = new Map<string, { refs: number; drop: () => void }>();
+const HELD = new Map<string, Primitive & { refs: number }>();
 
 export interface OwnerLock {
   key: string;
@@ -211,12 +253,57 @@ function primitiveName(key: string): string {
   return process.platform === "win32" ? `\\\\.\\pipe\\bot-relay-${key}` : `\0bot-relay-${key}`;
 }
 
-function tryPrimitiveOnce(key: string, dbPath: string): Promise<(() => void) | null> {
-  if (process.platform === "darwin") {
+/** flock's exit status for "held by another" (`-E`), distinct from its own failures. */
+const FLOCK_CONFLICT = 75;
+
+/** Linux: whether the trusted system `flock` exists (decided once per process); without it, the stated-limit socket. */
+let linuxFlock: string | null | undefined;
+let socketLimitWarned = false;
+function linuxScheme(): "flock" | "socket" {
+  if (linuxFlock === undefined) {
+    try {
+      linuxFlock = systemBinary("flock");
+    } catch {
+      linuxFlock = null;
+    }
+  }
+  if (linuxFlock === null && !socketLimitWarned) {
+    socketLimitWarned = true;
+    log.warn(
+      "[db] no trusted system `flock` on this host: the wasm single-owner lock falls back to an abstract socket, which " +
+        "excludes only processes in the SAME network namespace. Keep each wasm DB to one network namespace (one " +
+        "container), or install util-linux's flock."
+    );
+  }
+  return linuxFlock ? "flock" : "socket";
+}
+/** Test-only: force the Linux scheme ("socket" = the stated-limit fallback), or null to detect it again. */
+export function _setLinuxSchemeForTests(scheme: "flock" | "socket" | null): void {
+  linuxFlock = scheme === null ? undefined : scheme === "socket" ? null : systemBinary("flock");
+}
+
+/** Lock the open lock file `fd` with the system flock (Linux): true = held by THIS open file, false = held by another. */
+function flockFd(fd: number, file: string): boolean {
+  const r = spawnSystem("flock", ["-n", "-x", "-E", String(FLOCK_CONFLICT), "3"], {
+    stdio: ["ignore", "ignore", "pipe", fd],
+    encoding: "utf-8",
+    timeout: 10_000,
+  });
+  if (r.status === 0) return true;
+  if (r.status === FLOCK_CONFLICT) return false;
+  throw new OwnerLockError(
+    `the owner lock file ${file} could not be locked: the system flock failed (status ${r.status}, signal ${r.signal}): ${(r.error?.message ?? r.stderr ?? "").trim().slice(0, 300)}`
+  );
+}
+
+function tryPrimitiveOnce(key: string, dbPath: string): Promise<Primitive | null> {
+  const lockScheme = process.platform === "darwin" ? "darwin" : process.platform === "linux" ? linuxScheme() : null;
+  if (lockScheme === "darwin" || lockScheme === "flock") {
     const file = lockFilePath(dbPath);
+    const flags = fs.constants.O_RDWR | fs.constants.O_CREAT | (lockScheme === "darwin" ? fs.constants.O_NONBLOCK | O_EXLOCK_DARWIN : 0);
     let fd: number;
     try {
-      fd = openLockFile(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NONBLOCK | O_EXLOCK_DARWIN, 0o600);
+      fd = openLockFile(file, flags, 0o600);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "EAGAIN" || code === "EWOULDBLOCK") return Promise.resolve(null);
@@ -224,11 +311,15 @@ function tryPrimitiveOnce(key: string, dbPath: string): Promise<(() => void) | n
     }
     try {
       assertPrivateLockFile(fd, file);
+      if (lockScheme === "flock" && !flockFd(fd, file)) {
+        fs.closeSync(fd);
+        return Promise.resolve(null);
+      }
     } catch (err) {
       fs.closeSync(fd);
       return Promise.reject(err);
     }
-    return Promise.resolve(() => fs.closeSync(fd));
+    return Promise.resolve({ drop: () => fs.closeSync(fd), lockFile: file, fd });
   }
   if (process.platform !== "linux" && process.platform !== "win32") {
     return Promise.reject(new OwnerLockError(`no single-owner lock primitive is defined for ${process.platform}`));
@@ -239,9 +330,40 @@ function tryPrimitiveOnce(key: string, dbPath: string): Promise<(() => void) | n
     srv.once("error", (e: NodeJS.ErrnoException) => (e.code === "EADDRINUSE" ? resolve(null) : reject(e)));
     srv.listen(name, () => {
       srv.unref();
-      resolve(() => srv.close());
+      resolve({ drop: () => srv.close() });
     });
   });
+}
+
+/**
+ * INV-DB-01 (Codex #385 R1 P2-6): a materialize that died between linking its temp to the DB's name and removing the
+ * temp leaves the DB with TWO names, which every later open refuses (a hard-linked DB). Under the lock, this removes
+ * only such a leftover: a name of the materialize temp pattern (.<base>.<pid>.<12 hex>.new) beside the DB that is the
+ * SAME file (dev + ino) as the DB. Removing a name opens nothing.
+ */
+function removeOwnMaterializeLinks(dbPath: string): void {
+  let real: string;
+  let db: fs.BigIntStats;
+  try {
+    real = fs.realpathSync.native(dbPath);
+    db = fs.lstatSync(real, { bigint: true });
+  } catch {
+    return;
+  }
+  if (db.nlink < 2n) return;
+  const dir = path.dirname(real);
+  const base = path.basename(real).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`^\\.${base}\\.\\d+\\.[0-9a-f]{12}\\.new$`);
+  for (const name of fs.readdirSync(dir)) {
+    if (!pattern.test(name)) continue;
+    const p = path.join(dir, name);
+    try {
+      const st = fs.lstatSync(p, { bigint: true });
+      if (st.isFile() && st.dev === db.dev && st.ino === db.ino) fs.unlinkSync(p);
+    } catch {
+      /* gone, or not removable: the open's link-count check refuses by name */
+    }
+  }
 }
 
 /** Test-only: runs after the primitive is held and before the canonical path is re-derived. */
@@ -288,20 +410,21 @@ export async function acquirePrimitive(dbPath: string, opts: AcquireOptions = {}
       own.refs++;
       return { key, release: () => releaseKey(key) };
     }
-    const drop = await tryPrimitiveOnce(key, dbPath);
-    if (drop) {
-      afterAcquireHook?.();
+    const held = await tryPrimitiveOnce(key, dbPath);
+    if (held) {
       let now: string | null;
       try {
+        afterAcquireHook?.();
         now = lockKey(dbPath);
       } catch {
         now = null;
       }
       if (now === key) {
-        HELD.set(key, { refs: 1, drop });
+        HELD.set(key, { ...held, refs: 1 });
+        removeOwnMaterializeLinks(dbPath);
         return { key, release: () => releaseKey(key) };
       }
-      drop(); // the canonical path moved while we took the lock: never keep an owner on a stale key
+      held.drop(); // the canonical path moved while we took the lock: never keep an owner on a stale key
       lastReason = "its canonical path changed while the lock was being taken";
     }
     if (i >= attempts - 1) break;
@@ -343,6 +466,36 @@ export function assertPlatformEnabled(platform: NodeJS.Platform = process.platfo
 export async function acquireOwnerLock(dbPath: string, opts: AcquireOptions = {}): Promise<OwnerLock> {
   assertPlatformEnabled(opts.platform ?? process.platform);
   return acquirePrimitive(dbPath, opts);
+}
+
+/**
+ * The lock FILE this process holds for `dbPath` must still be the file at its name (dev + ino of the held fd against an
+ * lstat of the path). Removed or replaced (another process could then create and lock a NEW file there: two owners),
+ * this process DROPS its ownership and throws, by name: the owner stops writing. The wasm persist calls it immediately
+ * before every rename. A socket or pipe primitive has no file to check.
+ */
+export function assertLockIntact(dbPath: string): void {
+  const key = lockKey(dbPath);
+  const h = HELD.get(key);
+  if (!h) throw new OwnerLockError(`this process no longer holds the single-owner lock for ${dbPath}`);
+  if (h.fd === undefined || h.lockFile === undefined) return;
+  const held = fs.fstatSync(h.fd, { bigint: true });
+  let named: fs.BigIntStats | null = null;
+  try {
+    named = fs.lstatSync(h.lockFile, { bigint: true });
+  } catch {
+    named = null;
+  }
+  if (named && named.dev === held.dev && named.ino === held.ino) return;
+  HELD.delete(key);
+  try {
+    h.drop();
+  } catch {
+    /* closing a descriptor is best-effort here: the ownership is dropped either way */
+  }
+  throw new OwnerLockError(
+    `the owner lock file ${h.lockFile} was ${named ? "replaced" : "removed"} while this process held it, so another process may own the DB at ${dbPath} now: this process stops writing it (its ownership is dropped). Restart it once no other relay process uses the DB; never delete that file.`
+  );
 }
 
 /** Whether THIS process holds the owner lock for the DB at `dbPath` (the wasm persist checks it before every write). */

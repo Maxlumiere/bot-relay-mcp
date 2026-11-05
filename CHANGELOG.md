@@ -6,7 +6,9 @@
 
 - **Added:** `sqlite_driver: "wasm"` in an instance's `config.json` is accepted. It puts the instance in owner mode: its database is owned by ONE process, the relay daemon.
   - A new database is created already stamped for its owner.
-  - The owner holds a kernel-released single-owner lock, and every write is an atomic replace (a temp file, then a rename) under that lock.
+  - The owner holds a kernel-released single-owner lock (a flock-class lock on a private file beside the database on macOS and Linux; a named pipe on Windows), and every write is an atomic replace (a temp file, then a rename) under that lock, refused when another process replaced or rewrote the file since the owner's last write.
+  - Never delete the `.<name>.relay-owner` file beside an owned database: an owner that finds it removed or replaced stops writing.
+  - On Linux without the system `flock`, the lock falls back to one that excludes only processes in the same network namespace (warned at startup); on Windows the same one-container limit applies.
   - A second process, a stdio MCP server or a native opener of an owned database is refused by name, with the HTTP client config to use instead.
   - A backup or a restore runs under the lock when no owner is live, and is refused while one is.
 - **Changed:** when the instance declares a driver and `RELAY_SQLITE_DRIVER` contradicts it, the instance wins, and the relay warns. Previously the environment won. With no declaration, the environment still decides.
