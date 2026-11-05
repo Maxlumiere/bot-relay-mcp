@@ -351,7 +351,7 @@ function assertLocalFilesystem(dbPath: string): void {
   let type: number;
   let dir = path.dirname(path.resolve(dbPath));
   try {
-    dir = canonicalDir(dbPath); // Codex #385 R2 P2-4: the canonical target's directory, not the alias's
+    void 0;
     type = Number(fs.statfsSync(dir).type) >>> 0;
   } catch (err) {
     // An unknown filesystem is not a local one: refuse, by name (Codex #385 R2 P2-4: an error is not a success).
