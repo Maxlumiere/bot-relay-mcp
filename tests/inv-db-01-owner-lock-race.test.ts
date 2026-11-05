@@ -276,6 +276,52 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     }
   }, 60_000);
 
+  it.skipIf(process.platform !== "linux")("R2 P1-1 (ruling 2b0d70f8: fail closed): Linux with NO trusted flock refuses owner mode by name, with the remedies; no owner of any other kind", async () => {
+    const m = (await import("../dist/db-owner-lock.js")) as unknown as {
+      acquirePrimitive: (p: string, o?: { initialBytes?: Uint8Array; attempts?: number }) => Promise<{ release(): void }>;
+      _setLinuxSchemeForTests: (s: "flock" | "socket" | null) => void;
+    };
+    const db = path.join(ROOT, "no-flock.db");
+    fs.writeFileSync(db, "");
+    m._setLinuxSchemeForTests("socket"); // = no trusted flock on this host
+    try {
+      await expect(m.acquirePrimitive(db, { attempts: 1 })).rejects.toThrow(/no trusted system .?flock.*(util-linux|native driver|HTTP)/is);
+    } finally {
+      m._setLinuxSchemeForTests(null);
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("R2 P2-4: statfs judges the CANONICAL directory (an alias in a local dir to a DB on a network filesystem is refused), and a statfs ERROR refuses", async () => {
+    const m = (await import("../dist/db-owner-lock.js")) as unknown as { acquirePrimitive: (p: string, o?: { attempts?: number }) => Promise<{ release(): void }> };
+    const remoteDir = path.join(ROOT, "pretend-nfs");
+    const localDir = path.join(ROOT, "local-side");
+    fs.mkdirSync(remoteDir, { recursive: true });
+    fs.mkdirSync(localDir, { recursive: true });
+    const target = path.join(remoteDir, "relay.db");
+    fs.writeFileSync(target, "");
+    const alias = path.join(localDir, "relay.db");
+    fs.symlinkSync(target, alias);
+    const remoteReal = fs.realpathSync.native(remoteDir);
+    const real = fs.statfsSync;
+    let spy = vi.spyOn(fs, "statfsSync").mockImplementation(((p: fs.PathLike, o?: unknown) => {
+      const st = (real as (...a: unknown[]) => fs.StatsFs)(p, o);
+      return fs.realpathSync.native(String(p)) === remoteReal ? { ...st, type: 0x6969 } : st;
+    }) as typeof fs.statfsSync);
+    try {
+      await expect(m.acquirePrimitive(alias, { attempts: 1 })).rejects.toThrow(/network filesystem/);
+    } finally {
+      spy.mockRestore();
+    }
+    spy = vi.spyOn(fs, "statfsSync").mockImplementation((() => {
+      throw Object.assign(new Error("EIO: i/o error, statfs"), { code: "EIO" });
+    }) as typeof fs.statfsSync);
+    try {
+      await expect(m.acquirePrimitive(target, { attempts: 1 })).rejects.toThrow(/filesystem .*(EIO|could not be determined)/i);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it.skipIf(process.platform !== "linux")("Linux: a DB on a NETWORK filesystem (statfs says NFS) is refused owner mode, by name, before anything is locked", async () => {
     const m = (await import("../dist/db-owner-lock.js")) as unknown as { acquirePrimitive: (p: string, o?: { initialBytes?: Uint8Array }) => Promise<{ release(): void }> };
     const db = path.join(ROOT, "on-nfs.db");

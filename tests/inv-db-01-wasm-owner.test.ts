@@ -30,7 +30,7 @@ import * as compat from "../src/sqlite-compat.js";
 import * as db from "../src/db.js";
 import * as header from "../src/db-header.js";
 import { openRawRelayDb } from "../src/cli/_instance-db.js";
-import { exportRelayState, importRelayState } from "../src/backup.js";
+import { exportRelayState, importRelayState, _setBeforeRestoreSwapForTests } from "../src/backup.js";
 import { log } from "../src/logger.js";
 import { _takeFsSpyViolations } from "./_setup/no-fs-on-held-db.js";
 
@@ -410,6 +410,76 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     expect(sha(dbPath), "the owner's file is untouched").toBe(theirs);
     a.child.stdin!.write("exit\n");
     await waitExitOf(a.child);
+  }, 60_000);
+
+  // --- Codex #385 R2, each a RED on the source it reviewed ---
+
+  it.skipIf(process.platform === "win32")("R2 P1-2: a restore whose owner lock file is REPLACED before its swap (another process then owns the DB and writes it) REFUSES, and that owner's file survives", async () => {
+    makeDb(dbPath, WASM);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    let b: ChildProcess | null = null;
+    let theirs = "";
+    _setBeforeRestoreSwapForTests(async () => {
+      fs.rmSync(path.join(fs.realpathSync.native(caseDir), ".relay.db.relay-owner"));
+      b = spawn(process.execPath, [LOCK_ONLY, dbPath], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+      children.push(b);
+      await new Promise<void>((res, rej) => {
+        const t = setTimeout(() => rej(new Error("precondition: the second process did not hold within 20 s")), 20_000);
+        b!.stdout!.on("data", (d) => String(d).includes("HELD") && (clearTimeout(t), res()));
+      });
+      const other = path.join(caseDir, "theirs.db");
+      makeDb(other, WASM);
+      fs.renameSync(other, dbPath); // the new owner's write
+      theirs = sha(dbPath);
+    });
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/owner lock file .* (removed|replaced) while this process held it/);
+    } finally {
+      _setBeforeRestoreSwapForTests(null);
+    }
+    expect(theirs, "precondition: the other owner wrote").not.toBe("");
+    expect(sha(dbPath), "the other owner's file survives byte for byte").toBe(theirs);
+  }, 60_000);
+
+  /** In ANOTHER process: can it take the lock of `p` right now? */
+  const otherProcessAcquires = (p: string) =>
+    spawnSync(process.execPath, ["-e", `import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "db-owner-lock.js")).href)}).then((m) => m.acquirePrimitive(${JSON.stringify(p)}, { attempts: 1 })).then(() => { console.log("OWNER"); process.exit(0); }, () => { console.log("LOST"); process.exit(0); })`], { encoding: "utf8", env: process.env }).stdout.trim();
+
+  it.skipIf(process.platform === "win32")("R2 P2-3: a release token counts ONCE, and a STALE one (its acquisition invalidated) never closes a NEWER acquisition", async () => {
+    const p = path.join(caseDir, "tokens.db");
+    fs.writeFileSync(p, "");
+    const a = await lockMod.acquirePrimitive(p);
+    const m = await lockMod.acquirePrimitive(p); // re-entrant in this process
+    m.release();
+    m.release(); // the same token again
+    expect(lockMod.holdsOwnerLock(p), "a token released twice counted once").toBe(true);
+    fs.rmSync(lockMod.lockFilePath(p));
+    expect(() => lockMod.assertLockIntact(p), "precondition: the acquisition is invalidated").toThrow(/removed/);
+    const fresh = await lockMod.acquirePrimitive(p); // a NEW acquisition, same key
+    a.release(); // a stale token
+    expect(lockMod.holdsOwnerLock(p), "the newer acquisition survives the stale token").toBe(true);
+    expect(otherProcessAcquires(p), "and so does its kernel lock").toBe("LOST");
+    fresh.release();
+    expect(otherProcessAcquires(p), "twin: released for real, another process acquires").toBe("OWNER");
+  }, 60_000);
+
+  it("R2 P2-5: a cleanup that FAILS after the lock is taken rolls the acquisition back: no entry and no lock are kept", async () => {
+    const p = path.join(caseDir, "roll.db");
+    fs.writeFileSync(p, "x");
+    fs.linkSync(p, path.join(caseDir, ".roll.db.12345.abcdefabcdef.new")); // a leftover: the cleanup runs
+    const dir = fs.realpathSync.native(caseDir);
+    const real = fs.readdirSync;
+    const spy = vi.spyOn(fs, "readdirSync").mockImplementation(((d: fs.PathLike, o?: unknown) => {
+      if (String(d) === dir) throw Object.assign(new Error("EACCES: permission denied, scandir"), { code: "EACCES" });
+      return (real as (...a: unknown[]) => unknown)(d, o);
+    }) as typeof fs.readdirSync);
+    try {
+      await expect(lockMod.acquirePrimitive(p)).rejects.toThrow(/EACCES/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(lockMod.holdsOwnerLock(p), "no entry is kept").toBe(false);
+    expect(otherProcessAcquires(p), "no lock is kept").toBe("OWNER");
   }, 60_000);
 
   // --- Codex #385 R1, each a RED on the 2b-ii source it reviewed ---

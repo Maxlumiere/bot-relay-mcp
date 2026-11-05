@@ -241,6 +241,11 @@ describe("CI: a Windows step fails when any of its commands fails (pwsh reports 
     ["twin: a `;` inside quotes is one command", wrap("windows-2022", "      - name: q\n        run: node -e \"a(); b()\"\n"), 0],
     ["twin: one command continued with a backtick, plus comments", wrap("windows-2022", "      - name: cont\n        run: |\n          # a comment\n          npx vitest run `\n            tests/a.test.ts\n"), 0],
     ["shell: cmd with two commands", wrap("windows-2022", TWO.replace("        run: |", "        shell: cmd\n        run: |")), 1],
+    // Codex #385 R2: forms the first parser passed as green.
+    ["FLOW-style steps", "name: t\non: push\njobs:\n  j:\n    runs-on: windows-2022\n    steps: [{run: \"npx fail; npx pass\"}]\n", 1],
+    ["a runs-on MAPPING with labels", "name: t\non: push\njobs:\n  j:\n    runs-on:\n      labels: [windows-2022]\n    steps:\n" + TWO, 1],
+    ["a DOUBLE-QUOTED script with an escaped newline", wrap("windows-2022", "      - name: dq\n        run: \"npx a\\nnpx b\"\n"), 1],
+    ["a CUSTOM bash invocation without -e (`bash {0}`)", wrap("windows-2022", TWO.replace("        run: |", "        shell: bash {0}\n        run: |")), 1],
   ])("absent form: %s", (_label, src, expected) => {
     expect(maskedWindowsSteps(src)).toHaveLength(expected);
   });
