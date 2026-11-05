@@ -463,6 +463,18 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     expect(otherProcessAcquires(p), "twin: released for real, another process acquires").toBe("OWNER");
   }, 60_000);
 
+  it.skipIf(process.platform === "win32")("a token's assertIntact REFUSES once its acquisition was dropped, even when a newer acquisition reuses its descriptor number", async () => {
+    const p = path.join(caseDir, "stale-check.db");
+    fs.writeFileSync(p, "");
+    const t1 = await lockMod.acquirePrimitive(p);
+    fs.rmSync(lockMod.lockFilePath(p));
+    expect(() => t1.assertIntact(), "precondition: the acquisition is invalidated").toThrow(/removed/);
+    const t2 = await lockMod.acquirePrimitive(p); // a new lock file; it may well get t1's freed descriptor number
+    expect(() => t1.assertIntact(), "the stale token still refuses").toThrow(/no longer holds .*dropped/);
+    expect(() => t2.assertIntact(), "twin: the live token passes").not.toThrow();
+    t2.release();
+  }, 60_000);
+
   it("R2 P2-5: a cleanup that FAILS after the lock is taken rolls the acquisition back: no entry and no lock are kept", async () => {
     const p = path.join(caseDir, "roll.db");
     fs.writeFileSync(p, "x");

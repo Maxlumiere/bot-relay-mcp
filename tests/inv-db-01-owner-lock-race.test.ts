@@ -201,8 +201,10 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
   it.skipIf(process.platform === "win32")("a flock run that FAILS (here: it cannot even start on a bad descriptor) is a named refusal, never an acquire (ruling 75be90fa: fail closed)", async () => {
     const m = (await import("../dist/db-owner-lock.js")) as unknown as { _flockFdForTests: (fd: number, file: string) => boolean };
     const f = path.join(ROOT, "flock-fails.lock");
-    const fd = fs.openSync(f, "w");
-    fs.closeSync(fd); // a descriptor number that no longer names an open file
+    // A descriptor number above any process's limit, so it can never name an open file. A just-closed number made this
+    // row return instead of throw on Linux CI (MEASURED); the likely cause (ASSUMED): another open in the test worker
+    // reused the number, and flock locked that file.
+    const fd = 1_000_000;
     expect(() => m._flockFdForTests(fd, f)).toThrow(/could not be locked: the system flock failed/);
   });
 
