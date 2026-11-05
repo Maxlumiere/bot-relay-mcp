@@ -2,10 +2,20 @@
 
 ## Unreleased
 
+### Wasm driver: an instance can declare `sqlite_driver: "wasm"`, and its database gets a single owner
+
+- **Added:** `sqlite_driver: "wasm"` in an instance's `config.json` is accepted. It puts the instance in owner mode: its database is owned by ONE process, the relay daemon.
+  - A new database is created already stamped for its owner.
+  - The owner holds a kernel-released single-owner lock, and every write is an atomic replace (a temp file, then a rename) under that lock.
+  - A second process, a stdio MCP server or a native opener of an owned database is refused by name, with the HTTP client config to use instead.
+  - A backup or a restore runs under the lock when no owner is live, and is refused while one is.
+- **Changed:** when the instance declares a driver and `RELAY_SQLITE_DRIVER` contradicts it, the instance wins, and the relay warns. Previously the environment won. With no declaration, the environment still decides.
+- **Unchanged (the legacy wasm mode):** `RELAY_SQLITE_DRIVER=wasm` with no declaration works exactly as before: no owner, no stamp, and the existing hazard of two processes on one database. See the driver docs for the two populations; a later release converts them (`relay db convert-journal`).
+
 ### The SQLite driver becomes a property of the instance (`sqlite_driver`)
 
 - **Added:** a `sqlite_driver` key in the instance's `config.json` (default `native`). It is read where the relay selects its SQLite driver (when the daemon or a stdio server opens the database, and when backup or restore picks a driver) and validated at startup. Other database opens (CLI commands such as `relay pending` and `relay bind`, the hooks, backup and restore staging) do not read it yet; they follow in a later release.
-- **In this release only `"native"` is accepted.** `"wasm"` is refused by name as not yet supported (the single-owner guarantee a wasm instance needs comes later), and any other value is refused by name.
+- **Accepted values:** `"native"` and `"wasm"` (owner mode, above); any other value is refused by name.
 - **`RELAY_SQLITE_DRIVER` still works as before.** When it disagrees with the instance's driver, including the default, the relay logs a warning once per process: a later release will require converting the instance (`relay db convert-journal`). Nothing needs doing until then.
 
 ### Wasm driver: a failed write-back no longer stops every later write-back, and a loss at close is reported

@@ -7,7 +7,9 @@
  * INV-DB-01, slice 1: the SQLite driver is a property of the INSTANCE (`sqlite_driver` in the instance config, default
  * native), read before any DB open.
  *
- * In this release the instance value `wasm` is REFUSED as "not yet supported", before any file is opened or created.
+ * Slice 1 refused the instance value `wasm` as "not yet supported"; slice 2b-ii ACCEPTS it (owner mode: the wasm single
+ * owner, an RLYW DB), and an explicit instance value WINS over a contradicting env (ruling cd11ffa7). The rows below that
+ * asserted the slice-1 refusal now assert the 2b-ii behaviour.
  * A config.json that cannot be read (unparseable, unreadable) does NOT break a DB open that worked before: native,
  * with a named warning.
  * An invalid value is refused by name. An env override (RELAY_SQLITE_DRIVER) that disagrees with the instance driver,
@@ -64,15 +66,16 @@ const driverWarnings = (spy: ReturnType<typeof vi.spyOn>) =>
   spy.mock.calls.map((c) => c.map(String).join(" ")).filter((m) => /sqlite_driver|RELAY_SQLITE_DRIVER/.test(m));
 
 describe("INV-DB-01 slice 1: the driver is an instance property", () => {
-  it("instance sqlite_driver \"wasm\" is refused as not yet supported, before the DB file is created", async () => {
+  it("slice 2b-ii: instance sqlite_driver \"wasm\" is ACCEPTED: the open is the wasm single owner's", async () => {
     writeConfig(process.env.RELAY_CONFIG_PATH!, { sqlite_driver: "wasm" });
-    await expect(compat.initializeDb(dbPath)).rejects.toThrow(/sqlite_driver "wasm" is not yet supported/);
-    expect(fs.existsSync(dbPath), "no DB file was created").toBe(false);
+    await compat.initializeDb(dbPath);
+    expect(compat.getActiveDriver()).toBe("wasm");
+    expect(fs.existsSync(dbPath), "the owner created the DB").toBe(true);
   });
 
-  it("the same refusal at startup validation (the daemon and stdio servers validate their config first)", () => {
+  it("slice 2b-ii: startup validation accepts it too", () => {
     writeConfig(process.env.RELAY_CONFIG_PATH!, { sqlite_driver: "wasm" });
-    expect(() => config.validateConfigAndEnv(config.loadConfig())).toThrow(/sqlite_driver "wasm" is not yet supported/);
+    expect(() => config.validateConfigAndEnv(config.loadConfig())).not.toThrow();
   });
 
   it("an invalid sqlite_driver value is refused by name, listing the valid ones", async () => {
@@ -95,8 +98,7 @@ describe("INV-DB-01 slice 1: the driver is an instance property", () => {
 
   it.each([
     ["the implicit default (no sqlite_driver key)", {}],
-    ["an explicit \"native\"", { sqlite_driver: "native" }],
-  ])("RELAY_SQLITE_DRIVER=wasm against %s: WARNED once per process, saying nothing is needed yet; the env still wins", async (_label, body) => {
+  ])("RELAY_SQLITE_DRIVER=wasm against %s: WARNED once per process, saying nothing is needed yet; the env still wins (the legacy wasm mode)", async (_label, body) => {
     writeConfig(process.env.RELAY_CONFIG_PATH!, body);
     process.env.RELAY_SQLITE_DRIVER = "wasm";
     const warn = vi.spyOn(log, "warn");
@@ -110,6 +112,17 @@ describe("INV-DB-01 slice 1: the driver is an instance property", () => {
     compat.closeInitializedDb();
     await compat.initializeDb(dbPath); // a second open in the same process
     expect(driverWarnings(warn).length, "once per process, not once per open").toBe(1);
+  });
+
+  it("slice 2b-ii (ruling cd11ffa7): RELAY_SQLITE_DRIVER=wasm against an EXPLICIT \"native\": the INSTANCE wins (native), and the env is warned once", async () => {
+    writeConfig(process.env.RELAY_CONFIG_PATH!, { sqlite_driver: "native" });
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const warn = vi.spyOn(log, "warn");
+    await compat.initializeDb(dbPath);
+    expect(compat.getActiveDriver()).toBe("native");
+    const said = driverWarnings(warn);
+    expect(said.length, "warned exactly once").toBe(1);
+    expect(said[0]).toMatch(/RELAY_SQLITE_DRIVER=wasm is set, but this instance declares sqlite_driver native .*the instance wins/);
   });
 
   const canChmod = process.platform !== "win32" && typeof process.getuid === "function" && process.getuid() !== 0;
@@ -166,11 +179,11 @@ describe("INV-DB-01 slice 1: the driver is an instance property", () => {
   });
 
   it("db.initializeDb() checks the driver BEFORE creating the DB's parent: a refused config leaves no directory behind", async () => {
-    writeConfig(process.env.RELAY_CONFIG_PATH!, { sqlite_driver: "wasm" });
+    writeConfig(process.env.RELAY_CONFIG_PATH!, { sqlite_driver: "sql.js" }); // an invalid value (wasm is accepted since 2b-ii)
     const parent = path.join(caseDir, "missing", "sub");
     process.env.RELAY_DB_PATH = path.join(parent, "relay.db");
     db.closeDb();
-    await expect(db.initializeDb()).rejects.toThrow(/not yet supported/);
+    await expect(db.initializeDb()).rejects.toThrow(/is not valid/);
     expect(fs.existsSync(path.join(caseDir, "missing")), "the DB's parent was created before the refusal").toBe(false);
   });
 
@@ -259,13 +272,14 @@ describe("INV-DB-01 slice 1: the driver is an instance property", () => {
     expect(driverWarnings(warn)).toEqual([]);
   });
 
-  it("per instance: instance A's sqlite_driver \"wasm\" is refused; instance B (no value) opens natively", async () => {
+  it("per instance: instance A's sqlite_driver \"wasm\" opens as the wasm owner; instance B (no value) opens natively", async () => {
     delete process.env.RELAY_CONFIG_PATH;
     const instances = path.join(caseDir, ".bot-relay", "instances");
     writeConfig(path.join(instances, "a", "config.json"), { sqlite_driver: "wasm" });
     fs.mkdirSync(path.join(instances, "b"), { recursive: true });
     process.env.RELAY_INSTANCE_ID = "a";
-    await expect(compat.initializeDb(path.join(instances, "a", "relay.db"))).rejects.toThrow(/not yet supported/);
+    await compat.initializeDb(path.join(instances, "a", "relay.db"));
+    expect(compat.getActiveDriver()).toBe("wasm");
     compat.closeInitializedDb();
     process.env.RELAY_INSTANCE_ID = "b";
     await compat.initializeDb(path.join(instances, "b", "relay.db"));

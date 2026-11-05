@@ -26,7 +26,7 @@ import * as compat from "../src/sqlite-compat.js";
 import * as db from "../src/db.js";
 import * as header from "../src/db-header.js";
 import { openRawRelayDb } from "../src/cli/_instance-db.js";
-import { exportRelayState } from "../src/backup.js";
+import { exportRelayState, importRelayState } from "../src/backup.js";
 import { log } from "../src/logger.js";
 import { _takeFsSpyViolations } from "./_setup/no-fs-on-held-db.js";
 
@@ -284,5 +284,17 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     fs.rmSync(cfgPath);
     await expect(exportRelayState({ destinationPath: path.join(caseDir, "x.tar.gz") })).rejects.toThrow(/owned by .*(relay|daemon|process)/i);
     a.child.stdin!.write("exit\n");
+  }, 60_000);
+
+  it("restore's owner check only READS the header: a LIVE legacy wasm connection + env switched to native → the restore is not refused", async () => {
+    process.env.RELAY_SQLITE_DRIVER = "wasm"; // legacy wasm (no declaration)
+    await db.initializeDb();
+    db.registerAgent("restore-live-wasm", "role", []);
+    const exp = await exportRelayState({ destinationPath: path.join(caseDir, "r.tar.gz") });
+    expect(compat.getActiveDriver(), "precondition: the live connection is wasm").toBe("wasm");
+    process.env.RELAY_SQLITE_DRIVER = "native"; // the env now contradicts the live connection
+    await importRelayState(exp.archive_path, { force: true });
+    await db.initializeDb();
+    expect(db.getAgents().map((x: { name: string }) => x.name)).toContain("restore-live-wasm");
   }, 60_000);
 });

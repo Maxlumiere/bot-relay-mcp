@@ -53,9 +53,27 @@ That's it. The relay initializes sql.js instead of better-sqlite3, runs the same
 
 ### The instance's driver (`sqlite_driver`)
 
-The driver is becoming a property of the **instance**: a `sqlite_driver` key in the instance's `config.json` (default `native`). In this release only `"native"` is accepted there: `"wasm"` is refused as not yet supported, because the single-owner guarantee a wasm instance needs ships in a later release. Until then, run the wasm driver with `RELAY_SQLITE_DRIVER=wasm` as above.
+The driver is a property of the **instance**: a `sqlite_driver` key in the instance's `config.json` (default `native`).
 
-That environment override still works, but when it disagrees with the instance's driver (including the default `native`), the relay logs a warning once per process: a later release will require the instance to be converted (`relay db convert-journal`). Nothing needs doing until then.
+**`"wasm"` puts the instance in owner mode.** Its database is owned by ONE process, the relay daemon:
+- **A new database** is created already stamped for its owner (`application_id` RLYW).
+- **The owner holds a single-owner lock**, which the kernel releases when it exits: a private `.<name>.relay-owner` dotfile beside the database on macOS, a socket on Linux, a named pipe on Windows.
+- **Every write is atomic** (a temp file, then a rename), made under that lock.
+- **Other processes** reach the database through the daemon over HTTP:
+  - a second process that tries to open it is refused by name;
+  - so is a stdio MCP server, with the client config to use instead: `{ "type": "http", "url": "http://127.0.0.1:3777/mcp" }`;
+  - so is a native opener.
+- **A backup or a restore** of an owned database runs under the lock when no owner is live, and is refused while one is.
+
+**Two populations run side by side until a later release converts them** (`relay db convert-journal`, slice 4):
+- **Owner mode** (`sqlite_driver: "wasm"`): one owner, safe.
+- **The legacy wasm mode** (`RELAY_SQLITE_DRIVER=wasm` with no `sqlite_driver` in the instance): exactly as before this release.
+  - No owner and no stamp: several processes may open the same database.
+  - The hazard: the wasm driver writes the whole database back from memory, so two such processes on one file overwrite each other's writes.
+  - The fix is to declare `sqlite_driver: "wasm"` in the instance. A new database is then owned from the start; an existing legacy database stays in the legacy mode (it is not adopted) until it is converted.
+- **The file's header decides** for a database already stamped for an owner, whatever the environment says.
+- **When the instance declares a driver and `RELAY_SQLITE_DRIVER` contradicts it,** the instance wins, and the relay warns once per process. A later release refuses the contradiction.
+- **When the instance declares nothing,** `RELAY_SQLITE_DRIVER` decides, with the same warning.
 
 ## How to switch back
 

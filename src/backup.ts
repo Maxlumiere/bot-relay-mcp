@@ -41,7 +41,7 @@ import { withDeadline } from "./http-deadline.js";
 import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
 import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
-import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
+import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, resolveOpen, isOwnedDb, holdOwnerForMaintenance, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
 import { assertDriverHeaderAllows, nativeHandleCount, isDbFamilyMember, isInHeldNativeFamily, beginWasmUse, endWasmUse, assertNoNativeHandle } from "./db-header.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
@@ -297,12 +297,16 @@ async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<
     }
     return d;
   }
-  const d = configuredDriver();
+  const resolved = resolveOpen(srcDbPath);
+  const d = resolved.driver;
   // INV-DB-01 2b-i (Codex #383 R1): a cold WASM export reads the live file with fs (the image, then its torn-read
   // hash), across awaits. Its claim is recorded first, so a native open of the file in this process meanwhile is
   // refused by name, and it is re-checked synchronously right before the hash.
   const claim = d === "wasm" ? beginWasmUse(srcDbPath) : null;
+  // 2b-ii: an OWNED DB is exported under its single-owner lock (refused, by name, while another process owns it).
+  let owner: { release(): void } | null = null;
   try {
+    if (resolved.mode === "owner") owner = await holdOwnerForMaintenance(srcDbPath, "backup");
     for (let attempt = 1; ; attempt++) {
       const source = await openExportSource(srcDbPath, d);
       try {
@@ -327,6 +331,7 @@ async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<
       }
     }
   } finally {
+    owner?.release();
     if (claim) endWasmUse(claim);
   }
 }
@@ -367,7 +372,7 @@ export async function exportRelayState(options: ExportOptions = {}): Promise<Exp
   }
   // INV-DB-01 slice 2a: the source's header refuses (or allows) the driver that will read it BEFORE anything is made.
   const liveForHeader = peekDb();
-  assertDriverHeaderAllows(srcDbPath, liveForHeader ? driverOf(liveForHeader) : configuredDriver());
+  assertDriverHeaderAllows(srcDbPath, liveForHeader ? driverOf(liveForHeader) : configuredDriver(srcDbPath));
 
   const backupsDir = getBackupsDir();
   // v2.1 Phase 4c.4: the backups directory lives inside ~/.bot-relay so it
@@ -603,6 +608,9 @@ export async function importRelayState(archivePath: string, options: ImportOptio
   // no trace outside staging. ONE parser decides and extracts; no tar extracts the input archive (SEC-22, ruled 26
   // Oct; the safety backup still writes with tar).
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-import-"));
+  // 2b-ii: a restore onto an OWNED (RLYW) live DB holds its single-owner lock from before the safety backup to after
+  // the swap (refused, by name, while another process owns it).
+  let restoreOwner: { release(): void } | null = null;
   try {
     assertPrivateStaging(stagingDir);
     // INV-DB-01 2b-i: an archive path that IS the live DB (or one of its side files, or a hard link to one) is never
@@ -668,7 +676,8 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // nothing), else the configured driver, which is the one this process would instantiate (#190 r3). No main-DB
     // init, so a corrupt archive manufactures no state.
     const live = peekDb();
-    const probeDriver: SqliteDriver = live ? driverOf(live) : configuredDriver();
+    // 2b-ii: the staged copy is read with the driver ITS header calls for (an RLYW archive is read with wasm).
+    const probeDriver: SqliteDriver = live ? driverOf(live) : configuredDriver(extractedDbPath);
     const probe = await openReadOnly(extractedDbPath, probeDriver);
     try {
       const check = probe.prepare("PRAGMA integrity_check").get() as { integrity_check: string } | undefined;
@@ -690,6 +699,9 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // would survive the swap on the OLD file. Refused by name before any mutation, and again after closeDb().
     const liveNow = peekDb();
     assertNoOtherNativeHold(srcDbPath, liveNow && driverOf(liveNow) === "native" ? 1 : 0);
+    if (fs.existsSync(srcDbPath) && isOwnedDb(srcDbPath)) {
+      restoreOwner = await holdOwnerForMaintenance(srcDbPath, "restore");
+    }
     if (fs.existsSync(srcDbPath)) {
       const backupsDir = getBackupsDir();
       // v2.1 Phase 4c.4: ensureSecureDir (vs bare mkdirSync) — same pattern as
@@ -748,6 +760,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       skipped_members: skipped,
     };
   } finally {
+    restoreOwner?.release();
     fs.rmSync(stagingDir, { recursive: true, force: true });
   }
 }

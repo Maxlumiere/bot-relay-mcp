@@ -25,6 +25,7 @@ import { checkPrivatePath } from "./approved-roots.js";
 import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver } from "./config.js";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
+import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
 import {
   assertDriverHeaderAllows,
   noteNativeHandleOpened,
@@ -35,6 +36,10 @@ import {
   assertNoNativeHandle,
   WASM_USE_REFUSAL,
   DbHeaderRefusedError,
+  nativeHandleCount,
+  readDriverHeader,
+  RELAY_APP_ID_WASM,
+  httpClientHint,
   _installNativeProbe,
   type DriverHeader,
 } from "./db-header.js";
@@ -85,31 +90,108 @@ let driverUnreadableWarned = false;
 export function _resetDriverWarningForTests(): void {
   driverOverrideWarned = false;
   driverUnreadableWarned = false;
+  headerDecidesWarned = false;
+  notAdoptedWarned = false;
 }
-function getDriverType(): SqliteDriver {
+/** What the declarations say: the driver, and whether the INSTANCE declared it (owner mode needs that). */
+interface Declared {
+  driver: SqliteDriver;
+  /** The instance's explicit sqlite_driver, or null when the instance is silent (the default). */
+  instance: SqliteDriver | null;
+}
+/**
+ * The declarations (INV-DB-01 slices 1 and 2b-ii, ruling cd11ffa7): an EXPLICIT instance sqlite_driver wins, and an env
+ * override that contradicts it warns (a later release refuses it). A silent instance takes the env
+ * (RELAY_SQLITE_DRIVER=wasm is the legacy wasm mode: no owner, unstamped), else native.
+ */
+function declaredDriver(): Declared {
   const { value, configPath, unreadable } = readInstanceSqliteDriver();
   const problem = instanceSqliteDriverProblem(value, configPath);
   if (problem) throw new InvalidConfigError(problem);
-  const instanceDriver: SqliteDriver = "native"; // the only instance value accepted in this release
+  const instance: SqliteDriver | null = value === "wasm" ? "wasm" : value === "native" ? "native" : null;
   const raw = process.env.RELAY_SQLITE_DRIVER;
-  const requested: SqliteDriver = !raw ? instanceDriver : raw === "wasm" ? "wasm" : "native";
+  const envDriver: SqliteDriver | null = !raw ? null : raw === "wasm" ? "wasm" : "native";
+  const driver: SqliteDriver = instance ?? envDriver ?? "native";
   if (unreadable !== undefined && !driverUnreadableWarned) {
     driverUnreadableWarned = true;
     log.warn(
-      `[db] could not read this instance's sqlite_driver from ${configPath} (${unreadable}); using ${requested}, as ` +
+      `[db] could not read this instance's sqlite_driver from ${configPath} (${unreadable}); using ${driver}, as ` +
         `before this setting existed. Fix or remove that config.json.`
     );
   }
-  if (!raw) return instanceDriver;
-  if (requested !== instanceDriver && !driverOverrideWarned) {
+  if (envDriver !== null && envDriver !== (instance ?? "native") && !driverOverrideWarned) {
     driverOverrideWarned = true;
     log.warn(
-      `[db] RELAY_SQLITE_DRIVER=${raw} is set, but this instance's sqlite_driver is ${instanceDriver} ` +
-        `(${value === undefined ? "the default" : "set"} in ${configPath}). The environment wins for now, but a later ` +
-        `release will require the instance to be converted (\`relay db convert-journal\`); nothing to do until then.`
+      instance !== null
+        ? `[db] RELAY_SQLITE_DRIVER=${raw} is set, but this instance declares sqlite_driver ${instance} (in ` +
+            `${configPath}): the instance wins. Remove the env override; a later release refuses it.`
+        : `[db] RELAY_SQLITE_DRIVER=${raw} is set, but this instance's sqlite_driver is native (the default in ` +
+            `${configPath}). The environment wins for now (the legacy wasm mode: no single owner), but a later ` +
+            `release will require the instance to be converted (\`relay db convert-journal\`); nothing to do until then.`
     );
   }
-  return requested;
+  return { driver, instance };
+}
+function getDriverType(): SqliteDriver {
+  return declaredDriver().driver;
+}
+
+/** How a DB is opened: natively, through the legacy wasm mode (no owner, unstamped), or by its wasm single OWNER. */
+export type OpenMode = "native" | "legacy-wasm" | "owner";
+export interface ResolvedOpen {
+  driver: SqliteDriver;
+  mode: OpenMode;
+  header: DriverHeader;
+}
+let headerDecidesWarned = false;
+let notAdoptedWarned = false;
+/**
+ * INV-DB-01 slice 2b-ii: the declarations, then the DB FILE'S HEADER (ruling 5aa0c030, cd11ffa7). The header is read
+ * through source (1) or (3) (db-header.ts), never by a fresh fs open while a native handle is live.
+ * - RLYW: OWNER mode, whatever the declarations or the env (a contradicting declaration warns);
+ * - absent: OWNER mode only when the INSTANCE declares wasm; an env-only wasm is the legacy mode (never stamps RLYW);
+ * - legacy (0): the declarations; a wasm owner never ADOPTS it (it stays legacy, warned: slice 4 converts it);
+ * - RLYN, foreign, and the in-process driver mixes: as in 2a/2b-i (refused or warned by name).
+ */
+export function resolveOpen(dbPath: string): ResolvedOpen {
+  const d = declaredDriver();
+  const peek = readDriverHeaderForDriver(dbPath, d.driver);
+  if (peek.kind === "wasm") {
+    if (d.driver === "native" && !headerDecidesWarned) {
+      headerDecidesWarned = true;
+      log.warn(
+        `[db] the DB at '${dbPath}' is stamped for the wasm driver's single owner (RLYW), but the declarations say ` +
+          `native: the header decides (wasm, owner mode).`
+      );
+    }
+    assertDriverHeaderAllows(dbPath, "wasm"); // the in-process mixes (a native handle counted) are refused by name
+    return { driver: "wasm", mode: "owner", header: peek };
+  }
+  const header = assertDriverHeaderAllows(dbPath, d.driver);
+  if (d.driver === "native") return { driver: "native", mode: "native", header };
+  if (header.kind === "absent") return { driver: "wasm", mode: d.instance === "wasm" ? "owner" : "legacy-wasm", header };
+  if (header.kind === "legacy" && d.instance === "wasm" && !notAdoptedWarned) {
+    notAdoptedWarned = true;
+    log.warn(
+      `[db] the instance declares sqlite_driver "wasm", but the DB at '${dbPath}' is a legacy (unstamped) one: it is ` +
+        `NOT adopted by a single owner. It keeps the legacy wasm mode (no owner lock); a later release converts it ` +
+        `(\`relay db convert-journal\`).`
+    );
+  }
+  return { driver: "wasm", mode: "legacy-wasm", header };
+}
+/**
+ * Whether the DB at `dbPath` is OWNED (stamped RLYW), for maintenance that must take the owner's lock. It only READS
+ * the header (the held native handle, else one fs read when none is held): it decides no driver, so it never refuses
+ * a live connection of either driver the way resolveOpen's declared-driver check would.
+ */
+export function isOwnedDb(dbPath: string): boolean {
+  return readDriverHeader(dbPath).kind === "wasm";
+}
+/** The header, read through the same sources (and refusals) as an open with `driver` would use. */
+function readDriverHeaderForDriver(dbPath: string, driver: SqliteDriver): DriverHeader {
+  if (driver === "wasm" && nativeHandleCount(dbPath) > 0) return assertDriverHeaderAllows(dbPath, "wasm"); // refuses
+  return readDriverHeader(dbPath);
 }
 
 // --- Native driver (better-sqlite3 passthrough) ---
@@ -319,6 +401,12 @@ export function _setWasmExportForTests(fn: ((rawDb: any) => Uint8Array) | null):
 class WasmDatabase implements CompatDatabase {
   /** Set by the writable open (createWasmDb): releases its in-process record once the handle is closed. */
   onClosed: (() => void) | null = null;
+  /** INV-DB-01 2b-ii: an OWNED DB's single-owner lock (null in the legacy wasm mode); released when it is retired. */
+  ownerLock: OwnerLock | null = null;
+  /** The name every owner persist replaces: the caller's directory, the DB's CANONICAL basename (the lock's key). */
+  canonicalPath: string | null = null;
+  /** The main file's device + inode after this owner's last write: a persist onto a file replaced since is refused. */
+  lastIdentity: string | null = null;
   private db: any;
   private dbPath: string;
   private txDepth = 0;
@@ -515,6 +603,9 @@ class WasmDatabase implements CompatDatabase {
     (this.db as any).__dead = this.dead;
     this.onClosed?.();
     this.onClosed = null;
+    const lock = this.ownerLock;
+    this.ownerLock = null;
+    lock?.release();
   }
 
   /**
@@ -592,6 +683,11 @@ class WasmDatabase implements CompatDatabase {
     void cause;
     const data = this.exportTallied();
     this.unwrittenAtFailure = this.unwrittenChanges;
+    if (this.ownerLock) {
+      ownerPersist(this, Buffer.from(data));
+      this.unwrittenChanges = 0;
+      return;
+    }
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -609,6 +705,180 @@ class WasmDatabase implements CompatDatabase {
     }
     this.unwrittenChanges = 0;
   }
+}
+
+let persistRename: (from: string, to: string) => void = (from, to) => fs.renameSync(from, to);
+/** Test-only: replaces the owner persist's rename (e.g. with one that is refused). */
+export function _setPersistRenameForTests(fn: ((from: string, to: string) => void) | null): void {
+  persistRename = fn ?? ((from, to) => fs.renameSync(from, to));
+}
+const WINDOWS_OPEN_FILE_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+/** The atomic replace: Windows cannot replace a file another process holds open, so a short bounded retry, then named. */
+function replaceWithRetry(tmp: string, target: string): void {
+  const waits = process.platform === "win32" ? [25, 50, 100, 200] : [];
+  for (let i = 0; ; i++) {
+    try {
+      persistRename(tmp, target);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "";
+      const openOnWindows = process.platform === "win32" && WINDOWS_OPEN_FILE_CODES.has(code);
+      if (openOnWindows && i < waits.length) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waits[i]);
+        continue;
+      }
+      const why = openOnWindows ? "another process has the DB file open; Windows cannot replace it" : `the DB file could not be replaced (${code || (err as Error).message})`;
+      throw new Error(
+        `wasm persist refused: ${why}; nothing was written to ${target}. The change stays in memory and is written ` +
+          `with the next successful persist (it is lost if the process exits first).`
+      );
+    }
+  }
+}
+const identityOf = (p: string): string | null => {
+  try {
+    const st = fs.statSync(p, { bigint: true });
+    return `${st.dev}:${st.ino}`;
+  } catch {
+    return null;
+  }
+};
+/**
+ * INV-DB-01 2b-ii: an OWNED DB's persist. Only under this process's single-owner lock, never onto a hard-linked DB,
+ * never onto a file another writer replaced since this owner's last write (its identity) or that is no longer
+ * RLYW, and ATOMICALLY: a fresh temp file beside the DB, then renamed over it. Each refusal is named; nothing is
+ * written, and the change stays in memory for the next persist.
+ */
+function ownerPersist(w: WasmDatabase, data: Buffer): void {
+  const lock = w.ownerLock!;
+  const target = w.canonicalPath!;
+  if (!holdsOwnerLock(target) || lockKey(target) !== lock.key) {
+    throw new OwnerLockError(
+      `wasm persist refused: this process no longer holds the single-owner lock for ${target}, so another process may ` +
+        `own it. Nothing was written.`
+    );
+  }
+  assertSingleLink(target);
+  if (identityOf(target) !== w.lastIdentity) {
+    throw new OwnerLockError(
+      `wasm persist refused: the DB file at ${target} was replaced since this owner's last write (its identity ` +
+        `changed), so another writer touched it. Nothing was written; stop the other writer and restart this process.`
+    );
+  }
+  const now = readDriverHeader(target);
+  if (now.kind !== "wasm") {
+    throw new OwnerLockError(`wasm persist refused: the DB file at ${target} is no longer stamped RLYW (${now.kind}). Nothing was written.`);
+  }
+  const tmp = `${target}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+  try {
+    fs.writeFileSync(tmp, data, { mode: 0o600, flag: "wx" });
+    replaceWithRetry(tmp, target);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
+  w.lastIdentity = identityOf(target);
+}
+
+/** sql.js, loaded (a named refusal when it is not installed). */
+async function loadSqlJs(): Promise<any> {
+  let initSqlJs: any;
+  try {
+    initSqlJs = (await import("sql.js")).default;
+  } catch {
+    throw new Error("sql.js is not installed. RELAY_SQLITE_DRIVER=wasm requires sql.js. Install it with: npm install sql.js");
+  }
+  return initSqlJs();
+}
+
+/**
+ * INV-DB-01 2b-ii: open an OWNED DB as its single owner. The wasm claim first (before any await: a native open of the
+ * file in this process meanwhile is refused); a NEW DB is materialized already stamped RLYW (it appears complete, by a
+ * link); then the lock (another owner → a named refusal). After the lock the file must still be RLYW: a file a native
+ * process created first is legacy (0) and is NOT adopted (it opens in the legacy wasm mode, warned).
+ */
+async function createOwnedWasmDb(dbPath: string, header: DriverHeader): Promise<CompatDatabase> {
+  const token = beginWasmUse(dbPath);
+  try {
+    const SQL = await loadSqlJs();
+    let initialBytes: Uint8Array | undefined;
+    if (header.kind === "absent") {
+      const fresh = new SQL.Database();
+      fresh.exec(`PRAGMA application_id = ${RELAY_APP_ID_WASM}`);
+      initialBytes = fresh.export();
+      fresh.close();
+    }
+    let lock: OwnerLock;
+    try {
+      lock = await acquireOwnerLock(dbPath, { initialBytes });
+    } catch (err) {
+      if (err instanceof OwnerLockError && /could not be locked/.test(err.message)) {
+        throw new OwnerLockError(
+          `the DB at ${dbPath} is owned by another relay process (its wasm single owner), so this process does not open ` +
+            `it. Reach it through that process over HTTP (an MCP client config for it: ${httpClientHint()}), or stop it.`
+        );
+      }
+      throw err;
+    }
+    try {
+      // ONE synchronous sequence from here: the re-checks, the read, the construction.
+      const now = readDriverHeader(dbPath);
+      if (now.kind !== "wasm") {
+        lock.release();
+        log.warn(`[db] the DB at '${dbPath}' is not RLYW (${now.kind}): it is NOT adopted by a single owner; it opens in the legacy wasm mode.`);
+        return finishLegacyWasm(SQL, dbPath, token);
+      }
+      assertWasmSourceReadable(dbPath, "wasm open refused");
+      assertSingleLink(dbPath);
+      assertNoNativeHandle(dbPath);
+      const w = new WasmDatabase(new SQL.Database(fs.readFileSync(dbPath)), dbPath);
+      w.ownerLock = lock;
+      w.canonicalPath = canonicalReplaceTarget(dbPath);
+      w.lastIdentity = identityOf(w.canonicalPath);
+      w.onClosed = () => endWasmUse(token);
+      return w;
+    } catch (err) {
+      lock.release();
+      throw err;
+    }
+  } catch (err) {
+    endWasmUse(token);
+    throw err;
+  }
+}
+
+/**
+ * INV-DB-01 2b-ii: maintenance (a cold export, a restore) on an OWNED DB takes its single-owner lock for the duration:
+ * with no owner live it runs under the lock; with one live in another process it is refused by name (a short
+ * budget, never a wait for the owner to exit). In the owner's own process the lock is re-entrant.
+ */
+export async function holdOwnerForMaintenance(dbPath: string, what: string): Promise<OwnerLock> {
+  try {
+    return await acquireOwnerLock(dbPath, { budgetMs: 300 });
+  } catch (err) {
+    if (err instanceof OwnerLockError && /could not be locked/.test(err.message)) {
+      throw new OwnerLockError(
+        `${what} refused: the DB at ${dbPath} is owned by a live relay process (its wasm single owner). Stop that ` +
+          `process first (its data is safe in it meanwhile).`
+      );
+    }
+    throw err;
+  }
+}
+
+/** The legacy wasm mode's open, with sql.js already loaded and the claim held (its record becomes the connection's). */
+function finishLegacyWasm(SQL: any, dbPath: string, token: object): CompatDatabase {
+  assertNoNativeHandle(dbPath);
+  let rawDb: any;
+  if (fs.existsSync(dbPath)) rawDb = new SQL.Database(fs.readFileSync(dbPath));
+  else {
+    const dir = path.dirname(dbPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    rawDb = new SQL.Database();
+  }
+  const w = new WasmDatabase(rawDb, dbPath);
+  w.onClosed = () => endWasmUse(token);
+  return w;
 }
 
 async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
@@ -803,11 +1073,11 @@ export function fileSha256(p: string): string {
  * them); a -journal means a rollback may be pending. Each is refused by name. The WAL header alone is NOT (ruled): a
  * native DB whose last connection closed cleanly holds every commit in its main file (MEASURED).
  */
-export function assertWasmSourceReadable(dbPath: string): void {
+export function assertWasmSourceReadable(dbPath: string, what = "backup refused (wasm driver)"): void {
   for (const side of ["-wal", "-shm", "-journal"]) {
     if (fs.existsSync(dbPath + side)) {
       throw new Error(
-        `backup refused (wasm driver): a ${side} file is beside the DB at '${dbPath}', so another process may have it open ` +
+        `${what}: a ${side} file is beside the DB at '${dbPath}', so another process may have it open ` +
           `or its last transaction is not in the main file, and the wasm driver reads only the main file. Back up with ` +
           `the native driver, or once no other process has the DB open.`
       );
@@ -850,15 +1120,17 @@ export function initializeDb(dbPath: string): Promise<CompatDatabase> {
   if (_initPromise) return _initPromise;
 
   const p = (async () => {
-    const driver = getDriverType();
-    // INV-DB-01 slice 2a: the DB file's header decides, before the open (refused, or warned, by name).
-    const header = assertDriverHeaderAllows(dbPath, driver);
-    log.info(`[db] Initializing SQLite driver: ${driver}`);
+    // INV-DB-01 slices 2a/2b-ii: the declarations, then the DB file's header, decide the driver AND the mode.
+    const r = resolveOpen(dbPath);
+    const driver = r.driver;
+    log.info(`[db] Initializing SQLite driver: ${driver}${r.mode === "owner" ? " (single owner)" : r.mode === "legacy-wasm" ? " (legacy mode)" : ""}`);
 
-    if (driver === "wasm") {
+    if (r.mode === "owner") {
+      _initializedDb = await createOwnedWasmDb(dbPath, r.header);
+    } else if (driver === "wasm") {
       _initializedDb = await createWasmDb(dbPath);
     } else {
-      _initializedDb = await createNativeDb(dbPath, header);
+      _initializedDb = await createNativeDb(dbPath, r.header);
     }
 
     _driverUsed = driver;
@@ -901,8 +1173,9 @@ export function driverOf(db: CompatDatabase): SqliteDriver {
  * reality: it is the driver the process will instantiate. NEVER use this where a
  * live connection exists — use driverOf(db) there. #190 r3.
  */
-export function configuredDriver(): SqliteDriver {
-  return getDriverType();
+export function configuredDriver(dbPath?: string): SqliteDriver {
+  // 2b-ii: with a DB path, the header decides (an RLYW file is read with the wasm driver whatever the declarations).
+  return dbPath ? resolveOpen(dbPath).driver : getDriverType();
 }
 
 /**
@@ -911,7 +1184,7 @@ export function configuredDriver(): SqliteDriver {
  * directory). Warns as getDriverType() and the header check do.
  */
 export function assertInstanceDriverAccepted(dbPath: string): DriverHeader {
-  return assertDriverHeaderAllows(dbPath, getDriverType());
+  return resolveOpen(dbPath).header;
 }
 
 /**
