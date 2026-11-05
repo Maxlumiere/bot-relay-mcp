@@ -39,16 +39,24 @@ function stripComment(s: string): string {
   return s.trimEnd();
 }
 
+/** A flow-style collection the subset does not parse: kept as a marker, so the guard REFUSES what it cannot judge. */
+const FLOW = "\u0000flow:";
 function scalar(v: string): Y {
   const t = v.trim();
-  if (t.startsWith("[") && t.endsWith("]")) {
+  if (t.startsWith("[") && t.endsWith("]") && !/[{[]/.test(t.slice(1, -1))) {
     return t
       .slice(1, -1)
       .split(",")
       .map((x) => x.trim().replace(/^['"]|['"]$/g, ""))
       .filter(Boolean);
   }
-  return t.replace(/^['"]|['"]$/g, "");
+  if (t.startsWith("[") || t.startsWith("{")) return FLOW + t;
+  if (t.startsWith('"') && t.endsWith('"') && t.length >= 2) {
+    // A double-quoted scalar's escapes (YAML 1.2): an escaped newline IS a second line of the script.
+    return t.slice(1, -1).replace(/\\(["\\\/bfnrt0])/g, (_m, c: string) => ({ n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", "0": "\0", "/": "/", '"': '"', "\\": "\\" })[c] ?? c);
+  }
+  if (t.startsWith("'") && t.endsWith("'") && t.length >= 2) return t.slice(1, -1).replace(/''/g, "'");
+  return t;
 }
 
 interface Line {
@@ -173,31 +181,65 @@ export function commandsOf(script: string): string[] {
 
 const PWSH_FAIL_FAST = [/^\$ErrorActionPreference\s*=\s*['"]Stop['"]$/i, /^\$PSNativeCommandUseErrorActionPreference\s*=\s*\$true$/i];
 
+/** GitHub's own bash runs `bash --noprofile --norc -eo pipefail {0}`; a custom bash fails fast only with an -e flag. */
+function bashFailsFast(shell: string): boolean {
+  const tokens = shell.trim().split(/\s+/);
+  if (tokens[0] !== "bash") return false;
+  return tokens.length === 1 || tokens.slice(1).some((t) => /^-[a-zA-Z]*e[a-zA-Z]*$/.test(t));
+}
+
 /** The Windows-capable steps whose run can pass with a failed command, as "<job> / <step>: why". */
 export function maskedWindowsSteps(src: string): string[] {
+  const out: string[] = [];
+  // Anchors, aliases and merge keys are outside the subset: refuse, never guess.
+  src.split(/\r?\n/).forEach((l, n) => {
+    if (/^\s*<<\s*:|:\s+[&*][\w-]+|^\s*-\s+[&*][\w-]+/.test(l)) out.push(`line ${n + 1}: unsupported YAML (an anchor, alias or merge key): judge it by hand or simplify it`);
+  });
   const wf = asObj(parseYaml(src));
   const wfShell = asStr(asObj(asObj(wf.defaults).run).shell);
-  const out: string[] = [];
   for (const [jobName, jobY] of Object.entries(asObj(wf.jobs))) {
     const job = asObj(jobY);
     const runsOn = job["runs-on"];
     const oses: string[] = [];
+    let unresolved = false;
     if (typeof runsOn === "string" && /\$\{\{\s*matrix\.(\w+)\s*\}\}/.test(runsOn)) {
       const key = /matrix\.(\w+)/.exec(runsOn)![1]!;
       const v = asObj(asObj(job.strategy).matrix)[key];
       if (Array.isArray(v)) for (const x of v) oses.push(asStr(x));
+      else unresolved = true;
       for (const inc of (asObj(asObj(job.strategy).matrix).include as Y[] | undefined) ?? []) oses.push(asStr(asObj(inc)[key]));
     } else if (Array.isArray(runsOn)) for (const x of runsOn) oses.push(asStr(x));
-    else oses.push(asStr(runsOn));
-    if (!oses.some((o) => /windows/i.test(o))) continue;
+    else if (runsOn && typeof runsOn === "object") {
+      const labels = (runsOn as { [k: string]: Y }).labels;
+      if (Array.isArray(labels)) for (const x of labels) oses.push(asStr(x));
+      else if (typeof labels === "string") oses.push(labels);
+      else unresolved = true; // a runner group alone: its OS is not in the workflow
+    } else if (typeof runsOn === "string") {
+      if (runsOn.startsWith(FLOW) || /\$\{\{/.test(runsOn)) unresolved = true;
+      else oses.push(runsOn);
+    } else unresolved = true;
+    // Unresolvable: judged as Windows-capable (fail closed).
+    if (!unresolved && !oses.some((o) => /windows/i.test(o))) continue;
+    if (!Array.isArray(job.steps)) {
+      out.push(`${jobName}: its steps are not a block sequence (flow style or another form the subset does not parse): unjudgeable, refused`);
+      continue;
+    }
     const jobShell = asStr(asObj(asObj(job.defaults).run).shell);
     const steps = Array.isArray(job.steps) ? job.steps : [];
     steps.forEach((stepY, idx) => {
+      if (!stepY || typeof stepY !== "object" || Array.isArray(stepY)) {
+        out.push(`${jobName} / step ${idx + 1}: not a block mapping (flow style?): unjudgeable, refused`);
+        return;
+      }
       const step = asObj(stepY);
       const run = step.run;
       if (typeof run !== "string") return;
+      if (run.startsWith(FLOW)) {
+        out.push(`${jobName} / ${asStr(step.name) || `step ${idx + 1}`}: a flow-style run: unjudgeable, refused`);
+        return;
+      }
       const shell = asStr(step.shell) || jobShell || wfShell || "pwsh";
-      if (/^bash\b/.test(shell)) return; // GitHub runs bash -eo pipefail
+      if (bashFailsFast(shell)) return;
       const cmds = commandsOf(run);
       if (cmds.length <= 1) return;
       if (/^(pwsh|powershell)\b/.test(shell) && PWSH_FAIL_FAST.every((re) => cmds.slice(0, 2).some((c) => re.test(c)))) return;

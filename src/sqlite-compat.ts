@@ -25,7 +25,7 @@ import { checkPrivatePath } from "./approved-roots.js";
 import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver } from "./config.js";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
-import { acquireOwnerLock, assertLockIntact, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
+import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
 import {
   assertDriverHeaderAllows,
   noteNativeHandleOpened,
@@ -798,7 +798,7 @@ function ownerPersist(w: WasmDatabase, data: Buffer): void {
     // Read after the write is closed (a filesystem may settle timestamps at close).
     wrote = identityFrom(fs.statSync(tmp, { bigint: true }));
     try {
-      assertLockIntact(target); // immediately before the rename: a removed or replaced lock file stops the owner
+      lock.assertIntact(); // immediately before the rename: THIS acquisition, its lock file still the file at its name
     } catch (err) {
       log.error(`[db-wasm] ${(err as Error).message}`);
       w.ownerLost = true;

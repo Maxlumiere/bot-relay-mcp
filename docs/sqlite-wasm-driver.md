@@ -59,10 +59,11 @@ The driver is a property of the **instance**: a `sqlite_driver` key in the insta
 - **A new database** is created already stamped for its owner (`application_id` RLYW).
 - **The owner holds a single-owner lock**, which the kernel releases when it exits:
   - macOS and Linux: a flock-class lock on a private `.<name>.relay-owner` file beside the database. Linux takes it with the system `flock` (util-linux). **Never delete that file**: a relay that finds its lock file removed or replaced stops writing.
-  - Linux without a trusted system `flock`: an abstract socket, which excludes only processes in the **same network namespace**. Keep each wasm database to one container there; the relay warns once at startup.
-  - Windows: a named pipe, also one session namespace (one container) per database.
+  - Linux without a trusted system `flock` (util-linux, at a system path): owner mode is **refused** by name, with the remedies (install util-linux's flock, use the native driver, or reach a live owner over HTTP). There is no fallback lock: two kinds of lock could not exclude each other.
+  - Windows: a named pipe, which is per session namespace: one container per database there.
   - A wasm database must live on a LOCAL filesystem. On Linux, owner mode is refused on a network filesystem (NFS, SMB/CIFS, 9p, Ceph, Lustre and similar, by `statfs`). macOS is not checked.
   - **FUSE is refused too**, conservatively: a FUSE filesystem may be remote (sshfs) or local (gocryptfs), and the relay cannot tell which, nor whether it shares flock locks between processes. If you need a local FUSE filesystem allowed, open an issue naming it: allowing one needs a measurement that its flock excludes a second process, not a config switch. Until then, use the native driver there.
+- **Names of the form `.<db name>.<pid>.<12 hex digits>.new` beside an owned database are RESERVED for the relay** (a new database's first image). Under the lock, the owner removes such a name when it is the same file as the database (a leftover of a crash between creating and naming the database); do not keep your own files under such a name.
 - **Every write is atomic** (a temp file, then a rename), made under that lock. Before each write, the owner checks that the file is still the one it last wrote (its inode, size and modification time) and refuses to write over a file another process replaced or rewrote.
   - A metadata change, such as a `chmod`, is deliberately not treated as a write (the relay itself tightens its database's mode on every open).
   - On a filesystem with coarse timestamps (HFS+ 1 s, FAT/exFAT 2 s), a same-size rewrite within that granularity is not seen. APFS, ext4 and NTFS are fine-grained.

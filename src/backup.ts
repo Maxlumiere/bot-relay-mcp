@@ -616,7 +616,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-import-"));
   // 2b-ii: a restore onto an OWNED (RLYW) live DB holds its single-owner lock from before the safety backup to after
   // the swap (refused, by name, while another process owns it).
-  let restoreOwner: { release(): void } | null = null;
+  let restoreOwner: { release(): void; assertIntact(): void } | null = null;
   try {
     assertPrivateStaging(stagingDir);
     // INV-DB-01 2b-i: an archive path that IS the live DB (or one of its side files, or a hard link to one) is never
@@ -734,6 +734,9 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // atomic on Windows, but documented and the best POSIX-API equivalent
     // we can offer without shelling out to MoveFileExW.
     await beforeRestoreSwapHook?.(srcDbPath);
+    // Codex #385 R2 P1-2: an OWNED DB is replaced only while this restore's acquisition still holds the lock and its
+    // lock file is still the file at its name (removed or replaced, another process may own and have written the DB).
+    restoreOwner?.assertIntact();
     const newPath = srcDbPath + ".new";
     fs.copyFileSync(extractedDbPath, newPath);
     try {
