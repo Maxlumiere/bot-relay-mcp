@@ -27,9 +27,14 @@ import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
 import {
   assertDriverHeaderAllows,
-  assertNotHeldNatively,
-  registerNativeHold,
-  releaseNativeHold,
+  noteNativeHandleOpened,
+  noteNativeHandleClosed,
+  beginWasmUse,
+  endWasmUse,
+  wasmUseRecorded,
+  assertNoNativeHandle,
+  WASM_USE_REFUSAL,
+  DbHeaderRefusedError,
   _installNativeProbe,
   type DriverHeader,
 } from "./db-header.js";
@@ -112,20 +117,24 @@ function getDriverType(): SqliteDriver {
 const loadNative = () => createRequire(import.meta.url)("better-sqlite3") as typeof BetterSqlite3;
 
 /**
- * INV-DB-01 slice 2a: THE one construction of a native handle on a relay DB (the compat initializer, openReadOnly and
- * the export source, getDb()'s fallback, the raw CLI open). It registers the handle's hold on the DB's file family
- * (db-header.ts) and releases it only when a close actually closed the handle: better-sqlite3 refuses to close a busy
- * connection, and that handle stays open and held. `verdict` is the header read before the open.
+ * INV-DB-01 slices 2a/2b-i: THE one construction of a native handle on a relay DB (the compat initializer, openReadOnly
+ * and the export source, getDb()'s fallback, the raw CLI open). It is the only code that changes the in-process
+ * native-handle COUNT (db-header.ts): +1 on a successful open, -1 when a close actually closed the handle
+ * (better-sqlite3 refuses to close a busy connection, and that handle stays open and counted). The count keeps a
+ * strong reference, so a counted handle is never garbage-collected. `_verdict` is the header read before the open.
  */
-export function openNativeDb(dbPath: string, options: BetterSqlite3.Options, verdict: DriverHeader): BetterSqlite3.Database {
+export function openNativeDb(dbPath: string, options: BetterSqlite3.Options, _verdict: DriverHeader): BetterSqlite3.Database {
+  // The one construction enforces the in-process mix itself (Codex #383 R1): a wasm use of this file, open or still
+  // between its awaits, refuses it by name.
+  if (wasmUseRecorded(dbPath)) throw new DbHeaderRefusedError(WASM_USE_REFUSAL(dbPath));
   const db = new (loadNative())(dbPath, options);
-  const hold = registerNativeHold(dbPath, verdict, db);
+  const token = noteNativeHandleOpened(dbPath, db);
   const close = db.close.bind(db);
   db.close = () => {
     try {
       return close();
     } finally {
-      if (!db.open) releaseNativeHold(hold);
+      if (!db.open) noteNativeHandleClosed(token);
     }
   };
   return db;
@@ -291,7 +300,6 @@ class WasmStatement implements CompatStatement {
 
 /** The wasm write-back. Never of a file this process holds natively (the write's close would drop that handle's locks). */
 const persistWrite = (dbPath: string, bytes: Buffer) => {
-  assertNotHeldNatively(dbPath, "write back the DB");
   fs.writeFileSync(dbPath, bytes);
 };
 let wasmPersistWrite: (dbPath: string, bytes: Buffer) => void = persistWrite;
@@ -309,6 +317,8 @@ export function _setWasmExportForTests(fn: ((rawDb: any) => Uint8Array) | null):
 }
 
 class WasmDatabase implements CompatDatabase {
+  /** Set by the writable open (createWasmDb): releases its in-process record once the handle is closed. */
+  onClosed: (() => void) | null = null;
   private db: any;
   private dbPath: string;
   private txDepth = 0;
@@ -485,12 +495,26 @@ class WasmDatabase implements CompatDatabase {
     // The cleanup never throws OVER the loss: its error is attached to the first one.
     try {
       this.db.close();
-      this.closed = true;
     } catch (cleanupErr) {
       if (first) first.message += ` (closing the handle failed too: ${(cleanupErr as Error).message})`;
       else first = cleanupErr as Error;
+    } finally {
+      this.retire();
     }
     if (first) throw first;
+  }
+
+  /**
+   * After a close or discard, whatever the underlying close did (it may close and then throw): the handle is DEAD
+   * (no further write-back or use), and its in-process wasm claim is released (Codex #383 R2), so a stranded claim
+   * never refuses a legitimate native open.
+   */
+  private retire(): void {
+    this.closed = true;
+    if (!this.dead) this.dead = new Error("this wasm connection was closed: it can no longer be used");
+    (this.db as any).__dead = this.dead;
+    this.onClosed?.();
+    this.onClosed = null;
   }
 
   /**
@@ -500,8 +524,11 @@ class WasmDatabase implements CompatDatabase {
    */
   discard(): void {
     if (this.closed) return;
-    this.db.close();
-    this.closed = true;
+    try {
+      this.db.close();
+    } finally {
+      this.retire();
+    }
   }
 
   /**
@@ -585,33 +612,45 @@ class WasmDatabase implements CompatDatabase {
 }
 
 async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
-  let initSqlJs: any;
+  // INV-DB-01 2b-i (Codex #383 R1): the claim is recorded BEFORE the first await, so a native open of this file in
+  // this process while sql.js loads is refused by name; it becomes the writable connection's record, and ends when
+  // that connection closes (or when this open fails).
+  const token = beginWasmUse(dbPath);
   try {
-    const mod = await import("sql.js");
-    initSqlJs = mod.default;
-  } catch {
-    throw new Error(
-      "sql.js is not installed. RELAY_SQLITE_DRIVER=wasm requires sql.js. " +
-      "Install it with: npm install sql.js"
-    );
-  }
-
-  const SQL = await initSqlJs();
-
-  let rawDb: any;
-  if (fs.existsSync(dbPath)) {
-    assertNotHeldNatively(dbPath, "read the DB");
-    const fileData = fs.readFileSync(dbPath);
-    rawDb = new SQL.Database(fileData);
-  } else {
-    const dir = path.dirname(dbPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    let initSqlJs: any;
+    try {
+      const mod = await import("sql.js");
+      initSqlJs = mod.default;
+    } catch {
+      throw new Error(
+        "sql.js is not installed. RELAY_SQLITE_DRIVER=wasm requires sql.js. " +
+        "Install it with: npm install sql.js"
+      );
     }
-    rawDb = new SQL.Database();
-  }
 
-  return new WasmDatabase(rawDb, dbPath);
+    const SQL = await initSqlJs();
+
+    // From here to the record's handover: ONE synchronous sequence (the re-check, the read, the construction).
+    assertNoNativeHandle(dbPath);
+    let rawDb: any;
+    if (fs.existsSync(dbPath)) {
+      const fileData = fs.readFileSync(dbPath);
+      rawDb = new SQL.Database(fileData);
+    } else {
+      const dir = path.dirname(dbPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      rawDb = new SQL.Database();
+    }
+
+    const w = new WasmDatabase(rawDb, dbPath);
+    w.onClosed = () => endWasmUse(token);
+    return w;
+  } catch (err) {
+    endWasmUse(token);
+    throw err;
+  }
 }
 
 // --- #171: driver-aware DB-file operations for backup/restore ---
@@ -687,7 +726,6 @@ async function openReadOnlyUnchecked(dbPath: string, driver: SqliteDriver): Prom
   }
   const header = assertDriverHeaderAllows(dbPath, driver); // INV-DB-01 slice 2a: by path too
   if (driver === "wasm") {
-    assertNotHeldNatively(dbPath, "read the DB");
     const w = (await openWasmFromBytes(fs.readFileSync(dbPath), dbPath)) as WasmDatabase;
     // A READ-ONLY open never writes the file: its close discards the image (a write-back could clobber a file that
     // another connection changed meanwhile, or drop a native handle's locks on it).
@@ -716,7 +754,6 @@ export async function openExportSource(
   try {
     if (driver === "wasm") {
       // The EXACT bytes the image is built from, hashed, so the caller can tell a read that raced a writer.
-      assertNotHeldNatively(dbPath, "read the DB");
       const bytes = fs.readFileSync(dbPath);
       loadedSha256 = crypto.createHash("sha256").update(bytes).digest("hex");
       db = await openWasmFromBytes(bytes, dbPath);
@@ -757,7 +794,6 @@ export async function openExportSource(
 
 /** The SHA-256 of a file's current bytes (the torn-read guard's after-read). */
 export function fileSha256(p: string): string {
-  assertNotHeldNatively(p, "read (to hash) the file");
   return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
 }
 

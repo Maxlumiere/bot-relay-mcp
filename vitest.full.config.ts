@@ -12,7 +12,7 @@ import { withOperatorTripwire } from "./tests/_setup/vitest-tripwire-base.mjs";
 export default withOperatorTripwire({
   test: {
     globalSetup: ["./tests/global-user-config-tripwire.ts"],
-    setupFiles: ["./tests/_setup/hermetic-config.ts"],
+    setupFiles: ["./tests/_setup/hermetic-config.ts", "./tests/_setup/no-fs-on-held-db.ts"],
     include: ["tests/**/*.test.ts"],
     exclude: ["node_modules/**", "dist/**"],
   },

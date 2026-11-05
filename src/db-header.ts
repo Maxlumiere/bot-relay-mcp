@@ -13,16 +13,19 @@
  * - 0: a DB written before the stamp existed (legacy). The declarations (the instance config, the env) decide, as before.
  * Any other value belongs to another application, and the relay refuses to open (and stamp) it.
  *
- * The header is read BEFORE any open, with one non-blocking descriptor (a FIFO or a device at the DB path never
- * blocks the read). NEVER while this process holds a native connection to the file: closing ANY descriptor to a file
- * drops every POSIX lock the process holds on it (SQLite's documented hazard), so the connection would lose the
- * SHARED lock that keeps another process from checkpointing and deleting the WAL under it (MEASURED: an fcntl probe
- * from another process is DENIED before such a close and GRANTED after). A read on a path this process holds open
- * natively is therefore refused, and the stamp is decided from the header read before the open. A hold covers the
- * DB's whole FILE FAMILY (the main file, -wal, -shm, -journal: SQLite keeps its WAL locks in -shm), is registered where
- * the native handle is CONSTRUCTED (sqlite-compat.ts openNativeDb, the one place), and is released only by a close
- * that succeeded. This module never loads a driver itself (the ADR-0048 tripwire): the construction and the in-memory
- * probe live in the driver layer, which installs the probe here.
+ * Slice 2b-i: a NATIVE process never fs-opens a DB-family file. Closing ANY descriptor to a file drops every POSIX lock
+ * the process holds on it (SQLite's documented hazard), so a native connection would lose the SHARED lock that keeps
+ * another process from checkpointing and deleting the WAL under it (MEASURED in #380). The header therefore comes,
+ * in order, from:
+ *   (1) PRAGMA application_id on a native handle this process holds on the file (SQLite shares per-inode lock state
+ *       between connections in one process: MEASURED, an outside fcntl probe stays DENIED);
+ *   (3) otherwise ONE synchronous fs read of the main file's first 100 bytes, here, with no await between the check
+ *       that no handle is held and the read (a non-blocking descriptor: a FIFO or a device never blocks it).
+ * (2), a pre-open read-only SQLite open, was MEASURED out: it creates a -wal on every WAL file.
+ * The in-process native-handle COUNT (canonical path + device/inode) is changed only by the one native construction
+ * (sqlite-compat.ts openNativeDb), on a successful open and a successful close. It picks the header source and backs
+ * restore's refusal; it guards no fs read. This module loads no driver itself (the ADR-0048 tripwire): the
+ * construction and the in-memory probe live in the driver layer, which installs the probe here.
  *
  * The config and the env are declarations only: where they disagree with a stamped header, the header wins or the
  * open is refused, never silently mixed.
@@ -49,26 +52,8 @@ export type DriverHeader =
   /** A SQLite database whose application_id is not the relay's. */
   | { kind: "foreign"; id: number }
   /** Not readable as a SQLite header (not a regular file, too short, no SQLite magic, or unreadable): SQLite decides. */
-  | { kind: "unrecognised"; reason: string }
-  /** This process already holds a native connection to the file: `verdict` is what the FIRST open read; never re-read. */
-  | { kind: "held"; verdict: DriverHeader };
+  | { kind: "unrecognised"; reason: string };
 
-/** One native handle's hold on a DB's file family. */
-interface Hold {
-  /** The canonical path of the main file, UNCHANGED (never a suffix stripped: a DB may be named "x-wal"). */
-  main: string;
-  /** The main file's device + inode when the handle opened (an alias of the old file after a swap still matches). */
-  mainKey: string | null;
-  /** The header the FIRST open of this family read (a later open in this process inherits it). */
-  verdict: DriverHeader;
-  /**
-   * A STRONG reference to the handle: a held handle can never be garbage-collected (and closed by its finalizer)
-   * while it is counted. A handle abandoned without close() stays open, its locks stay, and the registry stays true.
-   */
-  handle: object;
-}
-const holds = new Set<Hold>();
-const SIDECARS = ["-wal", "-shm", "-journal"] as const;
 /** device + inode from a stat (which opens no descriptor), or null. */
 function fileKey(p: string): string | null {
   try {
@@ -90,80 +75,171 @@ function canonical(p: string): string {
     }
   }
 }
-/** The members of a hold's family: the main file and the three sidecar names SQLite appends to it. */
-const familyOf = (h: Hold): string[] => [h.main, ...SIDECARS.map((s) => h.main + s)];
-/**
- * Is a candidate (its canonical path `c`, its device + inode `k`) in a hold's family? Iff it IS the main file or one
- * of its appended sidecars by name, or a device + inode alias of the main file (then or now) or of an existing
- * sidecar. A suffix is never stripped from the candidate to guess its main file.
- */
-function inFamily(c: string, k: string | null, h: Hold): boolean {
-  const members = familyOf(h);
-  if (members.includes(c)) return true;
-  if (k === null) return false;
-  if (k === h.mainKey) return true;
-  return members.some((m) => fileKey(m) === k);
+
+/** A connection (or a wasm claim) this process holds on a DB file: its canonical path, device + inode then, handle. */
+interface Held {
+  main: string;
+  key: string | null;
+  /** A STRONG reference: a counted handle is never garbage-collected (and closed by its finalizer) while counted. */
+  handle: { pragma(source: string, options?: { simple?: boolean }): unknown } | null;
 }
-/** The first hold whose family `p` belongs to, or null. */
-function heldBy(p: string): Hold | null {
-  if (holds.size === 0) return null;
+/**
+ * The registry lives on globalThis (one per process), so every copy of this module (a test's vi.resetModules(), a
+ * second import path) registers and reads the SAME handles.
+ */
+const REGISTRY = Symbol.for("bot-relay.inv-db-01.handles");
+const registry: { native: Set<Held>; wasm: Set<Held> } = ((globalThis as Record<symbol, unknown>)[REGISTRY] ??= {
+  native: new Set<Held>(),
+  wasm: new Set<Held>(),
+}) as { native: Set<Held>; wasm: Set<Held> };
+const SIDECARS = ["-wal", "-shm", "-journal"] as const;
+/** Is `p` the file `h` was opened on (its canonical path, or its device + inode then or now)? */
+function sameFile(p: string, h: Held): boolean {
+  if (canonical(p) === h.main) return true;
+  const k = fileKey(p);
+  return k !== null && (k === h.key || k === fileKey(h.main));
+}
+function heldIn(set: Set<Held>, p: string): Held[] {
+  if (set.size === 0) return [];
+  return [...set].filter((h) => sameFile(p, h));
+}
+/** Is `p` a SIDE FILE (-wal / -shm / -journal) of `h`'s DB: by the name SQLite appends, or as an alias of one? */
+function sideFileOf(p: string, h: Held): boolean {
   const c = canonical(p);
   const k = fileKey(p);
-  for (const h of holds) if (inFamily(c, k, h)) return h;
-  return null;
+  return SIDECARS.some((s) => c === h.main + s || (k !== null && fileKey(h.main + s) === k));
 }
-/** How many native handles this process holds on the family of `p`, across every alias of it. */
-export function nativeHoldCount(p: string): number {
-  if (holds.size === 0) return 0;
-  const c = canonical(p);
-  const k = fileKey(p);
-  let n = 0;
-  for (const h of holds) if (inFamily(c, k, h)) n++;
-  return n;
+/**
+ * Is `candidate` a member of the family of the DB at `dbPath` (the DB, -wal, -shm, -journal: by canonical name, or as
+ * a device + inode alias of a member that exists)? Stats only, no descriptor. A suffix is never stripped from the
+ * candidate (a DB may be named "x-wal").
+ */
+export function isDbFamilyMember(candidate: string, dbPath: string): boolean {
+  const main = canonical(dbPath);
+  const members = [main, ...SIDECARS.map((s) => main + s)];
+  if (members.includes(canonical(candidate))) return true;
+  const k = fileKey(candidate);
+  return k !== null && members.some((m) => fileKey(m) === k);
+}
+/** A held handle that cannot run a statement now: better-sqlite3's "busy executing a query", or SQLITE_BUSY. */
+function isBusy(err: unknown): boolean {
+  const e = err as { code?: string; message?: string };
+  return e?.code === "SQLITE_BUSY" || /busy executing a query/i.test(String(e?.message ?? ""));
+}
+/**
+ * Is `p` a member of the family of any DB this process has CLAIMED: held natively, or with a wasm use recorded (the
+ * DB itself, or one of its side files, by name or by identity)? For a native construction outside openNativeDb (the
+ * doorbell's lock DB), which must never open such a file.
+ */
+export function isInClaimedFamily(p: string): boolean {
+  if (registry.native.size === 0 && registry.wasm.size === 0) return false;
+  return [...registry.native, ...registry.wasm].some((h) => sameFile(p, h) || sideFileOf(p, h));
 }
 
-/** An opaque hold, from registerNativeHold, for releaseNativeHold. */
-export type NativeHold = object;
-/**
- * Register the hold of a native handle just constructed on `dbPath` (sqlite-compat.ts openNativeDb, the one caller).
- * `verdict` is the header read before the open (a "held" verdict passes on the first open's). The hold keeps `handle`
- * alive until it is released.
- */
-export function registerNativeHold(dbPath: string, verdict: DriverHeader, handle: object): NativeHold {
-  const hold: Hold = {
-    main: canonical(dbPath),
-    mainKey: fileKey(dbPath),
-    verdict: verdict.kind === "held" ? verdict.verdict : verdict,
-    handle,
-  };
-  holds.add(hold);
-  return hold;
-}
-/** Release a hold: only once its handle is actually closed. Idempotent. */
-export function releaseNativeHold(hold: NativeHold): void {
-  holds.delete(hold as Hold);
+/** Is `p` a member of the family of ANY DB this process holds natively (the DB itself, or one of its side files)? */
+export function isInHeldNativeFamily(p: string): boolean {
+  if (registry.native.size === 0) return false;
+  return [...registry.native].some((h) => sameFile(p, h) || sideFileOf(p, h));
 }
 
+/** How many native handles this process holds on the DB at `p` (by any name of the same file). */
+export function nativeHandleCount(p: string): number {
+  return heldIn(registry.native, p).length;
+}
+/** An opaque registration, for noteNativeHandleClosed / endWasmUse. */
+export type HandleToken = object;
+/** The one native construction (sqlite-compat.ts openNativeDb) records a handle it opened. */
+export function noteNativeHandleOpened(dbPath: string, handle: NonNullable<Held["handle"]>): HandleToken {
+  const h: Held = { main: canonical(dbPath), key: fileKey(dbPath), handle };
+  registry.native.add(h);
+  return h;
+}
+/** ...and its successful close. Idempotent. */
+export function noteNativeHandleClosed(token: HandleToken): void {
+  registry.native.delete(token as Held);
+}
 /**
- * Throw when this process holds a native connection to the family of `p` (the DB, a sidecar, or an alias of one): an
- * fs open of it here, and the close that follows, would drop that connection's POSIX locks.
+ * A wasm use of a file: a writable wasm connection, or a wasm init or cold export still between its awaits. While it
+ * is recorded, a native open of that file in this process is refused (a wasm read or write-back would drop the
+ * native handle's locks). Recorded BEFORE the first await; ended once its last fs operation is done (or it failed).
  */
-export function assertNotHeldNatively(p: string, doing: string): void {
-  if (heldBy(p)) {
-    throw new Error(
-      `internal: refusing to ${doing} '${p}' through a new descriptor while this process holds a native ` +
-        `SQLite connection to that file: closing that descriptor would drop the connection's POSIX locks.`
+export function beginWasmUse(dbPath: string): HandleToken {
+  const h: Held = { main: canonical(dbPath), key: fileKey(dbPath), handle: null };
+  registry.wasm.add(h);
+  return h;
+}
+export function endWasmUse(token: HandleToken): void {
+  registry.wasm.delete(token as Held);
+}
+/** A wasm use of `dbPath` is recorded in this process. */
+export function wasmUseRecorded(dbPath: string): boolean {
+  return heldIn(registry.wasm, dbPath).length > 0;
+}
+export const WASM_USE_REFUSAL = (dbPath: string) =>
+  `REFUSING the native driver on the DB at '${dbPath}': a wasm connection to that file is open, or opening, in this ` +
+  `process, and mixing the two drivers on one file loses commits (a wasm read or write-back would drop the native ` +
+  `handle's locks).`;
+/**
+ * The synchronous re-check a wasm use makes AFTER its awaits, right before its fs read: a native handle opened in
+ * this process meanwhile (an opener that does not go through the header check) refuses it by name.
+ */
+export function assertNoNativeHandle(dbPath: string): void {
+  if (nativeHandleCount(dbPath) > 0 || isInHeldNativeFamily(dbPath)) {
+    throw new DbHeaderRefusedError(
+      `REFUSING the wasm driver on the DB at '${dbPath}': this process opened a native connection to that file ` +
+        `while the wasm open was loading, and mixing the two drivers on one file loses commits.`
     );
   }
 }
 
+function classify(id: number): DriverHeader {
+  if (id === 0) return { kind: "legacy" };
+  if (id === RELAY_APP_ID_NATIVE) return { kind: "native" };
+  if (id === RELAY_APP_ID_WASM) return { kind: "wasm" };
+  return { kind: "foreign", id };
+}
+
 /**
- * Read the driver stamp from the main file of the DB at `dbPath`, before any open. Never blocks. Throws only when this
- * process holds a native connection to that file (see the module comment): that is a bug in the caller, never a
- * verdict about the file.
+ * The DB's driver stamp. (1) A native handle this process holds on the file → its PRAGMA application_id (no fs open);
+ * (3) none → one synchronous fs read of the main file (readHeaderBytes). Never blocks.
  */
 export function readDriverHeader(dbPath: string): DriverHeader {
-  assertNotHeldNatively(dbPath, "read the header of");
+  // A side file of a DB this process holds natively is never a database, and an fs read of it would drop locks.
+  const owner = [...registry.native].find((h) => !sameFile(dbPath, h) && sideFileOf(dbPath, h));
+  if (owner) {
+    throw new DbHeaderRefusedError(
+      `REFUSING '${dbPath}' as a database: it is a side file of a database this process holds natively ` +
+        `('${owner.main}'), never a database itself, and opening it here would drop that connection's locks.`
+    );
+  }
+  const held = heldIn(registry.native, dbPath);
+  if (held.length > 0) {
+    // Source (1): the first held handle that answers. A BUSY one (an open iterator, or SQLITE_BUSY) is skipped; when
+    // every one is busy, the header cannot be read without an fs open, so the read is refused (retryable). Any other
+    // failure (e.g. SQLITE_NOTADB: the file is not a database) is the answer itself and is rethrown, never "busy".
+    let other: unknown = null;
+    for (const h of held) {
+      try {
+        return classify(Number(h.handle!.pragma("application_id", { simple: true })) | 0);
+      } catch (err) {
+        if (!isBusy(err)) other ??= err;
+      }
+    }
+    if (other) throw other;
+    throw new DbHeaderBusyError(
+      `the header of the DB at '${dbPath}' cannot be read now: every native connection this process holds on it is ` +
+        `busy (an open statement), and reading the file directly would drop their locks. Close or finish the open ` +
+        `statement, then retry.`
+    );
+  }
+  return readHeaderBytes(dbPath);
+}
+
+/**
+ * Source (3), THE one fs read of a DB-family file outside the wasm driver: only when this process holds no native
+ * handle on it (readDriverHeader checked, synchronously, just before). One non-blocking descriptor.
+ */
+function readHeaderBytes(dbPath: string): DriverHeader {
   let fd: number;
   try {
     fd = fs.openSync(dbPath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
@@ -181,11 +257,7 @@ export function readDriverHeader(dbPath: string): DriverHeader {
     if (n < HEADER_BYTES || !buf.subarray(0, SQLITE_MAGIC.length).equals(SQLITE_MAGIC)) {
       return { kind: "unrecognised", reason: "no SQLite header" };
     }
-    const id = buf.readInt32BE(APP_ID_OFFSET);
-    if (id === 0) return { kind: "legacy" };
-    if (id === RELAY_APP_ID_NATIVE) return { kind: "native" };
-    if (id === RELAY_APP_ID_WASM) return { kind: "wasm" };
-    return { kind: "foreign", id };
+    return classify(buf.readInt32BE(APP_ID_OFFSET));
   } catch (err) {
     return { kind: "unrecognised", reason: (err as NodeJS.ErrnoException).code ?? (err as Error).message };
   } finally {
@@ -197,6 +269,14 @@ export class DbHeaderRefusedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DbHeaderRefusedError";
+  }
+}
+/** The header could not be read because every held native handle is busy: retry once the open statement is done. */
+export class DbHeaderBusyError extends Error {
+  readonly retryable = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "DbHeaderBusyError";
   }
 }
 
@@ -276,20 +356,19 @@ export function _resetHeaderWarningsForTests(): void {
 }
 
 /**
- * Read the header of the DB at `dbPath`; throw (named) when it refuses `driver`, warn once when it warns. When this
- * process already holds a native connection to the file, the header was judged when that connection opened and is
- * NOT re-read (that would drop the connection's locks): another native connection is allowed (SQLite shares lock
- * state between connections in one process), and a wasm one is a driver mix, refused by name.
+ * Read the header of the DB at `dbPath`; throw (named) when it refuses `driver`, warn once when it warns. Two
+ * in-process driver mixes are refused by name first: a wasm open of a file this process holds natively, and a native
+ * open of a file it holds through a writable wasm connection. Another native connection is allowed (SQLite shares
+ * lock state between connections in one process), and its header comes through the held one (source 1).
  */
 export function assertDriverHeaderAllows(dbPath: string, driver: SqliteDriver): DriverHeader {
-  const held = heldBy(dbPath);
-  if (held) {
-    if (driver === "native") return { kind: "held", verdict: held.verdict };
+  if (driver === "wasm" && nativeHandleCount(dbPath) > 0) {
     throw new DbHeaderRefusedError(
       `REFUSING the wasm driver on the DB at '${dbPath}': this process already holds a native connection to that file, ` +
         `and mixing the two drivers on one file loses commits.`
     );
   }
+  if (driver === "native" && wasmUseRecorded(dbPath)) throw new DbHeaderRefusedError(WASM_USE_REFUSAL(dbPath));
   const header = readDriverHeader(dbPath);
   const verdict = driverHeaderVerdict(dbPath, header, driver);
   if (verdict && "refuse" in verdict) throw new DbHeaderRefusedError(verdict.refuse);
@@ -301,25 +380,18 @@ export function assertDriverHeaderAllows(dbPath: string, driver: SqliteDriver): 
 }
 
 /**
- * A native init stamps a legacy (0) or new DB "RLYN", then checkpoints (TRUNCATE) so the stamp is in the main file.
- * `before` is the header read BEFORE the open (or, for a file this process already held, the first open's): the file
- * is never read again here, since this process now holds a native connection to it (see the module comment). A DB
- * stamped before the open is not written at all. Never on a
- * wasm connection, never on a read-only one, never by an export. When another connection keeps the checkpoint from
- * completing (SQLite reports it busy), the stamp stays in the WAL until a later checkpoint carries it: warned, not fatal.
+ * A native init stamps a legacy (0) or new DB "RLYN", then checkpoints (TRUNCATE) so the stamp is in the main file
+ * (where a wasm reader, and the unheld fs read, look). `before` is the header read before the open, from either
+ * source: a held legacy file reads 0 through its connection and is stamped too. A DB already stamped is not written
+ * at all. Never on a wasm connection, never on a read-only one, never by an export. When another connection keeps the
+ * checkpoint from completing (SQLite reports it busy), the stamp stays in the WAL until a later checkpoint carries it:
+ * warned, not fatal.
  */
 export function stampNativeHeader(db: CompatDatabase, dbPath: string, before: DriverHeader): void {
-  const was = before.kind === "held" ? before.verdict : before;
-  if (was.kind !== "legacy" && was.kind !== "absent") return;
+  if (before.kind !== "legacy" && before.kind !== "absent") return;
   db.pragma(`application_id = ${RELAY_APP_ID_NATIVE}`);
   const rows = db.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy?: number }> | undefined;
-  const landed = !(Array.isArray(rows) && rows[0] && rows[0].busy !== 0);
-  if (landed) {
-    // Every hold on this file now knows it is native (a later open in this process does not stamp again).
-    const c = canonical(dbPath);
-    const k = fileKey(dbPath);
-    for (const h of holds) if (inFamily(c, k, h)) h.verdict = { kind: "native" };
-  } else {
+  if (Array.isArray(rows) && rows[0] && rows[0].busy !== 0) {
     log.warn(
       `[db] stamped the DB at '${dbPath}' as native, but the stamp is not in its main file yet (another connection ` +
         `kept the checkpoint from completing). A later checkpoint carries it; until then its header reads as legacy.`

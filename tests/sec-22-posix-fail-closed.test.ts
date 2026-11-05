@@ -21,6 +21,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { spawnSync } from "child_process";
 
 const UNRESOLVABLE = new Set<string>();
 vi.mock("../src/system-binary.js", async (importOriginal) => {
@@ -128,13 +129,15 @@ describe("SEC-22 POSIX: `relay backup` with no trusted tar fails BEFORE it write
     const archive = (await exportRelayState({ destinationPath: path.join(ROOT, "db", "restore-src.tar.gz") })).archive_path;
     const backupsDir = path.join(ROOT, "db", "backups");
     const backupsBefore = tree(backupsDir);
-    const dbBytes = fs.readFileSync(process.env.RELAY_DB_PATH!);
+    // Read by ANOTHER process: this one holds the live native connection (INV-DB-01 2b-i; the suite-wide spy).
+    const readElsewhere = (f: string) => Buffer.from(spawnSync(process.execPath, ["-e", "process.stdout.write(require('fs').readFileSync(process.argv[1]).toString('base64'))", f], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }).stdout, "base64");
+    const dbBytes = readElsewhere(process.env.RELAY_DB_PATH!);
     const before = stagings("relay-import-");
     UNRESOLVABLE.add("tar");
     await expect(importRelayState(archive, { force: true })).rejects.toThrow(/cannot locate the system tar/);
     expect(tree(backupsDir), "no safety backup written").toEqual(backupsBefore);
     expect(stagings("relay-import-"), "no staging dir created or left").toEqual(before);
-    expect(fs.readFileSync(process.env.RELAY_DB_PATH!).equals(dbBytes), "the live DB file is byte-identical").toBe(true);
+    expect(readElsewhere(process.env.RELAY_DB_PATH!).equals(dbBytes), "the live DB file is byte-identical").toBe(true);
     expect(db.getAgents().some((a) => a.name === "beta"), "the live connection still serves").toBe(true);
   });
 });

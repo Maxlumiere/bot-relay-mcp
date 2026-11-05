@@ -35,7 +35,7 @@ export default withOperatorTripwire({
     // sets its own RELAY_CONFIG_PATH at its module top overrides it (asserted in
     // tests/config-isolation.test.ts). Scoped to config+secrets, NOT RELAY_HOME.
     // (The operator tripwire is put FIRST, before this, by withOperatorTripwire.)
-    setupFiles: ["./tests/_setup/hermetic-config.ts"],
+    setupFiles: ["./tests/_setup/hermetic-config.ts", "./tests/_setup/no-fs-on-held-db.ts"],
     include: ["tests/**/*.test.ts"],
     exclude: [
       "node_modules/**",

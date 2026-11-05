@@ -20,6 +20,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import crypto from "crypto";
+import { spawnSync } from "child_process";
 
 const ENV = ["RELAY_DB_PATH", "RELAY_CONFIG_PATH", "RELAY_HTTP_PORT", "RELAY_SQLITE_DRIVER", "RELAY_ENCRYPTION_KEYRING", "RELAY_ENCRYPTION_KEYRING_PATH", "RELAY_ENCRYPTION_KEY"] as const;
 const WIN = process.platform === "win32";
@@ -66,11 +67,23 @@ async function makeSourceDb(opts: { webhookSecret?: string } = {}): Promise<void
   db.closeDb();
 }
 
+/**
+ * The main file's bytes, read by ANOTHER process: this one may hold a native handle on the DB, and an fs read here
+ * would drop that handle's locks (INV-DB-01 2b-i; the suite-wide spy enforces it).
+ */
+function bytesElsewhere(file: string): Buffer {
+  const script = path.join(os.tmpdir(), `inv-backup-01-read-${process.pid}.cjs`);
+  if (!fs.existsSync(script)) fs.writeFileSync(script, `process.stdout.write(require("fs").readFileSync(process.argv[2]).toString("base64"));\n`);
+  const r = spawnSync(process.execPath, [script, file], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error(`reading ${file} elsewhere failed: ${r.stderr}`);
+  return Buffer.from(r.stdout, "base64");
+}
+
 /** The LOGICAL content of a DB file, read through sql.js from the main file's bytes (no side file is touched). */
 async function logicalDump(file: string): Promise<string> {
   const initSqlJs = (await import("sql.js")).default;
   const SQL = await initSqlJs();
-  const db = new SQL.Database(fs.readFileSync(file));
+  const db = new SQL.Database(bytesElsewhere(file));
   try {
     const out: string[] = [];
     const master = db.exec("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name");
@@ -87,10 +100,10 @@ async function logicalDump(file: string): Promise<string> {
     db.close();
   }
 }
-const statOf = (f: string) => ({ bytes: crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex"), mtimeMs: fs.statSync(f).mtimeMs });
+const statOf = (f: string) => ({ bytes: crypto.createHash("sha256").update(bytesElsewhere(f)).digest("hex"), mtimeMs: fs.statSync(f).mtimeMs });
 /** The DB's journal mode as its header records it: bytes 18-19 are 2 in WAL mode, 1 in a rollback-journal mode. */
 const headerMode = (f: string) => {
-  const b = fs.readFileSync(f).subarray(18, 20);
+  const b = bytesElsewhere(f).subarray(18, 20);
   return b[0] === 2 && b[1] === 2 ? "wal" : "rollback";
 };
 /** A CONTENT change to the main file that keeps it a valid DB: the header's file change counter (bytes 24-27) + 1. */
