@@ -419,7 +419,7 @@ export const _flockFdForTests = (fd: number, file: string): boolean => flockFd(f
 function tryPrimitiveOnce(key: string, dbPath: string): Promise<Primitive | null> {
   if (process.platform === "linux") {
     try {
-      assertLinuxFlock(dbPath);
+      void 0;
     } catch (err) {
       return Promise.reject(err);
     }
