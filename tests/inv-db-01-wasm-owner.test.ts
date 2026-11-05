@@ -375,6 +375,16 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     a.child.stdin!.write("exit\n");
   }, 60_000);
 
+  it("in-process maintenance RE-ENTERS the owner's lock, and its release leaves the live owner holding it: a second process is still refused", async () => {
+    declareWasm();
+    await db.initializeDb(); // this process is the owner
+    const m = await compat.holdOwnerForMaintenance(dbPath, "backup"); // re-entrant here
+    m.release();
+    const b = startOwner();
+    expect(await b.first, "the owner's lock outlived the maintenance release").toMatch(/^REFUSED .*owned by another relay process/);
+    db.registerAgent("still-owner", "r", []); // and this owner still writes
+  }, 60_000);
+
   // --- Codex #385 R1, each a RED on the 2b-ii source it reviewed ---
 
   it("P1-1: a LEGACY (env-only) open that awaits sql.js while another process OWNS the file meanwhile does not become an unlocked writer", async () => {

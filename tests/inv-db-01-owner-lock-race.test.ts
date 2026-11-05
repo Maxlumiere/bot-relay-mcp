@@ -198,6 +198,34 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     }
   }, 60_000);
 
+  it.skipIf(process.platform === "win32")("the DB's canonical path MOVES while the lock is taken: the acquire re-derives the key and ends holding the lock of the path's CURRENT file", async () => {
+    const m = (await import("../dist/db-owner-lock.js")) as unknown as {
+      acquirePrimitive: (p: string, o?: { attempts?: number }) => Promise<{ release(): void }>;
+      holdsOwnerLock: (p: string) => boolean;
+      _setAfterAcquireHookForTests: (fn: (() => void) | null) => void;
+    };
+    const db = path.join(ROOT, "rederive.db");
+    const otherDir = path.join(ROOT, "rederive-elsewhere");
+    fs.mkdirSync(otherDir, { recursive: true });
+    const moved = path.join(otherDir, "moved.db");
+    fs.writeFileSync(db, "");
+    fs.writeFileSync(moved, "");
+    let once = true;
+    m._setAfterAcquireHookForTests(() => {
+      if (!once) return;
+      once = false;
+      fs.rmSync(db);
+      fs.symlinkSync(moved, db); // the name now resolves to another file, in another directory
+    });
+    try {
+      const lock = await m.acquirePrimitive(db, { attempts: 5 });
+      expect(m.holdsOwnerLock(db), "held under the CURRENT canonical file's key").toBe(true);
+      lock.release();
+    } finally {
+      m._setAfterAcquireHookForTests(null);
+    }
+  }, 60_000);
+
   it.skipIf(process.platform === "win32")("a second open + close of the lock file in the OWNER's process does not release it: a racer still loses", async () => {
     const db = path.join(ROOT, "reopen.db");
     const h = run(HOLDER_REOPENS, [db]);
