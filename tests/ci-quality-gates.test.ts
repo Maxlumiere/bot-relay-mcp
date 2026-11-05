@@ -67,6 +67,15 @@ describe("the added-line filter", () => {
     expect(ghProperty("src/a,b:c.ts")).toBe("src/a%2Cb%3Ac.ts");
     expect(ghData("a\n::x")).not.toMatch(/\n/);
   });
+  it("the lint gate prints NOTHING interpolated except through ghData (names, refs, messages)", () => {
+    const src = read("tools/lint/lint-changed.mjs");
+    // The one exception is the annotation, whose property and data are each escaped (never twice: %0A must stay %0A).
+    const annotation = "  console.log(`::${level} file=${ghProperty(f.file)},line=${f.line}::${ghData(`${f.rule}: ${f.message}`)}`);";
+    expect(src).toContain(annotation);
+    const raw = src.split("\n").filter((l) => /console\.log\(/.test(l) && /\$\{/.test(l) && !/console\.log\(ghData\(/.test(l) && l !== annotation);
+    expect(raw).toEqual([]);
+    expect(src).toContain("console.log(ghData(`lint: REFUSED: ${e.message}`));");
+  });
   it("nor the runner's LEGACY `##[...]` form, which it recognises anywhere in a line", () => {
     expect(ghData("src/##[stop-commands]pause.ts")).toBe("src/##%5Bstop-commands]pause.ts");
     expect(ghProperty("src/##[set-env name=X;]1.ts")).not.toContain("##[");

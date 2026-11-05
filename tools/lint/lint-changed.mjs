@@ -48,6 +48,7 @@ function summary(lines) {
 }
 
 function annotate(f, level = "error") {
+  // Each part escaped on its own (a property and the data are escaped differently); never the whole line again.
   console.log(`::${level} file=${ghProperty(f.file)},line=${f.line}::${ghData(`${f.rule}: ${f.message}`)}`);
 }
 
@@ -63,7 +64,7 @@ async function canary() {
   const missing = expected.filter((e) => !gotKeys.has(key(e)));
   const unexpected = got.filter((g) => !expKeys.has(key(g)));
   const rules = [...new Set(expected.map((e) => e.rule))].sort();
-  console.log(`lint canary: ${expected.length} expected findings over ${rules.length} rules (${rules.join(", ")}); ${got.length} reported`);
+  console.log(ghData(`lint canary: ${expected.length} expected findings over ${rules.length} rules (${rules.join(", ")}); ${got.length} reported`));
   for (const m of missing) console.log(ghData(`FAIL: ${m.file}:${m.line} expected ${m.rule}, which did NOT fire (the rule is off or broken: the gate would run blind)`));
   for (const u of unexpected) console.log(ghData(`FAIL: ${u.file}:${u.line} unexpected ${u.rule}: ${u.message}`));
   if (missing.length || unexpected.length) process.exit(1);
@@ -78,13 +79,14 @@ async function changed(kind, a, b) {
     const to = gateGit(ROOT, ["rev-parse", `${range.to}^{commit}`]).trim();
     if (to !== head) throw new Error(`the judged commit ${to} is not the checked-out HEAD ${head}: the files on disk are not that change`);
   } catch (e) {
-    console.log(`lint: REFUSED: ${e.message}`);
-    summary(["### Lint (bug rules, changed lines)", `REFUSED: ${e.message}`]);
+    // The message names refs the event supplied (a branch or SHA): escaped like every other printed name.
+    console.log(ghData(`lint: REFUSED: ${e.message}`));
+    summary(["### Lint (bug rules, changed lines)", `REFUSED: ${ghData(e.message)}`]);
     process.exit(1);
   }
   const files = changedFiles(ROOT, range.from, range.to).filter((f) => f.status !== "D" && inLintScope(f.to));
   if (files.length === 0) {
-    console.log(`lint: no changed file in the lint scope (${range.from.slice(0, 7)}..${range.to.slice(0, 7)})`);
+    console.log(ghData(`lint: no changed file in the lint scope (${range.from.slice(0, 7)}..${range.to.slice(0, 7)})`));
     summary(["### Lint (bug rules, changed lines)", "No changed file in the lint scope."]);
     return;
   }
@@ -96,7 +98,7 @@ async function changed(kind, a, b) {
   const linted = new Set(results.map((r) => path.relative(ROOT, r.filePath).split(path.sep).join("/")));
   for (const f of names) if (!linted.has(f)) kept.push({ file: f, line: 1, rule: "not-linted", message: "ESLint returned no result for this file" });
   const addedCount = [...added.values()].reduce((n, set) => n + set.size, 0);
-  console.log(`lint: ${range.from.slice(0, 7)}..${range.to.slice(0, 7)}: ${names.length} changed file(s), ${addedCount} added line(s), ${kept.length} finding(s) on them`);
+  console.log(ghData(`lint: ${range.from.slice(0, 7)}..${range.to.slice(0, 7)}: ${names.length} changed file(s), ${addedCount} added line(s), ${kept.length} finding(s) on them`));
   kept.forEach((f) => annotate(f));
   summary([
     "### Lint (bug rules, changed lines)",
@@ -112,7 +114,7 @@ async function all() {
   const found = results.flatMap((r) => r.messages.map((m) => ({ file: path.relative(ROOT, r.filePath), line: m.line, rule: m.ruleId ?? "not-linted", message: m.message })));
   const byRule = {};
   for (const f of found) byRule[f.rule] = (byRule[f.rule] ?? 0) + 1;
-  console.log(`lint (report only): ${names.length} files, ${found.length} finding(s): ${JSON.stringify(byRule)}`);
+  console.log(ghData(`lint (report only): ${names.length} files, ${found.length} finding(s): ${JSON.stringify(byRule)}`));
   for (const f of found) console.log(ghData(`${f.file}:${f.line} ${f.rule}: ${f.message}`));
   summary(["### Lint debt (report only, whole tree)", `${names.length} files, ${found.length} finding(s)`, ...Object.entries(byRule).map(([k, v]) => `- ${k}: ${v}`)]);
 }
