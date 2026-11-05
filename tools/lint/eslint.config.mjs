@@ -1,5 +1,5 @@
 // The CI lint gate: BUG rules only, nothing stylistic. It blocks a pull request only on the lines the pull request
-// ADDED (scripts/ci-lint-changed.mjs). Every rule here is proven live on each run by the canaries in canary/: a
+// ADDED (tools/lint/lint-changed.mjs). Every rule here is proven live on each run by the canaries in canary/: a
 // rule switched off makes its canary go silent, and the gate refuses to run.
 import tseslint from "typescript-eslint";
 

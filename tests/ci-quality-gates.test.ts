@@ -14,7 +14,7 @@ import { describe, it, expect } from "vitest";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { parseAddedLines, onAddedLines, inLintScope, canaryExpectations } from "../scripts/ci-lint-changed.mjs";
+import { parseAddedLines, onAddedLines, inLintScope, canaryExpectations } from "../scripts/ci-lint-lib.mjs";
 import { verdict } from "../scripts/ci-verdict.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");

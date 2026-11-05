@@ -187,7 +187,7 @@ jobs:
         if: github.event_name != 'pull_request'
         run: bash scripts/ci-gitleaks.sh baseline
 
-  # BLOCKING bug lint on the lines a change ADDS (scripts/ci-lint-changed.mjs; rules: tools/lint/eslint.config.mjs:
+  # BLOCKING bug lint on the lines a change ADDS (tools/lint/lint-changed.mjs; rules: tools/lint/eslint.config.mjs:
   # floating and misused promises, loose equality except `== null`, unused variables; nothing stylistic). The
   # toolchain is tools/lint's lockfile (exact versions, integrity hashes). Every rule is proven live by its canary
   # first. A pull request is linted at its HEAD commit, so the line numbers match the diff.
@@ -213,9 +213,9 @@ jobs:
       - name: Install the pinned lint toolchain
         run: npm ci --prefix tools/lint
       - name: Canary (every bug rule must fire where its canary says)
-        run: node scripts/ci-lint-changed.mjs --canary
+        run: node tools/lint/lint-changed.mjs --canary
       - name: Planted check (a floating promise on an added line must BLOCK; then reset)
-        run: node scripts/ci-lint-changed.mjs --plant-check
+        run: node tools/lint/lint-changed.mjs --plant-check
       - name: Lint the added lines (blocking)
         env:
           EVENT: ${{ github.event_name }}
@@ -225,9 +225,9 @@ jobs:
           PUSH_AFTER: ${{ github.sha }}
         run: |
           if [ "$EVENT" = pull_request ]; then
-            node scripts/ci-lint-changed.mjs --changed "$PR_BASE" "$PR_HEAD"
+            node tools/lint/lint-changed.mjs --changed "$PR_BASE" "$PR_HEAD"
           elif [ "$EVENT" = push ] && [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ]; then
-            node scripts/ci-lint-changed.mjs --changed "$PUSH_BEFORE" "$PUSH_AFTER"
+            node tools/lint/lint-changed.mjs --changed "$PUSH_BEFORE" "$PUSH_AFTER"
           else
             echo "lint: no change range on a $EVENT event"
           fi
@@ -255,7 +255,7 @@ jobs:
       - name: Install the pinned lint toolchain
         run: npm ci --prefix tools/lint
       - name: Bug-rule debt over the whole tree (report only)
-        run: node scripts/ci-lint-changed.mjs --all
+        run: node tools/lint/lint-changed.mjs --all
 
   # The PR-B timing bars measure LATENCY, so they run ALONE: on their own runner, with no suite beside them (in
   # parallel with ~300 files the runner's own noise, MEASURED 30-165 ms, exceeds the margins they resolve).

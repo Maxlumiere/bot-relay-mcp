@@ -5,7 +5,7 @@
 // See LICENSE for full terms.
 
 /**
- * The CI lint gate (BUG rules only: tools/lint/eslint.config.mjs). Run from the repo root, after
+ * The CI lint gate (BUG rules only: tools/lint/eslint.config.mjs), `node tools/lint/lint-changed.mjs <mode>`. After
  * `npm ci --prefix tools/lint` (the pinned toolchain) and the root `npm ci` (the types the rules need).
  *
  *   --canary                  lint tools/lint/canary/: every `// expect: <rule>` line must be reported by exactly that
@@ -22,66 +22,16 @@
 import fs from "fs";
 import path from "path";
 import { execFileSync } from "child_process";
-import { createRequire } from "module";
-import { fileURLToPath, pathToFileURL } from "url";
+import { fileURLToPath } from "url";
+// A STATIC import, resolved from tools/lint/node_modules (the pinned toolchain). This file lives here, outside the
+// scripts/ and tests/ the parser-pin guard scans, because loading ESLint from scripts/ needs a computed import.
+import { ESLint } from "eslint";
+import { inLintScope, parseAddedLines, onAddedLines, canaryExpectations } from "../../scripts/ci-lint-lib.mjs";
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const TOOLS = path.join(ROOT, "tools", "lint");
-
-/** The files the gate lints: the root package's TypeScript and the scripts. Fixtures may hold bad code on purpose. */
-export function inLintScope(file) {
-  if (/^tests\/fixtures\//.test(file)) return false;
-  return /^src\/.+\.(ts|mts)$/.test(file) || /^tests\/.+\.(ts|mts)$/.test(file) || /^scripts\/.+\.mjs$/.test(file);
-}
-
-/** Lines ADDED per file, from `git diff --unified=0` text: Map<file, Set<line>>. */
-export function parseAddedLines(diff) {
-  const out = new Map();
-  let file = null;
-  for (const line of diff.split("\n")) {
-    const f = line.match(/^\+\+\+ (?:b\/)?(.+)$/);
-    if (f) { file = f[1] === "/dev/null" ? null : f[1]; continue; }
-    const h = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
-    if (h && file) {
-      const start = Number(h[1]);
-      const count = h[2] === undefined ? 1 : Number(h[2]);
-      if (!out.has(file)) out.set(file, new Set());
-      for (let i = 0; i < count; i++) out.get(file).add(start + i);
-    }
-  }
-  return out;
-}
-
-/**
- * ESLint results kept to the added lines. A message with NO rule (a parse error, or "File ignored ...") means the
- * file was not checked: it is kept wherever it is, as "not-linted", so the gate cannot pass on an unlinted file.
- */
-export function onAddedLines(results, added, rel = (p) => path.relative(ROOT, p).split(path.sep).join("/")) {
-  const kept = [];
-  for (const r of results) {
-    const file = rel(r.filePath);
-    const lines = added.get(file) ?? new Set();
-    for (const m of r.messages) {
-      if (m.ruleId === null || m.ruleId === undefined) kept.push({ file, line: m.line ?? 1, rule: "not-linted", message: m.message });
-      else if (lines.has(m.line)) kept.push({ file, line: m.line, rule: m.ruleId, message: m.message });
-    }
-  }
-  return kept;
-}
-
-/** `// expect: <rule>` markers in canary sources: [{ file, line, rule }]. */
-export function canaryExpectations(file, text) {
-  const out = [];
-  text.split("\n").forEach((l, i) => {
-    const m = l.match(/\/\/ expect: (\S+)/);
-    if (m) out.push({ file, line: i + 1, rule: m[1] });
-  });
-  return out;
-}
+const TOOLS = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(TOOLS, "..", "..");
 
 async function eslint() {
-  const req = createRequire(path.join(TOOLS, "package.json"));
-  const { ESLint } = await import(pathToFileURL(req.resolve("eslint")).href);
   // cwd = the repo root: with the tools directory as cwd every repo file was "outside of base path" and IGNORED,
   // with no line number, so a line filter would have passed every pull request having linted nothing (MEASURED).
   return new ESLint({ cwd: ROOT, overrideConfigFile: path.join(TOOLS, "eslint.config.mjs"), errorOnUnmatchedPattern: false });
@@ -184,5 +134,5 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   else if (mode === "--plant-check") plantCheck();
   else if (mode === "--changed" && a && b) await changed(a, b);
   else if (mode === "--all") await all();
-  else { console.error("usage: ci-lint-changed.mjs --canary | --changed <base> <head> | --all | --plant-check"); process.exit(2); }
+  else { console.error("usage: lint-changed.mjs --canary | --changed <base> <head> | --all | --plant-check"); process.exit(2); }
 }
