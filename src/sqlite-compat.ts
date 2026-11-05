@@ -890,6 +890,12 @@ function finishLegacyWasm(SQL: any, dbPath: string, token: object): CompatDataba
   return w;
 }
 
+/** Test-only: awaited in a legacy wasm open right after sql.js loads (another process may own the file meanwhile). */
+let afterSqlJsLoadHook: ((dbPath: string) => void | Promise<void>) | null = null;
+export function _setAfterSqlJsLoadForTests(fn: ((dbPath: string) => void | Promise<void>) | null): void {
+  afterSqlJsLoadHook = fn;
+}
+
 async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
   // INV-DB-01 2b-i (Codex #383 R1): the claim is recorded BEFORE the first await, so a native open of this file in
   // this process while sql.js loads is refused by name; it becomes the writable connection's record, and ends when
@@ -908,6 +914,7 @@ async function createWasmDb(dbPath: string): Promise<CompatDatabase> {
     }
 
     const SQL = await initSqlJs();
+    await afterSqlJsLoadHook?.(dbPath);
 
     // From here to the record's handover: ONE synchronous sequence (the re-check, the read, the construction).
     assertNoNativeHandle(dbPath);
