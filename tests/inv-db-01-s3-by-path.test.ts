@@ -33,6 +33,16 @@ import { exportRelayState, importRelayState, _setBeforeRestoreSwapForTests } fro
 import * as backupMod from "../src/backup.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+/**
+ * Skips, each a FIXTURE limit named (the mechanism under test runs on every OS unless a constant says otherwise).
+ * MEASURED on Windows (#391 1baffd6, job 127929400610): the row "R1 P2-5" runs there and passes through the restore's
+ * lock-key check and assertIntact (both pass) before its nlink refusal, so those checks execute on win32.
+ */
+const WIN_FILE_SYMLINK = process.platform === "win32"; // a FILE symlink needs SeCreateSymbolicLink on Windows (a junction is directories only)
+const WIN_DIR_SYMLINK = process.platform === "win32"; // this fixture uses a directory SYMLINK (privileged on Windows), not a junction
+const WIN_LOCK_IS_A_PIPE = process.platform === "win32"; // the Windows owner lock is a named pipe: there is no lock FILE to replace
+const NO_MODE_000 = process.platform === "win32" || process.getuid?.() === 0; // mode 000 needs POSIX modes; root ignores it
+const NO_FIFO = process.platform === "win32"; // mkfifo is POSIX
 const DIST_DB = pathToFileURL(path.join(REPO, "dist", "db.js")).href;
 const WASM = 0x524c5957;
 const NATIVE = 0x524c594e;
@@ -197,7 +207,7 @@ async function stopOwner(o: { child: ChildProcess }): Promise<void> {
 describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
   // --- G1 / Codex #377 R1 P1-1: every replace targets the canonical referent ---
 
-  it.skipIf(process.platform === "win32")("G1: a restore through a SYMLINKED DB path keeps the link and restores its referent", async () => {
+  it.skipIf(WIN_FILE_SYMLINK)("G1: a restore through a SYMLINKED DB path keeps the link and restores its referent", async () => {
     const realDir = path.join(caseDir, "real");
     fs.mkdirSync(realDir);
     const real = path.join(realDir, "relay.db");
@@ -216,7 +226,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(keptRows(real), "the referent holds the archive").toEqual(["row-1"]);
   }, 60_000);
 
-  it.skipIf(process.platform === "win32")("P1-1: a restore through alias/link.db -> real/relay.db never touches alias/relay.db, another process's OWNED DB, which keeps working", async () => {
+  it.skipIf(WIN_FILE_SYMLINK)("P1-1: a restore through alias/link.db -> real/relay.db never touches alias/relay.db, another process's OWNED DB, which keeps working", async () => {
     const aliasDir = path.join(caseDir, "alias");
     const realDir = path.join(caseDir, "real");
     fs.mkdirSync(aliasDir);
@@ -350,7 +360,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     await waitExitOf(live);
   }, 60_000);
 
-  it.skipIf(process.platform === "win32")("Q2 (amended): a LIVE opener of the CANONICAL REFERENT of a symlinked DB path refuses the restore too (checked beside both names)", async () => {
+  it.skipIf(WIN_FILE_SYMLINK)("Q2 (amended): a LIVE opener of the CANONICAL REFERENT of a symlinked DB path refuses the restore too (checked beside both names)", async () => {
     const realDir = path.join(caseDir, "real");
     fs.mkdirSync(realDir);
     const real = path.join(realDir, "relay.db");
@@ -470,7 +480,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
   const setAfterCheckpoint = (backupMod as unknown as { _setAfterRestoreCheckpointForTests?: AfterCheckpoint })._setAfterRestoreCheckpointForTests;
   const setAfterStage = (backupMod as unknown as { _setAfterRestoreStageForTests?: (fn: ((newPath: string, target: string) => void) | null) => void })._setAfterRestoreStageForTests;
 
-  it.skipIf(process.platform === "win32")("R1 P1-1: a restore whose DB path is RETARGETED after its lock was taken (a symlink moved to another, owned DB) is refused by name; that DB and its live owner are untouched", async () => {
+  it.skipIf(WIN_FILE_SYMLINK)("R1 P1-1: a restore whose DB path is RETARGETED after its lock was taken (a symlink moved to another, owned DB) is refused by name; that DB and its live owner are untouched", async () => {
     const a = path.join(caseDir, "a.db");
     makeDb(a, WASM);
     const b = path.join(caseDir, "b.db");
@@ -630,11 +640,11 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     ["EACCES (mode 000)", (cfg) => {
       fs.writeFileSync(cfg, WASM_DECL, { mode: 0o600 });
       fs.chmodSync(cfg, 0o000);
-    }, process.platform === "win32" || process.getuid?.() === 0],
+    }, NO_MODE_000],
     ["a FIFO", (cfg) => {
       const r = spawnSync("mkfifo", [cfg]);
       if (r.status !== 0) throw new Error(`precondition: mkfifo failed: ${String(r.stderr)}`);
-    }, process.platform === "win32"],
+    }, NO_FIFO],
   ];
   for (const [label, make, skip] of unreadable) {
     it.skipIf(skip)(`R1 P2-4: the DB's own instance declaration is UNREADABLE (${label}) → a raw native open is refused by name, with the path and the remedy`, async () => {
@@ -665,7 +675,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(hookDbVerdict(elsewhere), "and the hooks may read it").toBe("sqlite3");
   });
 
-  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("R1 P2-4 split: a caller config path the resolver CANNOT JUDGE (EACCES on the active-instance marker, from its own syscall) fails closed: a raw open is refused, hook_db skip-unreadable", async () => {
+  it.skipIf(NO_MODE_000)("R1 P2-4 split: a caller config path the resolver CANNOT JUDGE (EACCES on the active-instance marker, from its own syscall) fails closed: a raw open is refused, hook_db skip-unreadable", async () => {
     const home = path.join(caseDir, ".bot-relay");
     fs.mkdirSync(home);
     delete process.env.RELAY_CONFIG_PATH;
@@ -735,7 +745,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
 
   // --- Codex #391 R2 (the last round), each a RED on 673bc79 ---
 
-  it.skipIf(process.platform === "win32")("R2 P1: a restore whose path moves to ANOTHER owned DB while its lock is being taken (and back before the swap) is refused: the lock it holds is not the target's; both DBs untouched", async () => {
+  it.skipIf(WIN_FILE_SYMLINK)("R2 P1: a restore whose path moves to ANOTHER owned DB while its lock is being taken (and back before the swap) is refused: the lock it holds is not the target's; both DBs untouched", async () => {
     const a = path.join(caseDir, "a.db");
     makeDb(a, WASM, ["a-row"]);
     const b = path.join(caseDir, "b.db");
@@ -767,7 +777,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(sha(b), "b is untouched").toBe(shaB);
   }, 60_000);
 
-  it.skipIf(process.platform === "win32")("R2: an owned DB's lock file REPLACED while the archive is staged refuses the rename (the lock's integrity is checked right before it); the DB untouched, the staged copy removed", async () => {
+  it.skipIf(WIN_LOCK_IS_A_PIPE)("R2: an owned DB's lock file REPLACED while the archive is staged refuses the rename (the lock's integrity is checked right before it); the DB untouched, the staged copy removed", async () => {
     makeDb(dbPath, WASM, ["row-1"]);
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
     const before = fileState(dbPath);
@@ -788,7 +798,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(fs.existsSync(staged), "the staged copy is removed").toBe(false);
   }, 60_000);
 
-  it.skipIf(process.platform === "win32")("R2 P2-3: a SYMLINKED instance directory (instances/a -> storage) still belongs to its instance: A's wasm declaration refuses B's native opener (absent DB: nothing created; legacy DB: refused, hook skip-declared-wasm)", async () => {
+  it.skipIf(WIN_DIR_SYMLINK)("R2 P2-3: a SYMLINKED instance directory (instances/a -> storage) still belongs to its instance: A's wasm declaration refuses B's native opener (absent DB: nothing created; legacy DB: refused, hook skip-declared-wasm)", async () => {
     const root = path.join(caseDir, ".bot-relay", "instances");
     fs.mkdirSync(path.join(root, "b"), { recursive: true });
     fs.writeFileSync(path.join(root, "b", "config.json"), JSON.stringify({ sqlite_driver: "native" }), { mode: 0o600 });
@@ -807,7 +817,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(hookDbVerdict(aDb)).toBe("skip-declared-wasm");
   });
 
-  it.skipIf(process.platform === "win32")("R2 P2-3: a DB path that is itself a SYMLINK INTO an instance directory belongs to that instance: A's wasm declaration refuses it (raw open, hook skip-declared-wasm)", async () => {
+  it.skipIf(WIN_FILE_SYMLINK)("R2 P2-3: a DB path that is itself a SYMLINK INTO an instance directory belongs to that instance: A's wasm declaration refuses it (raw open, hook skip-declared-wasm)", async () => {
     const { aDb } = twoInstances(WASM_DECL);
     makeDb(aDb, 0, ["row-1"]);
     const alias = path.join(caseDir, "alias.db");
@@ -817,7 +827,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(hookDbVerdict(alias)).toBe("skip-declared-wasm");
   });
 
-  it.skipIf(process.platform === "win32")("R2 P2-3: a DB path that is a SYMLINK INTO the flat relay home belongs to it: the home's wasm declaration refuses a native caller (RELAY_CONFIG_PATH native)", async () => {
+  it.skipIf(WIN_FILE_SYMLINK)("R2 P2-3: a DB path that is a SYMLINK INTO the flat relay home belongs to it: the home's wasm declaration refuses a native caller (RELAY_CONFIG_PATH native)", async () => {
     const home = path.join(caseDir, ".bot-relay");
     fs.mkdirSync(home, { recursive: true });
     fs.writeFileSync(path.join(home, "config.json"), WASM_DECL, { mode: 0o600 });
@@ -866,11 +876,11 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     ["EACCES (mode 000)", (cfg) => {
       fs.writeFileSync(cfg, JSON.stringify({ sqlite_driver: "native" }), { mode: 0o600 });
       fs.chmodSync(cfg, 0o000);
-    }, process.platform === "win32" || process.getuid?.() === 0],
+    }, NO_MODE_000],
     ["a FIFO", (cfg) => {
       const r = spawnSync("mkfifo", [cfg]);
       if (r.status !== 0) throw new Error(`precondition: mkfifo failed: ${String(r.stderr)}`);
-    }, process.platform === "win32"],
+    }, NO_FIFO],
   ];
   for (const [label, make, skip] of callerUnreadable) {
     it.skipIf(skip)(`R2 P2-4 exact twin: the CALLER's own config unreadable (${label}) → initializeDb (not a server) is refused by name, the DB unchanged`, async () => {

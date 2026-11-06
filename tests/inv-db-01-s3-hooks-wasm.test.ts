@@ -25,6 +25,9 @@ import Database from "better-sqlite3";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+/** Skips, each named: the bash hooks are not supported on native Windows (src/cli/generate-hooks.ts:124-133; WSL runs them as Linux). */
+const WIN_NO_BASH_HOOKS = process.platform === "win32";
+const NO_MODE_000 = process.platform === "win32" || process.getuid?.() === 0; // mode 000 needs POSIX modes; root ignores it
 const HOOKS = path.join(REPO, "hooks");
 const RELAY = path.join(REPO, "bin", "relay");
 const DIST_DB = pathToFileURL(path.join(REPO, "dist", "db.js")).href;
@@ -165,7 +168,7 @@ describe("INV-DB-01 slice 3: `relay where --fields` line 7, the hooks' DB verdic
     expect(lines[6], "line 7: the hooks' DB verdict").toBe(verdict);
   });
 
-  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("an UNREADABLE header (the file exists, mode 000) → skip-unreadable (fail closed), never sqlite3", () => {
+  it.skipIf(NO_MODE_000)("an UNREADABLE header (the file exists, mode 000) → skip-unreadable (fail closed), never sqlite3", () => {
     seedDb(DB());
     fs.chmodSync(DB(), 0o000);
     try {
@@ -234,7 +237,7 @@ describe("INV-DB-01 slice 3: `relay where --fields` line 7, the hooks' DB verdic
   });
 });
 
-describe.skipIf(process.platform === "win32" || !REAL_SQLITE)("INV-DB-01 slice 3: SessionStart runs NO sqlite3 on a wasm instance (a PATH-shim sqlite3 records every call)", () => {
+describe.skipIf(WIN_NO_BASH_HOOKS || !REAL_SQLITE)("INV-DB-01 slice 3: SessionStart runs NO sqlite3 on a wasm instance (a PATH-shim sqlite3 records every call)", () => {
   it.each(["rlyw", "declared-wasm"])("%s → zero sqlite3 invocations, and exactly ONE named notice", (fixture) => {
     FIXTURES[fixture]!();
     const r = runSessionStart();
@@ -328,7 +331,7 @@ function runPyHook(hook: string) {
   return { out: `${r.stdout ?? ""}\n${r.stderr ?? ""}`, loaded: lines.filter((l) => l.startsWith("LOADED")).length, connects: lines.filter((l) => l.startsWith("CONNECT")) };
 }
 
-describe.skipIf(process.platform === "win32" || !REAL_SQLITE)("INV-DB-01 slice 3: PostToolUse and Stop make ZERO python3 sqlite3 opens on a declared-wasm instance (a sitecustomize spy)", () => {
+describe.skipIf(WIN_NO_BASH_HOOKS || !REAL_SQLITE)("INV-DB-01 slice 3: PostToolUse and Stop make ZERO python3 sqlite3 opens on a declared-wasm instance (a sitecustomize spy)", () => {
   it("positive control: on RLYN, PostToolUse's python3 sqlite3 read runs (the spy sees > 0 connects)", () => {
     FIXTURES.rlyn!();
     const r = runPyHook("post-tool-use-check.sh");
