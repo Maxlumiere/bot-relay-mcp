@@ -88,10 +88,9 @@ export function _setAfterMaterializeHookForTests(fn: (() => void) | null): void 
  * Create the DB at `dbPath` if it is absent, with `initialBytes` (its first image, already stamped), ATOMICALLY: the
  * bytes go to a temp file in the same directory, which is then LINKED to the DB's name (link fails when the name
  * exists: a racer's file is kept, never overwritten), and the temp name is removed. When THIS call created it,
- * `verifyCreated` runs (no production caller passes one in this slice; the racer harness exercises it); a refusal
- * removes the DB only when it is PROVABLY the
- * one just created (the same dev + ino as the temp file's, the same size). Residual (stated): the name can still be
- * re-pointed between that comparison and the unlink.
+ * `verifyCreated` runs (no production caller passes one in this slice; the racer harness exercises it). A refusal
+ * LEAVES the created DB in place and names it, with its size (INV-DB-01 slice 3: relay code never unlinks a DB file;
+ * an unlink checked by identity could still remove a file that replaced it between the check and the unlink).
  */
 export function materializeDb(dbPath: string, initialBytes: Uint8Array, verifyCreated?: (dbPath: string) => void): void {
   if (fs.existsSync(dbPath)) return;
@@ -107,29 +106,19 @@ export function materializeDb(dbPath: string, initialBytes: Uint8Array, verifyCr
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
     if (!created) return;
-    const mine = fs.statSync(tmp, { bigint: true });
+    const size = fs.statSync(tmp).size;
     try {
       verifyCreated?.(dbPath);
     } catch (err) {
-      const left = removeIfJustCreated(dbPath, mine);
-      if (left && err instanceof Error) err.message += ` The file this open had created at ${dbPath} was NOT removed (${left}).`;
+      if (err instanceof Error) {
+        err.message +=
+          ` The DB this open created at ${dbPath} (${size} bytes) is LEFT in place: relay code never unlinks a DB file. ` +
+          `Remove it yourself if no relay process uses it.`;
+      }
       throw err;
     }
   } finally {
     fs.rmSync(tmp, { force: true });
-  }
-}
-
-/** Unlink `dbPath` only if it still names the created file (same dev + ino and size); returns why it was kept, or null. */
-function removeIfJustCreated(dbPath: string, created: fs.BigIntStats): string | null {
-  try {
-    const named = fs.lstatSync(dbPath, { bigint: true });
-    if (named.dev !== created.dev || named.ino !== created.ino) return "the name now resolves to another file";
-    if (named.size !== created.size) return "it changed since it was created";
-    fs.unlinkSync(dbPath);
-    return null;
-  } catch (err) {
-    return `it could not be checked or removed: ${(err as Error).message}`;
   }
 }
 

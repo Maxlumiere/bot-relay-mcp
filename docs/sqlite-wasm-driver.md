@@ -72,8 +72,10 @@ The driver is a property of the **instance**: a `sqlite_driver` key in the insta
 - **Other processes** reach the database through the daemon over HTTP:
   - a second process that tries to open it is refused by name;
   - so is a stdio MCP server, with the client config to use instead: `{ "type": "http", "url": "http://127.0.0.1:3777/mcp" }`;
-  - so is a native opener.
-- **A backup or a restore** of an owned database runs under the lock when no owner is live, and is refused while one is.
+  - so is a native opener;
+  - so is every relay opener that reaches the database by its PATH on an instance that declares `"wasm"` (the CLI verbs such as `relay bind`, `fleet`, `recover` and the `purge-*` verbs, and the synchronous fallback some callers use), even before the database exists: it names the HTTP client config and creates nothing;
+  - the hooks read no database on such an instance: SessionStart prints ONE notice ("hooks deliver no mail on a wasm instance; use the HTTP owner") instead of reading mail and tasks with `sqlite3` (the relay decides this for them: the 7th line of `relay where --fields`). Delivering mail to the hooks through the owner is a later release.
+- **A backup or a restore** of an owned database runs under the lock when no owner is live, and is refused while one is. A database with more than one hard link is refused by both (the lock is keyed by the file's name, so a second name could be locked by another process): remove the extra links.
 
 **Two populations run side by side until a later release converts them** (`relay db convert-journal`, slice 4):
 - **Owner mode** (`sqlite_driver: "wasm"`): one owner, safe.
@@ -131,6 +133,8 @@ If the process crashes between a write and the write-back flush, the last write 
 ## Backup and restore
 
 `relay backup` and `relay restore` work on the wasm driver (#171). The snapshot is taken via sql.js's atomic in-memory serialization (`.export()`) instead of `VACUUM INTO` (which can't write through the Emscripten virtual filesystem), and the manifest/integrity probes open through the active driver — so no native `better-sqlite3` binary is required. The `.export()` image is captured atomically, so a snapshot can't tear even if writes are in flight. Archives are standard SQLite files and **interoperate across drivers**: a backup made on native restores on wasm and vice versa, so switching drivers (e.g. adopting wasm after the npm-12 change) doesn't strand your existing archives.
+
+**A restore never deletes a database file or its side files** (either driver). It replaces the database's real file (a symlinked database path keeps its link), and it REQUIRES the `-wal`, `-shm` and `-journal` files to be absent beside it at the moment of the swap. A stale WAL or journal left beside a replaced database is applied to it by the next open, which would silently undo the restore. If one is there, the restore is refused by name (each file, with its size) and nothing is changed: stop the other process that has the database open, or open and close the database once with the native driver (SQLite then checkpoints and removes them), and retry.
 
 ## Troubleshooting
 

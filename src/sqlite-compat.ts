@@ -188,6 +188,25 @@ export function resolveOpen(dbPath: string): ResolvedOpen {
 export function isOwnedDb(dbPath: string): boolean {
   return readDriverHeader(dbPath).kind === "wasm";
 }
+/**
+ * INV-DB-01 slice 3: a NATIVE-ONLY opener that reaches the DB by its PATH (getDb()'s synchronous fallback, the CLI
+ * verbs' raw open) follows the INSTANCE. On an instance that declares sqlite_driver "wasm" the DB has ONE opener, its
+ * wasm single owner, so a native by-path open is refused by name, with the HTTP route, BEFORE anything is created or
+ * opened (whatever the file's header says, and when there is no file yet). Otherwise the header decides, as in 2a (an
+ * RLYW file is refused the same way). Returns the header verdict for the open's stamping.
+ */
+export function assertNativeByPathAllowed(dbPath: string, what: string): DriverHeader {
+  if (declaredDriver().instance === "wasm") {
+    const { configPath } = readInstanceSqliteDriver();
+    throw new DbHeaderRefusedError(
+      `REFUSING ${what} of the DB at '${dbPath}': this instance declares sqlite_driver "wasm" (in ${configPath}), so the ` +
+        `DB has ONE opener, its wasm single owner, and this native open would be a second one. Reach the owner over ` +
+        `HTTP (MCP client config: ${httpClientHint()}). If this instance should be native, set sqlite_driver to ` +
+        `"native" in that file. Nothing was created or opened.`
+    );
+  }
+  return assertDriverHeaderAllows(dbPath, "native");
+}
 /** The header, read through the same sources (and refusals) as an open with `driver` would use. */
 function readDriverHeaderForDriver(dbPath: string, driver: SqliteDriver): DriverHeader {
   if (driver === "wasm" && nativeHandleCount(dbPath) > 0) return assertDriverHeaderAllows(dbPath, "wasm"); // refuses
@@ -910,8 +929,13 @@ async function createOwnedWasmDb(dbPath: string, header: DriverHeader): Promise<
  * budget, never a wait for the owner to exit). In the owner's own process the lock is re-entrant.
  */
 export async function holdOwnerForMaintenance(dbPath: string, what: string): Promise<OwnerLock> {
+  // INV-DB-01 slice 3 (Codex #377 R1 P2-4): the lock is keyed by the canonical NAME, so a hard link (a second name of
+  // the same file) would be a second key: maintenance through it would run beside a live owner. A wasm DB with more
+  // than one link is refused by every opener, before the lock and again once it is held.
+  assertMaintenanceSingleLink(dbPath, what);
+  let lock: OwnerLock;
   try {
-    return await acquireOwnerLock(dbPath, { budgetMs: 300 });
+    lock = await acquireOwnerLock(dbPath, { budgetMs: 300 });
   } catch (err) {
     if (err instanceof OwnerLockError && /could not be locked/.test(err.message)) {
       throw new OwnerLockError(
@@ -920,6 +944,25 @@ export async function holdOwnerForMaintenance(dbPath: string, what: string): Pro
       );
     }
     throw err;
+  }
+  try {
+    assertMaintenanceSingleLink(dbPath, what); // a link made while the lock was being taken
+  } catch (err) {
+    lock.release();
+    throw err;
+  }
+  return lock;
+}
+/** Maintenance on an owned DB refuses a file with more than one hard link (each name would be its own lock key). */
+function assertMaintenanceSingleLink(dbPath: string, what: string): void {
+  if (!fs.existsSync(dbPath)) return;
+  const n = fs.statSync(dbPath).nlink;
+  if (n > 1) {
+    throw new OwnerLockError(
+      `${what} refused: the DB at ${dbPath} has ${n} hard links. Its single-owner lock is keyed by the file's name, so ` +
+        `another name could be locked and used by another process at the same time. Remove the extra links (find ` +
+        `them by the file's inode), then retry.`
+    );
   }
 }
 

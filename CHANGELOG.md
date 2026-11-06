@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### By-path opens follow the instance; a restore needs its side files gone; relay code never deletes a database file
+
+- **Changed:** on an instance that declares `sqlite_driver: "wasm"`, every relay command that opens the database natively by its path is refused by name, with the HTTP client config, and creates nothing, even before the database exists. This covers the CLI verbs that read the database directly (e.g. `relay bind`, `fleet`, `recover`, `pending`) and the synchronous fallback some callers use. Previously such a command could create and open a native database on a wasm instance.
+- **Changed:** a backup or a restore of an owned (wasm) database with more than one hard link is refused by name. The single-owner lock is keyed by the file's name, so a second name could be used beside a live owner.
+- **Changed:** a restore replaces the database's real file: a symlinked database path keeps its link. Previously it replaced the link with a regular file and left the real database as it was.
+- **Changed:** a restore REQUIRES the `-wal`, `-shm` and `-journal` files to be absent beside the database (and beside its real file) at the swap, and is refused by name, listing each file and its size, when one is present. It no longer deletes them after the swap: a stale WAL left beside a replaced database is applied to it by the next open, which silently undid the restore (measured: the pre-restore rows came back, and `integrity_check` said ok). The remedy is in the message: stop the other opener, or open and close the database once natively, then retry.
+- **Changed:** relay code never deletes a database file. A new owned database whose verification fails is left in place and named, with its size, and so is the empty file a refused open created (ADR-0048).
+- **Changed:** `relay where --fields` prints a 7th line, `hook_db`: whether the hooks may read the database with `sqlite3` (`sqlite3`, `skip-declared-wasm`, `skip-rlyw` or `skip-unreadable`). The first six lines are unchanged. The SessionStart hook reads mail and tasks only on `sqlite3`; otherwise it prints one notice naming why. On a wasm instance the hooks deliver no mail yet: use the HTTP owner. A 6-line answer (a relay CLI older than its hooks) is named as version skew, and nothing is read.
+- **Not yet (a later release):** a legacy database (no stamp) under `RELAY_SQLITE_DRIVER=wasm` with no instance declaration is unchanged: a native by-path open of it is not refused while a legacy wasm process writes it.
+
 ### Wasm driver: an instance can declare `sqlite_driver: "wasm"`, and its database gets a single owner
 
 - **Added:** `sqlite_driver: "wasm"` in an instance's `config.json` is accepted. It puts the instance in owner mode: its database is owned by ONE process, the relay daemon.

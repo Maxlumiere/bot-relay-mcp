@@ -16,9 +16,11 @@
  * by real path): a one-environment check. The full pre-restart check, which also
  * proves WHICH environment and WHICH open DB, is `relay deploy-gate`.
  *
- * --fields prints the same answer for a SHELL (the hooks): exactly six lines,
+ * --fields prints the same answer for a SHELL (the hooks): exactly seven lines,
  * kind, db_path, exists, reason, warning, vault_dir (empty lines where a field
- * does not apply), read with plain `read -r`. It is fail-closed: a resolved PATH
+ * does not apply) and hook_db (INV-DB-01 slice 3: whether the hooks may read the
+ * DB with sqlite3, one token of src/hook-db-verdict.ts HOOK_DB_VERDICTS;
+ * "skip-unreadable" on an error), read with plain `read -r`. It is fail-closed: a resolved PATH
  * containing a line break cannot be split across lines, so it is refused as the
  * error kind, and so is one with any other control character (C0 or DEL); a
  * control character in a reason or warning becomes a space.
@@ -67,7 +69,7 @@ function usage(requested = false): void {
     "Which relay DB this environment resolves to (the one strict resolver, ADR-0048).\n" +
     "Read-only. --expect-db PATH exits 1 unless the resolution names that DB (for\n" +
     "the full pre-restart check, see relay deploy-gate).\n" +
-    "--fields prints six lines for a shell: kind, db_path, exists, reason, warning, vault_dir.\n" +
+    "--fields prints seven lines for a shell: kind, db_path, exists, reason, warning, vault_dir, hook_db.\n" +
     "--env-keys lists the environment variables the resolver reads.\n\n" +
     "Exit: 0 = resolved (and matched) · 1 = a resolver fault, or no match · 2 = usage.\n";
   if (requested) process.stdout.write(text);
@@ -112,10 +114,13 @@ export async function run(argv: string[]): Promise<number> {
 
   if (args.fields) {
     const oneLine = (v: string | undefined) => (v ?? "").replace(/[\x00-\x1f\x7f]+/g, " ");
+    // INV-DB-01 slice 3: line 7 (APPENDED; lines 1-6 keep their positions) is the hooks' verdict on the sqlite3 CLI
+    // (src/hook-db-verdict.ts): the relay's one reader of the declaration and the header decides, computed now.
+    const { hookDbVerdict } = await import("../hook-db-verdict.js");
     const lines =
       r.kind === "error"
-        ? ["error", "", "", oneLine(r.reason), "", ""]
-        : [r.kind, r.dbPath, String(r.exists), "", r.kind === "flat" ? oneLine(r.warning) : "", vaultDir ?? ""];
+        ? ["error", "", "", oneLine(r.reason), "", "", "skip-unreadable"]
+        : [r.kind, r.dbPath, String(r.exists), "", r.kind === "flat" ? oneLine(r.warning) : "", vaultDir ?? "", hookDbVerdict(r.dbPath)];
     process.stdout.write(lines.join("\n") + "\n");
   } else if (args.json) {
     // ADR-0047: loaded only here, for --json (it hashes the installed
