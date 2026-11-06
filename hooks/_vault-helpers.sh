@@ -150,17 +150,19 @@ relay_hook_db_native_ok() {
   esac
   [ -n "${RELAY_HOOK_DB_NAMED:-}" ] && return 1
   RELAY_HOOK_DB_NAMED=1
-  local why
+  local why then
+  # Only the two wasm verdicts may say "a wasm instance": the others do not know what the instance is.
+  then="The hooks read nothing from this DB with sqlite3."
   case "${RELAY_RES_HOOK_DB:-}" in
-    skip-declared-wasm) why="the instance declares sqlite_driver \"wasm\"" ;;
-    skip-rlyw) why="the DB is stamped for the wasm driver's single owner (RLYW)" ;;
+    skip-declared-wasm) why="the instance declares sqlite_driver \"wasm\""; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
+    skip-rlyw) why="the DB is stamped for the wasm driver's single owner (RLYW)"; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
     skip-unreadable) why="the instance's sqlite_driver or the DB header could not be read or judged (fail closed)" ;;
     "(6-line answer)") why="the relay CLI gave a 6-line answer: CLI/hook version skew (update the relay and its hooks together)" ;;
     "") why="the relay CLI gave no DB verdict" ;;
     *) why="the relay CLI gave an unknown DB verdict" ;;
   esac
-  printf '[RELAY] hook DB read skipped (%s): %s. Hooks deliver no mail on a wasm instance; use the HTTP owner. Instance DB: %s\n' \
-    "$(printf '%s' "${RELAY_RES_HOOK_DB:-none}" | tr -cd 'A-Za-z0-9 ()_-' | cut -c1-40)" "$why" "${RELAY_RES_DB_PATH:-unknown}"
+  printf '[RELAY] hook DB read skipped (%s): %s. %s Instance DB: %s\n' \
+    "$(printf '%s' "${RELAY_RES_HOOK_DB:-none}" | tr -cd 'A-Za-z0-9 ()_-' | cut -c1-40)" "$why" "$then" "${RELAY_RES_DB_PATH:-unknown}"
   return 1
 }
 

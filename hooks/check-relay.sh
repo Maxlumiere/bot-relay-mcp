@@ -711,10 +711,11 @@ relay_deliver_pending_mail() {
       return 0
       ;;
   esac
-  # INV-DB-01 slice 3: `relay pending` opens the DB natively by path, so on a wasm instance (or any non-"sqlite3"
-  # verdict) the hook reads no mail; the skip is named once by relay_hook_db_native_ok. A resolver error keeps its
-  # own path below (the read reports the resolver's reason).
-  if [ "${RELAY_RES_KIND:-error}" != error ] && ! relay_hook_db_native_ok; then
+  # INV-DB-01 slice 3: `relay pending` opens the DB natively by path, so on a wasm instance (or a verdict this hook
+  # cannot trust: a 6-line answer, an unknown token) the hook reads no mail; the skip is named once by
+  # relay_hook_db_native_ok. skip-unreadable keeps today's read: `relay pending` judges the file itself and reports
+  # the failure by name (DEGRADED, "relay unreadable"), never as a wasm instance. A resolver error keeps its own path.
+  if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_HOOK_DB:-}" != skip-unreadable ] && ! relay_hook_db_native_ok; then
     RELAY_MAIL_MODE="no-native-db-read"
     relay_mail_verdict "CANNOT-JUDGE" "hooks deliver no mail on a wasm instance (DB verdict: ${RELAY_RES_HOOK_DB:-none}); use the HTTP owner" mail
     return 0

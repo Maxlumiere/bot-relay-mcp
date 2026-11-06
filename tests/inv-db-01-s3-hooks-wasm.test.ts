@@ -127,7 +127,7 @@ function runSessionStart(extra: Record<string, string> = {}) {
   fs.rmSync(CURL_LOG, { force: true });
   const r = spawnSync("bash", [path.join(SEAMED, "check-relay.sh")], { encoding: "utf-8", timeout: 30_000, input: "", env: envFor(extra) });
   const sqliteCalls = fs.existsSync(SQLITE_LOG) ? fs.readFileSync(SQLITE_LOG, "utf-8").split("\n").filter(Boolean) : [];
-  const notices = (r.stdout ?? "").split("\n").filter((l) => /Hooks deliver no mail on a wasm instance; use the HTTP owner/.test(l));
+  const notices = (r.stdout ?? "").split("\n").filter((l) => /^\[RELAY\] hook DB read skipped \(/.test(l));
   return { status: r.status, stdout: r.stdout ?? "", out: `${r.stdout ?? ""}\n${r.stderr ?? ""}`, sqliteCalls, notices };
 }
 
@@ -218,6 +218,7 @@ describe.skipIf(process.platform === "win32" || !REAL_SQLITE)("INV-DB-01 slice 3
     expect(r.sqliteCalls, r.out).toEqual([]);
     expect(r.notices.length, r.out).toBe(1);
     expect(r.notices[0]).toContain(fixture === "rlyw" ? "skip-rlyw" : "skip-declared-wasm");
+    expect(r.notices[0]).toContain("Hooks deliver no mail on a wasm instance; use the HTTP owner.");
     expect(r.notices[0]).toContain(DB());
   });
 
@@ -247,6 +248,7 @@ describe.skipIf(process.platform === "win32" || !REAL_SQLITE)("INV-DB-01 slice 3
     expect(r.sqliteCalls, r.out).toEqual([]);
     expect(r.notices.length, r.out).toBe(1);
     expect(r.notices[0]).toMatch(/version skew/);
+    expect(r.notices[0], "it does not claim a wasm instance").not.toMatch(/wasm instance/);
   });
 
   it("an UNKNOWN 7th token → zero sqlite3 invocations and ONE notice (only the exact token `sqlite3` enables a read)", () => {
