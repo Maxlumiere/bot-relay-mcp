@@ -691,6 +691,39 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(hookDbVerdict(elsewhere)).toBe("skip-unreadable");
   });
 
+  // The tolerated ambiguity (ADR-0048): instances exist, none is selected. Under an explicit RELAY_DB_PATH it resolves BY
+  // DESIGN to the flat config (a defined resolution, not a fault): D_db and the header decide. Without RELAY_DB_PATH
+  // the resolver throws, and that fails closed.
+  it("R1 ambiguity: an ambiguous instance set + RELAY_DB_PATH at a DB in a WASM instance → refused by that DB's own declaration", async () => {
+    const { aDb } = twoInstances(WASM_DECL);
+    delete process.env.RELAY_INSTANCE_ID; // none selected: ambiguous
+    makeDb(aDb, 0, ["row-1"]);
+    process.env.RELAY_DB_PATH = aDb;
+    await expect(openRawRelayDb(aDb, { readonly: true })).rejects.toThrow(/declares sqlite_driver "wasm"/);
+  });
+
+  it("R1 ambiguity twin: an ambiguous instance set + RELAY_DB_PATH at a DB in a NATIVE instance, the flat config native → allowed", async () => {
+    const { aDb } = twoInstances(JSON.stringify({ sqlite_driver: "native" }));
+    delete process.env.RELAY_INSTANCE_ID;
+    fs.writeFileSync(path.join(caseDir, ".bot-relay", "config.json"), JSON.stringify({ sqlite_driver: "native" }), { mode: 0o600 });
+    makeDb(aDb, 0, ["row-1"]);
+    process.env.RELAY_DB_PATH = aDb;
+    const h = await openRawRelayDb(aDb, { readonly: true });
+    h.close();
+    expect(hookDbVerdict(aDb)).toBe("sqlite3");
+  });
+
+  it("R1 ambiguity: an ambiguous instance set WITHOUT RELAY_DB_PATH → the caller's config resolution throws (no errno) → fail closed", async () => {
+    twoInstances(JSON.stringify({ sqlite_driver: "native" }));
+    delete process.env.RELAY_INSTANCE_ID;
+    delete process.env.RELAY_DB_PATH;
+    const elsewhere = path.join(caseDir, "explicit", "relay.db");
+    fs.mkdirSync(path.dirname(elsewhere), { recursive: true });
+    makeDb(elsewhere, 0, ["row-1"]);
+    await expect(openRawRelayDb(elsewhere, { readonly: true })).rejects.toThrow(/could not be read/);
+    expect(hookDbVerdict(elsewhere)).toBe("skip-unreadable");
+  });
+
   it("R1 P2-4 twin: the DB's own instance has NO config.json (ENOENT) → no declaration: the raw open is allowed", async () => {
     const { aDb } = twoInstances(null);
     makeDb(aDb, 0, ["row-1"]);
