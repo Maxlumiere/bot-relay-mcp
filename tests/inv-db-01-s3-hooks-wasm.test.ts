@@ -185,8 +185,8 @@ describe("INV-DB-01 slice 3: `relay where --fields` line 7, the hooks' DB verdic
       spy,
       `const M = require("module"); const fs = require("fs"); const load = M._load;\n` +
         `M._load = function (req, ...rest) { const m = load.call(this, req, ...rest);\n` +
-        `  if (req === "better-sqlite3" && typeof m === "function") { return new Proxy(m, { construct(t, a) { fs.appendFileSync(${JSON.stringify(spyLog)}, "better-sqlite3 " + String(a[0]) + "\\n"); return Reflect.construct(t, a); } }); }\n` +
-        `  if (req === "sql.js") fs.appendFileSync(${JSON.stringify(spyLog)}, "sql.js loaded\\n");\n` +
+        `  if (/(^|[\\\\/])better-sqlite3$/.test(req) && typeof m === "function") { return new Proxy(m, { construct(t, a) { fs.appendFileSync(${JSON.stringify(spyLog)}, "better-sqlite3 " + String(a[0]) + "\\n"); return Reflect.construct(t, a); } }); }\n` +
+        `  if (/(^|[\\\\/])sql\\.js$/.test(req)) fs.appendFileSync(${JSON.stringify(spyLog)}, "sql.js loaded\\n");\n` +
         `  return m; };\n`,
     );
     fs.rmSync(spyLog, { force: true });
