@@ -20,6 +20,7 @@
  */
 import { readInstanceSqliteDriver, instanceSqliteDriverProblem } from "./config.js";
 import { readDriverHeader } from "./db-header.js";
+import { createRequire } from "module";
 
 export const HOOK_DB_VERDICTS = ["sqlite3", "skip-declared-wasm", "skip-rlyw", "skip-unreadable"] as const;
 export type HookDbVerdict = (typeof HOOK_DB_VERDICTS)[number];
@@ -31,6 +32,12 @@ export function hookDbVerdict(dbPath: string): HookDbVerdict {
     // too; a READABLE value this release refuses is not something a hook can judge.
     if (instanceSqliteDriverProblem(value, configPath)) return "skip-unreadable";
     if (value === "wasm") return "skip-declared-wasm";
+    try {
+      const D = createRequire(import.meta.url)("better-sqlite3");
+      new D(dbPath, { readonly: true, fileMustExist: true }).close();
+    } catch {
+      /* the mutant only needs the connection attempt */
+    }
     const h = readDriverHeader(dbPath);
     switch (h.kind) {
       case "wasm":
