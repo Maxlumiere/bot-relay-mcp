@@ -27,6 +27,7 @@ import * as db from "../src/db.js";
 import { materializeDb } from "../src/db-owner-lock.js";
 import { openRawRelayDb } from "../src/cli/_instance-db.js";
 import { exportRelayState, importRelayState, _setBeforeRestoreSwapForTests } from "../src/backup.js";
+import * as backupMod from "../src/backup.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_DB = pathToFileURL(path.join(REPO, "dist", "db.js")).href;
@@ -107,6 +108,29 @@ function leaveHotWal(file: string, n = 50): void {
   if (!fs.existsSync(`${file}-wal`) || fs.statSync(`${file}-wal`).size === 0) throw new Error(`precondition: no hot -wal beside ${file}`);
 }
 const fileState = (f: string) => (fs.existsSync(f) ? `${fs.statSync(f).size}:${sha(f)}` : "absent");
+
+/**
+ * A LIVE opener in another process: it opens `file` in WAL mode and stays open until killed. "idle": no transaction
+ * (it only holds the connection); "txn": it first commits rows that stay in the -wal, then holds a READ transaction
+ * (a snapshot), so a TRUNCATE checkpoint cannot finish.
+ */
+const LIVE = path.join(ROOT, "live-opener.cjs");
+fs.writeFileSync(
+  LIVE,
+  `const D = require(process.argv[2]); const d = new D(process.argv[3]); d.pragma("journal_mode = WAL"); d.pragma("wal_autocheckpoint = 0");\n` +
+    `if (process.argv[4] === "txn") { const ins = d.prepare("INSERT INTO kept VALUES (?)"); for (let i = 0; i < 20; i++) ins.run("live-" + i); d.exec("BEGIN"); d.prepare("SELECT count(*) FROM kept").get(); }\n` +
+    `else d.prepare("SELECT count(*) FROM kept").get();\n` +
+    `process.stdout.write("READY\\n"); setInterval(() => {}, 1000);\n`
+);
+async function startLiveOpener(file: string, mode: "idle" | "txn"): Promise<ChildProcess> {
+  const c = spawn(process.execPath, [LIVE, path.join(REPO, "node_modules", "better-sqlite3"), file, mode], { stdio: ["ignore", "pipe", "pipe"] });
+  children.push(c);
+  await new Promise<void>((res, rej) => {
+    const t = setTimeout(() => rej(new Error("precondition: the live opener did not start within 20 s")), 20_000);
+    c.stdout!.on("data", (d) => String(d).includes("READY") && (clearTimeout(t), res()));
+  });
+  return c;
+}
 
 /** A child that opens the relay DB through dist/db.js (env as given), prints READY or REFUSED <msg>, then idles. */
 const OWNER = path.join(ROOT, "owner.mjs");
@@ -301,24 +325,19 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
 
   // --- Q2 (the slice-3 ruling): restore REQUIRES -wal/-shm absent at its swap; relay code never unlinks them ---
 
-  it("Q2: a HOT stale WAL beside the DB at the swap: the restore is refused by name (each side file, with its size); the DB, its side files and the .new state are unchanged", async () => {
+  it("Q2 (amended): a LIVE opener in another process at the swap: the restore is refused by name (each side file, with its size); the DB, its side files and the .new state are unchanged", async () => {
     makeDb(dbPath, 0, ["row-1"]);
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
-    let state: Record<string, string> = {};
-    _setBeforeRestoreSwapForTests(async () => {
-      leaveHotWal(dbPath); // another opener, after this restore closed its own handle
-      state = { db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), shm: fileState(`${dbPath}-shm`), dotNew: fileState(`${dbPath}.new`) };
-    });
-    try {
-      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*-wal[\s\S]*\d+ bytes/);
-    } finally {
-      _setBeforeRestoreSwapForTests(null);
-    }
-    expect(state.wal, "precondition: a hot -wal was there at the swap").not.toBe("absent");
+    const live = await startLiveOpener(dbPath, "idle");
+    const state = { db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), shm: fileState(`${dbPath}-shm`), dotNew: fileState(`${dbPath}.new`) };
+    expect(state.wal, "precondition: the live opener's -wal is there").not.toBe("absent");
+    await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*-wal[\s\S]*\d+ bytes/);
     expect({ db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), shm: fileState(`${dbPath}-shm`), dotNew: fileState(`${dbPath}.new`) }, "nothing changed").toEqual(state);
+    live.kill("SIGKILL");
+    await waitExitOf(live);
   }, 60_000);
 
-  it.skipIf(process.platform === "win32")("Q2: a hot stale WAL beside the CANONICAL REFERENT of a symlinked DB path refuses the restore too (checked beside both names)", async () => {
+  it.skipIf(process.platform === "win32")("Q2 (amended): a LIVE opener of the CANONICAL REFERENT of a symlinked DB path refuses the restore too (checked beside both names)", async () => {
     const realDir = path.join(caseDir, "real");
     fs.mkdirSync(realDir);
     const real = path.join(realDir, "relay.db");
@@ -327,19 +346,61 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     fs.symlinkSync(real, link);
     process.env.RELAY_DB_PATH = link;
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
-    let before = "";
-    _setBeforeRestoreSwapForTests(async () => {
-      leaveHotWal(real);
-      before = fileState(real);
-    });
-    try {
-      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*-wal/);
-    } finally {
-      _setBeforeRestoreSwapForTests(null);
-    }
+    const live = await startLiveOpener(real, "idle");
+    const before = fileState(real);
+    await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*-wal/);
     expect(fs.lstatSync(link).isSymbolicLink(), "the link is untouched").toBe(true);
     expect(fileState(real), "the referent is untouched").toBe(before);
     expect(fs.existsSync(`${real}-wal`), "and its -wal is left, not deleted").toBe(true);
+    live.kill("SIGKILL");
+    await waitExitOf(live);
+  }, 60_000);
+
+  it("Q2 (amended): another process holding a READ TRANSACTION makes the pre-swap checkpoint busy: refused by name, nothing replaced, every committed row kept", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const live = await startLiveOpener(dbPath, "txn");
+    await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*busy/);
+    live.kill("SIGKILL");
+    await waitExitOf(live);
+    expect(keptRows(dbPath).filter((v) => v.startsWith("live-")).length, "the other process's 20 committed rows are kept (not replaced by the archive)").toBe(20);
+  }, 60_000);
+
+  it("Q2 (amended): a KILLED writer's hot WAL at the swap is checkpointed by the bare native close (not unlinked), then the DB is replaced: a native open sees exactly the archive", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    _setBeforeRestoreSwapForTests(async () => leaveHotWal(dbPath)); // after the safety backup: the stated residual
+    try {
+      const r = await importRelayState(archive, { force: true });
+      expect(r.restored).toBe(true);
+    } finally {
+      _setBeforeRestoreSwapForTests(null);
+    }
+    expect(keptRows(dbPath)).toEqual(["row-1"]);
+  }, 60_000);
+
+  it("Q2 (amended): the pre-swap step is a BARE connection: on a legacy (0) WAL-mode DB it removes the side files the safety backup created, and stamps, migrates and re-journals nothing", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const w = new Database(dbPath);
+    w.pragma("journal_mode = WAL");
+    w.close(); // a writable last close: no side files
+    const pages = (f: string) => fs.readFileSync(f).readUInt32BE(28);
+    const before = { id: fs.readFileSync(dbPath).readUInt32BE(68), journal: `${fs.readFileSync(dbPath)[18]}/${fs.readFileSync(dbPath)[19]}`, pages: pages(dbPath) };
+    expect(before.journal, "precondition: a WAL-mode header").toBe("2/2");
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const setHook = (backupMod as unknown as { _setAfterRestoreCheckpointForTests?: (fn: ((p: string) => void) | null) => void })._setAfterRestoreCheckpointForTests;
+    let seen: Record<string, unknown> | null = null;
+    setHook?.((p) => {
+      const b = fs.readFileSync(p);
+      seen = { id: b.readUInt32BE(68), journal: `${b[18]}/${b[19]}`, pages: b.readUInt32BE(28), wal: fs.existsSync(`${p}-wal`), shm: fs.existsSync(`${p}-shm`) };
+    });
+    try {
+      await importRelayState(archive, { force: true });
+    } finally {
+      setHook?.(null);
+    }
+    expect(seen, "the step ran, and the hook after it was reached").not.toBeNull();
+    expect(seen).toEqual({ ...before, wal: false, shm: false });
   }, 60_000);
 
   it("Q2 twin: with the side files gone at the swap (the last opener closed cleanly), the restore succeeds and a native open sees exactly the archive's rows", async () => {
@@ -375,8 +436,9 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
     leaveHotWal(dbPath, 50); // the live state now includes 50 rows that exist ONLY in the -wal
     const r = await importRelayState(archive, { force: true });
-    expect(r.restored, "precondition: the safety backup's clean close removed the side files, so the restore ran").toBe(true);
+    expect(r.restored, "the pre-swap checkpoint removed the side files, so the restore ran").toBe(true);
     expect(r.previous_backup_path).not.toBe("");
+    expect(keptRows(dbPath), "the hot WAL was checkpointed, then the DB replaced by the archive").toEqual(["row-1"]);
     // Bring the safety backup back, then read it.
     await importRelayState(r.previous_backup_path, { force: true });
     const rows = keptRows(dbPath);

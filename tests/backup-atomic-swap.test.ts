@@ -146,7 +146,7 @@ describe("v2.1 Phase 4q MED #5 — atomic backup swap", () => {
     },
   );
 
-  it("(2) stale WAL/shm from the pre-restore session is removed after the rename", async () => {
+  it("(2) stale WAL/shm from the pre-restore session are gone before the swap (checkpointed away by restore's bare native close, never unlinked): no stale content reaches the restored DB", async () => {
     const archive = await seedAndBackup();
 
     // Simulate a stale WAL + shm left behind by a prior DB session. These
