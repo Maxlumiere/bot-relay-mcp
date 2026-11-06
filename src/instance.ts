@@ -405,7 +405,8 @@ export function configPathFor(r: ResolvedInstance): string {
   if (process.env.RELAY_CONFIG_PATH) return process.env.RELAY_CONFIG_PATH;
   if (r.kind === "error") {
     if (r.ambiguous && process.env.RELAY_DB_PATH) return flatConfigPath();
-    throw new Error(r.reason);
+    // The resolver's own errno travels with the fault (a typed `code`, absent when the fault is not a syscall's).
+    throw Object.assign(new Error(r.reason), r.code !== undefined ? { code: r.code } : {});
   }
   return r.kind === "instance" ? path.join(path.dirname(r.dbPath), CONFIG_FILE) : flatConfigPath();
 }

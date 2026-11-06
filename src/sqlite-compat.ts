@@ -22,7 +22,7 @@ import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
-import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver, readSqliteDriverAt } from "./config.js";
+import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver, readSqliteDriverAt, getConfigPath } from "./config.js";
 import { colocatedConfigPathFor } from "./instance.js";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
@@ -215,10 +215,33 @@ const sameConfigFile = (a: string, b: string): boolean => {
  * DIFFERENT file from the caller's: a DB of one instance reached from another instance's process (RELAY_DB_PATH,
  * --db-path, RELAY_CONFIG_PATH). Null when the DB has no instance association, or the file is the caller's own.
  */
-function dbHomeDeclaration(dbPath: string, caller: Declaration): Declaration | null {
+function dbHomeDeclaration(dbPath: string, caller: Declaration | null): Declaration | null {
   const own = colocatedConfigPathFor(dbPath);
-  if (own === null || sameConfigFile(own, caller.configPath)) return null;
+  if (own === null || (caller !== null && sameConfigFile(own, caller.configPath))) return null;
   return readSqliteDriverAt(own);
+}
+/**
+ * The caller's declaration FILE. When the caller's config path cannot be resolved, the resolver's fault is classified
+ * by the typed errno of its OWN syscall (never by message text):
+ * - PROVEN ABSENT (ENOENT, ENOTDIR: no instance or config can exist there, e.g. the relay home is a file) → no caller
+ *   declaration (null); the DB's own instance is still consulted;
+ * - anything else, including a fault with no code (an invalid instance id, an ambiguous resolution) → CANNOT JUDGE:
+ *   unreadable, fail closed (an instance marker this process cannot read might name a wasm instance).
+ */
+function callerDeclaration(): Declaration | null {
+  let configPath: string;
+  try {
+    configPath = getConfigPath();
+  } catch (err) {
+    const code = (err as { code?: unknown }).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    return {
+      value: undefined,
+      configPath: "(the instance config path could not be resolved)",
+      unreadable: typeof code === "string" ? `${(err as Error).message}` : `${(err as Error).message} (no errno: not provably absent)`,
+    };
+  }
+  return readSqliteDriverAt(configPath);
 }
 /** Why `d` forbids a NON-OWNER native open, or null when it allows one. */
 function declarationRefusal(dbPath: string, what: string, d: Declaration): { kind: "declared-wasm" | "unreadable"; message: string } | null {
@@ -255,9 +278,10 @@ export type NativeOpenVerdict = { ok: true } | { ok: false; kind: "declared-wasm
  * unreadable config (it reads its own file, so no reader disagrees with it).
  */
 export function nativeOpenVerdict(dbPath: string, what: string): NativeOpenVerdict {
-  const caller = readInstanceSqliteDriver();
+  const caller = callerDeclaration();
   const other = dbHomeDeclaration(dbPath, caller);
-  for (const d of other ? [caller, other] : [caller]) {
+  for (const d of [caller, other]) {
+    if (d === null) continue;
     const r = declarationRefusal(dbPath, what, d);
     if (r) return { ok: false, ...r };
   }
