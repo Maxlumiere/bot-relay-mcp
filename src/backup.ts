@@ -41,7 +41,7 @@ import { withDeadline } from "./http-deadline.js";
 import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
 import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
-import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, resolveOpen, isOwnedDb, holdOwnerForMaintenance, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
+import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, resolveOpen, isOwnedDb, holdOwnerForMaintenance, checkpointBeforeRestoreSwap, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
 import { assertDriverHeaderAllows, nativeHandleCount, isDbFamilyMember, isInHeldNativeFamily, beginWasmUse, endWasmUse, assertNoNativeHandle } from "./db-header.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
@@ -643,6 +643,11 @@ let beforeRestoreSwapHook: ((dbPath: string) => void | Promise<void>) | null = n
 export function _setBeforeRestoreSwapForTests(fn: ((dbPath: string) => void | Promise<void>) | null): void {
   beforeRestoreSwapHook = fn;
 }
+/** Test-only: awaited right after restore's pre-swap checkpoint step and before its side-file check. */
+let afterRestoreCheckpointHook: ((dbPath: string) => void | Promise<void>) | null = null;
+export function _setAfterRestoreCheckpointForTests(fn: ((dbPath: string) => void | Promise<void>) | null): void {
+  afterRestoreCheckpointHook = fn;
+}
 
 export async function importRelayState(archivePath: string, options: ImportOptions = {}): Promise<ImportResult> {
   assertTarLocatable(); // before the safety backup, the staging dir, or closing the live DB
@@ -789,6 +794,11 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // Codex #385 R2 P1-2: an OWNED DB is replaced only while this restore's acquisition still holds the lock and its
     // lock file is still the file at its name (removed or replaced, another process may own and have written the DB).
     restoreOwner?.assertIntact();
+    // INV-DB-01 slice 3, Q2 AMENDED: on a native or legacy DB, one bare writable native connection checkpoints the WAL
+    // (TRUNCATE, refused when busy) and closes, so the side files the safety backup's read-only open created are gone
+    // when no other process has the DB open. An owned DB opens nothing here. Then the absence check decides.
+    if (!restoreOwner) checkpointBeforeRestoreSwap(srcDbPath);
+    await afterRestoreCheckpointHook?.(srcDbPath);
     // INV-DB-01 slice 3: the swap replaces the DB's CANONICAL referent (a symlinked DB path keeps its link, and the
     // name the owner lock is keyed by is the name replaced), and it REQUIRES the side files ABSENT, checked by stat
     // only, beside both names, immediately before it. Relay code never deletes them: a stale WAL beside a replaced

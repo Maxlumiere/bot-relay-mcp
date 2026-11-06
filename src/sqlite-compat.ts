@@ -39,6 +39,7 @@ import {
   nativeHandleCount,
   readDriverHeader,
   RELAY_APP_ID_WASM,
+  RELAY_APP_ID_NATIVE,
   httpClientHint,
   _installNativeProbe,
   type DriverHeader,
@@ -239,6 +240,52 @@ export function openNativeDb(dbPath: string, options: BetterSqlite3.Options, _ve
     }
   };
   return db;
+}
+
+/**
+ * INV-DB-01 slice 3, Q2 AMENDED: restore's step right before its side-file check. The safety backup's
+ * READ-ONLY open creates -wal/-shm on a WAL-mode DB and cannot remove them, so restore would refuse the very files it
+ * planted. On a native (RLYN) or legacy (0) DB, when the native driver loads here: ONE bare writable connection (no
+ * initializeDb, no migration, no stamp, no journal_mode change), the application_id re-checked, a TRUNCATE checkpoint
+ * (refused by name when it reports busy), then close. SQLite removes the side files only when the LAST connection
+ * closes, so another process's live connection still leaves them, and the absence check refuses. It writes only pages
+ * already committed, after the safety backup, onto a file the swap then replaces. Run only after closeDb() and the
+ * second assertNoOtherNativeHold (this process holds no handle on the file). On an owned (RLYW) DB, a foreign or
+ * unreadable header, or without a native driver, it opens nothing and the absence check decides.
+ */
+export function checkpointBeforeRestoreSwap(dbPath: string): { ran: boolean; why?: string } {
+  if (!fs.existsSync(dbPath)) return { ran: false, why: "no DB at the path" };
+  const header = readDriverHeader(dbPath); // no native handle here: source (3), one fs read
+  if (header.kind !== "native" && header.kind !== "legacy") return { ran: false, why: `its header is ${header.kind}` };
+  let loads = true;
+  try {
+    new (loadNative())(":memory:").close();
+  } catch {
+    loads = false;
+  }
+  if (!loads) return { ran: false, why: "the native driver does not load in this process" };
+  const expected = header.kind === "native" ? RELAY_APP_ID_NATIVE : 0;
+  const db = openNativeDb(dbPath, { fileMustExist: true }, header);
+  try {
+    const id = (Number(db.pragma("application_id", { simple: true })) >>> 0);
+    if (id !== expected >>> 0) {
+      throw new Error(
+        `restore refused: the DB at '${dbPath}' changed while it was being restored (its application_id is now ` +
+          `0x${id.toString(16).padStart(8, "0")}, not 0x${(expected >>> 0).toString(16).padStart(8, "0")}). Nothing was replaced.`
+      );
+    }
+    const rows = db.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number; checkpointed: number }>;
+    const busy = rows[0]?.busy ?? 0;
+    if (busy !== 0) {
+      throw new Error(
+        `restore refused: the DB at '${dbPath}' is in use by another process (its WAL checkpoint reported busy). Stop ` +
+          `the other opener, then retry. Nothing was replaced.`
+      );
+    }
+  } finally {
+    db.close();
+  }
+  return { ran: true };
 }
 
 // The header check's "can native load HERE" probe: an in-memory open, closed at once (never a DB file).
