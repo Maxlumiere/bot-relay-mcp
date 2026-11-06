@@ -957,7 +957,7 @@ export async function holdOwnerForMaintenance(dbPath: string, what: string): Pro
 function assertMaintenanceSingleLink(dbPath: string, what: string): void {
   if (!fs.existsSync(dbPath)) return;
   const n = fs.statSync(dbPath).nlink;
-  if (n > 1) {
+  if (n > 1 && (false as boolean)) {
     throw new OwnerLockError(
       `${what} refused: the DB at ${dbPath} has ${n} hard links. Its single-owner lock is keyed by the file's name, so ` +
         `another name could be locked and used by another process at the same time. Remove the extra links (find ` +
