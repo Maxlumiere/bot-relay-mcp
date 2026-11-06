@@ -22,7 +22,8 @@ import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
-import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver } from "./config.js";
+import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver, readSqliteDriverAt } from "./config.js";
+import { colocatedConfigPathFor } from "./instance.js";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
 import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
@@ -168,6 +169,14 @@ export function resolveOpen(dbPath: string): ResolvedOpen {
     assertDriverHeaderAllows(dbPath, "wasm"); // the in-process mixes (a native handle counted) are refused by name
     return { driver: "wasm", mode: "owner", header: peek };
   }
+  if (d.driver === "native") {
+    // INV-DB-01 slice 3 (P2-3): a DB of ANOTHER instance (its own config.json is not the caller's) is opened natively
+    // only when that instance's declaration allows it too.
+    const { configPath } = readInstanceSqliteDriver();
+    const other = dbHomeDeclaration(dbPath, { value: undefined, configPath });
+    const r = other ? declarationRefusal(dbPath, "a native open", other) : null;
+    if (r) throw new DbHeaderRefusedError(r.message);
+  }
   const header = assertDriverHeaderAllows(dbPath, d.driver);
   if (d.driver === "native") return { driver: "native", mode: "native", header };
   if (header.kind === "absent") return { driver: "wasm", mode: d.instance === "wasm" ? "owner" : "legacy-wasm", header };
@@ -189,23 +198,79 @@ export function resolveOpen(dbPath: string): ResolvedOpen {
 export function isOwnedDb(dbPath: string): boolean {
   return readDriverHeader(dbPath).kind === "wasm";
 }
+/** One instance declaration as read from its config.json (ENOENT = no declaration; any other failure = unreadable). */
+type Declaration = { value: unknown; configPath: string; unreadable?: string };
+const sameConfigFile = (a: string, b: string): boolean => {
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync.native(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  return real(a) === real(b);
+};
+/**
+ * The declaration of the instance whose directory HOLDS the DB (instance.ts colocatedConfigPathFor), when it is a
+ * DIFFERENT file from the caller's: a DB of one instance reached from another instance's process (RELAY_DB_PATH,
+ * --db-path, RELAY_CONFIG_PATH). Null when the DB has no instance association, or the file is the caller's own.
+ */
+function dbHomeDeclaration(dbPath: string, caller: Declaration): Declaration | null {
+  const own = colocatedConfigPathFor(dbPath);
+  if (own === null || sameConfigFile(own, caller.configPath)) return null;
+  return readSqliteDriverAt(own);
+}
+/** Why `d` forbids a NON-OWNER native open, or null when it allows one. */
+function declarationRefusal(dbPath: string, what: string, d: Declaration): { kind: "declared-wasm" | "unreadable"; message: string } | null {
+  if (d.unreadable !== undefined) {
+    return {
+      kind: "unreadable",
+      message:
+        `REFUSING ${what} of the DB at '${dbPath}': the instance declaration at ${d.configPath} could not be read ` +
+        `(${d.unreadable}), so whether this DB may be opened natively is unknown. Fix or remove that config.json. ` +
+        `Nothing was created or opened.`,
+    };
+  }
+  const problem = instanceSqliteDriverProblem(d.value, d.configPath);
+  if (problem) return { kind: "unreadable", message: `REFUSING ${what} of the DB at '${dbPath}': ${problem} Nothing was created or opened.` };
+  if (d.value === "wasm") {
+    return {
+      kind: "declared-wasm",
+      message:
+        `REFUSING ${what} of the DB at '${dbPath}': its instance declares sqlite_driver "wasm" (in ${d.configPath}), ` +
+        `so the DB has ONE opener, its wasm single owner, and this native open would be a second one. Reach the owner ` +
+        `over HTTP (MCP client config: ${httpClientHint()}). If this instance should be native, set sqlite_driver to ` +
+        `"native" in that file. Nothing was created or opened.`,
+    };
+  }
+  return null;
+}
+export type NativeOpenVerdict = { ok: true } | { ok: false; kind: "declared-wasm" | "unreadable"; message: string };
+/**
+ * INV-DB-01 slice 3, the ONE native-open predicate for every NON-OWNER native opener (the by-path openers, getDb()'s
+ * fallback, a cold native export, restore's pre-swap step, and the hooks' verdict): it consults the CALLER's declaration
+ * (RELAY_CONFIG_PATH or the resolved config) AND the declaration of the instance that holds the DB. A native open is
+ * allowed only when neither declares wasm and neither is unreadable (widen-only: neither alone can allow). The header is
+ * checked separately (assertDriverHeaderAllows). The instance's own server keeps declaredDriver()'s warn on an
+ * unreadable config (it reads its own file, so no reader disagrees with it).
+ */
+export function nativeOpenVerdict(dbPath: string, what: string): NativeOpenVerdict {
+  const caller = readInstanceSqliteDriver();
+  const other = dbHomeDeclaration(dbPath, caller);
+  for (const d of other ? [caller, other] : [caller]) {
+    const r = declarationRefusal(dbPath, what, d);
+    if (r) return { ok: false, ...r };
+  }
+  return { ok: true };
+}
 /**
  * INV-DB-01 slice 3: a NATIVE-ONLY opener that reaches the DB by its PATH (getDb()'s synchronous fallback, the CLI
- * verbs' raw open) follows the INSTANCE. On an instance that declares sqlite_driver "wasm" the DB has ONE opener, its
- * wasm single owner, so a native by-path open is refused by name, with the HTTP route, BEFORE anything is created or
- * opened (whatever the file's header says, and when there is no file yet). Otherwise the header decides, as in 2a (an
- * RLYW file is refused the same way). Returns the header verdict for the open's stamping.
+ * verbs' raw open, a cold native export) is refused by name, BEFORE anything is created or opened, unless
+ * nativeOpenVerdict allows it; then the header decides, as in 2a. Returns the header verdict for the open's stamping.
  */
 export function assertNativeByPathAllowed(dbPath: string, what: string): DriverHeader {
-  if (declaredDriver().instance === "wasm") {
-    const { configPath } = readInstanceSqliteDriver();
-    throw new DbHeaderRefusedError(
-      `REFUSING ${what} of the DB at '${dbPath}': this instance declares sqlite_driver "wasm" (in ${configPath}), so the ` +
-        `DB has ONE opener, its wasm single owner, and this native open would be a second one. Reach the owner over ` +
-        `HTTP (MCP client config: ${httpClientHint()}). If this instance should be native, set sqlite_driver to ` +
-        `"native" in that file. Nothing was created or opened.`
-    );
-  }
+  const v = nativeOpenVerdict(dbPath, what);
+  if (!v.ok) throw new DbHeaderRefusedError(v.message);
   return assertDriverHeaderAllows(dbPath, "native");
 }
 /** The header, read through the same sources (and refusals) as an open with `driver` would use. */
@@ -255,6 +320,10 @@ export function openNativeDb(dbPath: string, options: BetterSqlite3.Options, _ve
  */
 export function checkpointBeforeRestoreSwap(dbPath: string): { ran: boolean; why?: string } {
   if (!fs.existsSync(dbPath)) return { ran: false, why: "no DB at the path" };
+  // Codex #391 R1 P1-2: the same predicate as every non-owner native opener (a declared-wasm instance, or an unreadable
+  // declaration, opens nothing natively here).
+  const verdict = nativeOpenVerdict(dbPath, "restore's pre-swap checkpoint");
+  if (!verdict.ok) return { ran: false, why: verdict.message };
   const header = readDriverHeader(dbPath); // no native handle here: source (3), one fs read
   if (header.kind !== "native" && header.kind !== "legacy") return { ran: false, why: `its header is ${header.kind}` };
   let loads = true;
@@ -1001,7 +1070,7 @@ export async function holdOwnerForMaintenance(dbPath: string, what: string): Pro
   return lock;
 }
 /** Maintenance on an owned DB refuses a file with more than one hard link (each name would be its own lock key). */
-function assertMaintenanceSingleLink(dbPath: string, what: string): void {
+export function assertMaintenanceSingleLink(dbPath: string, what: string): void {
   if (!fs.existsSync(dbPath)) return;
   const n = fs.statSync(dbPath).nlink;
   if (n > 1) {

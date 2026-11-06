@@ -13,24 +13,24 @@
  * - "sqlite3": the DB is native, legacy (application_id 0), absent or empty: today's sqlite3 path;
  * - "skip-declared-wasm": the instance declares sqlite_driver "wasm";
  * - "skip-rlyw": the DB is stamped for the wasm driver's single owner;
- * - "skip-unreadable": the declaration or the header could not be read or judged (fail closed).
+ * - "skip-unreadable": a declaration (the caller's, or the DB's own instance's) or the header could not be read or
+ *   judged (fail closed).
  *
  * It opens NO SQLite connection: the header comes from db-header.ts readDriverHeader, an fs read here (this process
  * holds no native handle on the DB). Computed on every call (the answer is about now; nothing is cached).
  */
-import { readInstanceSqliteDriver, instanceSqliteDriverProblem } from "./config.js";
 import { readDriverHeader } from "./db-header.js";
+import { nativeOpenVerdict } from "./sqlite-compat.js";
 
 export const HOOK_DB_VERDICTS = ["sqlite3", "skip-declared-wasm", "skip-rlyw", "skip-unreadable"] as const;
 export type HookDbVerdict = (typeof HOOK_DB_VERDICTS)[number];
 
 export function hookDbVerdict(dbPath: string): HookDbVerdict {
   try {
-    const { value, configPath } = readInstanceSqliteDriver();
-    // An unreadable config makes the relay itself fall back to the default (native, warned), so the header decides here
-    // too; a READABLE value this release refuses is not something a hook can judge.
-    if (instanceSqliteDriverProblem(value, configPath)) return "skip-unreadable";
-    if (value === "wasm") return "skip-declared-wasm";
+    // The ONE native-open predicate (sqlite-compat.ts nativeOpenVerdict): the caller's declaration AND the DB's own
+    // instance's; a wasm declaration skips, and an unreadable or invalid one skips too (fail closed, Codex #391 R1 P2-4).
+    const v = nativeOpenVerdict(dbPath, "a hook's sqlite3 read");
+    if (!v.ok) return v.kind === "declared-wasm" ? "skip-declared-wasm" : "skip-unreadable";
     const h = readDriverHeader(dbPath);
     switch (h.kind) {
       case "wasm":

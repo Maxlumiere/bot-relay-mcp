@@ -421,6 +421,28 @@ export function flatConfigPath(env: ResolverEnv = process.env): string {
   return path.join(relayRootFor(env), CONFIG_FILE);
 }
 
+/**
+ * INV-DB-01 slice 3 (the native-open predicate): the config.json of the instance whose directory HOLDS `dbPath` (by real
+ * path): an instance directory under the relay root, or the relay root itself (the flat layout). DB and config are
+ * colocated by construction there (configPathFor). Null when the DB's directory is neither (no association), or does
+ * not resolve.
+ */
+export function colocatedConfigPathFor(dbPath: string, env: ResolverEnv = process.env): string | null {
+  const real = (p: string): string | null => {
+    try {
+      return fs.realpathSync.native(p);
+    } catch {
+      return null;
+    }
+  };
+  const dir = real(path.dirname(path.resolve(dbPath)));
+  if (dir === null) return null;
+  if (dir === real(relayRootFor(env))) return path.join(dir, CONFIG_FILE);
+  const instances = real(instancesRootFor(env));
+  if (instances !== null && path.dirname(dir) === instances) return path.join(dir, CONFIG_FILE);
+  return null;
+}
+
 /** The config path of instance `id` under `env`'s relay root. An invalid id throws (the same rule as instanceDir). */
 export function configPathForInstance(id: string, env: ResolverEnv = process.env): string {
   const root = instancesRootFor(env);

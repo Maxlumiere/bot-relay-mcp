@@ -41,7 +41,7 @@ import { withDeadline } from "./http-deadline.js";
 import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
 import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
-import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, resolveOpen, isOwnedDb, holdOwnerForMaintenance, checkpointBeforeRestoreSwap, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
+import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, resolveOpen, isOwnedDb, holdOwnerForMaintenance, checkpointBeforeRestoreSwap, assertMaintenanceSingleLink, assertNativeByPathAllowed, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
 import { assertDriverHeaderAllows, nativeHandleCount, isDbFamilyMember, isInHeldNativeFamily, beginWasmUse, endWasmUse, assertNoNativeHandle } from "./db-header.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
@@ -300,6 +300,8 @@ async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<
   }
   const resolved = resolveOpen(srcDbPath);
   const d = resolved.driver;
+  // INV-DB-01 slice 3: a COLD native export is a non-owner native opener: the one predicate (both declarations).
+  if (d === "native") assertNativeByPathAllowed(srcDbPath, "a cold native export");
   // INV-DB-01 2b-i (Codex #383 R1): a cold WASM export reads the live file with fs (the image, then its torn-read
   // hash), across awaits. Its claim is recorded first, so a native open of the file in this process meanwhile is
   // refused by name, and it is re-checked synchronously right before the hash.
@@ -386,6 +388,23 @@ function restoreReplaceTarget(srcDbPath: string): string {
   return path.join(fs.realpathSync.native(path.dirname(srcDbPath)), path.basename(srcDbPath));
 }
 
+/**
+ * INV-DB-01 slice 3 (Codex #391 R1): what must hold at the swap, checked after the pre-swap step and again right before
+ * the rename: the configured path still resolves to the planned target (P1-1), an owned DB still has ONE link (P2-5),
+ * and no side file is beside either name.
+ */
+function assertSwapPreconditions(srcDbPath: string, target: string, owned: boolean): void {
+  const now = restoreReplaceTarget(srcDbPath);
+  if (now !== target) {
+    throw new Error(
+      `restore refused: the DB path ${srcDbPath} now resolves to ${now}, not ${target}, the file this restore checked` +
+        `${owned ? " and locked" : ""}. Nothing was replaced. Point the path back (or run the restore again).`
+    );
+  }
+  if (owned) assertMaintenanceSingleLink(target, "restore");
+  assertNoSideFilesAtSwap([srcDbPath, target]);
+}
+
 /** The SQLite side files whose presence at a restore's swap refuses it (a hot one would be applied to the new DB). */
 const SWAP_SIDE_SUFFIXES = ["-wal", "-shm", "-journal"] as const;
 /**
@@ -409,9 +428,9 @@ function assertNoSideFilesAtSwap(names: string[]): void {
   throw new Error(
     `restore refused: SQLite side files are beside the DB at the swap: ${present.join(", ")}. A stale WAL or journal ` +
       `beside a replaced DB is applied to it by the next open, which would silently undo the restore, and relay code ` +
-      `never deletes them. They mean another process has the DB open, or a WAL was not checkpointed: stop the other ` +
-      `opener, or open and close the DB once with the native driver (SQLite then checkpoints and removes them), and ` +
-      `retry. Nothing was changed.`
+      `never deletes them. They mean another process has the DB open (stop it, then retry), or they are a leftover ` +
+      `from an external tool's PERSIST/TRUNCATE or persistent-WAL mode: confirm that nothing has the DB open, then ` +
+      `remove them. Nothing was changed.`
   );
 }
 
@@ -643,10 +662,16 @@ let beforeRestoreSwapHook: ((dbPath: string) => void | Promise<void>) | null = n
 export function _setBeforeRestoreSwapForTests(fn: ((dbPath: string) => void | Promise<void>) | null): void {
   beforeRestoreSwapHook = fn;
 }
-/** Test-only: awaited right after restore's pre-swap checkpoint step and before its side-file check. */
-let afterRestoreCheckpointHook: ((dbPath: string) => void | Promise<void>) | null = null;
-export function _setAfterRestoreCheckpointForTests(fn: ((dbPath: string) => void | Promise<void>) | null): void {
+/** Test-only: awaited right after restore's pre-swap checkpoint step (with its result) and before its side-file check. */
+type CheckpointResult = { ran: boolean; why?: string };
+let afterRestoreCheckpointHook: ((dbPath: string, result: CheckpointResult) => void | Promise<void>) | null = null;
+export function _setAfterRestoreCheckpointForTests(fn: ((dbPath: string, result: CheckpointResult) => void | Promise<void>) | null): void {
   afterRestoreCheckpointHook = fn;
+}
+/** Test-only: awaited right after the archive is staged into `.new`, before the final checks and the rename. */
+let afterRestoreStageHook: ((newPath: string, target: string) => void | Promise<void>) | null = null;
+export function _setAfterRestoreStageForTests(fn: ((newPath: string, target: string) => void | Promise<void>) | null): void {
+  afterRestoreStageHook = fn;
 }
 
 export async function importRelayState(archivePath: string, options: ImportOptions = {}): Promise<ImportResult> {
@@ -762,6 +787,10 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // would survive the swap on the OLD file. Refused by name before any mutation, and again after closeDb().
     const liveNow = peekDb();
     assertNoOtherNativeHold(srcDbPath, liveNow && driverOf(liveNow) === "native" ? 1 : 0);
+    // Codex #391 R1 P1-1: the file this restore will replace is fixed HERE, with the lock it takes (the lock is keyed by
+    // this same canonical name). Right before the rename the configured path must still resolve to it, or the restore
+    // is refused: a retargeted symlink could otherwise point the swap at a file whose lock it never took.
+    const plannedTarget = restoreReplaceTarget(srcDbPath);
     if (fs.existsSync(srcDbPath) && isOwnedDb(srcDbPath)) {
       restoreOwner = await holdOwnerForMaintenance(srcDbPath, "restore");
     }
@@ -796,17 +825,27 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     restoreOwner?.assertIntact();
     // INV-DB-01 slice 3, Q2 AMENDED: on a native or legacy DB, one bare writable native connection checkpoints the WAL
     // (TRUNCATE, refused when busy) and closes, so the side files the safety backup's read-only open created are gone
-    // when no other process has the DB open. An owned DB opens nothing here. Then the absence check decides.
-    if (!restoreOwner) checkpointBeforeRestoreSwap(srcDbPath);
-    await afterRestoreCheckpointHook?.(srcDbPath);
+    // when no other process has the DB open. An owned DB, a declared-wasm instance or an unreadable declaration opens
+    // nothing here (the same predicate as every non-owner native opener). Then the absence check decides.
+    const checkpoint = restoreOwner ? { ran: false, why: "an owned DB (its single-owner lock is held)" } : checkpointBeforeRestoreSwap(srcDbPath);
+    await afterRestoreCheckpointHook?.(srcDbPath, checkpoint);
     // INV-DB-01 slice 3: the swap replaces the DB's CANONICAL referent (a symlinked DB path keeps its link, and the
     // name the owner lock is keyed by is the name replaced), and it REQUIRES the side files ABSENT, checked by stat
-    // only, beside both names, immediately before it. Relay code never deletes them: a stale WAL beside a replaced
-    // DB is applied to it by the next open (MEASURED: the pre-restore rows came back, integrity_check ok).
-    const target = restoreReplaceTarget(srcDbPath);
-    assertNoSideFilesAtSwap([srcDbPath, target]);
+    // only, beside both names. Relay code never deletes them: a stale WAL beside a replaced DB is applied to it by the
+    // next open (MEASURED: the pre-restore rows came back, integrity_check ok).
+    const target = plannedTarget;
+    assertSwapPreconditions(srcDbPath, target, restoreOwner !== null);
     const newPath = target + ".new";
     fs.copyFileSync(extractedDbPath, newPath);
+    try {
+      await afterRestoreStageHook?.(newPath, target);
+      // Codex #391 R1: the checks again, right before the rename (a side file, a retarget or a new hard link could
+      // appear while the archive was being copied into .new).
+      assertSwapPreconditions(srcDbPath, target, restoreOwner !== null);
+    } catch (err) {
+      fs.rmSync(newPath, { force: true }); // this restore's own staged copy (never a DB-family name)
+      throw err;
+    }
     try {
       fs.renameSync(newPath, target);
     } catch (err) {

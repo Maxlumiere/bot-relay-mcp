@@ -58,7 +58,7 @@ relay_helpers_cli() {
 # bounded by an explicit cap in seconds (the 2nd argument, from the caller's
 # relay_budget_for), or else by relay_budget_for here (the pre-mail budget).
 relay_where_load() {
-  local cli="${1:-$(relay_helpers_cli)}" cap="${2:-}" secs outf errf rc k="" d="" e="" why="" warn="" vault="" hookdb="" nlines=0
+  local cli="${1:-$(relay_helpers_cli)}" cap="${2:-}" secs outf errf rc k="" d="" e="" why="" warn="" vault="" hookdb="" nlines=0 nrec=0
   export RELAY_RES_LOADED=1 RELAY_RES_KIND=error RELAY_RES_DB_PATH="" RELAY_RES_EXISTS="" RELAY_RES_REASON="" RELAY_RES_WARNING="" RELAY_RES_HOOK_DB=""
   if ! command -v node >/dev/null 2>&1; then
     export RELAY_RES_REASON="node not found (the relay CLI runs on node)"
@@ -96,6 +96,9 @@ relay_where_load() {
   rc=$?
   { IFS= read -r k; IFS= read -r d; IFS= read -r e; IFS= read -r why; IFS= read -r warn; IFS= read -r vault; IFS= read -r hookdb; } < "$outf"
   nlines=$(wc -l < "$outf" 2>/dev/null | tr -d ' ')
+  # Codex #391 R1: an EXACT record: every field newline-terminated, nothing after the last one (wc -l counts newlines,
+  # awk counts records, so an unterminated trailing field makes them differ).
+  nrec=$(awk 'END { print NR }' "$outf" 2>/dev/null)
   rm -f "$outf" "$errf" "$outf.timedout" 2>/dev/null
   if [ "$rc" -eq 124 ]; then
     export RELAY_RES_REASON="relay where timed out after ${secs}s"
@@ -103,6 +106,10 @@ relay_where_load() {
   fi
   # INV-DB-01 slice 3: line 7 is the hooks' DB verdict (relay_hook_db_native_ok). A 6-line answer is an older relay CLI
   # than these hooks: the resolution stands, and the hooks read no DB (named as CLI/hook version skew).
+  if [ "${nrec:-0}" != "${nlines:-0}" ]; then
+    export RELAY_RES_REASON="relay where gave an invalid answer (exit $rc: ${nrec:-0} fields, ${nlines:-0} newline-terminated)"
+    return 1
+  fi
   case "${nlines:-0}" in
     7) export RELAY_RES_HOOK_DB="$hookdb" ;;
     6) export RELAY_RES_HOOK_DB="(6-line answer)" ;;

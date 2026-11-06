@@ -137,6 +137,15 @@ export function readInstanceSqliteDriver(): { value: unknown; configPath: string
   } catch (err) {
     return { value: undefined, configPath: "(the instance config path could not be resolved)", unreadable: (err as Error).message };
   }
+  return readSqliteDriverAt(configPath);
+}
+
+/**
+ * INV-DB-01 slice 3: `sqlite_driver` read from ONE given config.json (the caller's, or the one colocated with a DB in
+ * its instance directory), with readInstanceSqliteDriver's rules: ENOENT is "no declaration"; any other failure is
+ * named as unreadable.
+ */
+export function readSqliteDriverAt(configPath: string): { value: unknown; configPath: string; unreadable?: string } {
   // ONE descriptor for the inspection and the read (no stat-then-read race). It is opened NON-BLOCKING, so a FIFO with no
   // writer (or a terminal) returns at once instead of stalling a DB open that worked before this field existed. Only an
   // absent file (ENOENT) is "no config", silently, as before; a denied parent (EACCES, EPERM, ENOTDIR) is named; a

@@ -717,7 +717,12 @@ relay_deliver_pending_mail() {
   # the failure by name (DEGRADED, "relay unreadable"), never as a wasm instance. A resolver error keeps its own path.
   if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_HOOK_DB:-}" != skip-unreadable ] && ! relay_hook_db_native_ok; then
     RELAY_MAIL_MODE="no-native-db-read"
-    relay_mail_verdict "CANNOT-JUDGE" "hooks deliver no mail on a wasm instance (DB verdict: ${RELAY_RES_HOOK_DB:-none}); use the HTTP owner" mail
+    # Only the two wasm verdicts say "a wasm instance" (Codex #391 R1): the others do not know what the instance is.
+    case "${RELAY_RES_HOOK_DB:-}" in
+      skip-declared-wasm|skip-rlyw) why="hooks deliver no mail on a wasm instance (DB verdict: ${RELAY_RES_HOOK_DB}); use the HTTP owner" ;;
+      *) why="hooks read no mail: the relay CLI's DB verdict (${RELAY_RES_HOOK_DB:-none}) is not one they act on" ;;
+    esac
+    relay_mail_verdict "CANNOT-JUDGE" "$why" mail
     return 0
   fi
   bin="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"

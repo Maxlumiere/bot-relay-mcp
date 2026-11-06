@@ -61,8 +61,8 @@ const INVENTORY: Record<string, Entry> = {
   // --- config, keys, tokens, instance metadata ---
   "src/config.ts::loadConfig::readFileSync": { n: 1, source: "config.json (getConfigPath())" },
   "src/config.ts::readConfigFileKeys::readFileSync": { n: 1, source: "config.json (getConfigPath())" },
-  "src/config.ts::readInstanceSqliteDriver::openSync": { n: 1, source: "config.json (getConfigPath()), one non-blocking descriptor" },
-  "src/config.ts::readInstanceSqliteDriver::readFileSync": { n: 1, source: "the same descriptor" },
+  "src/config.ts::readSqliteDriverAt::openSync": { n: 1, source: "an instance's config.json (getConfigPath(), or the one colocated in an instance directory), one non-blocking descriptor" },
+  "src/config.ts::readSqliteDriverAt::readFileSync": { n: 1, source: "the same descriptor" },
   "src/encryption.ts::loadKeyring::readFileSync": { n: 1, source: "RELAY_ENCRYPTION_KEYRING_PATH" },
   "src/token-lookup.ts::persistedKey::readFileSync": { n: 1, source: "persistedSecretPath() (the token-lookup key file)" },
   "src/token-lookup.ts::persistedKey::writeFileSync": { n: 1, source: "persistedSecretPath()" },
