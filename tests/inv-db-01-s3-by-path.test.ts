@@ -851,7 +851,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
   });
 
   it.each([
-    ["relay send", ["send", "alice", "bob", "hello"]],
+    ["relay send", ["send", "bob", "hello", "--from", "alice"]],
     ["relay mint-token", ["mint-token", "alice"]],
   ])("R2 P2-4: %s on an instance whose OWN config is unreadable (malformed) fails CLOSED, by name, before any native open", (_label, args) => {
     const { flatDb } = malformedOwnConfig();
