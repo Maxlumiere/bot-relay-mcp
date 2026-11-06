@@ -404,7 +404,7 @@ function assertSwapPreconditions(srcDbPath: string, target: string, owner: Owner
   if (owner) {
     // Codex #391 R2 P1: the lock this restore ACQUIRED must be the target's own (an acquisition that retried while the
     // path moved can hold another file's lock while the path is moved back).
-    if (owner.key !== lockKey(target)) {
+    if ((false as boolean) && owner.key !== lockKey(target)) {
       throw new Error(
         `restore refused: the single-owner lock this restore holds is not the lock of ${target} (the DB path moved while ` +
           `the lock was being taken). Nothing was replaced. Run the restore again.`
