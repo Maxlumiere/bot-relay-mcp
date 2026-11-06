@@ -327,14 +327,18 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
 
   // --- Q2 (the slice-3 ruling): restore REQUIRES -wal/-shm absent at its swap; relay code never unlinks them ---
 
-  it("Q2 (amended): a LIVE opener in another process at the swap: the restore is refused by name (each side file, with its size); the DB, its side files and the .new state are unchanged", async () => {
+  it("Q2 (amended): a LIVE opener in another process at the swap: the restore is refused by name (each side file, with its size); the DB, its WAL and the .new state are unchanged, the -shm left in place", async () => {
     makeDb(dbPath, 0, ["row-1"]);
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
     const live = await startLiveOpener(dbPath, "idle");
     const state = { db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), shm: fileState(`${dbPath}-shm`), dotNew: fileState(`${dbPath}.new`) };
     expect(state.wal, "precondition: the live opener's -wal is there").not.toBe("absent");
     await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*-wal[\s\S]*\d+ bytes/);
-    expect({ db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), shm: fileState(`${dbPath}-shm`), dotNew: fileState(`${dbPath}.new`) }, "nothing changed").toEqual(state);
+    // The DB and its WAL are byte for byte unchanged, and no .new was made. The -shm is SQLite's shared-memory INDEX
+    // (no data): every connection updates it, the safety backup's read-only open and the pre-swap step included, so
+    // the row asserts it is still there (never deleted), at its size.
+    expect({ db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), dotNew: fileState(`${dbPath}.new`) }, "the DB, its WAL and the .new state are unchanged").toEqual({ db: state.db, wal: state.wal, dotNew: state.dotNew });
+    expect(fs.existsSync(`${dbPath}-shm`) ? fs.statSync(`${dbPath}-shm`).size : -1, "the -shm is left in place, at its size").toBe(Number(state.shm.split(":")[0]));
     live.kill("SIGKILL");
     await waitExitOf(live);
   }, 60_000);
