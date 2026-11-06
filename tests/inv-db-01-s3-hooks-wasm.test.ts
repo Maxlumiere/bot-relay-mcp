@@ -104,6 +104,11 @@ const FIXTURES: Record<string, () => void> = {
     fs.writeFileSync(DB(), "");
   },
   foreign: () => seedDb(DB(), 0x12345678),
+  "unreadable-wasm-declaration": () => {
+    seedDb(DB(), 0);
+    fs.mkdirSync(path.dirname(CFG()), { recursive: true });
+    fs.writeFileSync(CFG(), '{"sqlite_driver": "wasm"', { mode: 0o600 }); // a wasm declaration that no longer parses
+  },
   "invalid-declaration": () => {
     seedDb(DB());
     declare("turbo");
@@ -147,6 +152,7 @@ describe("INV-DB-01 slice 3: `relay where --fields` line 7, the hooks' DB verdic
     ["declared-wasm", "skip-declared-wasm"],
     ["foreign", "skip-unreadable"],
     ["invalid-declaration", "skip-unreadable"],
+    ["unreadable-wasm-declaration", "skip-unreadable"],
   ];
   it.each(table)("%s → line 7 is %s; lines 1-6 keep their positions", (fixture, verdict) => {
     FIXTURES[fixture]!();
@@ -167,6 +173,13 @@ describe("INV-DB-01 slice 3: `relay where --fields` line 7, the hooks' DB verdic
     } finally {
       fs.chmodSync(DB(), 0o600);
     }
+  });
+
+  it("R1 P2-4: an UNREADABLE wasm declaration over a readable legacy DB: `relay pending` (the hooks' mail read) is refused by name too, fail closed", () => {
+    FIXTURES["unreadable-wasm-declaration"]!();
+    const r = spawnSync(process.execPath, [RELAY, "pending", AGENT, "--json"], { encoding: "utf-8", env: envFor() });
+    expect(r.status, r.stdout + r.stderr).not.toBe(0);
+    expect(r.stdout + r.stderr).toMatch(/could not be read[\s\S]*fix or remove that config\.json/i);
   });
 
   it("a resolver ERROR still prints 7 lines (line 7 skip-unreadable), exit 1", () => {

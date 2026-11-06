@@ -14,6 +14,7 @@
  * until it is listed, and no listed remove may name a DB-family path.
  */
 import { describe, it, expect } from "vitest";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { srcProgram, virtualProgram } from "./_helpers/ts-binding.js";
@@ -89,3 +90,38 @@ describe("INV-DB-01 slice 3: no relay code unlinks a DB-family file", () => {
     });
   });
 });
+
+/**
+ * The side-file absence rule's stated limit (the slice-3 ruling): a PERSIST/TRUNCATE rollback journal or a persistent WAL
+ * leaves side files after a healthy close, so the rule would refuse. The relay itself never selects one: src sets
+ * journal_mode only to WAL (and, later, DELETE in convert-journal), and never persist_wal or journal_size_limit.
+ */
+describe("INV-DB-01 slice 3: src never selects a journal mode that leaves side files after a clean close", () => {
+  const SRC = path.join(REPO, "src");
+  const files = (d: string): string[] => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? files(path.join(d, e.name)) : e.name.endsWith(".ts") ? [path.join(d, e.name)] : []));
+  const MODE = /journal_mode\s*=\s*['"]?([A-Za-z]+)/gi;
+  const PERSIST = /persist_wal|journal_size_limit|PERSIST_WAL/i;
+  const scan = (text: string) => ({ modes: [...text.matchAll(MODE)].map((m) => m[1]!.toUpperCase()), persist: PERSIST.test(text) });
+  it("every journal_mode src sets is WAL or DELETE, and no persist_wal / journal_size_limit", () => {
+    const hits: string[] = [];
+    let modes = 0;
+    for (const f of files(SRC)) {
+      const r = scan(fs.readFileSync(f, "utf-8"));
+      modes += r.modes.length;
+      for (const m of r.modes) if (m !== "WAL" && m !== "DELETE") hits.push(`${path.relative(REPO, f)}: journal_mode=${m}`);
+      if (r.persist) hits.push(`${path.relative(REPO, f)}: persist_wal / journal_size_limit`);
+    }
+    expect(modes, "the scan sees the relay's own journal_mode = WAL").toBeGreaterThan(0);
+    expect(hits).toEqual([]);
+  });
+  it.each([
+    ["PERSIST", `db.pragma("journal_mode = PERSIST");`],
+    ["TRUNCATE", `db.pragma('journal_mode=truncate')`],
+    ["persist_wal", `db.fileControl(SQLITE_FCNTL_PERSIST_WAL, 1)`],
+    ["journal_size_limit", `db.pragma("journal_size_limit = 0")`],
+  ] as const)("planted %s is caught", (_label, text) => {
+    const r = scan(text);
+    expect(r.persist || r.modes.some((m) => m !== "WAL" && m !== "DELETE")).toBe(true);
+  });
+});
+

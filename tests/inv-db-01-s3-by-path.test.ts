@@ -335,7 +335,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     const live = await startLiveOpener(dbPath, "idle");
     const state = { db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), shm: fileState(`${dbPath}-shm`), dotNew: fileState(`${dbPath}.new`) };
     expect(state.wal, "precondition: the live opener's -wal is there").not.toBe("absent");
-    await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*-wal[\s\S]*\d+ bytes/);
+    await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*-wal[\s\S]*\d+ bytes[\s\S]*external tool's PERSIST\/TRUNCATE or persistent-WAL mode/);
     // The DB and its WAL are byte for byte unchanged, and no .new was made. The -shm is SQLite's shared-memory INDEX
     // (no data): every connection updates it, the safety backup's read-only open and the pre-swap step included, so
     // the row asserts it is still there (never deleted), at its size.
@@ -542,6 +542,120 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(fileState(dbPath), "the DB is untouched").toBe(before);
     expect(fs.existsSync(staged), "the staged .new (this restore's own copy, not a DB name) is removed").toBe(false);
   }, 60_000);
+
+  // --- Codex #391 R1 P2-3 / P2-4 (one predicate: the DB's own instance declaration AND the caller's) ---
+
+  /** Two instances under this test's relay root: A declares `declA` (or has none), B (active) declares native. */
+  function twoInstances(declA: string | null): { aDb: string; aCfg: string } {
+    const root = path.join(caseDir, ".bot-relay", "instances");
+    fs.mkdirSync(path.join(root, "a"), { recursive: true });
+    fs.mkdirSync(path.join(root, "b"), { recursive: true });
+    const aCfg = path.join(root, "a", "config.json");
+    if (declA !== null) fs.writeFileSync(aCfg, declA, { mode: 0o600 });
+    fs.writeFileSync(path.join(root, "b", "config.json"), JSON.stringify({ sqlite_driver: "native" }), { mode: 0o600 });
+    delete process.env.RELAY_CONFIG_PATH;
+    process.env.RELAY_INSTANCE_ID = "b";
+    return { aDb: path.join(root, "a", "relay.db"), aCfg };
+  }
+  const WASM_DECL = JSON.stringify({ sqlite_driver: "wasm" });
+  const RELAY_BIN = path.join(REPO, "bin", "relay");
+  const cli = (args: string[]) =>
+    spawnSync(process.execPath, [RELAY_BIN, ...args], {
+      encoding: "utf-8",
+      env: { PATH: process.env.PATH ?? "", HOME: caseDir, USERPROFILE: caseDir, RELAY_INSTANCE_ID: "b", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(caseDir, "wc.json") },
+    });
+
+  it("R1 P2-3: A declares wasm, B (active) is native: A's ABSENT DB through RELAY_DB_PATH is refused by getDb()'s fallback and by a raw open, and nothing is created", async () => {
+    const { aDb } = twoInstances(WASM_DECL);
+    process.env.RELAY_DB_PATH = aDb;
+    expect(() => db.getDb()).toThrow(/declares sqlite_driver "wasm"/);
+    await expect(openRawRelayDb(aDb, { readonly: true })).rejects.toThrow(/declares sqlite_driver "wasm"/);
+    expect(fs.existsSync(aDb), "nothing was created").toBe(false);
+  });
+
+  it("R1 P2-3: A declares wasm, B (active) is native: A's LEGACY (0) DB through RELAY_DB_PATH is refused by a raw open AND by initializeDb (no native init, the file unchanged)", async () => {
+    const { aDb } = twoInstances(WASM_DECL);
+    makeDb(aDb, 0, ["row-1"]);
+    const before = sha(aDb);
+    process.env.RELAY_DB_PATH = aDb;
+    await expect(openRawRelayDb(aDb, { readonly: true })).rejects.toThrow(/declares sqlite_driver "wasm"/);
+    await expect(db.initializeDb()).rejects.toThrow(/declares sqlite_driver "wasm"/);
+    expect(sha(aDb), "the file is unchanged (no stamp, no schema)").toBe(before);
+  });
+
+  it("R1 P2-3: the same through --db-path (a CLI verb, another process): A's absent DB and A's legacy (0) DB are each refused by name, nothing created or changed", () => {
+    const { aDb } = twoInstances(WASM_DECL);
+    const absent = cli(["purge-history", "someone", "--db-path", aDb, "--dry-run"]);
+    expect(absent.status, absent.stdout + absent.stderr).not.toBe(0);
+    expect(absent.stdout + absent.stderr).toMatch(/declares sqlite_driver "wasm"/);
+    expect(fs.existsSync(aDb), "nothing was created").toBe(false);
+    makeDb(aDb, 0, ["row-1"]);
+    const before = sha(aDb);
+    const legacy = cli(["purge-history", "someone", "--db-path", aDb, "--dry-run"]);
+    expect(legacy.status, legacy.stdout + legacy.stderr).not.toBe(0);
+    expect(legacy.stdout + legacy.stderr).toMatch(/declares sqlite_driver "wasm"/);
+    expect(sha(aDb), "the file is unchanged").toBe(before);
+  }, 60_000);
+
+  it("R1 P2-3: RELAY_CONFIG_PATH names a NATIVE config while the DB's own instance declares wasm → refused (both are consulted; neither alone can allow)", async () => {
+    const { aDb } = twoInstances(WASM_DECL);
+    makeDb(aDb, 0, ["row-1"]);
+    const nativeCfg = path.join(caseDir, "native-config.json");
+    fs.writeFileSync(nativeCfg, JSON.stringify({ sqlite_driver: "native" }), { mode: 0o600 });
+    process.env.RELAY_CONFIG_PATH = nativeCfg;
+    await expect(openRawRelayDb(aDb, { readonly: true })).rejects.toThrow(/declares sqlite_driver "wasm"/);
+  });
+
+  it("R1 P2-3 twin: both declarations native → the raw open is allowed", async () => {
+    const { aDb } = twoInstances(JSON.stringify({ sqlite_driver: "native" }));
+    makeDb(aDb, 0, ["row-1"]);
+    const h = await openRawRelayDb(aDb, { readonly: true });
+    h.close();
+  });
+
+  it("R1 P2-3 twin: a DB with NO instance association (outside every instance dir and the relay home) and a native caller → the header decides: a legacy (0) DB opens", async () => {
+    twoInstances(WASM_DECL);
+    const elsewhere = path.join(caseDir, "elsewhere", "relay.db");
+    fs.mkdirSync(path.dirname(elsewhere), { recursive: true });
+    makeDb(elsewhere, 0, ["row-1"]);
+    const h = await openRawRelayDb(elsewhere, { readonly: true });
+    h.close();
+  });
+
+  const unreadable: Array<[string, (cfg: string) => void, boolean]> = [
+    ["a parse error", (cfg) => fs.writeFileSync(cfg, '{"sqlite_driver": "wasm"', { mode: 0o600 }), false],
+    ["EACCES (mode 000)", (cfg) => {
+      fs.writeFileSync(cfg, WASM_DECL, { mode: 0o600 });
+      fs.chmodSync(cfg, 0o000);
+    }, process.platform === "win32" || process.getuid?.() === 0],
+    ["a FIFO", (cfg) => {
+      const r = spawnSync("mkfifo", [cfg]);
+      if (r.status !== 0) throw new Error(`precondition: mkfifo failed: ${String(r.stderr)}`);
+    }, process.platform === "win32"],
+  ];
+  for (const [label, make, skip] of unreadable) {
+    it.skipIf(skip)(`R1 P2-4: the DB's own instance declaration is UNREADABLE (${label}) → a raw native open is refused by name, with the path and the remedy`, async () => {
+      const { aDb, aCfg } = twoInstances(null);
+      makeDb(aDb, 0, ["row-1"]);
+      make(aCfg);
+      try {
+        await expect(openRawRelayDb(aDb, { readonly: true })).rejects.toThrow(/could not be read[\s\S]*fix or remove that config\.json/i);
+      } finally {
+        try {
+          fs.chmodSync(aCfg, 0o600);
+        } catch {
+          /* a FIFO or a parse-error file: nothing to restore */
+        }
+      }
+    });
+  }
+
+  it("R1 P2-4 twin: the DB's own instance has NO config.json (ENOENT) → no declaration: the raw open is allowed", async () => {
+    const { aDb } = twoInstances(null);
+    makeDb(aDb, 0, ["row-1"]);
+    const h = await openRawRelayDb(aDb, { readonly: true });
+    h.close();
+  });
 
   // --- G5: a DB file is never unlinked: a refusal leaves it and names it ---
 
