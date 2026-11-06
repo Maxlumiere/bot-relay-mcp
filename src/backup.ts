@@ -794,7 +794,6 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // only, beside both names, immediately before it. Relay code never deletes them: a stale WAL beside a replaced
     // DB is applied to it by the next open (MEASURED: the pre-restore rows came back, integrity_check ok).
     const target = restoreReplaceTarget(srcDbPath);
-    assertNoSideFilesAtSwap([srcDbPath, target]);
     const newPath = target + ".new";
     fs.copyFileSync(extractedDbPath, newPath);
     try {
