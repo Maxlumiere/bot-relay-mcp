@@ -31,7 +31,12 @@ const OPENERS = [
   "createReadStream", "createWriteStream", "copyFile", "copyFileSync", "cp", "cpSync", "truncate", "truncateSync",
   "watch", "watchFile", "openAsBlob",
 ];
-const OPENER = new RegExp(`(?:^|/)@types/node/(?:fs|fs/promises)\\.d\\.ts:(${OPENERS.join("|")})$`);
+const apiPattern = (apis: readonly string[]) => new RegExp(`(?:^|/)@types/node/(?:fs|fs/promises)\\.d\\.ts:(${apis.join("|")})$`);
+/**
+ * INV-DB-01 slice 3: the fs functions that REMOVE a path (the never-unlink scan: relay code never unlinks a DB-family
+ * file, side files included; the slice-3 ruling). Passed to fsOpenSites as its `apis`.
+ */
+export const REMOVERS = ["unlink", "unlinkSync", "rm", "rmSync", "rmdir", "rmdirSync"] as const;
 const FS_MODULE = /@types\/node\/(?:fs|fs\/promises)\.d\.ts:"(?:node:)?fs(?:\/promises)?"$/;
 const FS_SPECIFIER = /^(node:)?fs(\/promises)?$/;
 
@@ -44,7 +49,13 @@ export interface FsOpenSite {
   why?: string;
 }
 
-export function fsOpenSites(program: ts.Program, rel: (f: string) => string, inFile: (relPath: string) => boolean): FsOpenSite[] {
+export function fsOpenSites(
+  program: ts.Program,
+  rel: (f: string) => string,
+  inFile: (relPath: string) => boolean,
+  apis: readonly string[] = OPENERS,
+): FsOpenSite[] {
+  const OPENER = apiPattern(apis);
   const checker = program.getTypeChecker();
   const out: FsOpenSite[] = [];
   const keyOf = (b: { key: string } | null) => b?.key ?? "";
