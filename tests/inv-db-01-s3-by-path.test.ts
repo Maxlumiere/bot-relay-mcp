@@ -650,6 +650,17 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     });
   }
 
+  it("R1 P2-4 over-trigger twin: an UNRESOLVABLE caller config path (the relay home is a FILE) is no declaration, not an unreadable one: a raw open of an explicit legacy (0) DB is allowed", async () => {
+    fs.writeFileSync(path.join(caseDir, ".bot-relay"), "not a directory");
+    delete process.env.RELAY_CONFIG_PATH;
+    const elsewhere = path.join(caseDir, "explicit", "relay.db");
+    fs.mkdirSync(path.dirname(elsewhere), { recursive: true });
+    makeDb(elsewhere, 0, ["row-1"]);
+    process.env.RELAY_DB_PATH = elsewhere;
+    const h = await openRawRelayDb(elsewhere, { readonly: true });
+    h.close();
+  });
+
   it("R1 P2-4 twin: the DB's own instance has NO config.json (ENOENT) → no declaration: the raw open is allowed", async () => {
     const { aDb } = twoInstances(null);
     makeDb(aDb, 0, ["row-1"]);
