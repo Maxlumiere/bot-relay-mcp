@@ -122,10 +122,12 @@ fs.writeFileSync(
     `if (process.argv[4] === "txn") { const ins = d.prepare("INSERT INTO kept VALUES (?)"); for (let i = 0; i < 20; i++) ins.run("live-" + i); d.exec("BEGIN"); d.prepare("SELECT count(*) FROM kept").get(); }\n` +
     `else d.prepare("SELECT count(*) FROM kept").get();\n` +
     // PINNED: an unreferenced better-sqlite3 connection is closed on GC, which drops its locks and its side files.
-    `globalThis.__liveOpener = d; process.stdout.write("READY\\n"); setInterval(() => { if (!globalThis.__liveOpener.open) process.exit(9); }, 1000);\n`
+    `globalThis.__liveOpener = d; process.stdout.write("READY\\n"); setInterval(() => { if (!globalThis.__liveOpener.open) process.exit(9); }, 1000);\n` +
+    // "read" (stdin): the opener reads its own rows through its live connection and reports them on one line.
+    `process.stdin.on("data", (b) => { for (const l of String(b).split("\\n")) if (l === "read") { try { process.stdout.write("ROWS " + JSON.stringify(globalThis.__liveOpener.prepare("SELECT v FROM kept ORDER BY rowid").all().map((r) => r.v)) + "\\n"); } catch (e) { process.stdout.write("READ-FAILED " + String(e && e.message || e).split("\\n")[0] + "\\n"); } } });\n`
 );
 async function startLiveOpener(file: string, mode: "idle" | "txn"): Promise<ChildProcess> {
-  const c = spawn(process.execPath, [LIVE, path.join(REPO, "node_modules", "better-sqlite3"), file, mode], { stdio: ["ignore", "pipe", "pipe"] });
+  const c = spawn(process.execPath, [LIVE, path.join(REPO, "node_modules", "better-sqlite3"), file, mode], { stdio: ["pipe", "pipe", "pipe"] });
   children.push(c);
   await new Promise<void>((res, rej) => {
     const t = setTimeout(() => rej(new Error("precondition: the live opener did not start within 20 s")), 20_000);
@@ -339,6 +341,8 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     // the row asserts it is still there (never deleted), at its size.
     expect({ db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), dotNew: fileState(`${dbPath}.new`) }, "the DB, its WAL and the .new state are unchanged").toEqual({ db: state.db, wal: state.wal, dotNew: state.dotNew });
     expect(fs.existsSync(`${dbPath}-shm`) ? fs.statSync(`${dbPath}-shm`).size : -1, "the -shm is left in place, at its size").toBe(Number(state.shm.split(":")[0]));
+    // Positive control: the live opener still works, through its own connection, and sees exactly its pre-restore rows.
+    expect(await ask(live, "read"), "the live opener reads its own rows after the refused restore").toBe(`ROWS ${JSON.stringify(["row-1"])}`);
     live.kill("SIGKILL");
     await waitExitOf(live);
   }, 60_000);
