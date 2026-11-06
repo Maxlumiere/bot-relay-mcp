@@ -862,6 +862,34 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(sha(flatDb), "the DB is untouched").toBe(before);
   }, 60_000);
 
+  const callerUnreadable: Array<[string, (cfg: string) => void, boolean]> = [
+    ["EACCES (mode 000)", (cfg) => {
+      fs.writeFileSync(cfg, JSON.stringify({ sqlite_driver: "native" }), { mode: 0o600 });
+      fs.chmodSync(cfg, 0o000);
+    }, process.platform === "win32" || process.getuid?.() === 0],
+    ["a FIFO", (cfg) => {
+      const r = spawnSync("mkfifo", [cfg]);
+      if (r.status !== 0) throw new Error(`precondition: mkfifo failed: ${String(r.stderr)}`);
+    }, process.platform === "win32"],
+  ];
+  for (const [label, make, skip] of callerUnreadable) {
+    it.skipIf(skip)(`R2 P2-4 exact twin: the CALLER's own config unreadable (${label}) → initializeDb (not a server) is refused by name, the DB unchanged`, async () => {
+      makeDb(dbPath, 0, ["row-1"]);
+      const before = sha(dbPath);
+      make(cfgPath); // RELAY_CONFIG_PATH: this process's own declaration
+      try {
+        await expect(db.initializeDb()).rejects.toThrow(/could not be read[\s\S]*fix or remove that config\.json/i);
+      } finally {
+        try {
+          fs.chmodSync(cfgPath, 0o600);
+        } catch {
+          /* a FIFO: nothing to restore */
+        }
+      }
+      expect(sha(dbPath), "the DB is untouched").toBe(before);
+    });
+  }
+
   it("R2 P2-4 twin: the STDIO MCP server (every connector) with the same unreadable own config starts with the WARN and acknowledges a tool call", async () => {
     malformedOwnConfig();
     const transport = new StdioClientTransport({
