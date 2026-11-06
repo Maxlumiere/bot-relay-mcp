@@ -71,6 +71,10 @@ afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
  */
 const READ_APP_ID = path.join(ROOT, "read-app-id.cjs");
 fs.writeFileSync(READ_APP_ID, `process.stdout.write(String(require("fs").readFileSync(process.argv[2]).readInt32BE(68)));\n`);
+/** A file's SHA-256 computed by ANOTHER process (this one may hold a native handle on it). */
+const READ_SHA = path.join(ROOT, "read-sha.cjs");
+fs.writeFileSync(READ_SHA, `process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.argv[2])).digest("hex"));\n`);
+const shaElsewhere = (file: string) => spawnSync(process.execPath, [READ_SHA, file], { encoding: "utf8" }).stdout;
 const appIdOf = (file: string) => {
   const r = spawnSync(process.execPath, [READ_APP_ID, file], { encoding: "utf8" });
   expect(r.status, `the header read: ${r.stderr}`).toBe(0);
@@ -226,36 +230,44 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
     expect(otherProcessCanLockExclusive(dbPath)).toBe("DENIED");
   });
 
-  it("a header read of a DB this process holds natively is REFUSED by name (it would drop the connection's locks); after the close it reads again", async () => {
+  it("a header read of a DB this process holds natively goes THROUGH the held connection (no fs open, the lock kept); after the close, one fs read", async () => {
     await db.initializeDb();
-    expect(() => header.readDriverHeader(dbPath)).toThrow(/internal: refusing to read the header .* while this process holds a native SQLite connection/);
+    // 2b-i: read THROUGH the held connection (source 1), never by an fs open; after the close, by one fs read.
+    expect(header.nativeHandleCount(dbPath)).toBe(1);
+    expect(header.readDriverHeader(dbPath)).toEqual({ kind: "native" });
+    if (POSIX) expect(otherProcessCanLockExclusive(dbPath), "the connection's lock").toBe("DENIED");
     db.closeDb();
+    expect(header.nativeHandleCount(dbPath)).toBe(0);
     expect(header.readDriverHeader(dbPath)).toEqual({ kind: "native" });
   });
 
   it("the same while a raw CLI handle is open, and again after it is closed", async () => {
     makeDb(dbPath, NATIVE);
     const raw = await openRawRelayDb(dbPath, { readonly: true });
-    expect(() => header.readDriverHeader(dbPath)).toThrow(/internal: refusing to read the header/);
+    expect(header.nativeHandleCount(dbPath)).toBe(1);
+    expect(header.readDriverHeader(dbPath)).toEqual({ kind: "native" });
     raw.close();
+    expect(header.nativeHandleCount(dbPath)).toBe(0);
     expect(header.readDriverHeader(dbPath)).toEqual({ kind: "native" });
   });
 
-  it.skipIf(process.platform === "win32")("a SYMLINK alias of a DB this process holds natively is refused too (the hold is keyed by the file, not its name)", async () => {
+  it.skipIf(process.platform === "win32")("a SYMLINK alias of a DB this process holds natively is the same file: counted, and its header comes through the held connection", async () => {
     await db.initializeDb();
     const alias = path.join(caseDir, "alias.db");
     fs.symlinkSync(dbPath, alias);
-    expect(() => header.readDriverHeader(alias)).toThrow(/internal: refusing to read the header/);
+    expect(header.nativeHandleCount(alias)).toBe(1);
+    expect(header.readDriverHeader(alias)).toEqual({ kind: "native" });
+    expect(otherProcessCanLockExclusive(dbPath)).toBe("DENIED");
   });
 
-  it("a HARD-LINK alias of a held DB is refused too, and every other fs read of a held DB file is refused by the same guard", async () => {
+  it("a HARD-LINK alias of a held DB is the same file: counted, its header comes through the held connection, and a wasm read of it is refused", async () => {
     makeDb(dbPath, 0);
     const raw = await openRawRelayDb(dbPath, { readonly: true });
     try {
       const alias = path.join(caseDir, "hard.db");
       fs.linkSync(dbPath, alias);
-      expect(() => header.readDriverHeader(alias), "the header read").toThrow(/internal: refusing to read/);
-      expect(() => compat.fileSha256(alias), "the export's torn-read hash").toThrow(/internal: refusing to read/);
+      expect(header.nativeHandleCount(alias), "counted by identity").toBe(1);
+      expect(header.readDriverHeader(alias), "the header read").toEqual({ kind: "legacy" });
       await expect(compat.openExportSource(alias, "wasm"), "a wasm read of the source").rejects.toThrow(/already holds a native connection to that file/);
     } finally {
       raw.close();
@@ -282,50 +294,50 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
       ["openReadOnly (native)", () => compat.openReadOnly(dbPath, "native")],
       ["openExportSource (native)", async () => (await compat.openExportSource(dbPath, "native")).db],
       ["the compat initializer", () => compat.initializeDb(dbPath)],
-    ] as const)("P1-1: a native handle from %s is held from its construction: a header read is refused and the lock stays", async (_name, open) => {
+    ] as const)("P1-1: a native handle from %s is counted from its construction: the header comes through it and the lock stays", async (_name, open) => {
       makeWalDb(dbPath, NATIVE);
       const h = await open();
       try {
         expect(h.prepare("SELECT v FROM kept").get()).toEqual({ v: "row-1" });
-        expect(() => header.readDriverHeader(dbPath)).toThrow(/internal: refusing to read the header/);
+        expect(header.nativeHandleCount(dbPath)).toBe(1);
+        expect(header.readDriverHeader(dbPath)).toEqual({ kind: "native" });
         if (POSIX) expect(otherProcessCanLockExclusive(dbPath)).toBe("DENIED");
       } finally {
         h.close();
       }
-      expect(header.readDriverHeader(dbPath), "released by its close").toEqual({ kind: "native" });
+      expect(header.nativeHandleCount(dbPath), "released by its close").toBe(0);
     });
 
-    it("P1-2: the hold covers the FAMILY: a restore whose archive path is the held DB, or its -shm, is refused by name; so is a hash of the -shm", async () => {
+    it("P1-2: a restore whose archive path is the live DB, or its -shm, is refused by name (identity), and the locks stay", async () => {
       await db.initializeDb();
       db.getDb().prepare("SELECT count(*) FROM agents").get();
       expect(fs.existsSync(dbPath + "-shm"), "precondition: a -shm").toBe(true);
-      await expect(importRelayState(dbPath, { force: true })).rejects.toThrow(/internal: refusing to read the archive/);
-      await expect(importRelayState(dbPath + "-shm", { force: true })).rejects.toThrow(/internal: refusing to read the archive/);
-      expect(() => compat.fileSha256(dbPath + "-shm")).toThrow(/internal: refusing to read/);
+      await expect(importRelayState(dbPath, { force: true })).rejects.toThrow(/backup archive refused: .* is the live relay database/);
+      await expect(importRelayState(dbPath + "-shm", { force: true })).rejects.toThrow(/backup archive refused: .* is the live relay database/);
       if (POSIX) expect(otherProcessCanLockExclusive(dbPath), "the connection's lock").toBe("DENIED");
       if (POSIX) expect(otherProcessCanLockExclusive(dbPath + "-shm", SHM_DMS), "its -shm lock byte").toBe("DENIED");
     });
 
-    it("P1-3: a close that FAILS (a busy iterator) keeps the hold; the close that succeeds releases it", async () => {
+    it("P1-3: a close that FAILS (a busy iterator) keeps the handle counted; the close that succeeds releases it", async () => {
       makeWalDb(dbPath, NATIVE);
       const raw = await openRawRelayDb(dbPath, { readonly: true });
       const it = raw.prepare("SELECT v FROM kept").iterate() as IterableIterator<unknown>;
       it.next();
       expect(() => raw.close(), "better-sqlite3 refuses to close a busy connection").toThrow(/busy/);
-      expect(() => header.readDriverHeader(dbPath), "still held").toThrow(/internal: refusing to read the header/);
+      expect(header.nativeHandleCount(dbPath), "still counted").toBe(1);
       if (POSIX) expect(otherProcessCanLockExclusive(dbPath)).toBe("DENIED");
       it.return?.();
       raw.close();
-      expect(header.readDriverHeader(dbPath)).toEqual({ kind: "native" });
+      expect(header.nativeHandleCount(dbPath)).toBe(0);
     });
 
-    it("P1-3 (db.ts): a failed closeDb() keeps the hold too", async () => {
+    it("P1-3 (db.ts): a failed closeDb() keeps the handle counted too", async () => {
       makeWalDb(dbPath, NATIVE);
       await db.initializeDb();
       const it = db.getDb().prepare("SELECT v FROM kept").iterate() as IterableIterator<unknown>;
       it.next();
       expect(() => db.closeDb()).toThrow(/busy/);
-      expect(() => header.readDriverHeader(dbPath)).toThrow(/internal: refusing to read the header/);
+      expect(header.nativeHandleCount(dbPath)).toBe(1);
       it.return?.();
     });
 
@@ -367,9 +379,10 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
       const raw = await openRawRelayDb(dbPath, { readonly: true });
       try {
         db.closeDb();
-        const before = sha(dbPath);
+        // Hashed by ANOTHER process: this one still holds the raw handle (the suite-wide spy enforces it).
+        const before = shaElsewhere(dbPath);
         await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused: this process still holds a native connection/);
-        expect(sha(dbPath)).toBe(before);
+        expect(shaElsewhere(dbPath)).toBe(before);
       } finally {
         raw.close();
       }
@@ -395,7 +408,7 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
       try {
         raw.prepare("SELECT v FROM kept").get();
         expect(fs.existsSync(p + "-shm"), "precondition: its -shm").toBe(true);
-        expect(() => compat.fileSha256(p + "-shm")).toThrow(/internal: refusing to read/);
+        expect(header.readDriverHeader(p), "its header, through the held connection").toEqual({ kind: "native" });
         if (POSIX) expect(otherProcessCanLockExclusive(p + "-shm", SHM_DMS), "its -shm lock byte").toBe("DENIED");
       } finally {
         raw.close();
@@ -423,7 +436,7 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
       expect(() => db.closeDb()).toThrow(/busy/);
       it.return?.();
       db.closeDb();
-      expect(header.readDriverHeader(dbPath), "released by the retry").toEqual({ kind: "native" });
+      expect(header.nativeHandleCount(dbPath), "released by the retry").toBe(0);
     });
 
     it.skipIf(!POSIX)("P2: an ABANDONED native handle is kept alive by its hold (never GC-closed while counted): still held, still locked", async () => {
@@ -442,7 +455,7 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
         gc();
         await new Promise((r) => setTimeout(r, 20));
       }
-      expect(() => header.readDriverHeader(dbPath)).toThrow(/internal: refusing to read the header/);
+      expect(header.nativeHandleCount(dbPath), "still counted").toBe(1);
       expect(otherProcessCanLockExclusive(dbPath), "the abandoned handle's lock is still held").toBe("DENIED");
       (ref!.deref() as { close?: () => void } | undefined)?.close?.();
     });
