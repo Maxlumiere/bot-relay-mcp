@@ -78,5 +78,14 @@ describe("INV-DB-01 slice 3: no relay code unlinks a DB-family file", () => {
       expect(found.length, "the scan saw the remove").toBeGreaterThan(0);
       expect(diff(found).some((d) => d.startsWith("UNLISTED remove: src/backup.ts::"))).toBe(true);
     });
+
+    it("R1: a site's text is pinned IN FULL: two calls that differ only after 100 characters are two different sites", () => {
+      const long = "a".repeat(110);
+      const one = sitesOf(virtualProgram({ ...NODE_FS, "src/backup.ts": `import * as fs from "fs";\nexport function drop(${long}x: string) { fs.rmSync(${long}x); }` }), (f) => f === "src/backup.ts", virtualRel);
+      const two = sitesOf(virtualProgram({ ...NODE_FS, "src/backup.ts": `import * as fs from "fs";\nexport function drop(${long}y: string) { fs.rmSync(${long}y); }` }), (f) => f === "src/backup.ts", virtualRel);
+      expect(one.length).toBe(1);
+      expect(one[0]).toContain(`fs.rmSync(${long}x)`);
+      expect(one[0]).not.toBe(two[0]);
+    });
   });
 });

@@ -57,6 +57,7 @@ fs.writeFileSync(
     `  case "$FAKE_WHERE" in\n` +
     `    six) "${process.execPath}" "$@" | head -n 6; exit 0 ;;\n` +
     `    unknown) "${process.execPath}" "$@" | sed '7s/.*/skip-or-maybe-not/'; exit 0 ;;\n` +
+    `    eighth) "${process.execPath}" "$@"; printf 'trailing'; exit 0 ;;\n` +
     `  esac ;;\n` +
     `esac\n` +
     `exec "${process.execPath}" "$@"\n`,
@@ -194,6 +195,15 @@ describe("INV-DB-01 slice 3: `relay where --fields` line 7, the hooks' DB verdic
     expect(control.status, control.stderr).toBe(0);
     expect(fs.existsSync(spyLog) ? fs.readFileSync(spyLog, "utf-8") : "", "positive control: the spy sees a connection").toMatch(/better-sqlite3 :memory:/);
     fs.rmSync(spyLog, { force: true });
+    // The sql.js detector's own positive control: a stand-in module NAMED sql.js (independent of the optional install).
+    const fake = path.join(ROOT, "fake-sqljs");
+    fs.mkdirSync(path.join(fake, "node_modules", "sql.js"), { recursive: true });
+    fs.writeFileSync(path.join(fake, "node_modules", "sql.js", "index.js"), "module.exports = {};\n");
+    fs.writeFileSync(path.join(fake, "load.js"), `require("sql.js");\n`);
+    const control2 = spawnSync(process.execPath, ["--require", spy, path.join(fake, "load.js")], { encoding: "utf-8" });
+    expect(control2.status, control2.stderr).toBe(0);
+    expect(fs.existsSync(spyLog) ? fs.readFileSync(spyLog, "utf-8") : "", "positive control: the spy sees a sql.js load").toMatch(/sql\.js loaded/);
+    fs.rmSync(spyLog, { force: true });
     const r = where({}, ["--require", spy]);
     expect(r.stdout.split("\n")[6]).toBe("skip-rlyw");
     expect(fs.existsSync(spyLog) ? fs.readFileSync(spyLog, "utf-8") : "", "no SQLite connection, no sql.js").toBe("");
@@ -249,6 +259,14 @@ describe.skipIf(process.platform === "win32" || !REAL_SQLITE)("INV-DB-01 slice 3
     expect(r.notices.length, r.out).toBe(1);
     expect(r.notices[0]).toMatch(/version skew/);
     expect(r.notices[0], "it does not claim a wasm instance").not.toMatch(/wasm instance/);
+    expect(r.out, "nor does the mail verdict").not.toMatch(/VERDICT=[^\n]*wasm instance/);
+  });
+
+  it("R1: 7 newline-terminated fields followed by an UNTERMINATED 8th → not a valid answer: zero sqlite3 invocations, named", () => {
+    FIXTURES.rlyn!();
+    const r = runSessionStart({ FAKE_WHERE: "eighth" });
+    expect(r.sqliteCalls, r.out).toEqual([]);
+    expect(r.out).toMatch(/relay where gave (an incomplete|no valid|an invalid)[^\n]*answer/);
   });
 
   it("an UNKNOWN 7th token → zero sqlite3 invocations and ONE notice (only the exact token `sqlite3` enables a read)", () => {
@@ -324,5 +342,6 @@ describe.skipIf(process.platform === "win32" || !REAL_SQLITE)("INV-DB-01 slice 3
     const r = runPyHook("stop-check.sh");
     // The spy's liveness in Stop's python3 is the RLYN control above; here Stop may start no python3 at all.
     expect(r.connects, `${r.loaded} python3 process(es) loaded the spy: ${r.out}`).toEqual([]);
+    expect(r.out, "its mail read reached the NAMED by-path refusal").toMatch(/REFUSING a raw native open[\s\S]*declares sqlite_driver "wasm"/);
   });
 });

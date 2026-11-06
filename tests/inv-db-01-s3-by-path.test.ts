@@ -428,7 +428,11 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
   it("Q2 (the measure, permanent): a restore NEVER leaves a stale WAL to be replayed: it refuses, or a native open afterwards sees exactly the archive's rows (never the 50 WAL-only rows)", async () => {
     makeDb(dbPath, 0, ["row-1"]);
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
-    _setBeforeRestoreSwapForTests(async () => leaveHotWal(dbPath));
+    let injected = false;
+    _setBeforeRestoreSwapForTests(async () => {
+      leaveHotWal(dbPath);
+      injected = true;
+    });
     let refused = false;
     try {
       await importRelayState(archive, { force: true });
@@ -438,6 +442,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     } finally {
       _setBeforeRestoreSwapForTests(null);
     }
+    expect(injected, "the hot-WAL injection ran (the row reached the swap, not an earlier refusal)").toBe(true);
     if (!refused) expect(keptRows(dbPath), "the restored DB shows the archive, not the replayed stale WAL").toEqual(["row-1"]);
   }, 60_000);
 
@@ -455,6 +460,88 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(rows[0]).toBe("row-1");
     expect(rows.filter((v) => v.startsWith("wal-")).length, "all 50 WAL-only rows are in the safety backup").toBe(50);
   }, 90_000);
+
+  // --- Codex #391 R1, each a RED on e2948f4 ---
+
+  type AfterCheckpoint = (fn: ((p: string, result?: { ran: boolean; why?: string }) => void) | null) => void;
+  const setAfterCheckpoint = (backupMod as unknown as { _setAfterRestoreCheckpointForTests?: AfterCheckpoint })._setAfterRestoreCheckpointForTests;
+  const setAfterStage = (backupMod as unknown as { _setAfterRestoreStageForTests?: (fn: ((newPath: string, target: string) => void) | null) => void })._setAfterRestoreStageForTests;
+
+  it.skipIf(process.platform === "win32")("R1 P1-1: a restore whose DB path is RETARGETED after its lock was taken (a symlink moved to another, owned DB) is refused by name; that DB and its live owner are untouched", async () => {
+    const a = path.join(caseDir, "a.db");
+    makeDb(a, WASM);
+    const b = path.join(caseDir, "b.db");
+    const link = path.join(caseDir, "link.db");
+    fs.symlinkSync(a, link);
+    process.env.RELAY_DB_PATH = link;
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const owner = startOwner(b, path.join(caseDir, "owner-config.json"));
+    expect(await owner.first, "precondition: another process owns b.db").toBe("READY");
+    const theirs = sha(b);
+    let retargeted = false;
+    _setBeforeRestoreSwapForTests(async () => {
+      fs.unlinkSync(link);
+      fs.symlinkSync(b, link);
+      retargeted = true;
+    });
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*now resolves to/);
+    } finally {
+      _setBeforeRestoreSwapForTests(null);
+    }
+    expect(retargeted, "precondition: the link was moved after the lock was taken").toBe(true);
+    expect(sha(b), "the other owner's DB is untouched").toBe(theirs);
+    expect(await ask(owner.child, "write after-refused-restore"), "and its owner still writes").toBe("WROTE");
+    await stopOwner(owner);
+  }, 90_000);
+
+  it("R1 P1-2: on a declared-wasm instance the pre-swap step opens NOTHING natively (a legacy DELETE-mode DB): it reports itself skipped, by the declaration", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    declareWasm();
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    let result: unknown = "the hook after the step did not run";
+    setAfterCheckpoint?.((_p, r) => {
+      result = r;
+    });
+    try {
+      await importRelayState(archive, { force: true });
+    } finally {
+      setAfterCheckpoint?.(null);
+    }
+    expect(result).toMatchObject({ ran: false, why: expect.stringMatching(/declares sqlite_driver "wasm"/) });
+  }, 60_000);
+
+  it("R1 P2-5: an owned DB that gains a HARD LINK after the lock was taken (during the safety backup) is refused right before the replacement; both names still name the same file", async () => {
+    makeDb(dbPath, WASM);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const alias = path.join(caseDir, "late-alias.db");
+    _setBeforeRestoreSwapForTests(async () => fs.linkSync(dbPath, alias));
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/hard link/);
+    } finally {
+      _setBeforeRestoreSwapForTests(null);
+    }
+    expect(fs.statSync(alias).ino, "the names were not split").toBe(fs.statSync(dbPath).ino);
+  }, 60_000);
+
+  it("R1 table: a side file that appears WHILE the archive is staged into .new refuses the rename (a second stat right before it); the DB is untouched and the staged .new is removed", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const before = fileState(dbPath);
+    let staged = "";
+    setAfterStage?.((newPath, target) => {
+      staged = newPath;
+      fs.writeFileSync(`${target}-wal`, Buffer.alloc(32)); // a writer's WAL, during the copy
+    });
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*-wal/);
+    } finally {
+      setAfterStage?.(null);
+    }
+    expect(staged, "the hook after staging ran").not.toBe("");
+    expect(fileState(dbPath), "the DB is untouched").toBe(before);
+    expect(fs.existsSync(staged), "the staged .new (this restore's own copy, not a DB name) is removed").toBe(false);
+  }, 60_000);
 
   // --- G5: a DB file is never unlinked: a refusal leaves it and names it ---
 
