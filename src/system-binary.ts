@@ -78,6 +78,8 @@ const POSIX_TOOLS = {
     ps: fhs("ps"),
     lsof: fhs("lsof"),
     tar: fhs("tar"),
+    // INV-DB-01 2b-ii (ruling 594ca4cc): the wasm single owner's lock on Linux (Node core has no flock).
+    flock: fhs("flock"),
   },
 } as const satisfies Record<string, Record<string, readonly string[]>>;
 

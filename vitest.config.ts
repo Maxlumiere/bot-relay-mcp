@@ -44,6 +44,10 @@ export default withOperatorTripwire({
       "tests/load-smoke.test.ts",
       "tests/chaos.test.ts",
       "tests/cross-version.test.ts",
+      // INV-DB-01 2b-ii: the multi-process single-owner measurements run SERIAL and alone (vitest.serial.config.ts,
+      // their own CI step): racers and real daemons must not share the runner with the parallel suite.
+      "tests/inv-db-01-owner-lock-race.test.ts",
+      "tests/inv-db-01-single-owner-blackbox.test.ts",
     ],
     // v2.1 Phase 8 (CI-fix): CI disk + network are meaningfully slower than
     // local macOS. Webhook-firing tests, HTTP-probe tests, and file-IO-heavy

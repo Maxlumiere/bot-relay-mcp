@@ -53,9 +53,37 @@ That's it. The relay initializes sql.js instead of better-sqlite3, runs the same
 
 ### The instance's driver (`sqlite_driver`)
 
-The driver is becoming a property of the **instance**: a `sqlite_driver` key in the instance's `config.json` (default `native`). In this release only `"native"` is accepted there: `"wasm"` is refused as not yet supported, because the single-owner guarantee a wasm instance needs ships in a later release. Until then, run the wasm driver with `RELAY_SQLITE_DRIVER=wasm` as above.
+The driver is a property of the **instance**: a `sqlite_driver` key in the instance's `config.json` (default `native`).
 
-That environment override still works, but when it disagrees with the instance's driver (including the default `native`), the relay logs a warning once per process: a later release will require the instance to be converted (`relay db convert-journal`). Nothing needs doing until then.
+**`"wasm"` puts the instance in owner mode.** Its database is owned by ONE process, the relay daemon:
+- **A new database** is created already stamped for its owner (`application_id` RLYW).
+- **The owner holds a single-owner lock**, which the kernel releases when it exits:
+  - macOS and Linux: a flock-class lock on a private `.<name>.relay-owner` file beside the database. Linux takes it with the system `flock` (util-linux). **Never delete that file**: a relay that finds its lock file removed or replaced stops writing.
+  - Linux without a trusted system `flock` (util-linux, at a system path): owner mode is **refused** by name, with the remedies (install util-linux's flock, use the native driver, or reach a live owner over HTTP). There is no fallback lock: two kinds of lock could not exclude each other.
+  - Windows: a named pipe, which is per session namespace: one container per database there.
+  - A wasm database must live on a LOCAL filesystem. On Linux, owner mode is refused on a network filesystem (NFS, SMB/CIFS, 9p, Ceph, Lustre and similar, by `statfs`). macOS is not checked.
+  - **FUSE is refused too**, conservatively: a FUSE filesystem may be remote (sshfs) or local (gocryptfs), and the relay cannot tell which, nor whether it shares flock locks between processes. If you need a local FUSE filesystem allowed, open an issue naming it: allowing one needs a measurement that its flock excludes a second process, not a config switch. Until then, use the native driver there.
+- **Names of the form `.<db name>.<pid>.<12 hex digits>.new` beside an owned database are RESERVED for the relay** (a new database's first image). Under the lock, the owner removes such a name when it is the same file as the database (a leftover of a crash between creating and naming the database); do not keep your own files under such a name.
+- **Every write is atomic** (a temp file, then a rename), made under that lock. Before each write, the owner checks that the file is still the one it last wrote (its inode, size and modification time) and refuses to write over a file another process replaced or rewrote.
+  - A metadata change, such as a `chmod`, is deliberately not treated as a write (the relay itself tightens its database's mode on every open).
+  - On a filesystem with coarse timestamps (HFS+ 1 s, FAT/exFAT 2 s), a same-size rewrite within that granularity is not seen. APFS, ext4 and NTFS are fine-grained.
+  - The check DETECTS another writer before the owner's next write; it does not prevent a write landing between the check and the rename.
+  - There is no `fsync`: the atomic replace protects against a crash of the relay, not against a power loss.
+- **Other processes** reach the database through the daemon over HTTP:
+  - a second process that tries to open it is refused by name;
+  - so is a stdio MCP server, with the client config to use instead: `{ "type": "http", "url": "http://127.0.0.1:3777/mcp" }`;
+  - so is a native opener.
+- **A backup or a restore** of an owned database runs under the lock when no owner is live, and is refused while one is.
+
+**Two populations run side by side until a later release converts them** (`relay db convert-journal`, slice 4):
+- **Owner mode** (`sqlite_driver: "wasm"`): one owner, safe.
+- **The legacy wasm mode** (`RELAY_SQLITE_DRIVER=wasm` with no `sqlite_driver` in the instance): exactly as before this release.
+  - No owner and no stamp: several processes may open the same database.
+  - The hazard: the wasm driver writes the whole database back from memory, so two such processes on one file overwrite each other's writes.
+  - The fix is to declare `sqlite_driver: "wasm"` in the instance. A new database is then owned from the start; an existing legacy database stays in the legacy mode (it is not adopted) until it is converted.
+- **The file's header decides** for a database already stamped for an owner, whatever the environment says.
+- **When the instance declares a driver and `RELAY_SQLITE_DRIVER` contradicts it,** the instance wins, and the relay warns once per process. A later release refuses the contradiction.
+- **When the instance declares nothing,** `RELAY_SQLITE_DRIVER` decides, with the same warning.
 
 ## How to switch back
 

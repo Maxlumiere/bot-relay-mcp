@@ -12,7 +12,9 @@ import { loadConfig, validateConfigAndEnv, InvalidConfigError, readConfigFileKey
 import { startStdioServer } from "./transport/stdio.js";
 import { startHttpServer } from "./transport/http.js";
 import { registerConfigSecret } from "./secret-registry.js";
-import { closeDb, initializeDb } from "./db.js";
+import { closeDb, initializeDb, getDbPath } from "./db.js";
+import { resolveOpen } from "./sqlite-compat.js";
+import { httpClientHint } from "./db-header.js";
 import { assertInstanceResolution } from "./instance.js";
 import { startOutboxTail, stopOutboxTail } from "./outbox-tail.js";
 import { log } from "./logger.js";
@@ -241,6 +243,20 @@ async function main(): Promise<void> {
   // nobody can identify. See assertInstanceResolution() for why this keys on the
   // multi-instance CONTRADICTION rather than on a missing RELAY_INSTANCE_ID.
   assertInstanceResolution((msg) => log.info(msg));
+
+  // INV-DB-01 slice 2b-ii: a STDIO server never opens an OWNED (wasm single-owner) DB: each client terminal spawns its
+  // own stdio process, so it would be a second owner. Refused by name, with the HTTP client config that reaches the
+  // owner instead. (A legacy wasm DB, under RELAY_SQLITE_DRIVER=wasm alone, keeps working over stdio, as before.)
+  if (config.transport === "stdio") {
+    const dbPath = getDbPath();
+    if (resolveOpen(dbPath).mode === "owner") {
+      throw new Error(
+        `a stdio MCP server does not open the DB at '${dbPath}': it is (or will be) owned by the wasm driver's single ` +
+          `owner, a relay daemon (the instance declares sqlite_driver "wasm", or the DB is stamped for it). Point the ` +
+          `MCP client at the daemon over HTTP instead: ${httpClientHint()}`
+      );
+    }
+  }
 
   // Pre-initialize the DB so schema + purge run up front.
   // v1.11: async init supports both native (sync under hood) and wasm (async wasm load).

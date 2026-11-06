@@ -265,6 +265,15 @@ function readHeaderBytes(dbPath: string): DriverHeader {
   }
 }
 
+/**
+ * A copy-pasteable MCP client config for the relay daemon (the wasm owner): `"type": "http"` and its URL (the port
+ * from RELAY_HTTP_PORT, default 3777).
+ */
+export function httpClientHint(): string {
+  const port = Number(process.env.RELAY_HTTP_PORT) || 3777;
+  return `{ "type": "http", "url": "http://127.0.0.1:${port}/mcp" }`;
+}
+
 export class DbHeaderRefusedError extends Error {
   constructor(message: string) {
     super(message);
@@ -336,13 +345,14 @@ export function driverHeaderVerdict(dbPath: string, header: DriverHeader, driver
       };
     }
     case "wasm":
-      // Slice 2a: nothing in this release creates a wasm-stamped DB, and this release has no wasm single owner, so
-      // it refuses the file with EITHER driver (a native open would bypass the owner; a wasm open would race it).
+      // Slice 2b-ii: an OWNED DB. A native open would bypass its single owner (and the owner's rename persist would
+      // leave it on an old inode): refused, pointing at the owner. A wasm open follows the owner protocol (the lock).
+      if (driver === "wasm") return null;
       return {
         refuse:
-          `REFUSING the DB at '${dbPath}': its header says it is owned by the wasm driver's single owner, which a later ` +
-          `relay release provides and this one does not. Neither driver may open it here: run the relay release that ` +
-          `created it.`,
+          `REFUSING the native driver on the DB at '${dbPath}': its header says it is owned by the wasm driver's single ` +
+          `owner (a relay daemon). Reach it through that daemon over HTTP; an MCP client config for it: ` +
+          `${httpClientHint()}. If no daemon runs, start one (the instance declares sqlite_driver "wasm").`,
       };
     default:
       return null;

@@ -191,20 +191,18 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
     expect(named[0]).toMatch(/Could not locate the bindings file.*AT RISK: another install with a working native driver.*convert-journal/);
   });
 
-  it("a WASM-stamped DB is refused by every opener in this slice, by path too, and the file is untouched", async () => {
+  it("slice 2b-ii: a WASM-stamped DB refuses every NATIVE-only opener (by path too, with the HTTP client config), untouched; the initializer opens it as its owner (the header decides)", async () => {
     makeDb(dbPath, WASM);
     const before = sha(dbPath);
-    const owned = /owned by the wasm driver's single owner/;
-    await expect(db.initializeDb(), "native init").rejects.toThrow(owned);
+    const owned = /owned by the wasm driver's single owner .*"type": "http"/;
     expect(() => db.getDb(), "the sync native fallback").toThrow(owned);
     await expect(openRawRelayDb(dbPath, { readonly: true }), "a raw CLI open").rejects.toThrow(owned);
     await expect(compat.openExportSource(dbPath, "native"), "a native export source").rejects.toThrow(owned);
     await expect(compat.openReadOnly(dbPath, "native"), "a native read-only probe").rejects.toThrow(owned);
-    await expect(exportRelayState({ destinationPath: path.join(caseDir, "b.tar.gz") }), "a cold export").rejects.toThrow(owned);
-    process.env.RELAY_SQLITE_DRIVER = "wasm";
-    await expect(compat.initializeDb(dbPath), "a wasm open (this slice has no single owner)").rejects.toThrow(owned);
     expect(sha(dbPath)).toBe(before);
     expect(sideFiles(dbPath)).toEqual([]);
+    await db.initializeDb(); // declarations native: the RLYW header decides (wasm, the single owner)
+    expect(compat.getActiveDriver()).toBe("wasm");
   });
 
   it("a FOREIGN application_id is refused by name: never opened, migrated or stamped", async () => {
@@ -366,9 +364,11 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
       expect(compat.driverOf(opened)).toBe("native");
     });
 
+    // Slice 2b-ii: a cold export of an RLYW DB with no owner live now RUNS (under the owner's lock), so the refused
+    // case here is a FOREIGN header.
     it("a refused cold export creates NOTHING (the header is checked before the backups directory is made)", async () => {
-      makeDb(dbPath, WASM);
-      await expect(exportRelayState({ destinationPath: path.join(caseDir, "x.tar.gz") })).rejects.toThrow(/owned by the wasm driver/);
+      makeDb(dbPath, FOREIGN);
+      await expect(exportRelayState({ destinationPath: path.join(caseDir, "x.tar.gz") })).rejects.toThrow(/not the relay's/);
       expect(fs.existsSync(path.join(caseDir, "backups")), "no backups directory").toBe(false);
     });
 

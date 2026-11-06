@@ -125,8 +125,8 @@ export function configPathOverride(): string | undefined {
 /**
  * INV-DB-01 slice 1: the SQLite driver is a property of the INSTANCE: `sqlite_driver` in its config.json (the one
  * getConfigPath() resolves), default native. Read straight from the file, so every process that opens the instance's
- * DB reads the same value. In this release only "native" is accepted: "wasm" is refused as not yet supported (the
- * single-owner guarantee it needs ships in a later slice), and any other value is refused by name.
+ * DB reads the same value. "native" and (since slice 2b-ii) "wasm" are accepted: "wasm" puts the instance in OWNER mode
+ * (the wasm single owner, an RLYW DB); any other value is refused by name.
  */
 export function readInstanceSqliteDriver(): { value: unknown; configPath: string; unreadable?: string } {
   // A config that cannot be read must not break a DB open that worked before this field existed: the caller falls
@@ -163,13 +163,8 @@ export function readInstanceSqliteDriver(): { value: unknown; configPath: string
 
 /** Why an instance's sqlite_driver value is refused in this release, or null when it is accepted. */
 export function instanceSqliteDriverProblem(value: unknown, configPath: string): string | null {
-  if (value === undefined || value === "native") return null;
-  if (value === "wasm") {
-    return (
-      `sqlite_driver "wasm" is not yet supported for an instance (${configPath}): remove it (native is the default). ` +
-      `To run the wasm driver today, keep RELAY_SQLITE_DRIVER=wasm in the environment.`
-    );
-  }
+  // INV-DB-01 slice 2b-ii: "wasm" is accepted: it puts the instance in OWNER mode (a single-owner lock, an RLYW DB).
+  if (value === undefined || value === "native" || value === "wasm") return null;
   return `sqlite_driver ${JSON.stringify(value)} is not valid (${configPath}): use "native" (the default), or remove it.`;
 }
 

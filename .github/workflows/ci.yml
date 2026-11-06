@@ -97,6 +97,11 @@ jobs:
         # blob: merged by "Test (Node 22)" into the suite's totals; json: the files this shard RAN, for the
         # parity check there.
         run: npx vitest run --shard=${{ matrix.shard }}/4 --maxWorkers=2 --reporter=default --reporter=blob --reporter=json --outputFile.json=.vitest-shard/shard-${{ matrix.shard }}.json
+      # INV-DB-01 2b-ii: the single-owner measurements (racers, real daemons) run SERIAL and alone, once (shard 1).
+      - name: INV-DB-01 single-owner measurements, serial (lock racers + the black-box K-process test)
+        # Runs even when the shard's suite failed (a skipped measurement reads as no evidence, not as a pass).
+        if: ${{ !cancelled() && matrix.shard == 1 }}
+        run: npx vitest run --config vitest.serial.config.ts --reporter=verbose
       # vitest 5 writes the blob report to .vitest/blob/ (MEASURED: --merge-reports read that default path and
       # .vitest-reports/ did not exist). Both reports must be there: the step fails otherwise.
       - name: Check the shard wrote both reports
@@ -363,6 +368,16 @@ jobs:
       - name: SEC-24 structural bound + the sandbox env allowlist (Windows parity)
         run: npx vitest run tests/sec-24-structural-bound.test.ts tests/sandbox-env-node-options.test.ts
 
+      # INV-DB-01 2b-ii: the Windows single-owner primitive (a named pipe) is measured here, serial and alone; and the
+      # owner behaviour rows. ONE command per step: pwsh reports only a step's LAST command's exit code, so a red first
+      # command was green (MEASURED: 10 failed tests under a passing step).
+      - name: INV-DB-01 single-owner measurements, serial (Windows)
+        if: ${{ !cancelled() }}
+        run: npx vitest run --config vitest.serial.config.ts --reporter=verbose
+      - name: INV-DB-01 owner behaviour rows (Windows)
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/inv-db-01-wasm-owner.test.ts --reporter=verbose
+
   # REQUIRED CHECK. macOS launchd side-effect guard. The Ubuntu jobs structurally CANNOT catch a test that shells
   # to real `launchctl` — init.ts's daemon bootstrap is darwin-gated, so a `runInit` test that forgets
   # RELAY_SKIP_DAEMON silently installs a real launchd KeepAlive service + a :3777 daemon on a contributor's Mac
@@ -418,6 +433,15 @@ jobs:
       - name: Run the full test suite (main and nightly)
         if: github.event_name != 'pull_request'
         run: npx vitest run --maxWorkers=2
+
+      # INV-DB-01 2b-ii: the macOS single-owner primitive (an O_EXLOCK dotfile) is measured here, serial and alone, on
+      # every PR and on main; and the owner behaviour rows (not in the PR subset otherwise).
+      - name: INV-DB-01 single-owner measurements, serial (macOS)
+        if: ${{ !cancelled() }}
+        run: npx vitest run --config vitest.serial.config.ts --reporter=verbose
+      - name: INV-DB-01 owner behaviour rows (macOS)
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/inv-db-01-wasm-owner.test.ts --reporter=verbose
 
       - name: Timing bars, serial and isolated (failed-auth loop + availability)
         # Latency bars run ALONE after the tests; scripts/run-timing-bars.mjs asserts the EXACT set ran and passed.
