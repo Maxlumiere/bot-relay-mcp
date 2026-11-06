@@ -28,7 +28,6 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import * as lockMod from "../src/db-owner-lock.js";
 import * as compat from "../src/sqlite-compat.js";
 import * as db from "../src/db.js";
-import * as header from "../src/db-header.js";
 import { openRawRelayDb } from "../src/cli/_instance-db.js";
 import { exportRelayState, importRelayState, _setBeforeRestoreSwapForTests } from "../src/backup.js";
 import { log } from "../src/logger.js";
