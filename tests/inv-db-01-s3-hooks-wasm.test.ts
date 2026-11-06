@@ -234,6 +234,13 @@ describe.skipIf(process.platform === "win32" || !REAL_SQLITE)("INV-DB-01 slice 3
     expect(r.notices, r.out).toEqual([]);
   });
 
+  it("twin: zero-byte → no notice (no header is not an unreadable one: today's path)", () => {
+    FIXTURES["zero-byte"]!();
+    const r = runSessionStart();
+    expect(r.notices, r.out).toEqual([]);
+    expect(where().stdout.split("\n")[6]).toBe("sqlite3");
+  });
+
   it("an older relay CLI (a 6-line answer) → zero sqlite3 invocations and ONE notice naming the version skew", () => {
     FIXTURES.rlyn!();
     const r = runSessionStart({ FAKE_WHERE: "six" });
@@ -248,5 +255,65 @@ describe.skipIf(process.platform === "win32" || !REAL_SQLITE)("INV-DB-01 slice 3
     expect(r.sqliteCalls, r.out).toEqual([]);
     expect(r.notices.length, r.out).toBe(1);
     expect(r.notices[0]).toMatch(/unknown DB verdict/);
+  });
+});
+
+/**
+ * The PostToolUse hook also opens the DB natively: python3's sqlite3 module (its liveness self-heal), and only after
+ * `relay pending` read the mailbox. A sitecustomize on PYTHONPATH wraps sqlite3.connect in every python3 the hook
+ * starts and records each call (and that it loaded, so a zero count is a measured zero). The Stop hook has no python3
+ * sqlite3 read at all (grep of hooks/stop-check.sh), so its control is the spy having loaded.
+ */
+const PYSPY = path.join(ROOT, "pyspy");
+const PYSPY_LOG = path.join(ROOT, "pyspy.log");
+fs.mkdirSync(PYSPY, { recursive: true });
+fs.writeFileSync(
+  path.join(PYSPY, "sitecustomize.py"),
+  [
+    "import os",
+    "_log = os.environ.get('RELAY_TEST_PYSPY_LOG')",
+    "if _log:",
+    "    with open(_log, 'a') as f: f.write('LOADED %d\\n' % os.getpid())",
+    "    import sqlite3 as _s",
+    "    _orig = _s.connect",
+    "    def _connect(*a, **k):",
+    "        with open(_log, 'a') as f: f.write('CONNECT %r\\n' % (a[0] if a else k.get('database'),))",
+    "        return _orig(*a, **k)",
+    "    _s.connect = _connect",
+    "",
+  ].join("\n"),
+);
+function runPyHook(hook: string) {
+  fs.rmSync(PYSPY_LOG, { force: true });
+  const r = spawnSync("bash", [path.join(SEAMED, hook)], {
+    encoding: "utf-8",
+    timeout: 30_000,
+    input: "",
+    env: envFor({ PYTHONPATH: PYSPY, RELAY_TEST_PYSPY_LOG: PYSPY_LOG, RELAY_AGENT_TOKEN: "s3-test-token-0001" }),
+  });
+  const lines = fs.existsSync(PYSPY_LOG) ? fs.readFileSync(PYSPY_LOG, "utf-8").split("\n").filter(Boolean) : [];
+  return { out: `${r.stdout ?? ""}\n${r.stderr ?? ""}`, loaded: lines.filter((l) => l.startsWith("LOADED")).length, connects: lines.filter((l) => l.startsWith("CONNECT")) };
+}
+
+describe.skipIf(process.platform === "win32" || !REAL_SQLITE)("INV-DB-01 slice 3: PostToolUse and Stop make ZERO python3 sqlite3 opens on a declared-wasm instance (a sitecustomize spy)", () => {
+  it("positive control: on RLYN, PostToolUse's python3 sqlite3 read runs (the spy sees > 0 connects)", () => {
+    FIXTURES.rlyn!();
+    const r = runPyHook("post-tool-use-check.sh");
+    expect(r.loaded, `the spy loaded in the hook's python3: ${r.out}`).toBeGreaterThan(0);
+    expect(r.connects.length, r.out).toBeGreaterThan(0);
+  });
+
+  it("declared-wasm: PostToolUse makes ZERO python3 sqlite3 opens (the spy loaded, and saw none)", () => {
+    FIXTURES["declared-wasm"]!();
+    const r = runPyHook("post-tool-use-check.sh");
+    expect(r.loaded, `the spy loaded in the hook's python3: ${r.out}`).toBeGreaterThan(0);
+    expect(r.connects, r.out).toEqual([]);
+  });
+
+  it("declared-wasm: Stop makes ZERO python3 sqlite3 opens (the spy loaded, and saw none)", () => {
+    FIXTURES["declared-wasm"]!();
+    const r = runPyHook("stop-check.sh");
+    expect(r.loaded, `the spy loaded in the hook's python3: ${r.out}`).toBeGreaterThan(0);
+    expect(r.connects, r.out).toEqual([]);
   });
 });
