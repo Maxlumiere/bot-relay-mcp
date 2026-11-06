@@ -312,10 +312,17 @@ describe.skipIf(process.platform === "win32" || !REAL_SQLITE)("INV-DB-01 slice 3
     expect(r.connects, r.out).toEqual([]);
   });
 
-  it("declared-wasm: Stop makes ZERO python3 sqlite3 opens (the spy loaded, and saw none)", () => {
-    FIXTURES["declared-wasm"]!();
+  it("positive control: on RLYN, the spy loads in the Stop hook's python3 (Stop has no python3 sqlite3 read: zero connects)", () => {
+    FIXTURES.rlyn!();
     const r = runPyHook("stop-check.sh");
     expect(r.loaded, `the spy loaded in the hook's python3: ${r.out}`).toBeGreaterThan(0);
     expect(r.connects, r.out).toEqual([]);
+  });
+
+  it("declared-wasm: Stop makes ZERO python3 sqlite3 opens (its mail read is refused by name before any python3 starts)", () => {
+    FIXTURES["declared-wasm"]!();
+    const r = runPyHook("stop-check.sh");
+    // The spy's liveness in Stop's python3 is the RLYN control above; here Stop may start no python3 at all.
+    expect(r.connects, `${r.loaded} python3 process(es) loaded the spy: ${r.out}`).toEqual([]);
   });
 });
