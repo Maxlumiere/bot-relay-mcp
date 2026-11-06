@@ -397,21 +397,21 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
   const refuse = () => {
     throw new Error("refused by verify");
   };
-  it("a DB the acquire just CREATED, refused by its verify, is REMOVED (provably its own: same dev + ino and size), and the refusal stands", async () => {
+  it("a DB the acquire just CREATED, refused by its verify, is LEFT in place and NAMED with its size (slice 3: never unlink a DB file), and the refusal stands", async () => {
     const { acquirePrimitive } = (await import("../dist/db-owner-lock.js")) as { acquirePrimitive: Acquire };
     const db = path.join(ROOT, "refused-new.db");
-    await expect(acquirePrimitive(db, { verifyCreated: refuse, initialBytes: FIRST })).rejects.toThrow(/refused by verify/);
-    expect(fs.existsSync(db), "the file it created is gone").toBe(false);
+    await expect(acquirePrimitive(db, { verifyCreated: refuse, initialBytes: FIRST })).rejects.toThrow(/refused by verify.*\(3 bytes\) is LEFT in place/);
+    expect(fs.existsSync(db), "the file it created is left, not unlinked").toBe(true);
   }, 60_000);
 
   it.each([
     ["a DIFFERENT file replaced it (another inode)", (p: string) => { fs.renameSync(p, `${p}.moved`); fs.writeFileSync(p, "abc"); }],
     ["its own file CHANGED size", (p: string) => fs.appendFileSync(p, "x")],
-  ])("twin: NOT removed when %s, and the refusal says so", async (_label, meddle) => {
+  ])("twin: still left in place when %s, and the refusal says so", async (_label, meddle) => {
     const { acquirePrimitive } = (await import("../dist/db-owner-lock.js")) as { acquirePrimitive: Acquire };
     const db = path.join(ROOT, `kept-${Math.random().toString(36).slice(2)}.db`);
-    await expect(acquirePrimitive(db, { initialBytes: FIRST, verifyCreated: (p) => { meddle(p); refuse(); } })).rejects.toThrow(/refused by verify.*NOT removed/);
-    expect(fs.existsSync(db), "a file not provably its own is left in place").toBe(true);
+    await expect(acquirePrimitive(db, { initialBytes: FIRST, verifyCreated: (p) => { meddle(p); refuse(); } })).rejects.toThrow(/refused by verify.*LEFT in place/);
+    expect(fs.existsSync(db), "the name is left in place").toBe(true);
   }, 60_000);
 
   it("twin: a DB that already EXISTED is never verified as created (nor removed)", async () => {

@@ -632,7 +632,7 @@ describe("Codex #291 R2 #2 — a resolution field with NUL or any C0 control is 
     expect(r.stdout, r.stderr).toMatch(/^rc=1 kind=error db=$/m);
   });
 
-  it("`relay where --fields` refuses a resolved path with a C0 control (kind error, exit 1, exactly 6 lines)", () => {
+  it("`relay where --fields` refuses a resolved path with a C0 control (kind error, exit 1, exactly 7 lines)", () => {
     const r = spawnSync(process.execPath, [path.join(REPO_ROOT, "bin", "relay"), "where", "--fields"], {
       encoding: "utf-8",
       env: { PATH: process.env.PATH ?? "", HOME, RELAY_DB_PATH: path.join(HOME, "a\u001bb", "relay.db") },
@@ -642,7 +642,7 @@ describe("Codex #291 R2 #2 — a resolution field with NUL or any C0 control is 
     expect(f[0]).toBe("error");
     expect(f[1]).toBe("");
     expect(f[3]).toMatch(/control character/);
-    expect(f.length, "exactly 6 lines + the final newline").toBe(7);
+    expect(f.length, "exactly 7 lines (line 7: the hooks' DB verdict) + the final newline").toBe(8);
   });
 
   it("`relay where --fields`: a control character in the REASON becomes a space (the line stays one clean line)", () => {
