@@ -474,7 +474,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(msg, "and its size").toMatch(/4096 bytes/);
   });
 
-  it.skipIf(process.platform === "win32")("G5 (ADR-0048 amended): a DB refused after its open is never unlinked: the refusal NAMES the 0-byte file the open created", async () => {
+  it("G5 (ADR-0048 amended): a DB refused after its open is never unlinked: the refusal NAMES the 0-byte file the open created", async () => {
     // Outside the approved roots (this test's HOME and the temp dir): beside the repo, removed at the end.
     const outside = path.join(REPO, `.s3-outside-${process.pid}`);
     fs.mkdirSync(outside, { recursive: true });
@@ -482,10 +482,11 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     const configured = path.join(dir, "relay.db");
     process.env.RELAY_DB_PATH = configured;
     const realMkdir = fs.mkdirSync.bind(fs);
-    // The racer: when the DB's directory is created, a symlink to OUTSIDE appears there instead.
+    // The racer: when the DB's directory is created, a link to OUTSIDE appears there instead (on Windows an NTFS
+    // junction, which needs no privilege, unlike a directory symlink).
     const spy = vi.spyOn(fs, "mkdirSync").mockImplementation(((p: fs.PathLike, o?: unknown) => {
       if (String(p) === dir) {
-        fs.symlinkSync(outside, dir);
+        fs.symlinkSync(outside, dir, process.platform === "win32" ? "junction" : undefined);
         return undefined;
       }
       return realMkdir(p, o as never);
