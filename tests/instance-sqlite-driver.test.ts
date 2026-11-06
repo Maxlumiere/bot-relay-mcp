@@ -46,8 +46,13 @@ beforeEach(() => {
   process.env.RELAY_CONFIG_PATH = path.join(caseDir, "config.json");
   compat.closeInitializedDb();
   (compat as unknown as { _resetDriverWarningForTests?: () => void })._resetDriverWarningForTests?.();
+  // INV-DB-01 slice 3 (Codex #391 R2, as ruled): these rows are the instance SERVER's own open (its warn on an
+  // unreadable config is the server's: src/index.ts main() marks every server). A CLI verb fails closed instead
+  // (tests/inv-db-01-s3-by-path.test.ts "R2 P2-4").
+  compat._setInstanceServerForTests(true);
 });
 afterEach(() => {
+  compat._setInstanceServerForTests(false);
   db.closeDb();
   compat.closeInitializedDb();
   vi.restoreAllMocks();

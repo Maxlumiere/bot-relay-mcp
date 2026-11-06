@@ -13,7 +13,7 @@ import { startStdioServer } from "./transport/stdio.js";
 import { startHttpServer } from "./transport/http.js";
 import { registerConfigSecret } from "./secret-registry.js";
 import { closeDb, initializeDb, getDbPath } from "./db.js";
-import { resolveOpen } from "./sqlite-compat.js";
+import { resolveOpen, markInstanceServer } from "./sqlite-compat.js";
 import { httpClientHint } from "./db-header.js";
 import { assertInstanceResolution } from "./instance.js";
 import { startOutboxTail, stopOutboxTail } from "./outbox-tail.js";
@@ -33,6 +33,9 @@ function checkNodeVersion(): void {
 }
 
 async function main(): Promise<void> {
+  // INV-DB-01 slice 3: this process is an instance SERVER (the daemon or the stdio MCP server): it keeps the warn on an
+  // unreadable config; every other native opener fails closed (sqlite-compat.ts markInstanceServer).
+  markInstanceServer();
   checkNodeVersion();
 
   // v2.2.1 B1: CLI flag parsing. Must run BEFORE loadConfig so CLI values

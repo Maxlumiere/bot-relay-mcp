@@ -49,7 +49,7 @@ import { VERSION } from "./version.js";
 import { ensureSecureDir, ensureSecureFile, restrictToOwnerWindows } from "./fs-perms.js";
 import { serializeConfigForArchive, scanCiphertextKeyIds, classifyWebhookSecrets, manifestKeysOf, assertKeyringCanRead, type ArchivedConfig, type ManifestKey, type WebhookSecretCount } from "./backup-secrets.js";
 import { getKeyringInfo } from "./encryption.js";
-import { canonicalReplaceTarget } from "./db-owner-lock.js";
+import { canonicalReplaceTarget, lockKey, type OwnerLock } from "./db-owner-lock.js";
 import { ERROR_CODES } from "./error-codes.js";
 
 /**
@@ -393,15 +393,27 @@ function restoreReplaceTarget(srcDbPath: string): string {
  * the rename: the configured path still resolves to the planned target (P1-1), an owned DB still has ONE link (P2-5),
  * and no side file is beside either name.
  */
-function assertSwapPreconditions(srcDbPath: string, target: string, owned: boolean): void {
+function assertSwapPreconditions(srcDbPath: string, target: string, owner: OwnerLock | null): void {
   const now = restoreReplaceTarget(srcDbPath);
   if (now !== target) {
     throw new Error(
       `restore refused: the DB path ${srcDbPath} now resolves to ${now}, not ${target}, the file this restore checked` +
-        `${owned ? " and locked" : ""}. Nothing was replaced. Point the path back (or run the restore again).`
+        `${owner ? " and locked" : ""}. Nothing was replaced. Point the path back (or run the restore again).`
     );
   }
-  if (owned) assertMaintenanceSingleLink(target, "restore");
+  if (owner) {
+    // Codex #391 R2 P1: the lock this restore ACQUIRED must be the target's own (an acquisition that retried while the
+    // path moved can hold another file's lock while the path is moved back).
+    if (owner.key !== lockKey(target)) {
+      throw new Error(
+        `restore refused: the single-owner lock this restore holds is not the lock of ${target} (the DB path moved while ` +
+          `the lock was being taken). Nothing was replaced. Run the restore again.`
+      );
+    }
+    // Codex #391 R2: and it still holds that lock, with its lock file still at its name, right before the replacement.
+    owner.assertIntact();
+    assertMaintenanceSingleLink(target, "restore");
+  }
   assertNoSideFilesAtSwap([srcDbPath, target]);
 }
 
@@ -668,6 +680,11 @@ let afterRestoreCheckpointHook: ((dbPath: string, result: CheckpointResult) => v
 export function _setAfterRestoreCheckpointForTests(fn: ((dbPath: string, result: CheckpointResult) => void | Promise<void>) | null): void {
   afterRestoreCheckpointHook = fn;
 }
+/** Test-only: awaited right before a restore takes an owned DB's single-owner lock. */
+let beforeRestoreAcquireHook: ((dbPath: string) => void | Promise<void>) | null = null;
+export function _setBeforeRestoreAcquireForTests(fn: ((dbPath: string) => void | Promise<void>) | null): void {
+  beforeRestoreAcquireHook = fn;
+}
 /** Test-only: awaited right after the archive is staged into `.new`, before the final checks and the rename. */
 let afterRestoreStageHook: ((newPath: string, target: string) => void | Promise<void>) | null = null;
 export function _setAfterRestoreStageForTests(fn: ((newPath: string, target: string) => void | Promise<void>) | null): void {
@@ -698,7 +715,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-import-"));
   // 2b-ii: a restore onto an OWNED (RLYW) live DB holds its single-owner lock from before the safety backup to after
   // the swap (refused, by name, while another process owns it).
-  let restoreOwner: { release(): void; assertIntact(): void } | null = null;
+  let restoreOwner: OwnerLock | null = null;
   try {
     assertPrivateStaging(stagingDir);
     // INV-DB-01 2b-i: an archive path that IS the live DB (or one of its side files, or a hard link to one) is never
@@ -792,6 +809,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // is refused: a retargeted symlink could otherwise point the swap at a file whose lock it never took.
     const plannedTarget = restoreReplaceTarget(srcDbPath);
     if (fs.existsSync(srcDbPath) && isOwnedDb(srcDbPath)) {
+      await beforeRestoreAcquireHook?.(srcDbPath);
       restoreOwner = await holdOwnerForMaintenance(srcDbPath, "restore");
     }
     if (fs.existsSync(srcDbPath)) {
@@ -834,14 +852,14 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // only, beside both names. Relay code never deletes them: a stale WAL beside a replaced DB is applied to it by the
     // next open (MEASURED: the pre-restore rows came back, integrity_check ok).
     const target = plannedTarget;
-    assertSwapPreconditions(srcDbPath, target, restoreOwner !== null);
+    assertSwapPreconditions(srcDbPath, target, restoreOwner);
     const newPath = target + ".new";
     fs.copyFileSync(extractedDbPath, newPath);
     try {
       await afterRestoreStageHook?.(newPath, target);
       // Codex #391 R1: the checks again, right before the rename (a side file, a retarget or a new hard link could
       // appear while the archive was being copied into .new).
-      assertSwapPreconditions(srcDbPath, target, restoreOwner !== null);
+      assertSwapPreconditions(srcDbPath, target, restoreOwner);
     } catch (err) {
       fs.rmSync(newPath, { force: true }); // this restore's own staged copy (never a DB-family name)
       throw err;

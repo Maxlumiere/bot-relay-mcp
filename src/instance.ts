@@ -436,11 +436,30 @@ export function colocatedConfigPathFor(dbPath: string, env: ResolverEnv = proces
       return null;
     }
   };
-  const dir = real(path.dirname(path.resolve(dbPath)));
-  if (dir === null) return null;
-  if (dir === real(relayRootFor(env))) return path.join(dir, CONFIG_FILE);
-  const instances = real(instancesRootFor(env));
-  if (instances !== null && path.dirname(dir) === instances) return path.join(dir, CONFIG_FILE);
+  // Codex #391 R2: the DB path's own directory AND, when the DB exists, its canonical referent's directory (a DB path
+  // that is a symlink INTO an instance directory belongs to that instance).
+  const dirs = new Set<string>();
+  const parent = real(path.dirname(path.resolve(dbPath)));
+  if (parent !== null) dirs.add(parent);
+  const referent = real(dbPath);
+  if (referent !== null) dirs.add(path.dirname(referent));
+  if (dirs.size === 0) return null;
+  // The flat relay home, and EACH instance directory by its own real path (an instance dir may be a symlink elsewhere).
+  const homes: string[] = [];
+  const flat = real(relayRootFor(env));
+  if (flat !== null) homes.push(flat);
+  const instancesRoot = instancesRootFor(env);
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(instancesRoot);
+  } catch {
+    entries = [];
+  }
+  for (const id of entries) {
+    const d = real(path.join(instancesRoot, id));
+    if (d !== null) homes.push(d);
+  }
+  for (const dir of dirs) if (homes.includes(dir)) return path.join(dir, CONFIG_FILE);
   return null;
 }
 

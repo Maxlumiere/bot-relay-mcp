@@ -138,6 +138,22 @@ function getDriverType(): SqliteDriver {
   return declaredDriver().driver;
 }
 
+/**
+ * INV-DB-01 slice 3 (Codex #391 R2, as ruled): set by EVERY relay SERVER entrypoint (src/index.ts main(): the
+ * HTTP daemon AND the stdio MCP server every connector runs) before it opens its own DB. Only a server keeps
+ * declaredDriver()'s warn on an unreadable config (it reads its own file, so no reader disagrees with it, and refusing
+ * would turn one corrupt config.json into a fleet-wide outage). Every other native opener, every CLI verb included,
+ * runs the one fail-closed predicate (nativeOpenVerdict).
+ */
+let instanceServer = false;
+export function markInstanceServer(): void {
+  instanceServer = true;
+}
+/** Test-only: run as (or stop running as) an instance server. */
+export function _setInstanceServerForTests(on: boolean): void {
+  instanceServer = on;
+}
+
 /** How a DB is opened: natively, through the legacy wasm mode (no owner, unstamped), or by its wasm single OWNER. */
 export type OpenMode = "native" | "legacy-wasm" | "owner";
 export interface ResolvedOpen {
@@ -170,12 +186,18 @@ export function resolveOpen(dbPath: string): ResolvedOpen {
     return { driver: "wasm", mode: "owner", header: peek };
   }
   if (d.driver === "native") {
-    // INV-DB-01 slice 3 (P2-3): a DB of ANOTHER instance (its own config.json is not the caller's) is opened natively
-    // only when that instance's declaration allows it too.
-    const { configPath } = readInstanceSqliteDriver();
-    const other = dbHomeDeclaration(dbPath, { value: undefined, configPath });
-    const r = other ? declarationRefusal(dbPath, "a native open", other) : null;
-    if (r) throw new DbHeaderRefusedError(r.message);
+    if (instanceServer) {
+      // INV-DB-01 slice 3 (P2-3): the server reads its own config with declaredDriver()'s warn; a DB of ANOTHER instance
+      // (its own config.json is not the caller's) is opened natively only when that instance's declaration allows it.
+      const { configPath } = readInstanceSqliteDriver();
+      const other = dbHomeDeclaration(dbPath, { value: undefined, configPath });
+      const r = other ? declarationRefusal(dbPath, "a native open", other) : null;
+      if (r) throw new DbHeaderRefusedError(r.message);
+    } else {
+      // Codex #391 R2: a non-server native open (a CLI verb's initializeDb) runs the one fail-closed predicate.
+      const v = nativeOpenVerdict(dbPath, "a native open (a relay CLI verb)");
+      if (!v.ok) throw new DbHeaderRefusedError(v.message);
+    }
   }
   const header = assertDriverHeaderAllows(dbPath, d.driver);
   if (d.driver === "native") return { driver: "native", mode: "native", header };
