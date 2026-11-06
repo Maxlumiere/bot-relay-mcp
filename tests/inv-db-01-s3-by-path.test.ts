@@ -26,6 +26,7 @@ import * as compat from "../src/sqlite-compat.js";
 import * as db from "../src/db.js";
 import { materializeDb } from "../src/db-owner-lock.js";
 import { openRawRelayDb } from "../src/cli/_instance-db.js";
+import { hookDbVerdict } from "../src/hook-db-verdict.js";
 import { exportRelayState, importRelayState, _setBeforeRestoreSwapForTests } from "../src/backup.js";
 import * as backupMod from "../src/backup.js";
 
@@ -659,6 +660,35 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     process.env.RELAY_DB_PATH = elsewhere;
     const h = await openRawRelayDb(elsewhere, { readonly: true });
     h.close();
+    expect(hookDbVerdict(elsewhere), "and the hooks may read it").toBe("sqlite3");
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("R1 P2-4 split: a caller config path the resolver CANNOT JUDGE (EACCES on the active-instance marker, from its own syscall) fails closed: a raw open is refused, hook_db skip-unreadable", async () => {
+    const home = path.join(caseDir, ".bot-relay");
+    fs.mkdirSync(home);
+    delete process.env.RELAY_CONFIG_PATH;
+    const elsewhere = path.join(caseDir, "explicit", "relay.db");
+    fs.mkdirSync(path.dirname(elsewhere), { recursive: true });
+    makeDb(elsewhere, 0, ["row-1"]);
+    process.env.RELAY_DB_PATH = elsewhere;
+    fs.chmodSync(home, 0o000); // lstat of the home still works; the marker inside it gets EACCES
+    try {
+      await expect(openRawRelayDb(elsewhere, { readonly: true })).rejects.toThrow(/could not be read[\s\S]*EACCES/);
+      expect(hookDbVerdict(elsewhere)).toBe("skip-unreadable");
+    } finally {
+      fs.chmodSync(home, 0o700);
+    }
+  });
+
+  it("R1 P2-4 split: a CODELESS resolver error (an instance id that is a path step) is \"other\": fail closed, the raw open refused, hook_db skip-unreadable", async () => {
+    delete process.env.RELAY_CONFIG_PATH;
+    process.env.RELAY_INSTANCE_ID = "..";
+    const elsewhere = path.join(caseDir, "explicit", "relay.db");
+    fs.mkdirSync(path.dirname(elsewhere), { recursive: true });
+    makeDb(elsewhere, 0, ["row-1"]);
+    process.env.RELAY_DB_PATH = elsewhere;
+    await expect(openRawRelayDb(elsewhere, { readonly: true })).rejects.toThrow(/could not be read/);
+    expect(hookDbVerdict(elsewhere)).toBe("skip-unreadable");
   });
 
   it("R1 P2-4 twin: the DB's own instance has NO config.json (ENOENT) → no declaration: the raw open is allowed", async () => {
