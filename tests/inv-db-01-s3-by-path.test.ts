@@ -24,7 +24,9 @@ import Database from "better-sqlite3";
 import crypto from "crypto";
 import * as compat from "../src/sqlite-compat.js";
 import * as db from "../src/db.js";
-import { materializeDb } from "../src/db-owner-lock.js";
+import { materializeDb, lockFilePath } from "../src/db-owner-lock.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { openRawRelayDb } from "../src/cli/_instance-db.js";
 import { hookDbVerdict } from "../src/hook-db-verdict.js";
 import { exportRelayState, importRelayState, _setBeforeRestoreSwapForTests } from "../src/backup.js";
@@ -730,6 +732,181 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     const h = await openRawRelayDb(aDb, { readonly: true });
     h.close();
   });
+
+  // --- Codex #391 R2 (the last round), each a RED on 673bc79 ---
+
+  it.skipIf(process.platform === "win32")("R2 P1: a restore whose path moves to ANOTHER owned DB while its lock is being taken (and back before the swap) is refused: the lock it holds is not the target's; both DBs untouched", async () => {
+    const a = path.join(caseDir, "a.db");
+    makeDb(a, WASM, ["a-row"]);
+    const b = path.join(caseDir, "b.db");
+    makeDb(b, WASM, ["b-row"]);
+    const link = path.join(caseDir, "link.db");
+    fs.symlinkSync(a, link);
+    process.env.RELAY_DB_PATH = link;
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const [shaA, shaB] = [sha(a), sha(b)];
+    const setAcquire = (backupMod as unknown as { _setBeforeRestoreAcquireForTests?: (fn: (() => void) | null) => void })._setBeforeRestoreAcquireForTests;
+    let moved = false;
+    setAcquire?.(() => {
+      fs.unlinkSync(link);
+      fs.symlinkSync(b, link); // the lock is taken while the path names b
+      moved = true;
+    });
+    _setBeforeRestoreSwapForTests(async () => {
+      fs.unlinkSync(link);
+      fs.symlinkSync(a, link); // and the path names a again at the swap
+    });
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/lock this restore holds is not the lock of/);
+    } finally {
+      setAcquire?.(null);
+      _setBeforeRestoreSwapForTests(null);
+    }
+    expect(moved, "the path moved while the lock was being taken").toBe(true);
+    expect(sha(a), "a is untouched").toBe(shaA);
+    expect(sha(b), "b is untouched").toBe(shaB);
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("R2: an owned DB's lock file REPLACED while the archive is staged refuses the rename (the lock's integrity is checked right before it); the DB untouched, the staged copy removed", async () => {
+    makeDb(dbPath, WASM, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const before = fileState(dbPath);
+    let staged = "";
+    setAfterStage?.((newPath, target) => {
+      staged = newPath;
+      const lf = lockFilePath(target);
+      fs.rmSync(lf);
+      fs.writeFileSync(lf, ""); // another owner's lock file now has that name
+    });
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/removed|replaced/);
+    } finally {
+      setAfterStage?.(null);
+    }
+    expect(staged, "the hook after staging ran").not.toBe("");
+    expect(fileState(dbPath), "the DB is untouched").toBe(before);
+    expect(fs.existsSync(staged), "the staged copy is removed").toBe(false);
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("R2 P2-3: a SYMLINKED instance directory (instances/a -> storage) still belongs to its instance: A's wasm declaration refuses B's native opener (absent DB: nothing created; legacy DB: refused, hook skip-declared-wasm)", async () => {
+    const root = path.join(caseDir, ".bot-relay", "instances");
+    fs.mkdirSync(path.join(root, "b"), { recursive: true });
+    fs.writeFileSync(path.join(root, "b", "config.json"), JSON.stringify({ sqlite_driver: "native" }), { mode: 0o600 });
+    const storage = path.join(caseDir, "storage", "a");
+    fs.mkdirSync(storage, { recursive: true });
+    fs.writeFileSync(path.join(storage, "config.json"), WASM_DECL, { mode: 0o600 });
+    fs.symlinkSync(storage, path.join(root, "a"));
+    delete process.env.RELAY_CONFIG_PATH;
+    process.env.RELAY_INSTANCE_ID = "b";
+    const aDb = path.join(root, "a", "relay.db");
+    process.env.RELAY_DB_PATH = aDb;
+    expect(() => db.getDb()).toThrow(/declares sqlite_driver "wasm"/);
+    expect(fs.existsSync(path.join(storage, "relay.db")), "nothing was created").toBe(false);
+    makeDb(path.join(storage, "relay.db"), 0, ["row-1"]);
+    await expect(openRawRelayDb(aDb, { readonly: true })).rejects.toThrow(/declares sqlite_driver "wasm"/);
+    expect(hookDbVerdict(aDb)).toBe("skip-declared-wasm");
+  });
+
+  it.skipIf(process.platform === "win32")("R2 P2-3: a DB path that is itself a SYMLINK INTO an instance directory belongs to that instance: A's wasm declaration refuses it (raw open, hook skip-declared-wasm)", async () => {
+    const { aDb } = twoInstances(WASM_DECL);
+    makeDb(aDb, 0, ["row-1"]);
+    const alias = path.join(caseDir, "alias.db");
+    fs.symlinkSync(aDb, alias);
+    process.env.RELAY_DB_PATH = alias;
+    await expect(openRawRelayDb(alias, { readonly: true })).rejects.toThrow(/declares sqlite_driver "wasm"/);
+    expect(hookDbVerdict(alias)).toBe("skip-declared-wasm");
+  });
+
+  it.skipIf(process.platform === "win32")("R2 P2-3: a DB path that is a SYMLINK INTO the flat relay home belongs to it: the home's wasm declaration refuses a native caller (RELAY_CONFIG_PATH native)", async () => {
+    const home = path.join(caseDir, ".bot-relay");
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, "config.json"), WASM_DECL, { mode: 0o600 });
+    makeDb(path.join(home, "relay.db"), 0, ["row-1"]);
+    const nativeCfg = path.join(caseDir, "native-config.json");
+    fs.writeFileSync(nativeCfg, JSON.stringify({ sqlite_driver: "native" }), { mode: 0o600 });
+    process.env.RELAY_CONFIG_PATH = nativeCfg;
+    const alias = path.join(caseDir, "alias-flat.db");
+    fs.symlinkSync(path.join(home, "relay.db"), alias);
+    process.env.RELAY_DB_PATH = alias;
+    await expect(openRawRelayDb(alias, { readonly: true })).rejects.toThrow(/declares sqlite_driver "wasm"/);
+  });
+
+  /** The flat layout with its OWN config unreadable (malformed) and a legacy (0) DB: a CLI verb vs a server. */
+  function malformedOwnConfig(): { home: string; flatDb: string } {
+    const home = path.join(caseDir, ".bot-relay");
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, "config.json"), '{"sqlite_driver": "wasm"', { mode: 0o600 });
+    const flatDb = path.join(home, "relay.db");
+    makeDb(flatDb, 0, ["row-1"]);
+    return { home, flatDb };
+  }
+  const flatEnv = (extra: Record<string, string> = {}): NodeJS.ProcessEnv => ({
+    PATH: process.env.PATH ?? "",
+    HOME: caseDir,
+    USERPROFILE: caseDir,
+    RELAY_SKIP_TTY_CHECK: "1",
+    RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(caseDir, "wc.json"),
+    ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+    ...extra,
+  });
+
+  it.each([
+    ["relay send", ["send", "alice", "bob", "hello"]],
+    ["relay mint-token", ["mint-token", "alice"]],
+  ])("R2 P2-4: %s on an instance whose OWN config is unreadable (malformed) fails CLOSED, by name, before any native open", (_label, args) => {
+    const { flatDb } = malformedOwnConfig();
+    const before = sha(flatDb);
+    const r = spawnSync(process.execPath, [RELAY_BIN, ...args], { encoding: "utf-8", env: flatEnv() });
+    expect(r.status, r.stdout + r.stderr).not.toBe(0);
+    expect(r.stdout + r.stderr).toMatch(/could not be read[\s\S]*fix or remove that config\.json/i);
+    expect(sha(flatDb), "the DB is untouched").toBe(before);
+  }, 60_000);
+
+  it("R2 P2-4 twin: the STDIO MCP server (every connector) with the same unreadable own config starts with the WARN and acknowledges a tool call", async () => {
+    malformedOwnConfig();
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [path.join(REPO, "dist", "index.js")],
+      env: flatEnv({ RELAY_TRANSPORT: "stdio" }) as Record<string, string>,
+      stderr: "pipe",
+    });
+    let stderr = "";
+    transport.stderr?.on("data", (d) => (stderr += String(d)));
+    const client = new Client({ name: "s3-r2-stdio", version: "0" }, { capabilities: {} });
+    await client.connect(transport);
+    try {
+      const r = (await client.callTool({ name: "health_check", arguments: {} })) as { isError?: boolean; content?: unknown };
+      expect(r.isError, JSON.stringify(r.content)).not.toBe(true);
+    } finally {
+      await client.close();
+    }
+    expect(stderr, "the server warned about its unreadable config").toMatch(/could not read this instance's sqlite_driver/);
+  }, 60_000);
+
+  it("R2 P2-4 twin: the HTTP DAEMON with the same unreadable own config starts with the WARN and answers /health", async () => {
+    malformedOwnConfig();
+    const port = 20000 + Math.floor(Math.random() * 30000);
+    const child = spawn(process.execPath, [path.join(REPO, "dist", "index.js")], {
+      env: flatEnv({ RELAY_TRANSPORT: "http", RELAY_HTTP_PORT: String(port), RELAY_HTTP_HOST: "127.0.0.1" }),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    children.push(child);
+    let stderr = "";
+    child.stderr!.on("data", (d) => (stderr += String(d)));
+    let status = 0;
+    for (let i = 0; i < 60 && status !== 200; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      try {
+        status = (await fetch(`http://127.0.0.1:${port}/health`)).status;
+      } catch {
+        /* not up yet */
+      }
+    }
+    child.kill("SIGTERM");
+    await waitExitOf(child);
+    expect(status, `the daemon answered /health: ${stderr.slice(-800)}`).toBe(200);
+    expect(stderr, "the daemon warned about its unreadable config").toMatch(/could not read this instance's sqlite_driver/);
+  }, 60_000);
 
   // --- G5: a DB file is never unlinked: a refusal leaves it and names it ---
 
