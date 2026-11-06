@@ -355,6 +355,8 @@ describe.skipIf(process.platform === "win32" || !REAL_SQLITE)("INV-DB-01 slice 3
     const r = runPyHook("stop-check.sh");
     // The spy's liveness in Stop's python3 is the RLYN control above; here Stop may start no python3 at all.
     expect(r.connects, `${r.loaded} python3 process(es) loaded the spy: ${r.out}`).toEqual([]);
-    expect(r.out, "its mail read reached the NAMED by-path refusal").toMatch(/REFUSING a raw native open[\s\S]*declares sqlite_driver "wasm"/);
+    // The hook's verdict reason is cut at a fixed length, so the row matches the refusal's own opening words: only
+    // assertNativeByPathAllowed prints "REFUSING a raw native open".
+    expect(r.out, "its mail read reached the NAMED by-path refusal").toMatch(/REFUSING a raw native open \(a relay CLI verb\)/);
   });
 });
