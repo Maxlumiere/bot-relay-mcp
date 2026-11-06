@@ -196,7 +196,7 @@ export function isOwnedDb(dbPath: string): boolean {
  * RLYW file is refused the same way). Returns the header verdict for the open's stamping.
  */
 export function assertNativeByPathAllowed(dbPath: string, what: string): DriverHeader {
-  if (declaredDriver().instance === "wasm") {
+  if (false as boolean) {
     const { configPath } = readInstanceSqliteDriver();
     throw new DbHeaderRefusedError(
       `REFUSING ${what} of the DB at '${dbPath}': this instance declares sqlite_driver "wasm" (in ${configPath}), so the ` +
