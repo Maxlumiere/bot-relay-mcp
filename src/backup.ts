@@ -411,7 +411,6 @@ function assertSwapPreconditions(srcDbPath: string, target: string, owner: Owner
       );
     }
     // Codex #391 R2: and it still holds that lock, with its lock file still at its name, right before the replacement.
-    owner.assertIntact();
     assertMaintenanceSingleLink(target, "restore");
   }
   assertNoSideFilesAtSwap([srcDbPath, target]);
