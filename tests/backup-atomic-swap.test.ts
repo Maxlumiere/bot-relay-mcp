@@ -91,6 +91,9 @@ describe("v2.1 Phase 4q MED #5 — atomic backup swap", () => {
     async () => {
       const archive = await seedAndBackup();
       const DB = path.resolve(TEST_DB_PATH);
+      // INV-DB-01 slice 3: the swap targets the DB's CANONICAL referent (macOS: /var → /private/var). Both names are
+      // the same DB file, so either spelling counts as the DB.
+      const DB_REAL = path.join(fs.realpathSync.native(path.dirname(DB)), path.basename(DB));
 
       // Intercept every fs op that could leave the DB path missing, moved, or
       // half-written. Spies RECORD and call through, so restore behaves exactly
@@ -115,7 +118,7 @@ describe("v2.1 Phase 4q MED #5 — atomic backup swap", () => {
         await importRelayState(archive, { force: true });
       } finally {
         // Classify only after the run, so nothing perturbs the restore.
-        const isDb = (p: unknown) => typeof p === "string" && path.resolve(p) === DB;
+        const isDb = (p: unknown) => typeof p === "string" && (path.resolve(p) === DB || path.resolve(p) === DB_REAL);
         for (const [from, to] of spies.renameSync.mock.calls as unknown[][]) {
           if (isDb(to)) atomicReplaces++; // rename INTO place — the only safe swap
           if (isDb(from)) harmful.push(`rename moved the DB away (${String(from)} → ${String(to)})`);

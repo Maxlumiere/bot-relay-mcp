@@ -110,7 +110,8 @@ function leaveHotWal(file: string, n = 50): void {
 const fileState = (f: string) => (fs.existsSync(f) ? `${fs.statSync(f).size}:${sha(f)}` : "absent");
 
 /**
- * A LIVE opener in another process: it opens `file` in WAL mode and stays open until killed. "idle": no transaction
+ * A LIVE opener in another process: it opens `file` in WAL mode and stays open until killed (its connection is pinned
+ * on globalThis: an unreferenced better-sqlite3 connection is closed on GC, measured to drop its locks). "idle": no transaction
  * (it only holds the connection); "txn": it first commits rows that stay in the -wal, then holds a READ transaction
  * (a snapshot), so a TRUNCATE checkpoint cannot finish.
  */
@@ -120,7 +121,8 @@ fs.writeFileSync(
   `const D = require(process.argv[2]); const d = new D(process.argv[3]); d.pragma("journal_mode = WAL"); d.pragma("wal_autocheckpoint = 0");\n` +
     `if (process.argv[4] === "txn") { const ins = d.prepare("INSERT INTO kept VALUES (?)"); for (let i = 0; i < 20; i++) ins.run("live-" + i); d.exec("BEGIN"); d.prepare("SELECT count(*) FROM kept").get(); }\n` +
     `else d.prepare("SELECT count(*) FROM kept").get();\n` +
-    `process.stdout.write("READY\\n"); setInterval(() => {}, 1000);\n`
+    // PINNED: an unreferenced better-sqlite3 connection is closed on GC, which drops its locks and its side files.
+    `globalThis.__liveOpener = d; process.stdout.write("READY\\n"); setInterval(() => { if (!globalThis.__liveOpener.open) process.exit(9); }, 1000);\n`
 );
 async function startLiveOpener(file: string, mode: "idle" | "txn"): Promise<ChildProcess> {
   const c = spawn(process.execPath, [LIVE, path.join(REPO, "node_modules", "better-sqlite3"), file, mode], { stdio: ["ignore", "pipe", "pipe"] });
