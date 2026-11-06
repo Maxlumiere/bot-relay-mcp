@@ -198,60 +198,21 @@ describe("INV-DB-01 slice 1: the driver is an instance property", () => {
     expect(() => config.validateConfigAndEnv(config.DEFAULT_CONFIG)).not.toThrow();
   });
 
-  it.skipIf(process.platform === "win32")("a config path that BLOCKS on read (a FIFO with no writer) does not stall a DB open: it returns promptly, native", async () => {
-    const fifo = path.join(caseDir, "config.fifo");
-    const mk = await new Promise<number | null>((res) => spawn("mkfifo", [fifo]).on("exit", res));
-    expect(mk, "mkfifo").toBe(0);
-    // In a CHILD process with a deadline: on the old code the read blocks forever, and must not hang this worker.
-    const script = path.join(caseDir, "open.mjs");
-    fs.writeFileSync(
-      script,
-      `const c = await import(${JSON.stringify(pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "sqlite-compat.js")).href)});\n` +
-        `await c.initializeDb(":memory:");\n` +
-        `process.stdout.write("OPENED " + c.getActiveDriver() + "\\n");\n` +
-        `process.exit(0);\n`
-    );
-    const child = spawn(process.execPath, [script], {
-      env: { ...process.env, RELAY_CONFIG_PATH: fifo, HOME: caseDir, USERPROFILE: caseDir },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let out = "";
-    child.stdout!.on("data", (d) => (out += d));
-    const finished = await new Promise<boolean>((res) => {
-      const t = setTimeout(() => res(false), 10_000);
-      child.on("close", () => {
-        clearTimeout(t);
-        res(true);
-      });
-    });
-    if (!finished) child.kill("SIGKILL");
-    expect(finished, "the DB open returned (it did not block on the FIFO)").toBe(true);
-    expect(out).toMatch(/OPENED native/);
-  }, 30_000);
-
-  it.skipIf(process.platform === "win32")("a config swapped to a FIFO AFTER its check (a stale stat) does not stall a DB open: inspection and read use one descriptor", async () => {
-    const fifo = path.join(caseDir, "swapped.fifo");
-    const regular = path.join(caseDir, "regular.json");
-    fs.writeFileSync(regular, "{}", { mode: 0o600 });
-    const mk = await new Promise<number | null>((res) => spawn("mkfifo", [fifo]).on("exit", res));
-    expect(mk, "mkfifo").toBe(0);
-    // The race, made deterministic: the PATH check (statSync) reports a regular file, while the path IS a FIFO, as if it
-    // was swapped between the check and the read. A read that trusts the check blocks forever (in a child, deadline).
-    const script = path.join(caseDir, "swapped.mjs");
-    fs.writeFileSync(
-      script,
-      `import fs from "fs";\n` +
-        `const real = fs.statSync;\n` +
-        `fs.statSync = (p, o) => (String(p) === ${JSON.stringify(fifo)} ? real(${JSON.stringify(regular)}, o) : real(p, o));\n` +
-        `const c = await import(${JSON.stringify(pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "sqlite-compat.js")).href)});\n` +
-        `await c.initializeDb(":memory:");\n` +
-        `process.stdout.write("OPENED " + c.getActiveDriver() + "\\n");\n` +
-        `process.exit(0);\n`
-    );
-    const child = spawn(process.execPath, [script], {
-      env: { ...process.env, RELAY_CONFIG_PATH: fifo, HOME: caseDir, USERPROFILE: caseDir },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+  // INV-DB-01 slice 3 (Codex #391 R2 P2-4, as ruled): each "does not stall" row runs twice, with the SAME time bound. As
+  // the instance SERVER (markInstanceServer: src/index.ts main) the open returns promptly, native, with the warn; as a
+  // NON-server process (a CLI verb) it returns promptly too, REFUSED by name: an unreadable caller declaration fails
+  // closed there (the intended consequence of the fail-closed ruling).
+  const COMPAT_DIST = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "sqlite-compat.js")).href;
+  /** The child's open: a server marks itself first; either way it prints OPENED <driver> or REFUSED <first line>. */
+  const openScript = (server: boolean, prelude = "") =>
+    prelude +
+    `const c = await import(${JSON.stringify(COMPAT_DIST)});\n` +
+    (server ? `c.markInstanceServer();\n` : "") +
+    `try { await c.initializeDb(":memory:"); process.stdout.write("OPENED " + c.getActiveDriver() + "\\n"); }\n` +
+    `catch (e) { process.stdout.write("REFUSED " + String(e && e.message || e).split("\\n")[0] + "\\n"); }\n` +
+    `process.exit(0);\n`;
+  async function runBounded(script: string, env: NodeJS.ProcessEnv): Promise<{ finished: boolean; out: string; err: string }> {
+    const child = spawn(process.execPath, [script], { env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     let err = "";
     child.stdout!.on("data", (d) => (out += d));
@@ -264,9 +225,54 @@ describe("INV-DB-01 slice 1: the driver is an instance property", () => {
       });
     });
     if (!finished) child.kill("SIGKILL");
-    expect(finished, "the DB open returned (the read did not trust the stale check)").toBe(true);
-    expect(out).toMatch(/OPENED native/);
-    expect(err, "the fallback is named").toMatch(/could not read this instance's sqlite_driver from .*swapped\.fifo .*not a regular file/);
+    return { finished, out, err };
+  }
+
+  it.skipIf(process.platform === "win32").each([
+    ["the instance SERVER: native, with the warn", true],
+    ["a NON-server process: refused by name", false],
+  ] as const)("a config path that BLOCKS on read (a FIFO with no writer) does not stall a DB open: it returns promptly (%s)", async (_label, server) => {
+    const fifo = path.join(caseDir, "config.fifo");
+    const mk = await new Promise<number | null>((res) => spawn("mkfifo", [fifo]).on("exit", res));
+    expect(mk, "mkfifo").toBe(0);
+    // In a CHILD process with a deadline: on the old code the read blocks forever, and must not hang this worker.
+    const script = path.join(caseDir, "open.mjs");
+    fs.writeFileSync(script, openScript(server));
+    const r = await runBounded(script, { ...process.env, RELAY_CONFIG_PATH: fifo, HOME: caseDir, USERPROFILE: caseDir });
+    expect(r.finished, "the DB open returned (it did not block on the FIFO)").toBe(true);
+    if (server) expect(r.out).toMatch(/OPENED native/);
+    else expect(r.out).toMatch(/^REFUSED .*config\.fifo.*could not be read.*not a regular file/);
+  }, 30_000);
+
+  it.skipIf(process.platform === "win32").each([
+    ["the instance SERVER: native, with the warn", true],
+    ["a NON-server process: refused by name", false],
+  ] as const)("a config swapped to a FIFO AFTER its check (a stale stat) does not stall a DB open: inspection and read use one descriptor (%s)", async (_label, server) => {
+    const fifo = path.join(caseDir, "swapped.fifo");
+    const regular = path.join(caseDir, "regular.json");
+    fs.writeFileSync(regular, "{}", { mode: 0o600 });
+    const mk = await new Promise<number | null>((res) => spawn("mkfifo", [fifo]).on("exit", res));
+    expect(mk, "mkfifo").toBe(0);
+    // The race, made deterministic: the PATH check (statSync) reports a regular file, while the path IS a FIFO, as if it
+    // was swapped between the check and the read. A read that trusts the check blocks forever (in a child, deadline).
+    const script = path.join(caseDir, "swapped.mjs");
+    fs.writeFileSync(
+      script,
+      openScript(
+        server,
+        `import fs from "fs";\n` +
+          `const real = fs.statSync;\n` +
+          `fs.statSync = (p, o) => (String(p) === ${JSON.stringify(fifo)} ? real(${JSON.stringify(regular)}, o) : real(p, o));\n`
+      )
+    );
+    const r = await runBounded(script, { ...process.env, RELAY_CONFIG_PATH: fifo, HOME: caseDir, USERPROFILE: caseDir });
+    expect(r.finished, "the DB open returned (the read did not trust the stale check)").toBe(true);
+    if (server) {
+      expect(r.out).toMatch(/OPENED native/);
+      expect(r.err, "the fallback is named").toMatch(/could not read this instance's sqlite_driver from .*swapped\.fifo .*not a regular file/);
+    } else {
+      expect(r.out).toMatch(/^REFUSED .*swapped\.fifo.*could not be read.*not a regular file/);
+    }
   }, 30_000);
 
   it("RELAY_SQLITE_DRIVER=native with no instance value: no warning (known-good twin)", async () => {
