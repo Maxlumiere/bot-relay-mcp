@@ -109,7 +109,7 @@ describe("the macOS pull-request subset", () => {
 describe("the aggregate verdicts check every skip against the Scope", () => {
   const needs = (full: boolean, over: Record<string, string> = {}) => {
     const base: Record<string, string> = {
-      changes: "success", shard: "success", checks: "success", test: "success", smoke: "success",
+      changes: "success", shard: "success", checks: "success", test: "success", smoke: "success", secrets: "success", lint: "success",
       "timing-bars": full ? "success" : "skipped", "test-windows": full ? "success" : "skipped", "test-macos": full ? "success" : "skipped",
     };
     const o = { ...base, ...over };
@@ -176,7 +176,10 @@ describe("ci.yml keeps the safety properties", () => {
     expect(J.test).toMatch(/node scripts\/ci-verdict\.mjs linux/);
     expect(J["ci-ok"]).toMatch(/node scripts\/ci-verdict\.mjs all/);
     const needs = (J["ci-ok"].match(/^    needs: \[([^\]]*)\]/m) ?? [])[1]?.split(",").map((s) => s.trim()).sort();
-    expect(needs).toEqual(Object.keys(J).filter((k) => k !== "ci-ok").sort());
+    // Every job except ci-ok itself and the REPORT-ONLY jobs, which never gate (continue-on-error) and stay out of it.
+    const reportOnly = Object.keys(J).filter((k) => /^    continue-on-error: true$/m.test(J[k]));
+    expect(reportOnly).toEqual(["quality-report"]);
+    expect(needs).toEqual(Object.keys(J).filter((k) => k !== "ci-ok" && !reportOnly.includes(k)).sort());
   });
   it("no scoped job can be skipped by a FAILED scope job (it fails safe and runs)", () => {
     for (const id of ["timing-bars", "test-windows", "test-macos"]) expect(J[id], id).toMatch(/needs\.changes\.result != 'success' \|\|/);
