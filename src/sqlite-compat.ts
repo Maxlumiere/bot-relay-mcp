@@ -22,7 +22,7 @@ import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
-import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver, readSqliteDriverAt } from "./config.js";
+import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver, readSqliteDriverAt, getConfigPath } from "./config.js";
 import { colocatedConfigPathFor } from "./instance.js";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
@@ -215,10 +215,24 @@ const sameConfigFile = (a: string, b: string): boolean => {
  * DIFFERENT file from the caller's: a DB of one instance reached from another instance's process (RELAY_DB_PATH,
  * --db-path, RELAY_CONFIG_PATH). Null when the DB has no instance association, or the file is the caller's own.
  */
-function dbHomeDeclaration(dbPath: string, caller: Declaration): Declaration | null {
+function dbHomeDeclaration(dbPath: string, caller: Declaration | null): Declaration | null {
   const own = colocatedConfigPathFor(dbPath);
-  if (own === null || sameConfigFile(own, caller.configPath)) return null;
+  if (own === null || (caller !== null && sameConfigFile(own, caller.configPath))) return null;
   return readSqliteDriverAt(own);
+}
+/**
+ * The caller's declaration FILE, or null when the caller's config path cannot even be resolved (e.g. the relay home is
+ * not a directory): a resolver fault is not a declaration, so there is nothing to judge, and the DB's own instance is
+ * still consulted (Codex #391 R1 fix: only an unreadable declaration FILE fails closed).
+ */
+function callerDeclaration(): Declaration | null {
+  let configPath: string;
+  try {
+    configPath = getConfigPath();
+  } catch {
+    return null;
+  }
+  return readSqliteDriverAt(configPath);
 }
 /** Why `d` forbids a NON-OWNER native open, or null when it allows one. */
 function declarationRefusal(dbPath: string, what: string, d: Declaration): { kind: "declared-wasm" | "unreadable"; message: string } | null {
@@ -255,9 +269,10 @@ export type NativeOpenVerdict = { ok: true } | { ok: false; kind: "declared-wasm
  * unreadable config (it reads its own file, so no reader disagrees with it).
  */
 export function nativeOpenVerdict(dbPath: string, what: string): NativeOpenVerdict {
-  const caller = readInstanceSqliteDriver();
+  const caller = callerDeclaration();
   const other = dbHomeDeclaration(dbPath, caller);
-  for (const d of other ? [caller, other] : [caller]) {
+  for (const d of [caller, other]) {
+    if (d === null) continue;
     const r = declarationRefusal(dbPath, what, d);
     if (r) return { ok: false, ...r };
   }
