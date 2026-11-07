@@ -42,7 +42,7 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "81aa4d2f37b1";
+export const RESOLVER_REVISION = "24c3a313f19f";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";
@@ -107,7 +107,7 @@ export type ResolvedInstance =
   | { kind: "explicit-db"; dbPath: string; exists: boolean; containment: ContainmentModel; basis: "RELAY_DB_PATH" | "--db-path" }
   | { kind: "instance"; id: string; dbPath: string; exists: boolean; containment: ContainmentModel; basis: "RELAY_INSTANCE_ID" | "active-instance" }
   | { kind: "flat"; dbPath: string; exists: boolean; containment: ContainmentModel; warning?: string }
-  | { kind: "error"; reason: string; ambiguous?: boolean };
+  | { kind: "error"; reason: string; ambiguous?: boolean; code?: string };
 
 export interface ResolveOptions {
   /** An explicit DB path (`--db-path`): wins over everything. */
@@ -121,7 +121,10 @@ export interface ResolveOptions {
 export function resolveInstance(opts: ResolveOptions = {}): ResolvedInstance {
   const env = opts.env ?? process.env;
   const home = homeFor(env);
-  const failed = (reason: string): ResolvedInstance => ({ kind: "error", reason });
+  // `code`: the errno of the resolver's OWN failed syscall, when that is the fault (INV-DB-01 slice 3: the native-open
+  // predicate classifies a caller-config fault by it, never by the reason's text). Never serialized.
+  const failed = (reason: string, errno?: unknown): ResolvedInstance =>
+    typeof errno === "string" ? { kind: "error", reason, code: errno } : { kind: "error", reason };
   const code = (err: unknown) => (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.message : String(err));
   type Placed = { abs: string; exists: boolean; containment: ContainmentModel };
   const placed = (dbPath: string, make: (p: Placed) => ResolvedInstance): ResolvedInstance => {
@@ -158,7 +161,7 @@ export function resolveInstance(opts: ResolveOptions = {}): ResolvedInstance {
     fs.lstatSync(root);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return flat();
-    return failed(`cannot inspect the relay home ${root} (${code(err)})`);
+    return failed(`cannot inspect the relay home ${root} (${code(err)})`, (err as NodeJS.ErrnoException).code);
   }
 
   // The marker, read ONCE.
@@ -167,7 +170,7 @@ export function resolveInstance(opts: ResolveOptions = {}): ResolvedInstance {
   try {
     markerStat = fs.lstatSync(marker);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return failed(`cannot inspect ${marker} (${code(err)})`);
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return failed(`cannot inspect ${marker} (${code(err)})`, (err as NodeJS.ErrnoException).code);
   }
   if (markerStat) {
     let id: string;
@@ -191,7 +194,7 @@ export function resolveInstance(opts: ResolveOptions = {}): ResolvedInstance {
   try {
     instStat = fs.lstatSync(instDir);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return failed(`cannot inspect ${instDir} (${code(err)})`);
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return failed(`cannot inspect ${instDir} (${code(err)})`, (err as NodeJS.ErrnoException).code);
   }
   // instances/ present but NOT a directory (or a symlink to one) is corruption,
   // not a positive absence: it never yields flat.

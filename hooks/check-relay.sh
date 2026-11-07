@@ -711,6 +711,20 @@ relay_deliver_pending_mail() {
       return 0
       ;;
   esac
+  # INV-DB-01 slice 3: `relay pending` opens the DB natively by path, so on a wasm instance (or a verdict this hook
+  # cannot trust: a 6-line answer, an unknown token) the hook reads no mail; the skip is named once by
+  # relay_hook_db_native_ok. skip-unreadable keeps today's read: `relay pending` judges the file itself and reports
+  # the failure by name (DEGRADED, "relay unreadable"), never as a wasm instance. A resolver error keeps its own path.
+  if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_HOOK_DB:-}" != skip-unreadable ] && ! relay_hook_db_native_ok; then
+    RELAY_MAIL_MODE="no-native-db-read"
+    # Only the two wasm verdicts say "a wasm instance" (Codex #391 R1): the others do not know what the instance is.
+    case "${RELAY_RES_HOOK_DB:-}" in
+      skip-declared-wasm|skip-rlyw) why="hooks deliver no mail on a wasm instance (DB verdict: ${RELAY_RES_HOOK_DB}); use the HTTP owner" ;;
+      *) why="hooks read no mail: the relay CLI's DB verdict (${RELAY_RES_HOOK_DB:-none}) is not one they act on" ;;
+    esac
+    relay_mail_verdict "CANNOT-JUDGE" "$why" mail
+    return 0
+  fi
   bin="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
   # The TRUE cause when the read cannot even start: never phrased as an unreadable DB.
   if ! command -v node >/dev/null 2>&1; then
@@ -969,7 +983,9 @@ elif [ -n "${RELAY_AGENT_TOKEN:-}" ]; then
   # the collision guard. Populated-live rows still skip as before.
   # Every sqlite3 read runs under the watchdog, at what is left of the budget.
   LIVENESS=""
-  relay_budget_for "the liveness read" 1 && LIVENESS=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 "$DB_PATH" <<SQL 2>/dev/null
+  # INV-DB-01 slice 3: every sqlite3 read is gated on the relay's DB verdict (relay_hook_db_native_ok: a wasm
+  # instance's DB has one opener, its owner; the skip is named once). A skipped read here falls through to register.
+  relay_hook_db_native_ok && relay_budget_for "the liveness read" 1 && LIVENESS=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 SELECT CASE
   WHEN session_id IS NOT NULL AND session_id != ''
@@ -1009,7 +1025,7 @@ SQL
     # problem dominates the verdict line).
     # With no time left for the anchor read there is no diagnosis to make (the skip
     # is DEGRADED on its own): never a verdict from an anchor that was not read.
-    if [ "$RELAY_VERDICT" != "MUTE" ] && relay_budget_for "the anchor read" 1; then
+    if [ "$RELAY_VERDICT" != "MUTE" ] && relay_hook_db_native_ok && relay_budget_for "the anchor read" 1; then
       RELAY_OWN_GUID=$(relay_machine_guid 2>/dev/null || printf '')
       RELAY_ANCHOR_ROW=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
@@ -1328,7 +1344,9 @@ TASKS_HEX=""
 # After the mail read: what is left minus the margin (no reserve to keep). A task
 # read that was skipped or timed out is TOLD: tasks may exist that are not shown.
 RELAY_TASKS_RC=0
-if relay_budget_for "the task read" 2 margin; then
+if ! relay_hook_db_native_ok; then
+  RELAY_TASKS_RC=126 # INV-DB-01 slice 3: not read on a wasm instance (named once by relay_hook_db_native_ok)
+elif relay_budget_for "the task read" 2 margin; then
   TASKS_HEX=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 -separator '|' "$DB_PATH" <<SQL 2>/dev/null
 .parameter set :name '$AGENT_NAME'
 SELECT hex(priority), hex(title), hex(from_agent), hex(id)
@@ -1482,7 +1500,7 @@ fi
 # `discover_agents view='topology'`. Visible classes mirror
 # TOPOLOGY_VISIBLE_CLASSES in src/agent-class.ts (SSOT); transient + unclassified
 # are excluded by omission from the IN-list.
-if [ "${RELAY_ONBOARD_TOPOLOGY:-0}" = "1" ] && relay_budget_for "the team map read" 1 margin; then
+if [ "${RELAY_ONBOARD_TOPOLOGY:-0}" = "1" ] && relay_hook_db_native_ok && relay_budget_for "the team map read" 1 margin; then
   TOPOLOGY=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 "$DB_PATH" <<'SQL' 2>/dev/null
 SELECT '  ' || class || ': ' || GROUP_CONCAT(name, ', ')
 FROM agents

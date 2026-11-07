@@ -58,8 +58,8 @@ relay_helpers_cli() {
 # bounded by an explicit cap in seconds (the 2nd argument, from the caller's
 # relay_budget_for), or else by relay_budget_for here (the pre-mail budget).
 relay_where_load() {
-  local cli="${1:-$(relay_helpers_cli)}" cap="${2:-}" secs outf errf rc k="" d="" e="" why="" warn="" nlines=0
-  export RELAY_RES_LOADED=1 RELAY_RES_KIND=error RELAY_RES_DB_PATH="" RELAY_RES_EXISTS="" RELAY_RES_REASON="" RELAY_RES_WARNING=""
+  local cli="${1:-$(relay_helpers_cli)}" cap="${2:-}" secs outf errf rc k="" d="" e="" why="" warn="" vault="" hookdb="" nlines=0 nrec=0
+  export RELAY_RES_LOADED=1 RELAY_RES_KIND=error RELAY_RES_DB_PATH="" RELAY_RES_EXISTS="" RELAY_RES_REASON="" RELAY_RES_WARNING="" RELAY_RES_HOOK_DB=""
   if ! command -v node >/dev/null 2>&1; then
     export RELAY_RES_REASON="node not found (the relay CLI runs on node)"
     return 1
@@ -94,17 +94,30 @@ relay_where_load() {
   fi
   relay_run_pending "$secs" "$outf" "$errf" node "$cli" where --fields
   rc=$?
-  { IFS= read -r k; IFS= read -r d; IFS= read -r e; IFS= read -r why; IFS= read -r warn; } < "$outf"
+  { IFS= read -r k; IFS= read -r d; IFS= read -r e; IFS= read -r why; IFS= read -r warn; IFS= read -r vault; IFS= read -r hookdb; } < "$outf"
   nlines=$(wc -l < "$outf" 2>/dev/null | tr -d ' ')
+  # Codex #391 R1: an EXACT record: every field newline-terminated, nothing after the last one (wc -l counts newlines,
+  # awk counts records, so an unterminated trailing field makes them differ).
+  nrec=$(awk 'END { print NR }' "$outf" 2>/dev/null)
   rm -f "$outf" "$errf" "$outf.timedout" 2>/dev/null
   if [ "$rc" -eq 124 ]; then
     export RELAY_RES_REASON="relay where timed out after ${secs}s"
     return 1
   fi
-  if [ "${nlines:-0}" != 6 ]; then
-    export RELAY_RES_REASON="relay where gave an incomplete answer (exit $rc, ${nlines:-0} of 6 lines)"
+  # INV-DB-01 slice 3: line 7 is the hooks' DB verdict (relay_hook_db_native_ok). A 6-line answer is an older relay CLI
+  # than these hooks: the resolution stands, and the hooks read no DB (named as CLI/hook version skew).
+  if [ "${nrec:-0}" != "${nlines:-0}" ]; then
+    export RELAY_RES_REASON="relay where gave an invalid answer (exit $rc: ${nrec:-0} fields, ${nlines:-0} newline-terminated)"
     return 1
   fi
+  case "${nlines:-0}" in
+    7) export RELAY_RES_HOOK_DB="$hookdb" ;;
+    6) export RELAY_RES_HOOK_DB="(6-line answer)" ;;
+    *)
+      export RELAY_RES_REASON="relay where gave an incomplete answer (exit $rc, ${nlines:-0} of 7 lines)"
+      return 1
+      ;;
+  esac
   case "$k" in
     explicit-db|instance|flat)
       if [ "$rc" -ne 0 ] || [ -z "$d" ] || { [ "$e" != true ] && [ "$e" != false ]; }; then
@@ -129,6 +142,34 @@ relay_where_load() {
       ;;
   esac
   export RELAY_RES_REASON="relay where gave no valid answer (exit $rc)"
+  return 1
+}
+
+# relay_hook_db_native_ok — INV-DB-01 slice 3: may this hook open the DB natively (the sqlite3 CLI, or a `relay pending`
+# read)? ONLY on the exact verdict "sqlite3" (`relay where --fields` line 7, src/hook-db-verdict.ts HOOK_DB_VERDICTS:
+# the relay's one reader of the instance declaration and the DB header). Any other answer (a skip verdict, an unknown
+# token, an empty line, a 6-line answer from an older CLI) is a skip, NAMED ONCE per hook run. A resolver error is not
+# judged here (no DB path; the resolver's own reason is reported).
+relay_hook_db_native_ok() {
+  [ "${RELAY_RES_KIND:-error}" = error ] && return 1
+  case "${RELAY_RES_HOOK_DB:-}" in
+    sqlite3) return 0 ;;
+  esac
+  [ -n "${RELAY_HOOK_DB_NAMED:-}" ] && return 1
+  RELAY_HOOK_DB_NAMED=1
+  local why then
+  # Only the two wasm verdicts may say "a wasm instance": the others do not know what the instance is.
+  then="The hooks read nothing from this DB with sqlite3."
+  case "${RELAY_RES_HOOK_DB:-}" in
+    skip-declared-wasm) why="the instance declares sqlite_driver \"wasm\""; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
+    skip-rlyw) why="the DB is stamped for the wasm driver's single owner (RLYW)"; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
+    skip-unreadable) why="the instance's sqlite_driver or the DB header could not be read or judged (fail closed)" ;;
+    "(6-line answer)") why="the relay CLI gave a 6-line answer: CLI/hook version skew (update the relay and its hooks together)" ;;
+    "") why="the relay CLI gave no DB verdict" ;;
+    *) why="the relay CLI gave an unknown DB verdict" ;;
+  esac
+  printf '[RELAY] hook DB read skipped (%s): %s. %s Instance DB: %s\n' \
+    "$(printf '%s' "${RELAY_RES_HOOK_DB:-none}" | tr -cd 'A-Za-z0-9 ()_-' | cut -c1-40)" "$why" "$then" "${RELAY_RES_DB_PATH:-unknown}"
   return 1
 }
 

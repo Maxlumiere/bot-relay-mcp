@@ -240,7 +240,7 @@ describe("ADR-0048 PR C — `relay where --fields`: the resolver's answer for ba
       encoding: "utf-8",
       env: { PATH: process.env.PATH ?? "", HOME, ...env },
     });
-  it("an instance → kind, db_path, exists, reason, warning, vault_dir (6 lines), exit 0", () => {
+  it("an instance → kind, db_path, exists, reason, warning, vault_dir, hook_db (7 lines), exit 0", () => {
     seedDb(path.join(RH, "instances", "work", "relay.db"), false);
     fs.symlinkSync("work", path.join(RH, "active-instance"));
     const r = where({});
@@ -269,7 +269,7 @@ describe("ADR-0048 PR C — `relay where --fields`: the resolver's answer for ba
     const f = r.stdout.split("\n");
     expect(f[0]).toBe("error");
     expect(f[3]).toMatch(/line break/);
-    expect(r.stdout.split("\n").length, "exactly 6 lines + the final newline").toBe(7);
+    expect(r.stdout.split("\n").length, "exactly 7 lines (line 7: the hooks' DB verdict) + the final newline").toBe(8);
   });
 });
 

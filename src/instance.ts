@@ -405,7 +405,8 @@ export function configPathFor(r: ResolvedInstance): string {
   if (process.env.RELAY_CONFIG_PATH) return process.env.RELAY_CONFIG_PATH;
   if (r.kind === "error") {
     if (r.ambiguous && process.env.RELAY_DB_PATH) return flatConfigPath();
-    throw new Error(r.reason);
+    // The resolver's own errno travels with the fault (a typed `code`, absent when the fault is not a syscall's).
+    throw Object.assign(new Error(r.reason), r.code !== undefined ? { code: r.code } : {});
   }
   return r.kind === "instance" ? path.join(path.dirname(r.dbPath), CONFIG_FILE) : flatConfigPath();
 }
@@ -419,6 +420,47 @@ const CONFIG_FILE = "config.json";
  */
 export function flatConfigPath(env: ResolverEnv = process.env): string {
   return path.join(relayRootFor(env), CONFIG_FILE);
+}
+
+/**
+ * INV-DB-01 slice 3 (the native-open predicate): the config.json of the instance whose directory HOLDS `dbPath` (by real
+ * path): an instance directory under the relay root, or the relay root itself (the flat layout). DB and config are
+ * colocated by construction there (configPathFor). Null when the DB's directory is neither (no association), or does
+ * not resolve.
+ */
+export function colocatedConfigPathFor(dbPath: string, env: ResolverEnv = process.env): string | null {
+  const real = (p: string): string | null => {
+    try {
+      return fs.realpathSync.native(p);
+    } catch {
+      return null;
+    }
+  };
+  // Codex #391 R2: the DB path's own directory AND, when the DB exists, its canonical referent's directory (a DB path
+  // that is a symlink INTO an instance directory belongs to that instance).
+  const dirs = new Set<string>();
+  const parent = real(path.dirname(path.resolve(dbPath)));
+  if (parent !== null) dirs.add(parent);
+  const referent = real(dbPath);
+  if (referent !== null) dirs.add(path.dirname(referent));
+  if (dirs.size === 0) return null;
+  // The flat relay home, and EACH instance directory by its own real path (an instance dir may be a symlink elsewhere).
+  const homes: string[] = [];
+  const flat = real(relayRootFor(env));
+  if (flat !== null) homes.push(flat);
+  const instancesRoot = instancesRootFor(env);
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(instancesRoot);
+  } catch {
+    entries = [];
+  }
+  for (const id of entries) {
+    const d = real(path.join(instancesRoot, id));
+    if (d !== null) homes.push(d);
+  }
+  for (const dir of dirs) if (homes.includes(dir)) return path.join(dir, CONFIG_FILE);
+  return null;
 }
 
 /** The config path of instance `id` under `env`'s relay root. An invalid id throws (the same rule as instanceDir). */

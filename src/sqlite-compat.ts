@@ -22,7 +22,8 @@ import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
 import { checkPrivatePath } from "./approved-roots.js";
-import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver } from "./config.js";
+import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriver, readSqliteDriverAt, getConfigPath } from "./config.js";
+import { colocatedConfigPathFor } from "./instance.js";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
 import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
@@ -39,6 +40,7 @@ import {
   nativeHandleCount,
   readDriverHeader,
   RELAY_APP_ID_WASM,
+  RELAY_APP_ID_NATIVE,
   httpClientHint,
   _installNativeProbe,
   type DriverHeader,
@@ -136,6 +138,22 @@ function getDriverType(): SqliteDriver {
   return declaredDriver().driver;
 }
 
+/**
+ * INV-DB-01 slice 3 (Codex #391 R2, as ruled): set by EVERY relay SERVER entrypoint (src/index.ts main(): the
+ * HTTP daemon AND the stdio MCP server every connector runs) before it opens its own DB. Only a server keeps
+ * declaredDriver()'s warn on an unreadable config (it reads its own file, so no reader disagrees with it, and refusing
+ * would turn one corrupt config.json into a fleet-wide outage). Every other native opener, every CLI verb included,
+ * runs the one fail-closed predicate (nativeOpenVerdict).
+ */
+let instanceServer = false;
+export function markInstanceServer(): void {
+  instanceServer = true;
+}
+/** Test-only: run as (or stop running as) an instance server. */
+export function _setInstanceServerForTests(on: boolean): void {
+  instanceServer = on;
+}
+
 /** How a DB is opened: natively, through the legacy wasm mode (no owner, unstamped), or by its wasm single OWNER. */
 export type OpenMode = "native" | "legacy-wasm" | "owner";
 export interface ResolvedOpen {
@@ -167,6 +185,20 @@ export function resolveOpen(dbPath: string): ResolvedOpen {
     assertDriverHeaderAllows(dbPath, "wasm"); // the in-process mixes (a native handle counted) are refused by name
     return { driver: "wasm", mode: "owner", header: peek };
   }
+  if (d.driver === "native") {
+    if (instanceServer) {
+      // INV-DB-01 slice 3 (P2-3): the server reads its own config with declaredDriver()'s warn; a DB of ANOTHER instance
+      // (its own config.json is not the caller's) is opened natively only when that instance's declaration allows it.
+      const { configPath } = readInstanceSqliteDriver();
+      const other = dbHomeDeclaration(dbPath, { value: undefined, configPath });
+      const r = other ? declarationRefusal(dbPath, "a native open", other) : null;
+      if (r) throw new DbHeaderRefusedError(r.message);
+    } else {
+      // Codex #391 R2: a non-server native open (a CLI verb's initializeDb) runs the one fail-closed predicate.
+      const v = nativeOpenVerdict(dbPath, "a native open (a relay CLI verb)");
+      if (!v.ok) throw new DbHeaderRefusedError(v.message);
+    }
+  }
   const header = assertDriverHeaderAllows(dbPath, d.driver);
   if (d.driver === "native") return { driver: "native", mode: "native", header };
   if (header.kind === "absent") return { driver: "wasm", mode: d.instance === "wasm" ? "owner" : "legacy-wasm", header };
@@ -187,6 +219,105 @@ export function resolveOpen(dbPath: string): ResolvedOpen {
  */
 export function isOwnedDb(dbPath: string): boolean {
   return readDriverHeader(dbPath).kind === "wasm";
+}
+/** One instance declaration as read from its config.json (ENOENT = no declaration; any other failure = unreadable). */
+type Declaration = { value: unknown; configPath: string; unreadable?: string };
+const sameConfigFile = (a: string, b: string): boolean => {
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync.native(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  return real(a) === real(b);
+};
+/**
+ * The declaration of the instance whose directory HOLDS the DB (instance.ts colocatedConfigPathFor), when it is a
+ * DIFFERENT file from the caller's: a DB of one instance reached from another instance's process (RELAY_DB_PATH,
+ * --db-path, RELAY_CONFIG_PATH). Null when the DB has no instance association, or the file is the caller's own.
+ */
+function dbHomeDeclaration(dbPath: string, caller: Declaration | null): Declaration | null {
+  const own = colocatedConfigPathFor(dbPath);
+  if (own === null || (caller !== null && sameConfigFile(own, caller.configPath))) return null;
+  return readSqliteDriverAt(own);
+}
+/**
+ * The caller's declaration FILE. When the caller's config path cannot be resolved, the resolver's fault is classified
+ * by the typed errno of its OWN syscall (never by message text):
+ * - PROVEN ABSENT (ENOENT, ENOTDIR: no instance or config can exist there, e.g. the relay home is a file) → no caller
+ *   declaration (null); the DB's own instance is still consulted;
+ * - anything else, including a fault with no code (an invalid instance id, an ambiguous resolution) → CANNOT JUDGE:
+ *   unreadable, fail closed (an instance marker this process cannot read might name a wasm instance).
+ */
+function callerDeclaration(): Declaration | null {
+  let configPath: string;
+  try {
+    configPath = getConfigPath();
+  } catch (err) {
+    const code = (err as { code?: unknown }).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    return {
+      value: undefined,
+      configPath: "(the instance config path could not be resolved)",
+      unreadable: typeof code === "string" ? `${(err as Error).message}` : `${(err as Error).message} (no errno: not provably absent)`,
+    };
+  }
+  return readSqliteDriverAt(configPath);
+}
+/** Why `d` forbids a NON-OWNER native open, or null when it allows one. */
+function declarationRefusal(dbPath: string, what: string, d: Declaration): { kind: "declared-wasm" | "unreadable"; message: string } | null {
+  if (d.unreadable !== undefined) {
+    return {
+      kind: "unreadable",
+      message:
+        `REFUSING ${what} of the DB at '${dbPath}': the instance declaration at ${d.configPath} could not be read ` +
+        `(${d.unreadable}), so whether this DB may be opened natively is unknown. Fix or remove that config.json. ` +
+        `Nothing was created or opened.`,
+    };
+  }
+  const problem = instanceSqliteDriverProblem(d.value, d.configPath);
+  if (problem) return { kind: "unreadable", message: `REFUSING ${what} of the DB at '${dbPath}': ${problem} Nothing was created or opened.` };
+  if (d.value === "wasm") {
+    return {
+      kind: "declared-wasm",
+      message:
+        `REFUSING ${what} of the DB at '${dbPath}': its instance declares sqlite_driver "wasm" (in ${d.configPath}), ` +
+        `so the DB has ONE opener, its wasm single owner, and this native open would be a second one. Reach the owner ` +
+        `over HTTP (MCP client config: ${httpClientHint()}). If this instance should be native, set sqlite_driver to ` +
+        `"native" in that file. Nothing was created or opened.`,
+    };
+  }
+  return null;
+}
+export type NativeOpenVerdict = { ok: true } | { ok: false; kind: "declared-wasm" | "unreadable"; message: string };
+/**
+ * INV-DB-01 slice 3, the ONE native-open predicate for every NON-OWNER native opener (the by-path openers, getDb()'s
+ * fallback, a cold native export, restore's pre-swap step, and the hooks' verdict): it consults the CALLER's declaration
+ * (RELAY_CONFIG_PATH or the resolved config) AND the declaration of the instance that holds the DB. A native open is
+ * allowed only when neither declares wasm and neither is unreadable (widen-only: neither alone can allow). The header is
+ * checked separately (assertDriverHeaderAllows). The instance's own server keeps declaredDriver()'s warn on an
+ * unreadable config (it reads its own file, so no reader disagrees with it).
+ */
+export function nativeOpenVerdict(dbPath: string, what: string): NativeOpenVerdict {
+  const caller = callerDeclaration();
+  const other = dbHomeDeclaration(dbPath, caller);
+  for (const d of [caller, other]) {
+    if (d === null) continue;
+    const r = declarationRefusal(dbPath, what, d);
+    if (r) return { ok: false, ...r };
+  }
+  return { ok: true };
+}
+/**
+ * INV-DB-01 slice 3: a NATIVE-ONLY opener that reaches the DB by its PATH (getDb()'s synchronous fallback, the CLI
+ * verbs' raw open, a cold native export) is refused by name, BEFORE anything is created or opened, unless
+ * nativeOpenVerdict allows it; then the header decides, as in 2a. Returns the header verdict for the open's stamping.
+ */
+export function assertNativeByPathAllowed(dbPath: string, what: string): DriverHeader {
+  const v = nativeOpenVerdict(dbPath, what);
+  if (!v.ok) throw new DbHeaderRefusedError(v.message);
+  return assertDriverHeaderAllows(dbPath, "native");
 }
 /** The header, read through the same sources (and refusals) as an open with `driver` would use. */
 function readDriverHeaderForDriver(dbPath: string, driver: SqliteDriver): DriverHeader {
@@ -220,6 +351,56 @@ export function openNativeDb(dbPath: string, options: BetterSqlite3.Options, _ve
     }
   };
   return db;
+}
+
+/**
+ * INV-DB-01 slice 3, Q2 AMENDED: restore's step right before its side-file check. The safety backup's
+ * READ-ONLY open creates -wal/-shm on a WAL-mode DB and cannot remove them, so restore would refuse the very files it
+ * planted. On a native (RLYN) or legacy (0) DB, when the native driver loads here: ONE bare writable connection (no
+ * initializeDb, no migration, no stamp, no journal_mode change), the application_id re-checked, a TRUNCATE checkpoint
+ * (refused by name when it reports busy), then close. SQLite removes the side files only when the LAST connection
+ * closes, so another process's live connection still leaves them, and the absence check refuses. It writes only pages
+ * already committed, after the safety backup, onto a file the swap then replaces. Run only after closeDb() and the
+ * second assertNoOtherNativeHold (this process holds no handle on the file). On an owned (RLYW) DB, a foreign or
+ * unreadable header, or without a native driver, it opens nothing and the absence check decides.
+ */
+export function checkpointBeforeRestoreSwap(dbPath: string): { ran: boolean; why?: string } {
+  if (!fs.existsSync(dbPath)) return { ran: false, why: "no DB at the path" };
+  // Codex #391 R1 P1-2: the same predicate as every non-owner native opener (a declared-wasm instance, or an unreadable
+  // declaration, opens nothing natively here).
+  const verdict = nativeOpenVerdict(dbPath, "restore's pre-swap checkpoint");
+  if (!verdict.ok) return { ran: false, why: verdict.message };
+  const header = readDriverHeader(dbPath); // no native handle here: source (3), one fs read
+  if (header.kind !== "native" && header.kind !== "legacy") return { ran: false, why: `its header is ${header.kind}` };
+  let loads = true;
+  try {
+    new (loadNative())(":memory:").close();
+  } catch {
+    loads = false;
+  }
+  if (!loads) return { ran: false, why: "the native driver does not load in this process" };
+  const expected = header.kind === "native" ? RELAY_APP_ID_NATIVE : 0;
+  const db = openNativeDb(dbPath, { fileMustExist: true }, header);
+  try {
+    const id = (Number(db.pragma("application_id", { simple: true })) >>> 0);
+    if (id !== expected >>> 0) {
+      throw new Error(
+        `restore refused: the DB at '${dbPath}' changed while it was being restored (its application_id is now ` +
+          `0x${id.toString(16).padStart(8, "0")}, not 0x${(expected >>> 0).toString(16).padStart(8, "0")}). Nothing was replaced.`
+      );
+    }
+    const rows = db.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number; checkpointed: number }>;
+    const busy = rows[0]?.busy ?? 0;
+    if (busy !== 0) {
+      throw new Error(
+        `restore refused: the DB at '${dbPath}' is in use by another process (its WAL checkpoint reported busy). Stop ` +
+          `the other opener, then retry. Nothing was replaced.`
+      );
+    }
+  } finally {
+    db.close();
+  }
+  return { ran: true };
 }
 
 // The header check's "can native load HERE" probe: an in-memory open, closed at once (never a DB file).
@@ -910,8 +1091,13 @@ async function createOwnedWasmDb(dbPath: string, header: DriverHeader): Promise<
  * budget, never a wait for the owner to exit). In the owner's own process the lock is re-entrant.
  */
 export async function holdOwnerForMaintenance(dbPath: string, what: string): Promise<OwnerLock> {
+  // INV-DB-01 slice 3 (Codex #377 R1 P2-4): the lock is keyed by the canonical NAME, so a hard link (a second name of
+  // the same file) would be a second key: maintenance through it would run beside a live owner. A wasm DB with more
+  // than one link is refused by every opener, before the lock and again once it is held.
+  assertMaintenanceSingleLink(dbPath, what);
+  let lock: OwnerLock;
   try {
-    return await acquireOwnerLock(dbPath, { budgetMs: 300 });
+    lock = await acquireOwnerLock(dbPath, { budgetMs: 300 });
   } catch (err) {
     if (err instanceof OwnerLockError && /could not be locked/.test(err.message)) {
       throw new OwnerLockError(
@@ -920,6 +1106,25 @@ export async function holdOwnerForMaintenance(dbPath: string, what: string): Pro
       );
     }
     throw err;
+  }
+  try {
+    assertMaintenanceSingleLink(dbPath, what); // a link made while the lock was being taken
+  } catch (err) {
+    lock.release();
+    throw err;
+  }
+  return lock;
+}
+/** Maintenance on an owned DB refuses a file with more than one hard link (each name would be its own lock key). */
+export function assertMaintenanceSingleLink(dbPath: string, what: string): void {
+  if (!fs.existsSync(dbPath)) return;
+  const n = fs.statSync(dbPath).nlink;
+  if (n > 1) {
+    throw new OwnerLockError(
+      `${what} refused: the DB at ${dbPath} has ${n} hard links. Its single-owner lock is keyed by the file's name, so ` +
+        `another name could be locked and used by another process at the same time. Remove the extra links (find ` +
+        `them by the file's inode), then retry.`
+    );
   }
 }
 

@@ -62,8 +62,9 @@ import {
   driverOf,
   openNativeDb,
   isOpenNative,
+  assertNativeByPathAllowed,
 } from "./sqlite-compat.js";
-import { assertDriverHeaderAllows, stampNativeHeader } from "./db-header.js";
+import { stampNativeHeader } from "./db-header.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile, privacyFaults, restrictToOwnerWindows } from "./fs-perms.js";
 import { resolveInstance } from "./instance.js";
@@ -97,6 +98,32 @@ export function assertStillContained(dbPath: string): void {
   if (!c.ok) {
     throw new Error(`REFUSING the relay DB after opening it: ${c.reason}`);
   }
+}
+
+/** Whether a name exists at the DB path (lstat: a stat, never an open of the file). */
+function dbNameExists(dbPath: string): boolean {
+  try {
+    fs.lstatSync(dbPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ADR-0048, amended by INV-DB-01 slice 3: a DB refused after its open is NEVER unlinked (an unlink through a swapped
+ * path could remove another file). When this open created the file (a native open creates it, empty), the refusal
+ * names it, with its size, so the operator can remove it.
+ */
+function nameLeftover(err: unknown, dbPath: string, existedBefore: boolean): unknown {
+  if (existedBefore || !(err instanceof Error)) return err;
+  try {
+    const size = fs.lstatSync(dbPath).size;
+    err.message += ` This open created ${dbPath} (${size} bytes); it is LEFT in place (relay code never unlinks a DB file). Remove it if nothing uses it.`;
+  } catch {
+    /* nothing was created at that name: nothing to name */
+  }
+  return err;
 }
 
 /**
@@ -342,6 +369,7 @@ export async function initializeDb(): Promise<void> {
   // no window where a fresh DB lives under a 0755 parent. An existing directory is
   // narrowed only after the re-check below (ADR-0048: never chmod through an
   // unverified path).
+  const existedBefore = dbNameExists(dbPath);
   createDbDir(path.dirname(dbPath));
   _db = await initDriver(dbPath);
   // Re-check BEFORE anything else touches the file: on a refusal the handle is
@@ -352,7 +380,7 @@ export async function initializeDb(): Promise<void> {
   } catch (err) {
     discardInitializedDb();
     _db = null;
-    throw err;
+    throw nameLeftover(err, dbPath, existedBefore);
   }
   // Verified: narrow the directory and the DB file itself.
   ensureSecureDir(path.dirname(dbPath), 0o700);
@@ -396,9 +424,11 @@ export function getDb(): CompatDatabase {
   if (_db) return _db;
 
   const dbPath = getDbPath();
-  // INV-DB-01 slice 2a: this fallback is native only, so the DB's header must allow native, before anything is made.
-  const before = assertDriverHeaderAllows(dbPath, "native");
+  // INV-DB-01 slices 2a + 3: this fallback is native only, so a declared-wasm instance (one opener: its wasm owner) and a
+  // header that refuses native are refused by name, before anything is made.
+  const before = assertNativeByPathAllowed(dbPath, "getDb()'s synchronous native fallback");
   const dir = path.dirname(dbPath);
+  const existedBefore = dbNameExists(dbPath);
   // v2.1 Phase 4c.4: same dir + file perm narrowing as the eager init path
   // (the existing directory is narrowed only after the re-check).
   createDbDir(dir);
@@ -421,7 +451,7 @@ export function getDb(): CompatDatabase {
       /* closing a refused handle is best-effort */
     }
     _db = null;
-    throw err;
+    throw nameLeftover(err, dbPath, existedBefore);
   }
   ensureSecureDir(dir, 0o700);
   ensureSecureFile(dbPath, 0o600);

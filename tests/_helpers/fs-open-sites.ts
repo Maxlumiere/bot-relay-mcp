@@ -31,7 +31,12 @@ const OPENERS = [
   "createReadStream", "createWriteStream", "copyFile", "copyFileSync", "cp", "cpSync", "truncate", "truncateSync",
   "watch", "watchFile", "openAsBlob",
 ];
-const OPENER = new RegExp(`(?:^|/)@types/node/(?:fs|fs/promises)\\.d\\.ts:(${OPENERS.join("|")})$`);
+const apiPattern = (apis: readonly string[]) => new RegExp(`(?:^|/)@types/node/(?:fs|fs/promises)\\.d\\.ts:(${apis.join("|")})$`);
+/**
+ * INV-DB-01 slice 3: the fs functions that REMOVE a path (the never-unlink scan: relay code never unlinks a DB-family
+ * file, side files included; the slice-3 ruling). Passed to fsOpenSites as its `apis`.
+ */
+export const REMOVERS = ["unlink", "unlinkSync", "rm", "rmSync", "rmdir", "rmdirSync"] as const;
 const FS_MODULE = /@types\/node\/(?:fs|fs\/promises)\.d\.ts:"(?:node:)?fs(?:\/promises)?"$/;
 const FS_SPECIFIER = /^(node:)?fs(\/promises)?$/;
 
@@ -39,12 +44,18 @@ export interface FsOpenSite {
   /** `<file>::<enclosing top-level function>::<api>` (or `::rejected`). */
   key: string;
   api: string;
-  /** The site's source text (first 100 chars), for a reader. */
+  /** The site's FULL source text (the never-unlink scan pins it exactly; Codex #391 R1). */
   text: string;
   why?: string;
 }
 
-export function fsOpenSites(program: ts.Program, rel: (f: string) => string, inFile: (relPath: string) => boolean): FsOpenSite[] {
+export function fsOpenSites(
+  program: ts.Program,
+  rel: (f: string) => string,
+  inFile: (relPath: string) => boolean,
+  apis: readonly string[] = OPENERS,
+): FsOpenSite[] {
+  const OPENER = apiPattern(apis);
   const checker = program.getTypeChecker();
   const out: FsOpenSite[] = [];
   const keyOf = (b: { key: string } | null) => b?.key ?? "";
@@ -52,7 +63,7 @@ export function fsOpenSites(program: ts.Program, rel: (f: string) => string, inF
     const file = rel(sf.fileName);
     if (!inFile(file) || sf.isDeclarationFile) continue;
     const site = (n: ts.Node, api: string, why?: string) =>
-      out.push({ key: `${file}::${topLevelName(n)}::${api}`, api, text: n.getText(sf).slice(0, 100), ...(why ? { why } : {}) });
+      out.push({ key: `${file}::${topLevelName(n)}::${api}`, api, text: n.getText(sf), ...(why ? { why } : {}) });
 
     const isLoaderCall = (c: ts.CallExpression): boolean => {
       if (c.expression.kind === ts.SyntaxKind.ImportKeyword) return true;
