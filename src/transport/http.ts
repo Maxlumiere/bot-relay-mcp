@@ -2110,6 +2110,11 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
   // http.Server. Hijacks only /dashboard/ws upgrades; every other upgrade
   // path is left untouched. Auth is checked inside attachDashboardWs.
   if (ownerPeek) {
+    // A listen failure (no loopback: EADDRNOTAVAIL) is an ASYNC 'error' event: unhandled, it would end the process
+    // that owns the DB. The owner keeps serving; no record is written, so the hooks skip, by name.
+    server.on("error", (err) => {
+      log.warn(`[owner-endpoint] the owner-peek listener failed (${err.message}): no owner endpoint record, so the hooks read no mail from this owner.`);
+    });
     // An upgrade bypasses Express (and so the gate): the owner-peek listener accepts none.
     server.on("upgrade", (_req, socket) => socket.destroy());
   } else {
