@@ -46,7 +46,7 @@ const INVENTORY: Record<string, Entry> = {
   "src/db-owner-lock.ts::openLockFile::openSync": { n: 1, source: "the single-owner lock file, its own dotfile (.<name>.relay-owner): a name with more than one link is refused BEFORE this open, so it is never a hard link to a database file (Codex #385 R1 P2-7), and a symlink fails the open (O_NOFOLLOW)" },
   "src/convert-journal.ts::identityOf::readFileSync": { n: 1, db: true, source: "the DB being converted by sql.js (a host where native does not load: no native handle can be held), under its single-owner lock" },
   "src/convert-journal.ts::verifySqlJs::readFileSync": { n: 1, db: true, source: "the converted DB, read back for the fresh verify load (sql.js; no native handle)" },
-  "src/convert-journal.ts::convertViaSqlJs::writeFileSync": { n: 1, db: true, source: "the safety copy of the original bytes, a NEW file (wx, 0600) in the backups directory" },
+  "src/convert-journal.ts::writeSafetyCopy::writeFileSync": { n: 1, db: true, source: "the safety copy of the original bytes, a NEW file (wx, 0600) in the backups directory" },
   "src/convert-journal.ts::convertViaSqlJs::openSync": { n: 2, db: true, source: "the converted image's NEW dotfile temp (wx, 0600) beside the DB's referent, and that directory (fsync after the rename)" },
   "src/convert-journal.ts::journalBytes::openSync": { n: 1, db: true, source: "the DB being converted, read (its journal bytes) only between conversion steps, every native connection of the conversion closed, under its single-owner lock" },
   "src/sqlite-compat.ts::restampStagedCopy::readFileSync": { n: 2, db: true, source: "restore's PRIVATE staged copy (never the live DB), before and after its re-stamp" },

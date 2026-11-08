@@ -508,7 +508,7 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     await stopOwner(owner);
   }, 90_000);
 
-  it("R1 P1-2: on a declared-wasm instance the pre-swap step opens NOTHING natively: on an owned (RLYW) DB it reports itself skipped, by the declaration (slice 4: the fixture was a legacy DB, which a wasm instance no longer keeps)", async () => {
+  it("R1 P1-2: on a declared-wasm instance the pre-swap step opens NOTHING natively: on an owned (RLYW) DB it reports itself skipped because the DB is OWNED (slice 4: the fixture was a legacy DB, which a wasm instance no longer keeps; there the skip reason was the declaration)", async () => {
     makeDb(dbPath, WASM, ["row-1"]);
     declareWasm();
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
@@ -521,7 +521,9 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     } finally {
       setAfterCheckpoint?.(null);
     }
-    expect(result).toMatchObject({ ran: false, why: expect.stringMatching(/declares sqlite_driver "wasm"/) });
+    // Measured on ea72cdf: an owned DB is skipped BEFORE the declaration is consulted (its owner lock is held), so the
+    // reason is the ownership, not the declaration. Either way nothing is opened natively (ran: false).
+    expect(result).toMatchObject({ ran: false, why: expect.stringMatching(/an owned DB \(its single-owner lock is held\)/) });
   }, 60_000);
 
   it("R1 P1-2, slice 4 (BREAKING 5.0.0) twin: a declared-wasm instance over a live LEGACY DB refuses the restore by name BEFORE the pre-swap step (so nothing is opened natively), the file untouched (before: the step ran, skipped by the declaration)", async () => {
