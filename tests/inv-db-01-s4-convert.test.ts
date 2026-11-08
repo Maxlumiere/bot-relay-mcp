@@ -888,6 +888,11 @@ describe("INV-DB-01 slice 4, Codex #401 R1 P1-3 (ruled): native openers during a
     expect(readCfg()).toEqual({});
   }, 60_000);
 
+  // RETIRED (the rename it measured is gone): "MEASURE (Windows, the #401 residual (a) seam): a better-sqlite3
+  // connection held open on the original makes the converter's rename FAIL". MEASURED on 6c7c376 (Windows job
+  // 128710155548): refused with EPERM, the original intact. The in-place header patch (52b2937) removed that rename; an
+  // idle handle open across a conversion is the stated residual (c), detected by the owner's identity guard. (The row
+  // was dropped inside 184da3f's edit span without being named; this records it.)
   it("Codex #401 R2 P1 (ruled): a foreign commit landing AFTER the converter's last pre-patch check (immediately before its first header write) is a FAILURE, never a success: the foreign rows are still present, nothing overwritten (every OS)", async () => {
     makeDb(dbPath, 0, ["a"], "DELETE");
     writeCfg({});
