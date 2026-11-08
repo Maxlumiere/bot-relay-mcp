@@ -272,6 +272,9 @@ relay_curl_config_line() {
   printf '%s = "%s"\n' "$1" "$v"
 }
 
+# An inherited RELAY_OWNER_PORT (or ERR) proves nothing: only relay_owner_prove, in THIS hook run, sets them.
+unset RELAY_OWNER_PORT RELAY_OWNER_ERR
+
 # relay_owner_prove — hook PR 1 (as ruled): before ANY credential goes to the DB's owner endpoint, prove it is the
 # process that wrote the 0600 record. RELAY_RES_OWNER_ENDPOINT is "URL KEY" from `relay where --fields` line 8:
 #   - the URL must be EXACTLY http://127.0.0.1:<port>, the key 32 lowercase hex: anything else is a named skip with no

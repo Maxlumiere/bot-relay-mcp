@@ -665,7 +665,13 @@ relay_remote_failed() {
 
 # REMOTE mode only (relay pending said: no local instance; RELAY_HTTP_HOST set).
 relay_deliver_remote_mail() {
-  local host="$RELAY_HTTP_HOST" port="${RELAY_HTTP_PORT:-3777}" tok="${RELAY_AGENT_TOKEN:-}" payload resp block
+  # `owner` (hook PR 1, as ruled): the record URL relay_owner_prove proved in THIS run, never RELAY_HTTP_HOST/PORT; the
+  # only route that sends the http_secret.
+  local route="${1:-remote}" host="$RELAY_HTTP_HOST" port="${RELAY_HTTP_PORT:-3777}" tok="${RELAY_AGENT_TOKEN:-}" payload resp block
+  if [ "$route" = owner ]; then
+    host=127.0.0.1
+    port="${RELAY_OWNER_PORT:-}"
+  fi
   if ! relay_whole_match "$host" '^[A-Za-z0-9_.:-]{1,253}$' || ! relay_whole_match "$port" '^[0-9]{1,5}$' \
      || ! relay_whole_match "$tok" '^[A-Za-z0-9_=.-]{8,128}$' || ! command -v curl >/dev/null 2>&1; then
     relay_remote_failed "no usable remote relay settings, token or curl"
@@ -682,7 +688,7 @@ relay_deliver_remote_mail() {
     return 0
   fi
   # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
-  resp=$({ relay_owner_secret_curl_config; relay_curl_token_config "$tok" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
+  resp=$({ [ "$route" != owner ] || relay_owner_secret_curl_config; relay_curl_token_config "$tok" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
     -X POST "http://${host}:${port}/mcp" \
     -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
     2>/dev/null) || { relay_remote_failed "the remote relay did not answer"; return 0; }
@@ -719,7 +725,7 @@ relay_deliver_pending_mail() {
   # proves the record's key (relay_owner_prove). Any failure is named, and nothing else is read: never sqlite3.
   if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
     if relay_owner_prove; then
-      RELAY_HTTP_HOST=127.0.0.1 RELAY_HTTP_PORT="$RELAY_OWNER_PORT" relay_deliver_remote_mail
+      relay_deliver_remote_mail owner
     else
       echo "[RELAY] mail not read: $RELAY_OWNER_ERR. Mail may be waiting: call get_messages."
       RELAY_MAIL_MODE="owner-unproved"

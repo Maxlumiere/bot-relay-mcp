@@ -683,7 +683,8 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → a loopback 
   }, 90_000);
 
   it("the peek listener's bind host is a CONSTANT 127.0.0.1: startHttpServer in owner-peek mode refuses any other host", async () => {
-    const mod = (await import(pathToFileURL(path.join(REPO, "dist", "transport", "http.js")).href)) as { startHttpServer: (p: number, h: string, o?: { ownerPeek?: boolean }) => unknown };
+    // A LITERAL specifier (the parser-pin gate refuses a computed one); the assert throws before any setup.
+    const mod = (await import("../src/transport/http.js")) as { startHttpServer: (p: number, h: string, o?: { ownerPeek?: boolean }) => unknown };
     for (const h of ["0.0.0.0", "::", "::1", "localhost", LAN_V4 ?? "10.0.0.1"]) {
       expect(() => mod.startHttpServer(0, h, { ownerPeek: true }), h).toThrow(/127\.0\.0\.1/);
     }

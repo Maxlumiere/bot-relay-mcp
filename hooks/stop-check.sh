@@ -336,9 +336,19 @@ http_peek() {
   # of this hook's budget (relay_budget_for); with no time left it is skipped
   # (exit 125: this runs in a $(...) subshell, so the caller records the skip;
   # DEGRADED "no time budget left for the remote read", in the verdict below).
-  relay_budget_for "the remote health probe" 1 margin || return 125
-  if ! curl -fsS -m "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
-    return 1
+  # As ruled (a STRUCTURAL skip): the `owner` route goes ONLY to the record URL relay_owner_prove proved in THIS run
+  # (127.0.0.1:RELAY_OWNER_PORT; never HTTP_HOST/HTTP_PORT), and that handshake IS its liveness probe, so it never
+  # calls /health (which the owner-peek listener refuses). Every other route keeps its /health probe.
+  local route="${1:-remote}" base
+  if [ "$route" = owner ]; then
+    [ -n "${RELAY_OWNER_PORT:-}" ] || return 1
+    base="http://127.0.0.1:${RELAY_OWNER_PORT}"
+  else
+    base="http://${HTTP_HOST}:${HTTP_PORT}"
+    relay_budget_for "the remote health probe" 1 margin || return 125
+    if ! curl -fsS -m "$RELAY_STEP_SECS" "${base}/health" >/dev/null 2>&1; then
+      return 1
+    fi
   fi
 
   local payload
@@ -364,8 +374,8 @@ print(json.dumps({
   local response
   relay_budget_for "the remote mail read" 2 margin || return 125
   # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
-  response=$({ relay_owner_secret_curl_config; relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
-    -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  response=$({ [ "$route" != owner ] || relay_owner_secret_curl_config; relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
+    -X POST "${base}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     2>/dev/null) || return 1
@@ -508,10 +518,8 @@ case "$F1_RC" in
     if relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS" && [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
       if relay_owner_prove; then
         MODE=remote
-        HTTP_HOST=127.0.0.1
-        HTTP_PORT="$RELAY_OWNER_PORT"
         [ -n "$AGENT_TOKEN" ] || relay_hydrate_token
-        SUMMARY=$(http_peek)
+        SUMMARY=$(http_peek owner)
         case $? in
           0) READ_OK=1 ;;
           125) RELAY_BUDGET_SKIPPED="${RELAY_BUDGET_SKIPPED:-the remote read}" ;;
