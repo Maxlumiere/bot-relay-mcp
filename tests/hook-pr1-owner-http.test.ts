@@ -4,15 +4,19 @@
 // See LICENSE for full terms.
 
 /**
- * Hook PR 1: the hooks read mail over HTTP from a wasm DB's DAEMON OWNER (as ruled: the owner endpoint record, a
- * challenge-response before any credential, `relay where --fields` line 8 = "URL KEY", the existing remote mail read).
- * - The owner writes realpath(parent)/.<basename>.relay-owner.json (0600, after it is listening; never deleted):
- *   {v, host:"127.0.0.1", port, pid, pid_start, key, transport}. The key is NEVER served.
- * - GET /owner-id?c=<challenge> answers HMAC-SHA256(key, challenge ‖ port).
- * - `where` line 7 is `http` only for a wasm DB with a VALID record (the lock held, the pid alive with the same start);
- *   line 8 is "http://127.0.0.1:<port> <key>", empty otherwise; exactly 8 lines.
- * - The hook sends a fresh challenge, verifies the answer with the key (node, key on STDIN), and only then sends the
- *   agent's token, for a get_messages peek. Any failure is a named skip, never a sqlite3 read, never a token sent.
+ * Hook PR 1: the hooks read a wasm DB's mail through its OWNER DOOR (as ruled after
+ * Codex #418 R1). No bearer credential is ever sent on it.
+ * - The owner writes realpath(parent)/.<basename>.relay-owner.json (v2, 0600 / an owner-only ACL set BEFORE the key
+ *   bytes, after it is listening, never deleted): {v, host:"127.0.0.1", port, pid, pid_start, key, transport}.
+ * - The door: POST /owner/v1/peek and /owner/v1/liveness. The request carries HMAC(key, "req\n" path ts nonce body)
+ *   (a 30 s window, a replay cache); the reply carries HMAC(key, "resp\n" nonce status body), verified BEFORE anything
+ *   is shown. The peek is a PURE read (`relay pending`'s query); liveness restamps the anchor only.
+ * - The record is trusted only when it is a regular, single-linked, euid-owned, private file in a private dir (Windows:
+ *   the owner-only ACL predicate).
+ * - The client is `relay owner peek|liveness` (node's http, no proxy, no redirect; it opens no DB): it prints
+ *   `relay pending --json`'s contract, so the hooks render the owner's mail with their LOCAL code.
+ * - `where` line 8 is the URL only: the key never passes through bash, a file, the environment or argv.
+ * - On `http`, SessionStart's credential calls go ONLY to a configured endpoint that IS the proven owner.
  * The TS rows run on every OS; the hook rows run where the bash hooks do (POSIX).
  */
 import { describe, it, expect, afterEach, afterAll } from "vitest";
@@ -96,7 +100,7 @@ function seedNativeDb(c: Case): string {
   expect(r.status, r.stderr).toBe(0);
   return r.stdout.trim();
 }
-/** The wasm owner daemon (HTTP, 127.0.0.1). Resolves once /health answers. */
+/** The wasm owner daemon (HTTP). Resolves once /health answers and its record exists. */
 async function startOwnerDaemon(c: Case, host = "127.0.0.1", extraEnv: Record<string, string> = {}): Promise<{ child: ChildProcess; port: number; stderr: () => string }> {
   const port = await getFreePort();
   const reach = host === "0.0.0.0" ? "127.0.0.1" : host.includes(":") ? `[${host}]` : host;
@@ -127,46 +131,194 @@ const whereFields = (c: Case, extra: Record<string, string> = {}) => {
   const r = spawnSync(process.execPath, [RELAY, "where", "--fields"], { encoding: "utf-8", env: baseEnv(c, extra) });
   return { status: r.status, lines: r.stdout.split("\n").slice(0, -1), raw: r.stdout, stderr: r.stderr };
 };
-const mac = (key: string, challenge: string, port: number) => crypto.createHmac("sha256", Buffer.from(key, "hex")).update(`${challenge}${port}`).digest("hex");
+interface OwnerRecord {
+  v: number;
+  host: string;
+  port: number;
+  pid: number;
+  pid_start: string | null;
+  key: string;
+  transport: string;
+}
+const readRecord = (c: Case) => JSON.parse(fs.readFileSync(c.record, "utf-8")) as OwnerRecord;
 
-describe("hook PR 1: the owner endpoint record and the challenge-response (every OS)", () => {
-  it("a wasm DAEMON owner writes its record after listening: 0600, {v, host 127.0.0.1, port, pid, pid_start, key, transport}; /owner-id answers HMAC(key, challenge‖port) and never serves the key", async () => {
+// ---------------------------------------------------------------------------------------------------------------------
+// THE OWNER DOOR, as ruled: a MUTUAL MAC, no bearer credential. "\n" separates fields.
+const hmac = (key: string, text: string) => crypto.createHmac("sha256", Buffer.from(key, "hex")).update(text).digest("hex");
+const reqMac = (key: string, p: string, ts: number, nonce: string, body: string) => hmac(key, `req\n${p}\n${ts}\n${nonce}\n${body}`);
+const respMac = (key: string, nonce: string, status: number, body: string) => hmac(key, `resp\n${nonce}\n${status}\n${body}`);
+const PEEK = "/owner/v1/peek";
+const LIVENESS = "/owner/v1/liveness";
+interface DoorOpts {
+  ts?: number;
+  nonce?: string;
+  body?: string;
+  mac?: string;
+}
+/** One door exchange, as a client with the key would make it. macOk: the reply carries the owner's response MAC. */
+async function door(port: number, key: string, p: string, args: Record<string, unknown>, o: DoorOpts = {}) {
+  const ts = o.ts ?? Math.floor(Date.now() / 1000);
+  const nonce = o.nonce ?? crypto.randomBytes(16).toString("hex");
+  const body = o.body ?? JSON.stringify({ agent_name: AGENT, args, ts, client_nonce: nonce });
+  const res = await fetch(`http://127.0.0.1:${port}${p}`, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain", "X-Owner-MAC": o.mac ?? reqMac(key, p, ts, nonce, body) },
+    body,
+  });
+  const text = await res.text();
+  const got = res.headers.get("x-owner-mac");
+  return { status: res.status, text, nonce, macOk: got !== null && got === respMac(key, nonce, res.status, text) };
+}
+/** The whole DB, from a COPY read with sql.js (never an open of the live file): every table's rows, in order. */
+async function dbDump(c: Case): Promise<Record<string, unknown[][]>> {
+  const copy = path.join(c.home, `copy-${crypto.randomBytes(4).toString("hex")}.db`);
+  fs.copyFileSync(c.db, copy);
+  const initSqlJs = (await import("sql.js")).default;
+  const SQL = await initSqlJs();
+  const db = new SQL.Database(fs.readFileSync(copy));
+  const out: Record<string, unknown[][]> = {};
+  const tables = db.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")[0]?.values.map((r) => String(r[0])) ?? [];
+  for (const t of tables) {
+    const r = db.exec(`SELECT * FROM "${t}" ORDER BY rowid`)[0];
+    out[t] = r ? [r.columns, ...r.values] : [];
+  }
+  db.close();
+  return out;
+}
+
+describe("hook PR 1: the owner record and the owner door (every OS)", () => {
+  it("a wasm DAEMON owner writes its v2 record after listening (POSIX 0600; Windows owner-only ACL), never deleted; GET /owner-id is retired", async () => {
     const c = newCase("record");
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const rec = JSON.parse(fs.readFileSync(c.record, "utf-8")) as Record<string, unknown>;
-    expect(rec).toMatchObject({ v: 1, host: "127.0.0.1", port: d.port, pid: d.child.pid, transport: "http" });
-    expect(String(rec.key)).toMatch(KEY_RE);
-    // The start token comes from ps, which Windows lacks (there it is null, and `where` never says http: the bash hooks
-    // do not run there either).
-    if (process.platform !== "win32") expect(typeof rec.pid_start === "string" && rec.pid_start.length > 0, "the owner's start token is recorded").toBe(true);
-    if (process.platform !== "win32") expect(fs.statSync(c.record).mode & 0o777).toBe(0o600);
-    const challenge = crypto.randomBytes(16).toString("hex");
-    const res = await fetch(`http://127.0.0.1:${d.port}/owner-id?c=${challenge}`);
-    const body = await res.text();
-    expect(res.status).toBe(200);
-    expect(JSON.parse(body)).toEqual({ mac: mac(String(rec.key), challenge, d.port) });
-    expect(body, "the key is never served").not.toContain(String(rec.key));
-    expect((await fetch(`http://127.0.0.1:${d.port}/owner-id`)).status, "no challenge: refused").toBe(400);
-    expect((await fetch(`http://127.0.0.1:${d.port}/health`).then((r) => r.text())), "/health does not carry the key").not.toContain(String(rec.key));
+    const rec = readRecord(c);
+    expect(rec).toMatchObject({ v: 2, host: "127.0.0.1", port: d.port, pid: d.child.pid, transport: "http" });
+    expect(rec.key).toMatch(KEY_RE);
+    if (process.platform === "win32") {
+      const { privacyFaults } = (await import("../src/fs-perms.js")) as { privacyFaults: (p: string, m: number) => string[] };
+      expect(privacyFaults(c.record, 0o600), "the record's ACL is owner-only").toEqual([]);
+    } else {
+      expect(typeof rec.pid_start === "string" && rec.pid_start.length > 0, "the owner's start token is recorded").toBe(true);
+      expect(fs.statSync(c.record).mode & 0o777).toBe(0o600);
+    }
+    expect((await fetch(`http://127.0.0.1:${d.port}/owner-id?c=${"a".repeat(32)}`)).status, "the challenge door is retired").toBe(404);
+    expect(await fetch(`http://127.0.0.1:${d.port}/health`).then((r) => r.text()), "/health does not carry the key").not.toContain(rec.key);
     await stopDaemon(d.child);
     expect(fs.existsSync(c.record), "the record is never deleted, even on a clean exit").toBe(true);
   }, 90_000);
 
-  it.skipIf(process.platform === "win32")("`relay where --fields`: a wasm DB with a VALID record → exactly 8 lines, line 7 `http`, line 8 `http://127.0.0.1:<port> <key>` (skipped on Windows: no ps start token there, and no bash hooks)", async () => {
+  it("POST /owner/v1/peek: a MAC'd request gets the agent's pending set with a reply MAC; no bearer credential is asked for or used", async () => {
+    const c = newCase("door-peek");
+    seedWasmDb(c, "pr1 door mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: `pr1-door-secret-${"x".repeat(32)}` }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const { key } = readRecord(c);
+    const r = await door(d.port, key, PEEK, { with_content: 5 });
+    expect(r.status, r.text).toBe(200);
+    expect(r.macOk, "the reply is MAC'd with the owner key").toBe(true);
+    const body = JSON.parse(r.text) as { ok: boolean; registered: boolean; count: number; messages: Array<{ from_agent?: string; content?: string }> };
+    expect(body).toMatchObject({ ok: true, registered: true, count: 1 });
+    expect(body.messages[0]?.content).toBe("pr1 door mail");
+    expect(r.text, "the key is never served").not.toContain(key);
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("the door REFUSES: a wrong MAC, a stale or future ts, a replayed nonce, a tampered body, another path's MAC, a malformed nonce: none reveals mail", async () => {
+    const c = newCase("door-refuse");
+    seedWasmDb(c, "pr1 refused mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const { key } = readRecord(c);
+    const now = Math.floor(Date.now() / 1000);
+    const nonce = crypto.randomBytes(16).toString("hex");
+    const goodBody = JSON.stringify({ agent_name: AGENT, args: { with_content: 5 }, ts: now, client_nonce: nonce });
+    const cases: Array<[string, Promise<{ status: number; text: string }>]> = [
+      ["a wrong MAC", door(d.port, key, PEEK, { with_content: 5 }, { mac: "00".repeat(32) })],
+      ["a stale ts (60s old)", door(d.port, key, PEEK, { with_content: 5 }, { ts: now - 60 })],
+      ["a future ts (60s ahead)", door(d.port, key, PEEK, { with_content: 5 }, { ts: now + 60 })],
+      ["a tampered body", door(d.port, key, PEEK, {}, { ts: now, nonce: crypto.randomBytes(16).toString("hex"), mac: reqMac(key, PEEK, now, nonce, goodBody) })],
+      ["the liveness path's MAC on peek", door(d.port, key, PEEK, { with_content: 5 }, { mac: reqMac(key, LIVENESS, now, nonce, goodBody), ts: now, nonce, body: goodBody })],
+      ["a malformed nonce", door(d.port, key, PEEK, { with_content: 5 }, { nonce: "zz" })],
+    ];
+    for (const [what, p] of cases) {
+      const r = await p;
+      expect(r.status, `${what}: ${r.text}`).toBeGreaterThanOrEqual(400);
+      expect(r.text, what).not.toContain("pr1 refused mail");
+    }
+    // A replay: the SAME request twice. The first is served; the second is refused (its nonce was seen).
+    const rts = Math.floor(Date.now() / 1000);
+    const rnonce = crypto.randomBytes(16).toString("hex");
+    const rbody = JSON.stringify({ agent_name: AGENT, args: { with_content: 5 }, ts: rts, client_nonce: rnonce });
+    const send = () =>
+      fetch(`http://127.0.0.1:${d.port}${PEEK}`, { method: "POST", headers: { "Content-Type": "text/plain", "X-Owner-MAC": reqMac(key, PEEK, rts, rnonce, rbody) }, body: rbody });
+    const first = await send();
+    expect(first.status, await first.clone().text()).toBe(200);
+    const again = await send();
+    const againText = await again.text();
+    expect(again.status, `a replayed nonce: ${againText}`).toBeGreaterThanOrEqual(400);
+    expect(againText).not.toContain("pr1 refused mail");
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("the peek is a PURE read: after several peeks the DB is identical (no seq/epoch stamp, no read mark, no cursor move)", async () => {
+    const c = newCase("door-pure");
+    seedWasmDb(c, "pr1 pure mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const { key } = readRecord(c);
+    await new Promise((r) => setTimeout(r, 1500)); // the owner's startup writes are behind it
+    const before = await dbDump(c);
+    for (let i = 0; i < 3; i++) expect((await door(d.port, key, PEEK, { with_content: 5 })).status).toBe(200);
+    await new Promise((r) => setTimeout(r, 500));
+    const after = await dbDump(c);
+    for (const t of ["messages", "mailbox", "agent_cursor", "inbox_events"]) expect(after[t], `table ${t} unchanged by the peek`).toEqual(before[t]);
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("POST /owner/v1/liveness restamps ONLY agent_pid / agent_pid_start / host_id; any other argument key is refused", async () => {
+    const c = newCase("door-live");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const { key } = readRecord(c);
+    await new Promise((r) => setTimeout(r, 1500));
+    const before = await dbDump(c);
+    const extra = await door(d.port, key, LIVENESS, { agent_pid: 4242, agent_pid_start: "t0", status: "busy" });
+    expect(extra.status, `an extra key: ${extra.text}`).toBeGreaterThanOrEqual(400);
+    const r = await door(d.port, key, LIVENESS, { agent_pid: 4242, agent_pid_start: "t0" });
+    expect(r.status, r.text).toBe(200);
+    expect(r.macOk).toBe(true);
+    await new Promise((r2) => setTimeout(r2, 500));
+    const after = await dbDump(c);
+    for (const t of Object.keys(before)) {
+      if (t === "agents") continue;
+      expect(after[t], `table ${t} untouched by the liveness door`).toEqual(before[t]);
+    }
+    const cols = before.agents![0] as string[];
+    const strip = (rows: unknown[][]) => rows.slice(1).map((row) => row.map((v, i) => (["agent_pid", "agent_pid_start", "host_id"].includes(cols[i]!) ? "*" : v)));
+    expect(strip(after.agents!), "only agent_pid / agent_pid_start / host_id moved").toEqual(strip(before.agents!));
+    const row = after.agents!.slice(1).find((x) => x[cols.indexOf("name")] === AGENT)!;
+    expect(row[cols.indexOf("agent_pid")]).toBe(4242);
+    expect(row[cols.indexOf("agent_pid_start")]).toBe("t0");
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it.skipIf(process.platform === "win32")("`relay where --fields`: a valid record → 8 lines, line 7 `http`, line 8 the URL ONLY (the key is never in where's answer)", async () => {
     const c = newCase("where-http");
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const key = String((JSON.parse(fs.readFileSync(c.record, "utf-8")) as { key: string }).key);
+    const { key } = readRecord(c);
     const w = whereFields(c);
     expect(w.lines.length, w.raw).toBe(8);
     expect(w.lines[6]).toBe("http");
-    expect(w.lines[7]).toBe(`http://127.0.0.1:${d.port} ${key}`);
+    expect(w.lines[7]).toBe(`http://127.0.0.1:${d.port}`);
+    expect(w.raw + w.stderr, "the key is in no part of where's answer").not.toContain(key);
+    await stopDaemon(d.child);
   }, 90_000);
 
-  it("the LOCK FREE (the owner exited, its record left behind) → not `http`, line 8 empty", async () => {
+  it("the LOCK FREE (the owner exited, its record left behind) → not `http`, and the verdict is decided BY THE LOCK (every OS, Windows included)", async () => {
     const c = newCase("where-free");
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
@@ -177,19 +329,21 @@ describe("hook PR 1: the owner endpoint record and the challenge-response (every
     expect(w.lines.length, w.raw).toBe(8);
     expect(w.lines[6]).not.toBe("http");
     expect(w.lines[7]).toBe("");
+    const { ownerEndpointVerdict } = (await import("../src/owner-endpoint.js")) as { ownerEndpointVerdict: (db: string) => { ok: boolean; reason?: string } };
+    expect(ownerEndpointVerdict(c.db)).toMatchObject({ ok: false, reason: "lock-free" });
   }, 90_000);
 
-  it("the PID REUSED (the record names a live pid whose start token differs) → not `http`, line 8 empty", async () => {
+  it.skipIf(process.platform === "win32")("the PID REUSED (a live pid whose start token differs) → not `http` (reason pid-mismatch)", async () => {
     const c = newCase("where-pid");
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const rec = JSON.parse(fs.readFileSync(c.record, "utf-8")) as Record<string, unknown>;
+    const rec = readRecord(c);
     fs.writeFileSync(c.record, JSON.stringify({ ...rec, pid: process.pid, pid_start: "a-start-token-that-is-not-this-process's" }), { mode: 0o600 });
     const w = whereFields(c);
-    expect(w.lines.length, w.raw).toBe(8);
     expect(w.lines[6]).not.toBe("http");
-    expect(w.lines[7]).toBe("");
+    const { ownerEndpointVerdict } = (await import("../src/owner-endpoint.js")) as { ownerEndpointVerdict: (db: string) => { ok: boolean; reason?: string } };
+    expect(ownerEndpointVerdict(c.db)).toMatchObject({ ok: false, reason: "pid-mismatch" });
     await stopDaemon(d.child);
   }, 90_000);
 
@@ -202,261 +356,270 @@ describe("hook PR 1: the owner endpoint record and the challenge-response (every
     expect(w.lines[7]).toBe("");
   }, 60_000);
 
-  it("the closed verdict set is pinned TS ↔ bash: `http` is a verdict, and only `sqlite3` and `http` enable a read", async () => {
+  it("the closed verdict set is pinned EXACTLY (TS), and the hooks' gate names each", async () => {
     const { HOOK_DB_VERDICTS } = (await import("../src/hook-db-verdict.js")) as { HOOK_DB_VERDICTS: readonly string[] };
-    expect(HOOK_DB_VERDICTS).toContain("http");
+    expect([...HOOK_DB_VERDICTS]).toEqual(["sqlite3", "skip-declared-wasm", "skip-rlyw", "skip-unreadable", "skip-owner-locked", "http"]);
     const src = fs.readFileSync(path.join(HOOKS, "_vault-helpers.sh"), "utf-8");
-    expect(src, "the hooks know the http verdict").toMatch(/\bhttp\)/);
+    for (const v of HOOK_DB_VERDICTS) expect(src, `the hooks know ${v}`).toMatch(new RegExp(`\\b${v.replace(/-/g, "\\-")}\\)`));
   });
 });
 
-// ---------------------------------------------------------------------------------------------------------------------
-// The hook rows: bash, POSIX. A SPY listener stands in for an owner (or an impostor) and records every byte it receives.
+describe("hook PR 1: the record TRUST model (cross-user), as ruled", () => {
+  type Verdict = { ok: boolean; reason?: string };
+  const verdictOf = async (db: string): Promise<Verdict> =>
+    ((await import("../src/owner-endpoint.js")) as { ownerEndpointVerdict: (d: string) => Verdict }).ownerEndpointVerdict(db);
 
-interface Spy {
-  port: number;
-  requests: Array<{ method: string; url: string; headers: http.IncomingHttpHeaders; body: string }>;
-  bytes: () => string;
-}
-async function startSpy(handler: (req: http.IncomingMessage, res: http.ServerResponse, body: string) => void): Promise<Spy> {
-  const requests: Spy["requests"] = [];
-  const server = http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (d: Buffer) => (body += d));
-    req.on("end", () => {
-      requests.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body });
-      handler(req, res, body);
-    });
+  it("the stat predicate: a regular file, nlink 1, owned by the effective uid, no group/other bits; a FOREIGN owner is refused", async () => {
+    const { recordStatTrusted } = (await import("../src/owner-endpoint.js")) as { recordStatTrusted: (st: { isFile(): boolean; nlink: number; uid: number; mode: number }, euid: number) => boolean };
+    const st = (o: Partial<{ file: boolean; nlink: number; uid: number; mode: number }>) => ({ isFile: () => o.file ?? true, nlink: o.nlink ?? 1, uid: o.uid ?? 501, mode: o.mode ?? 0o100600 });
+    expect(recordStatTrusted(st({}), 501), "the control: trusted").toBe(true);
+    expect(recordStatTrusted(st({ uid: 502 }), 501), "another user's record").toBe(false);
+    expect(recordStatTrusted(st({ mode: 0o100644 }), 501), "0644").toBe(false);
+    expect(recordStatTrusted(st({ mode: 0o100620 }), 501), "group-writable").toBe(false);
+    expect(recordStatTrusted(st({ nlink: 2 }), 501), "a second hard link").toBe(false);
+    expect(recordStatTrusted(st({ file: false }), 501), "not a regular file").toBe(false);
   });
-  servers.push(server);
-  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
-  const port = (server.address() as { port: number }).port;
-  return { port, requests, bytes: () => requests.map((q) => `${q.method} ${q.url}\n${JSON.stringify(q.headers)}\n${q.body}`).join("\n") };
-}
-/** A PATH stub for `node`: `node <relay> where --fields` prints FAKE_WHERE_FILE's content; anything else runs node. */
-const STUBS = path.join(ROOT, "stubs");
-fs.mkdirSync(STUBS, { recursive: true });
-const ARGV_LOG = path.join(ROOT, "argv.log");
-const RM_CAPTURE = path.join(ROOT, "rm-capture.log");
-fs.writeFileSync(
-  path.join(STUBS, "node"),
-  `#!/bin/sh\nprintf 'node %s\\n' "$*" >> "${ARGV_LOG}"\nif [ -n "$FAKE_NODE_HANG" ]; then case "$*" in *"$FAKE_NODE_HANG"*) exec sleep 30 ;; esac; fi\ncase "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\nif [ -n "$FAKE_PENDING_RC" ] && [ "$2" = pending ]; then exit "$FAKE_PENDING_RC"; fi\nexec "${process.execPath}" "$@"\n`,
-  { mode: 0o755 }
-);
-const REAL_CURL = spawnSync("sh", ["-c", "command -v curl"], { encoding: "utf-8" }).stdout.trim();
-const REAL_RM = spawnSync("sh", ["-c", "command -v rm"], { encoding: "utf-8" }).stdout.trim();
-/** curl: its argv logged, then the real curl (its stdin, the -K - config, passes through untouched). */
-fs.writeFileSync(path.join(STUBS, "curl"), `#!/bin/sh\nprintf 'curl %s\\n' "$*" >> "${ARGV_LOG}"\nexec "${REAL_CURL}" "$@"\n`, { mode: 0o755 });
-/** rm: every file the hook deletes (its temp files, the where capture) is COPIED into the capture log first. */
-fs.writeFileSync(
-  path.join(STUBS, "rm"),
-  `#!/bin/sh\nfor a in "$@"; do case "$a" in -*) ;; *) [ -f "$a" ] && { printf '== %s\\n' "$a"; cat "$a"; printf '\\n'; } >> "${RM_CAPTURE}" ;; esac; done\nexec "${REAL_RM}" "$@"\n`,
-  { mode: 0o755 }
-);
-const SQLITE_LOG = path.join(ROOT, "sqlite3.log");
-fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SQLITE_LOG}"\nexit 1\n`, { mode: 0o755 });
+
+  it.skipIf(process.platform === "win32")("a live owner's record that is a SYMLINK, 0644, hard-linked twice, or in a group/other-writable dir → refused by name; restored → trusted again", async () => {
+    const c = newCase("trust");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    expect(await verdictOf(c.db), "the control: a fresh record is trusted").toMatchObject({ ok: true });
+    const original = fs.readFileSync(c.record);
+    const elsewhere = path.join(c.home, "planted.json");
+    // A symlink to a same-content file.
+    fs.writeFileSync(elsewhere, original, { mode: 0o600 });
+    fs.rmSync(c.record);
+    fs.symlinkSync(elsewhere, c.record);
+    expect(await verdictOf(c.db), "a symlinked record").toMatchObject({ ok: false, reason: "untrusted-record" });
+    fs.rmSync(c.record);
+    fs.writeFileSync(c.record, original, { mode: 0o600 });
+    expect(await verdictOf(c.db), "restored").toMatchObject({ ok: true });
+    fs.chmodSync(c.record, 0o644);
+    expect(await verdictOf(c.db), "0644").toMatchObject({ ok: false, reason: "untrusted-record" });
+    fs.chmodSync(c.record, 0o600);
+    const link = path.join(c.home, "second-name.json");
+    fs.linkSync(c.record, link);
+    expect(await verdictOf(c.db), "a second hard link").toMatchObject({ ok: false, reason: "untrusted-record" });
+    fs.rmSync(link);
+    fs.chmodSync(c.dir, 0o775);
+    expect(await verdictOf(c.db), "the DB's dir is group-writable").toMatchObject({ ok: false, reason: "untrusted-dir" });
+    fs.chmodSync(c.dir, 0o700);
+    expect(await verdictOf(c.db), "restored again").toMatchObject({ ok: true });
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it.runIf(process.platform === "win32")("Windows twin: a record whose ACL grants another principal (Everyone: read) is refused", async () => {
+    const c = newCase("trust-win");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const g = spawnSync("icacls", [c.record, "/grant", "*S-1-1-0:R"], { encoding: "utf-8" });
+    expect(g.status, `${g.stdout}${g.stderr}`).toBe(0);
+    expect(await verdictOf(c.db)).toMatchObject({ ok: false, reason: "untrusted-record" });
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("the record writer sets the owner-only ACL BEFORE any key byte, and an ACL fault publishes NO record (every OS, an injected fault)", () => {
+    const c = newCase("acl-order");
+    fs.writeFileSync(c.db, "");
+    const script = path.join(c.home, "acl.mjs");
+    const log = path.join(c.home, "acl.log");
+    fs.writeFileSync(
+      script,
+      `import fs from "fs";
+       const m = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "owner-endpoint.js")).href)});
+       const seen = [];
+       m._setAclRestrictForTests((p) => { seen.push(fs.statSync(p).size); return ["an injected ACL fault"]; });
+       let threw = false;
+       try { m.writeOwnerEndpoint(${JSON.stringify(c.db)}, 1234, "http"); } catch { threw = true; }
+       const left = fs.readdirSync(${JSON.stringify(c.dir)}).filter((f) => f.includes("relay-owner"));
+       m._setAclRestrictForTests((p) => { seen.push(fs.statSync(p).size); return []; });
+       m.writeOwnerEndpoint(${JSON.stringify(c.db)}, 1234, "http");
+       fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify({ threw, left, seen }));`
+    );
+    const r = spawnSync(process.execPath, [script], { encoding: "utf-8", env: baseEnv(c), timeout: 30_000 });
+    expect(r.status, r.stderr).toBe(0);
+    const out = JSON.parse(fs.readFileSync(log, "utf-8")) as { threw: boolean; left: string[]; seen: number[] };
+    expect(out.threw, "an ACL fault refuses the write").toBe(true);
+    expect(out.left, "no record and no temp file is left").toEqual([]);
+    expect(out.seen, "the ACL is set while the file holds ZERO bytes (before the key)").toEqual([0, 0]);
+    expect(fs.existsSync(c.record), "with a clean ACL the record is written").toBe(true);
+  }, 60_000);
+});
+
+describe.skipIf(process.platform === "win32")("hook PR 1: `relay owner peek` (the hooks' client): the door's one exchange, printed as `relay pending --json` prints", () => {
+  it("its JSON has exactly `relay pending --json`'s keys (plus source: owner), with the content; it opens NO DB (a spy with a positive control)", async () => {
+    const twin = newCase("owner-cli-twin");
+    seedNativeDb(twin);
+    const pend = spawnSync(process.execPath, [RELAY, "pending", AGENT, "--json", "--with-content", "5"], { encoding: "utf-8", env: baseEnv(twin) });
+    expect(pend.status, pend.stderr).toBe(0);
+    const pendKeys = Object.keys(JSON.parse(pend.stdout) as object).sort();
+    const c = newCase("owner-cli");
+    seedWasmDb(c, "pr1 cli mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const spyLog = path.join(c.home, "spy.log");
+    const spy = path.join(c.home, "spy.cjs");
+    fs.writeFileSync(
+      spy,
+      `const M = require("module"); const fs = require("fs"); const load = M._load;\n` +
+        `M._load = function (req, ...rest) { const m = load.call(this, req, ...rest);\n` +
+        `  if (/(^|[\\\\/])better-sqlite3$/.test(req) && typeof m === "function") { return new Proxy(m, { construct(t, a) { fs.appendFileSync(${JSON.stringify(spyLog)}, "better-sqlite3 " + String(a[0]) + "\\n"); return Reflect.construct(t, a); } }); }\n` +
+        `  if (/(^|[\\\\/])sql\\.js$/.test(req)) fs.appendFileSync(${JSON.stringify(spyLog)}, "sql.js loaded\\n");\n` +
+        `  return m; };\n`
+    );
+    // The spy's positive control on the SAME CLI: `relay pending` on the native twin opens its DB, and the spy sees it.
+    const ctl = spawnSync(process.execPath, ["--require", spy, RELAY, "pending", AGENT, "--json"], { encoding: "utf-8", env: baseEnv(twin) });
+    expect(ctl.status, ctl.stderr).toBe(0);
+    expect(fs.existsSync(spyLog) ? fs.readFileSync(spyLog, "utf-8") : "", "positive control: the spy sees the CLI open a DB").toMatch(/better-sqlite3|sql\.js/);
+    fs.rmSync(spyLog, { force: true });
+    const r = spawnSync(process.execPath, ["--require", spy, RELAY, "owner", "peek", AGENT, "--json", "--with-content", "5", "--timeout-ms", "5000"], { encoding: "utf-8", env: baseEnv(c) });
+    expect(r.status, r.stderr).toBe(0);
+    const out = JSON.parse(r.stdout) as Record<string, unknown> & { messages: Array<{ content?: string }> };
+    expect(Object.keys(out).filter((k) => k !== "source").sort()).toEqual(pendKeys);
+    expect(out.source).toBe("owner");
+    expect(out.messages[0]?.content).toBe("pr1 cli mail");
+    expect(fs.existsSync(spyLog) ? fs.readFileSync(spyLog, "utf-8") : "", "the client opens NO DB").toBe("");
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("--timeout-ms is ENFORCED: an owner that never answers → a named failure inside the bound", async () => {
+    const c = newCase("owner-cli-timeout");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    // A listener that accepts and never answers, recorded in place of the owner's port (the owner still holds the lock).
+    const silent = http.createServer(() => {});
+    servers.push(silent);
+    await new Promise<void>((r) => silent.listen(0, "127.0.0.1", () => r()));
+    const rec = readRecord(c);
+    fs.writeFileSync(c.record, JSON.stringify({ ...rec, port: (silent.address() as { port: number }).port }), { mode: 0o600 });
+    const t0 = Date.now();
+    const r = spawnSync(process.execPath, [RELAY, "owner", "peek", AGENT, "--json", "--timeout-ms", "1500"], { encoding: "utf-8", env: baseEnv(c), timeout: 30_000 });
+    expect(Date.now() - t0, "bounded by --timeout-ms (plus node's start)").toBeLessThan(6000);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/relay owner: .*(timed out|no answer)/i);
+    await stopDaemon(d.child);
+  }, 90_000);
+});
 
 /**
- * The hook, run ASYNCHRONOUSLY: a spy listener lives in THIS process, so a spawnSync would starve it (the event loop
- * blocked: the hook's request never served, a vacuous "zero bytes received"). Measured on 5771f88: 0 requests.
+ * Q9, as ruled: the record ALWAYS names a listener the hooks reach as 127.0.0.1. A daemon 127.0.0.1 cannot reach (bound
+ * to ::1 or one LAN address, or whose Host allowlist leaves 127.0.0.1 out) also opens the loopback OWNER-PEEK listener,
+ * and the record names it. That listener serves ONLY the two door endpoints.
  */
-async function runHook(c: Case, hook: string, extra: Record<string, string>, input = "") {
-  fs.rmSync(SQLITE_LOG, { force: true });
-  const env = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_AGENT_NAME: AGENT, RELAY_TEST_CLOCK: "0", ...extra });
-  const child = spawn("bash", [path.join(HOOKS, hook)], { env, stdio: ["pipe", "pipe", "pipe"] });
-  procs.push(child);
-  let stdout = "";
-  let stderr = "";
-  child.stdout!.on("data", (d: Buffer) => (stdout += d));
-  child.stderr!.on("data", (d: Buffer) => (stderr += d));
-  child.stdin!.end(input);
-  const t0 = Date.now();
-  const status = await new Promise<number | null>((resolve) => {
-    const t = setTimeout(() => {
-      child.kill("SIGKILL");
-      resolve(null);
-    }, 60_000);
-    child.once("exit", (code) => {
-      clearTimeout(t);
-      resolve(code);
+const LAN_V4 = Object.values(os.networkInterfaces()).flat().find((a) => a && a.family === "IPv4" && !a.internal)?.address ?? null;
+const V6_LOOPBACK = await new Promise<boolean>((resolve) => {
+  const srv = http.createServer();
+  srv.once("error", () => resolve(false));
+  srv.listen(0, "::1", () => srv.close(() => resolve(true)));
+});
+const UNREACHABLE_BINDS: Array<[string, string | null]> = [
+  ["::1 (IPv6 loopback only)", V6_LOOPBACK ? "::1" : null],
+  ["one LAN IPv4 address (with an http_secret, as a non-loopback bind requires)", LAN_V4],
+];
+const PEEK_SECRET = `pr1-peek-secret-${crypto.randomBytes(16).toString("hex")}`;
+
+describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopback owner-peek listener, and the record names it", () => {
+  it.each(UNREACHABLE_BINDS)("a daemon bound to %s: the record names a 127.0.0.1 listener on ANOTHER port whose door answers, MAC'd", async (what, host) => {
+    if (host === null) return void console.warn(`[hook-pr1] skipped by name: no such address on this runner (${what})`);
+    const c = newCase(`peek-${host.replace(/[^0-9a-z]/gi, "")}`);
+    seedWasmDb(c, "pr1 peek-listener mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c, host);
+    const rec = readRecord(c);
+    expect(rec.host).toBe("127.0.0.1");
+    expect(rec.port, "the record names the peek listener, not the main one").not.toBe(d.port);
+    const r = await door(rec.port, rec.key, PEEK, { with_content: 5 });
+    expect(r.status, r.text).toBe(200);
+    expect(r.macOk).toBe(true);
+    expect(r.text).toContain("pr1 peek-listener mail");
+    if (host === LAN_V4) {
+      const off = await fetch(`http://${LAN_V4}:${rec.port}${PEEK}`, { method: "POST", body: "{}" }).then((x) => x.status, () => "refused");
+      expect(off, "the peek listener is bound to 127.0.0.1 only").toBe("refused");
+    }
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("the peek listener serves ONLY the two door endpoints: every other route of startHttpServer, /mcp, /owner-id, /health → 403; a WS upgrade is never accepted", async () => {
+    const host = V6_LOOPBACK ? "::1" : LAN_V4;
+    if (host === null) return void console.warn("[hook-pr1] skipped by name: no address 127.0.0.1 cannot reach on this runner");
+    const c = newCase("peek-gate");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c, host);
+    const rec = readRecord(c);
+    const peek = `http://127.0.0.1:${rec.port}`;
+    const src = fs.readFileSync(path.join(REPO, "src", "transport", "http.ts"), "utf-8");
+    const routes = [...src.matchAll(/app\.(get|post|put|delete|patch|all)\(\s*"([^"]+)"/g)].map((m) => [m[1]!.toUpperCase(), m[2]!] as const);
+    expect(routes.length, "precondition: the route scan found the routes").toBeGreaterThan(15);
+    expect(routes.some(([m, r]) => m === "POST" && r === PEEK), "precondition: the door's routes are literal in http.ts").toBe(true);
+    for (const [method, route] of routes) {
+      if (method === "POST" && (route === PEEK || route === LIVENESS)) continue;
+      const res = await fetch(`${peek}${route.replace(/:[a-z_]+/gi, "x")}`, { method: method === "ALL" ? "GET" : method, headers: { "X-Relay-Secret": PEEK_SECRET }, body: method === "GET" ? undefined : "{}" });
+      expect(res.status, `${method} ${route}`).toBe(403);
+    }
+    for (const [m, r] of [["POST", "/mcp"], ["GET", "/mcp"], ["GET", "/owner-id"], ["GET", "/health"]] as const) {
+      expect((await fetch(`${peek}${r}`, { method: m, body: m === "POST" ? "{}" : undefined })).status, `${m} ${r}`).toBe(403);
+    }
+    const upgraded = await new Promise<string>((resolve) => {
+      const req = http.request({ host: "127.0.0.1", port: rec.port, path: "/dashboard/ws", headers: { Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": crypto.randomBytes(16).toString("base64") } });
+      req.on("upgrade", () => resolve("upgraded"));
+      req.on("response", (x) => resolve(`status ${x.statusCode}`));
+      req.on("error", () => resolve("refused"));
+      req.end();
     });
+    expect(upgraded, "a WS upgrade is never accepted").not.toBe("upgraded");
+    await stopDaemon(d.child);
+  }, 180_000);
+
+  it("twin: a daemon bound to 127.0.0.1 records its MAIN port (no second listener)", async () => {
+    const c = newCase("peek-twin");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    expect(readRecord(c).port).toBe(d.port);
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("a daemon whose Host allowlist leaves 127.0.0.1 out → the peek listener (loopback-only Host check); the main door is Host-checked", async () => {
+    const c = newCase("peek-hostlist");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c, "127.0.0.1", { RELAY_HTTP_ALLOWED_HOSTS: "relay.example.internal" });
+    const rec = readRecord(c);
+    expect(rec.port).not.toBe(d.port);
+    expect((await door(rec.port, rec.key, PEEK, {})).status).toBe(200);
+    expect((await door(d.port, rec.key, PEEK, {})).status, "the main door is Host-checked").toBe(421);
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("the peek listener's bind host is a CONSTANT 127.0.0.1: startHttpServer in owner-peek mode refuses any other host", async () => {
+    // A LITERAL specifier (the parser-pin gate refuses a computed one); the assert throws before any setup.
+    const mod = (await import("../src/transport/http.js")) as { startHttpServer: (p: number, h: string, o?: { ownerPeek?: boolean }) => unknown };
+    for (const h of ["0.0.0.0", "::", "::1", "localhost", LAN_V4 ?? "10.0.0.1"]) {
+      expect(() => mod.startHttpServer(0, h, { ownerPeek: true }), h).toThrow(/127\.0\.0\.1/);
+    }
   });
-  const sqliteCalls = fs.existsSync(SQLITE_LOG) ? fs.readFileSync(SQLITE_LOG, "utf-8").split("\n").filter(Boolean) : [];
-  return { status, out: `${stdout}\n${stderr}`, stdout, sqliteCalls, ms: Date.now() - t0 };
-}
-/** A fake `where --fields` answer: an instance on c.db, verdict `line7`, and `line8` (or no 8th line at all). */
-function fakeWhere(c: Case, line7: string, line8: string | null): string {
-  const f = path.join(c.home, `where-${crypto.randomBytes(4).toString("hex")}.txt`);
-  const lines = ["explicit-db", c.db, "true", "", "", path.join(c.dir, "agents"), line7, ...(line8 === null ? [] : [line8])];
-  fs.writeFileSync(f, lines.join("\n") + "\n");
-  return f;
-}
-const TOKEN = "pr1-secret-token-aaaaaaaaaaaaaaaa";
-const KEY = crypto.randomBytes(16).toString("hex");
 
-describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP from a daemon owner (POSIX)", () => {
-  it.each(["check-relay.sh", "stop-check.sh", "post-tool-use-check.sh"])(
-    "%s: a wasm DB owned by a DAEMON → the agent's pending mail is read over HTTP, never with sqlite3",
-    async (hook) => {
-      const c = newCase(`deliver-${hook.split(".")[0]}`);
-      const token = seedWasmDb(c, `pr1 mail for ${hook}`);
-      fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
-      const d = await startOwnerDaemon(c);
-      const input = hook === "check-relay.sh" ? "" : JSON.stringify({ session_id: "s-pr1", hook_event_name: hook === "stop-check.sh" ? "Stop" : "PostToolUse" });
-      const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token }, input);
-      expect(r.sqliteCalls, "never a sqlite3 read on a wasm DB").toEqual([]);
-      expect(r.out, `the mail arrives over HTTP\n${r.out}\n${d.stderr()}`).toMatch(new RegExp(`pr1 mail for ${hook.replace(".", "\\.")}|pr1-sender`));
-      await stopDaemon(d.child);
-    },
-    120_000
-  );
-
-  const SECRET = `pr1-http-secret-${crypto.randomBytes(16).toString("hex")}`;
-  it.each(["check-relay.sh", "stop-check.sh", "post-tool-use-check.sh"])(
-    "%s: the owner daemon has an http_secret → the mail is still read (the secret goes curl-config-on-stdin only), and NO secret byte is in any argv, any file the hook wrote, or its output",
-    async (hook) => {
-      const c = newCase(`secret-${hook.split(".")[0]}`);
-      const token = seedWasmDb(c, `pr1 secret mail for ${hook}`);
-      fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: SECRET }), { mode: 0o600 });
-      const d = await startOwnerDaemon(c);
-      fs.rmSync(ARGV_LOG, { force: true });
-      fs.rmSync(RM_CAPTURE, { force: true });
-      const input = hook === "check-relay.sh" ? "" : JSON.stringify({ session_id: "s-pr1", hook_event_name: hook === "stop-check.sh" ? "Stop" : "PostToolUse" });
-      const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token }, input);
-      expect(r.out, `the mail arrives through the secret-protected owner\n${r.out}\n${d.stderr()}`).toMatch(new RegExp(`pr1 secret mail for ${hook.replace(".", "\\.")}|pr1-sender`));
-      const argv = fs.existsSync(ARGV_LOG) ? fs.readFileSync(ARGV_LOG, "utf-8") : "";
-      expect(argv.length, "precondition: the stubs logged the hook's curl/node runs").toBeGreaterThan(0);
-      expect(argv, "the secret is in no process argv").not.toContain(SECRET);
-      const captured = fs.existsSync(RM_CAPTURE) ? fs.readFileSync(RM_CAPTURE, "utf-8") : "";
-      expect(captured, "no file the hook wrote (its temp files, the where capture) held the secret").not.toContain(SECRET);
-      const tmp = path.join(c.home, ".tmp");
-      const leftovers = fs.existsSync(tmp) ? fs.readdirSync(tmp).map((f) => { try { return fs.readFileSync(path.join(tmp, f), "utf-8"); } catch { return ""; } }).join("\n") : "";
-      expect(leftovers, "nothing left in the hook's temp dir holds the secret").not.toContain(SECRET);
-      expect(r.out, "the secret is in no hook output").not.toContain(SECRET);
-      await stopDaemon(d.child);
-    },
-    120_000
-  );
-
-  it("an http_secret curl config CANNOT carry (a quote) is declined BY NAME: the hook says it can't be sent safely, and never prints the secret", async () => {
-    const c = newCase("secret-unsafe");
-    const token = seedWasmDb(c, "pr1 unsafe-secret mail");
-    const unsafe = `pr1-"quoted"-secret-${crypto.randomBytes(16).toString("hex")}`;
-    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: unsafe }), { mode: 0o600 });
-    const d = await startOwnerDaemon(c);
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token });
-    expect(r.out).toMatch(/http_secret can't be sent safely: it contains a character curl config can't carry/);
-    expect(r.out, "the secret is in no hook output").not.toContain(unsafe);
-    expect(r.sqliteCalls).toEqual([]);
-    await stopDaemon(d.child);
-  }, 120_000);
-
-  it.each([
-    ["the http_secret read", "curl-auth-config", /the http_secret could not be read in time/],
-    ["the proof check", "timingSafeEqual", /did not prove the record's key/],
-  ])("a HUNG %s (its node never returns) is bounded in time: the hook ends inside its budget and names it", async (_what, hang, named) => {
-    const c = newCase(`hang-${hang}`);
-    const token = seedWasmDb(c, "pr1 hang mail");
-    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: SECRET }), { mode: 0o600 });
-    const d = await startOwnerDaemon(c);
-    fs.rmSync(ARGV_LOG, { force: true });
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: hang });
-    const argv = fs.existsSync(ARGV_LOG) ? fs.readFileSync(ARGV_LOG, "utf-8") : "";
-    expect(argv, "precondition: the hung step ran (the stub saw it)").toContain(hang);
-    expect(r.status, "the hook exited by itself (not killed by the 60s runner)").not.toBeNull();
-    expect(r.ms, `the stub sleeps 30s: the hook must end inside its 10s budget\n${r.out}`).toBeLessThan(10_000);
-    expect(r.out).toMatch(named);
-    expect(r.out).not.toContain(SECRET);
-    await stopDaemon(d.child);
-  }, 120_000);
-
-  it("a WRONG http_secret (the hook resolves a different one) is a NAMED failure: no mail, never a sqlite3 read", async () => {
-    const c = newCase("secret-wrong");
-    const token = seedWasmDb(c, "pr1 must not arrive");
-    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: SECRET }), { mode: 0o600 });
-    const d = await startOwnerDaemon(c);
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_SECRET: `wrong-${SECRET}` });
-    expect(r.out).not.toMatch(/pr1 must not arrive/);
-    expect(r.out).toMatch(/remote relay read failed|could not be read|unauthorized/i);
-    expect(r.sqliteCalls).toEqual([]);
-    expect(r.out, "the secret is in no hook output").not.toContain(SECRET);
-    await stopDaemon(d.child);
-  }, 120_000);
-
-  it("an IMPOSTOR on the record's port (a wrong MAC) receives ZERO token bytes, and the hook names the skip", async () => {
-    const c = newCase("impostor");
-    seedNativeDb(c);
-    const spy = await startSpy((req, res) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ mac: "00".repeat(32) }));
-    });
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", `http://127.0.0.1:${spy.port} ${KEY}`) });
-    expect(spy.bytes(), "the token never reached the impostor").not.toContain(TOKEN);
-    expect(spy.requests.every((q) => q.url.startsWith("/owner-id?c=")), `only the challenge was sent: ${spy.bytes()}`).toBe(true);
-    expect(spy.requests.length, "the challenge was sent (the handshake ran)").toBeGreaterThanOrEqual(1);
-    expect(r.out).toMatch(/owner (endpoint|record) .*(not proved|did not prove|failed the challenge)/i);
-    expect(r.sqliteCalls).toEqual([]);
-  }, 60_000);
-
-  it("a REPLAYED MAC (correct for an OLD challenge) is refused: zero token bytes", async () => {
-    const c = newCase("replay");
-    seedNativeDb(c);
-    let port = 0;
-    const old = "0123456789abcdef0123456789abcdef";
-    const spy = await startSpy((req, res) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ mac: mac(KEY, old, port) })); // what a cached answer to an earlier challenge would be
-    });
-    port = spy.port;
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", `http://127.0.0.1:${spy.port} ${KEY}`) });
-    expect(spy.requests.length, "the handshake ran").toBeGreaterThanOrEqual(1);
-    expect(spy.requests[0]!.url, "a fresh challenge, not the old one").not.toContain(old);
-    expect(spy.bytes()).not.toContain(TOKEN);
-    expect(r.out).toMatch(/owner (endpoint|record) .*(not proved|did not prove|failed the challenge)/i);
-  }, 60_000);
-
-  it("a 3xx from /owner-id is NOT followed: the redirect target receives nothing, zero token bytes", async () => {
-    const c = newCase("redirect");
-    seedNativeDb(c);
-    const target = await startSpy((req, res) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end("{}");
-    });
-    const spy = await startSpy((req, res) => {
-      res.writeHead(302, { Location: `http://127.0.0.1:${target.port}${req.url}` });
-      res.end();
-    });
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", `http://127.0.0.1:${spy.port} ${KEY}`) });
-    expect(spy.requests.length, "the handshake ran").toBeGreaterThanOrEqual(1);
-    expect(target.requests, "the redirect was never followed").toEqual([]);
-    expect(spy.bytes() + target.bytes()).not.toContain(TOKEN);
-    expect(r.out).toMatch(/owner (endpoint|record) .*(not proved|did not prove|failed the challenge)/i);
-  }, 60_000);
-
-  it.each([
-    ["a non-loopback host", (p: number) => `http://192.0.2.1:${p} ${KEY}`],
-    ["localhost (not the exact 127.0.0.1)", (p: number) => `http://localhost:${p} ${KEY}`],
-    ["a short key", (p: number) => `http://127.0.0.1:${p} abcd`],
-    ["a path after the port", (p: number) => `http://127.0.0.1:${p}/x ${KEY}`],
-    ["no key", (p: number) => `http://127.0.0.1:${p}`],
-  ])("a MALFORMED line 8 (%s) → a named skip with NO network call", async (_label, line8) => {
-    const c = newCase("malformed");
-    seedNativeDb(c);
-    const spy = await startSpy((req, res) => res.end("{}"));
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", line8(spy.port)) });
-    expect(spy.requests, "no request at all").toEqual([]);
-    expect(r.out).toMatch(/owner (endpoint|record) .*(malformed|invalid|not a loopback)/i);
-    expect(r.sqliteCalls).toEqual([]);
-  }, 60_000);
-
-  it("a 7-line answer (an older relay CLI than these hooks) → a named version-skew skip: no sqlite3, no network", async () => {
-    const c = newCase("seven");
-    seedNativeDb(c);
-    const spy = await startSpy((req, res) => res.end("{}"));
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", null) });
-    expect(spy.requests).toEqual([]);
-    expect(r.sqliteCalls).toEqual([]);
-    expect(r.out).toMatch(/7-line answer[\s\S]*(version skew|update the relay)/i);
+  it("the owner-peek listener SURVIVES its own listen failure (an async 'error' event): logged, no record, the process lives", () => {
+    const c = newCase("peek-error");
+    fs.writeFileSync(c.cfg, "{}", { mode: 0o600 });
+    const script = path.join(c.home, "peek-error.mjs");
+    fs.writeFileSync(
+      script,
+      `const { startHttpServer } = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "transport", "http.js")).href)});
+       const s = startHttpServer(0, "127.0.0.1", { ownerPeek: true });
+       s.once("listening", () => {
+         s.emit("error", Object.assign(new Error("probe EADDRNOTAVAIL"), { code: "EADDRNOTAVAIL" }));
+         setTimeout(() => { process.stdout.write("alive"); s.close(() => process.exit(0)); }, 200);
+       });`
+    );
+    const r = spawnSync(process.execPath, [script], { encoding: "utf-8", env: baseEnv(c), timeout: 30_000 });
+    expect(r.stdout, r.stderr).toBe("alive");
+    expect(r.stderr).toMatch(/the owner-peek listener failed \(probe EADDRNOTAVAIL\)/);
   }, 60_000);
 });
 
@@ -512,201 +675,285 @@ describe("hook PR 1: the record is never deleted by relay code (a scan row)", ()
   }, 120_000);
 });
 
-/**
- * Hook PR 1, as ruled (Q9): the record ALWAYS points at a listener the hooks reach as 127.0.0.1. A daemon whose main
- * listener 127.0.0.1 cannot reach (bound to ::1, or to one LAN address) ALSO opens a loopback-only "owner peek"
- * listener, and the record points there. That listener serves ONLY GET /owner-id and the hooks' get_messages peek.
- */
-const LAN_V4 = Object.values(os.networkInterfaces()).flat().find((a) => a && a.family === "IPv4" && !a.internal)?.address ?? null;
-const V6_LOOPBACK = await new Promise<boolean>((resolve) => {
-  const srv = http.createServer();
-  srv.once("error", () => resolve(false));
-  srv.listen(0, "::1", () => srv.close(() => resolve(true)));
-});
-const UNREACHABLE_BINDS: Array<[string, string | null, Record<string, string>]> = [
-  ["::1 (IPv6 loopback only)", V6_LOOPBACK ? "::1" : null, {}],
-  ["one LAN IPv4 address (with an http_secret, as a non-loopback bind requires)", LAN_V4, {}],
-];
-const PEEK_SECRET = `pr1-peek-secret-${crypto.randomBytes(16).toString("hex")}`;
-async function mcpCall(base: string, body: unknown, headers: Record<string, string> = {}) {
-  const res = await fetch(`${base}/mcp`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers },
-    body: typeof body === "string" ? body : JSON.stringify(body),
-  });
-  const text = await res.text();
-  const data = text.split("\n").find((l) => l.startsWith("data: "));
-  let json: any = null;
-  try { json = JSON.parse(data ? data.slice(6) : text); } catch { /* not JSON */ }
-  return { status: res.status, text, json };
+// ---------------------------------------------------------------------------------------------------------------------
+// The hook rows: bash, POSIX. Spies stand in for an inherited destination, a proxy, or a port thief.
+interface Spy {
+  port: number;
+  requests: Array<{ method: string; url: string; headers: http.IncomingHttpHeaders; body: string }>;
+  bytes: () => string;
 }
-const peekArgs = (token: string) => ({ agent_name: AGENT, status: "pending", limit: 10, peek: true, since: "all", agent_token: token });
-const call = (name: string, args: Record<string, unknown>) => ({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } });
+async function startSpy(handler: (req: http.IncomingMessage, res: http.ServerResponse, body: string) => void): Promise<Spy> {
+  const requests: Spy["requests"] = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (d: Buffer) => (body += d));
+    req.on("end", () => {
+      requests.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body });
+      handler(req, res, body);
+    });
+  });
+  servers.push(server);
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const port = (server.address() as { port: number }).port;
+  return { port, requests, bytes: () => requests.map((q) => `${q.method} ${q.url}\n${JSON.stringify(q.headers)}\n${q.body}`).join("\n") };
+}
+/** PATH stubs: node and curl log their argv AND environment; rm copies each file the hook deletes; sqlite3 logs calls. */
+const STUBS = path.join(ROOT, "stubs");
+fs.mkdirSync(STUBS, { recursive: true });
+const ARGV_LOG = path.join(ROOT, "argv.log");
+const ENV_LOG = path.join(ROOT, "env.log");
+const RM_CAPTURE = path.join(ROOT, "rm-capture.log");
+fs.writeFileSync(
+  path.join(STUBS, "node"),
+  `#!/bin/sh\nprintf 'node %s\\n' "$*" >> "${ARGV_LOG}"\nenv >> "${ENV_LOG}"\n` +
+    `if [ -n "$FAKE_NODE_HANG" ]; then case "$*" in *"$FAKE_NODE_HANG"*) exec sleep 30 ;; esac; fi\n` +
+    `case "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\n` +
+    `if [ -n "$FAKE_PENDING_RC" ] && [ "$2" = pending ]; then exit "$FAKE_PENDING_RC"; fi\n` +
+    `exec "${process.execPath}" "$@"\n`,
+  { mode: 0o755 }
+);
+const REAL_CURL = spawnSync("sh", ["-c", "command -v curl"], { encoding: "utf-8" }).stdout.trim();
+const REAL_RM = spawnSync("sh", ["-c", "command -v rm"], { encoding: "utf-8" }).stdout.trim();
+fs.writeFileSync(path.join(STUBS, "curl"), `#!/bin/sh\nprintf 'curl %s\\n' "$*" >> "${ARGV_LOG}"\nenv >> "${ENV_LOG}"\nexec "${REAL_CURL}" "$@"\n`, { mode: 0o755 });
+fs.writeFileSync(
+  path.join(STUBS, "rm"),
+  `#!/bin/sh\nfor a in "$@"; do case "$a" in -*) ;; *) [ -f "$a" ] && { printf '== %s\\n' "$a"; cat "$a"; printf '\\n'; } >> "${RM_CAPTURE}" ;; esac; done\nexec "${REAL_RM}" "$@"\n`,
+  { mode: 0o755 }
+);
+const SQLITE_LOG = path.join(ROOT, "sqlite3.log");
+fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SQLITE_LOG}"\nexit 1\n`, { mode: 0o755 });
 
-describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → a loopback owner-peek listener, and the record points there", () => {
-  it.each(UNREACHABLE_BINDS)("a daemon bound to %s: the record names a 127.0.0.1 listener on ANOTHER port that proves the key", async (_what, host, env) => {
-    if (host === null) return void console.warn(`[hook-pr1] skipped by name: no such address on this runner (${_what})`);
-    const c = newCase(`peek-${host.replace(/[^0-9a-z]/gi, "")}`);
-    seedWasmDb(c);
-    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
-    const d = await startOwnerDaemon(c, host, env);
-    const rec = JSON.parse(fs.readFileSync(c.record, "utf-8")) as { host: string; port: number; key: string };
-    expect(rec.host).toBe("127.0.0.1");
-    expect(rec.port, "the record points at the peek listener, not the main one").not.toBe(d.port);
-    const challenge = crypto.randomBytes(16).toString("hex");
-    const res = await fetch(`http://127.0.0.1:${rec.port}/owner-id?c=${challenge}`);
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ mac: mac(rec.key, challenge, rec.port) });
-    if (host === LAN_V4) {
-      const off = await fetch(`http://${LAN_V4}:${rec.port}/owner-id?c=${challenge}`).then((r) => r.status, () => "refused");
-      expect(off, "the peek listener is bound to 127.0.0.1 only").toBe("refused");
-    }
-    await stopDaemon(d.child);
-  }, 90_000);
+/** The hook, run ASYNCHRONOUSLY (a spy in this process must not be starved by a spawnSync). */
+async function runHook(c: Case, hook: string, extra: Record<string, string>, input = "") {
+  for (const f of [SQLITE_LOG, ARGV_LOG, ENV_LOG, RM_CAPTURE]) fs.rmSync(f, { force: true });
+  const env = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_AGENT_NAME: AGENT, RELAY_TEST_CLOCK: "0", ...extra });
+  const child = spawn("bash", [path.join(HOOKS, hook)], { env, stdio: ["pipe", "pipe", "pipe"] });
+  procs.push(child);
+  let stdout = "";
+  let stderr = "";
+  child.stdout!.on("data", (d: Buffer) => (stdout += d));
+  child.stderr!.on("data", (d: Buffer) => (stderr += d));
+  child.stdin!.end(input);
+  const t0 = Date.now();
+  const status = await new Promise<number | null>((resolve) => {
+    const t = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve(null);
+    }, 60_000);
+    child.once("exit", (code) => {
+      clearTimeout(t);
+      resolve(code);
+    });
+  });
+  const read = (f: string) => (fs.existsSync(f) ? fs.readFileSync(f, "utf-8") : "");
+  return { status, out: `${stdout}\n${stderr}`, sqliteCalls: read(SQLITE_LOG).split("\n").filter(Boolean), argv: read(ARGV_LOG), env: read(ENV_LOG), removed: read(RM_CAPTURE), ms: Date.now() - t0 };
+}
+function fakeWhere(c: Case, line7: string, line8: string | null): string {
+  const f = path.join(c.home, `where-${crypto.randomBytes(4).toString("hex")}.txt`);
+  const lines = ["explicit-db", c.db, "true", "", "", path.join(c.dir, "agents"), line7, ...(line8 === null ? [] : [line8])];
+  fs.writeFileSync(f, lines.join("\n") + "\n");
+  return f;
+}
+const HOOK_SET = ["check-relay.sh", "stop-check.sh", "post-tool-use-check.sh"] as const;
+const inputFor = (hook: string) => (hook === "check-relay.sh" ? "" : JSON.stringify({ session_id: "s-pr1", hook_event_name: hook === "stop-check.sh" ? "Stop" : "PostToolUse" }));
+const mailIn = (out: string, text: string) => new RegExp(`${text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}|pr1-sender`).test(out);
+const SECRET = `pr1-http-secret-${crypto.randomBytes(16).toString("hex")}`;
+const TOKEN = "pr1-secret-token-aaaaaaaaaaaaaaaa";
 
-  it.skipIf(process.platform === "win32").each(UNREACHABLE_BINDS)("a daemon bound to %s: SessionStart reads the agent's mail through the peek listener (the secret included), never sqlite3", async (_what, host, env) => {
-    if (host === null) return void console.warn(`[hook-pr1] skipped by name: no such address on this runner (${_what})`);
-    const c = newCase(`peek-hook-${host.replace(/[^0-9a-z]/gi, "")}`);
-    const token = seedWasmDb(c, "pr1 mail via the peek listener");
-    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
-    const d = await startOwnerDaemon(c, host, env);
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token });
-    expect(r.out, `${r.out}\n${d.stderr()}`).toMatch(/pr1 mail via the peek listener|pr1-sender/);
-    expect(r.sqliteCalls).toEqual([]);
-    expect(r.out).not.toContain(PEEK_SECRET);
+describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the owner door (POSIX)", () => {
+  it.each(HOOK_SET)("%s: a wasm DAEMON owner → the agent's mail through the door, never sqlite3", async (hook) => {
+    const c = newCase(`deliver-${hook.split(".")[0]}`);
+    const token = seedWasmDb(c, `pr1 mail for ${hook}`);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: SECRET }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token }, inputFor(hook));
+    expect(r.sqliteCalls, "never a sqlite3 read on a wasm DB").toEqual([]);
+    expect(mailIn(r.out, `pr1 mail for ${hook}`), `the mail arrives\n${r.out}\n${d.stderr()}`).toBe(true);
     await stopDaemon(d.child);
   }, 120_000);
 
-  it.skipIf(process.platform === "win32").each(["stop-check.sh", "post-tool-use-check.sh"])("%s through the peek listener (a daemon 127.0.0.1 cannot reach): the mail is read; no /health probe on the proved owner route (the listener refuses /health)", async (hook) => {
+  it.each(HOOK_SET)("%s through the PEEK LISTENER (a daemon 127.0.0.1 cannot reach) → the mail, never sqlite3", async (hook) => {
     const host = V6_LOOPBACK ? "::1" : LAN_V4;
     if (host === null) return void console.warn("[hook-pr1] skipped by name: no address 127.0.0.1 cannot reach on this runner");
     const c = newCase(`peek-${hook.split(".")[0]}`);
     const token = seedWasmDb(c, `pr1 peek mail for ${hook}`);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
-    const d = await startOwnerDaemon(c, host, host === LAN_V4 ? { RELAY_HTTP_ALLOWED_HOSTS: LAN_V4 } : {});
-    fs.rmSync(ARGV_LOG, { force: true });
-    const input = JSON.stringify({ session_id: "s-pr1", hook_event_name: hook === "stop-check.sh" ? "Stop" : "PostToolUse" });
-    const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token }, input);
-    expect(r.out, `${r.out}\n${d.stderr()}`).toMatch(new RegExp(`pr1 peek mail for ${hook.replace(".", "\\.")}|pr1-sender`));
+    const d = await startOwnerDaemon(c, host);
+    const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token }, inputFor(hook));
     expect(r.sqliteCalls).toEqual([]);
-    const argv = fs.existsSync(ARGV_LOG) ? fs.readFileSync(ARGV_LOG, "utf-8") : "";
-    expect(argv, "no /health probe on the owner route").not.toMatch(/\/health/);
+    expect(mailIn(r.out, `pr1 peek mail for ${hook}`), `${r.out}\n${d.stderr()}`).toBe(true);
     await stopDaemon(d.child);
   }, 120_000);
 
-  it("the peek listener serves ONLY /owner-id and the get_messages peek: every other route, every other tool, any other argument key, a batch, a session, a WS upgrade → refused", async () => {
-    const host = V6_LOOPBACK ? "::1" : LAN_V4;
-    if (host === null) return void console.warn("[hook-pr1] skipped by name: no address 127.0.0.1 cannot reach on this runner");
-    const c = newCase("peek-gate");
-    const token = seedWasmDb(c, "pr1 gate mail");
-    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
-    // A LAN main listener's own Host check must accept the LAN address (the registry is read through it below).
-    const d = await startOwnerDaemon(c, host, host === LAN_V4 ? { RELAY_HTTP_ALLOWED_HOSTS: LAN_V4 } : {});
-    const rec = JSON.parse(fs.readFileSync(c.record, "utf-8")) as { port: number };
-    const peek = `http://127.0.0.1:${rec.port}`;
-    const auth = { "X-Relay-Secret": PEEK_SECRET, "X-Agent-Token": token };
-    // The allowed peek works (the gate is not a wall).
-    const ok = await mcpCall(peek, call("get_messages", peekArgs(token)), auth);
-    expect(ok.status, ok.text).toBe(200);
-    expect(ok.text).toContain("pr1 gate mail");
-    // Every route startHttpServer registers (read from its source), on the peek listener → 403, but the two.
-    const src = fs.readFileSync(path.join(REPO, "src", "transport", "http.ts"), "utf-8");
-    const routes = [...src.matchAll(/app\.(get|post|put|delete|patch|all)\(\s*"([^"]+)"/g)].map((m) => [m[1]!.toUpperCase(), m[2]!] as const);
-    expect(routes.length, "precondition: the route scan found the routes").toBeGreaterThan(15);
-    for (const [method, route] of routes) {
-      if ((method === "GET" && route === "/owner-id") || (method === "POST" && route === "/mcp")) continue;
-      const res = await fetch(`${peek}${route.replace(/:[a-z_]+/gi, "x")}`, { method: method === "ALL" ? "GET" : method, headers: auth, body: method === "GET" ? undefined : "{}" });
-      expect(res.status, `${method} ${route}`).toBe(403);
-    }
-    // Every tool but get_messages (the live registry, from the MAIN listener) → 403.
-    const reach = host.includes(":") ? `[${host}]` : host;
-    const list = await mcpCall(`http://${reach}:${d.port}`, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, auth);
-    const names: string[] = (list.json?.result?.tools ?? []).map((t: { name: string }) => t.name);
-    expect(names.length, `precondition: the registry was read (${list.status} ${list.text.slice(0, 200)})`).toBeGreaterThan(20);
-    for (const name of names.filter((n) => n !== "get_messages")) {
-      const res = await mcpCall(peek, call(name, { agent_name: AGENT, agent_token: token }), auth);
-      expect(res.status, `tools/call ${name}`).toBe(403);
-    }
-    const refused: Array<[string, unknown, Record<string, string>?]> = [
-      ["tools/list", { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }],
-      ["initialize", { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "x", version: "1" } } }],
-      ["ack: true (resolves mail through a read-only door)", call("get_messages", { ...peekArgs(token), ack: true })],
-      ["peek: false", call("get_messages", { ...peekArgs(token), peek: false })],
-      ["peek absent", call("get_messages", (({ peek: _p, ...rest }) => rest)(peekArgs(token)))],
-      ["status other than pending", call("get_messages", { ...peekArgs(token), status: "all" })],
-      ["a batch", [call("get_messages", peekArgs(token))]],
-      ["an mcp-session-id", call("get_messages", peekArgs(token)), { "mcp-session-id": "x" }],
-    ];
-    for (const [what, body, extra] of refused) {
-      const res = await mcpCall(peek, body, { ...auth, ...(extra ?? {}) });
-      expect(res.status, what).toBe(403);
-    }
-    expect((await fetch(`${peek}/mcp`, { headers: auth })).status, "GET /mcp").toBe(403);
-    expect((await fetch(`${peek}/health`)).status, "GET /health").toBe(403);
-    // A WebSocket upgrade bypasses Express: it must be refused at the socket.
-    const upgraded = await new Promise<string>((resolve) => {
-      const req = http.request({ host: "127.0.0.1", port: rec.port, path: "/dashboard/ws", headers: { Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": crypto.randomBytes(16).toString("base64") } });
-      req.on("upgrade", () => resolve("upgraded"));
-      req.on("response", (r) => resolve(`status ${r.statusCode}`));
-      req.on("error", () => resolve("refused"));
-      req.end();
+  it.each(["check-relay.sh", "post-tool-use-check.sh"])("%s: a PORT THIEF (the record's port answered by someone without the key) gets NO credential, and its forged reply is never shown", async (hook) => {
+    const c = newCase(`thief-${hook.split(".")[0]}`);
+    const token = seedWasmDb(c, "pr1 real mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: SECRET }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const forged = JSON.stringify({ ok: true, registered: true, session_bound: false, count: 1, top_priority: "high", messages: [{ id: "x", from_agent: "pr1-sender", content: "FORGED-MAIL-INJECTION", created_at: "now", priority: "high" }] });
+    const thief = await startSpy((req, res) => {
+      res.writeHead(200, { "Content-Type": "text/plain", "X-Owner-MAC": "00".repeat(32) });
+      res.end(forged);
     });
-    expect(upgraded, "a WS upgrade is never accepted").not.toBe("upgraded");
-    // A wrong agent token on the allowed peek: no mail (the auth path is the daemon's own).
-    const wrong = await mcpCall(peek, call("get_messages", peekArgs("wrong-token-aaaaaaaaaaaaaaaa")), { ...auth, "X-Agent-Token": "wrong-token-aaaaaaaaaaaaaaaa" });
-    expect(wrong.text).not.toContain("pr1 gate mail");
+    fs.writeFileSync(c.record, JSON.stringify({ ...readRecord(c), port: thief.port }), { mode: 0o600 });
+    const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(thief.port) }, inputFor(hook));
+    expect(thief.requests.length, `precondition: the thief was asked (${r.out})`).toBeGreaterThan(0);
+    expect(thief.bytes(), "the thief got no agent token").not.toContain(token);
+    expect(thief.bytes(), "the thief got no http_secret").not.toContain(SECRET);
+    expect(thief.requests.every((q) => q.headers["x-agent-token"] === undefined && q.headers["x-relay-secret"] === undefined && q.headers.authorization === undefined), "no bearer header at all").toBe(true);
+    expect(r.out, "the forged reply is never rendered").not.toContain("FORGED-MAIL-INJECTION");
+    expect(r.out).toMatch(/relay owner: .*reply .*(MAC|forged|altered)/i);
+    expect(r.sqliteCalls).toEqual([]);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("a TAMPERED reply (relayed from the real owner, its body altered, the owner's MAC kept) → nothing from it is shown", async () => {
+    const c = newCase("tamper");
+    const token = seedWasmDb(c, "pr1 tamper mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const relayTo = d.port;
+    const mitm = await startSpy((req, res, body) => {
+      const up = http.request({ host: "127.0.0.1", port: relayTo, path: req.url, method: req.method, headers: req.headers }, (ur) => {
+        let ub = "";
+        ur.on("data", (x: Buffer) => (ub += x));
+        ur.on("end", () => {
+          res.writeHead(ur.statusCode ?? 500, { "Content-Type": "text/plain", "X-Owner-MAC": String(ur.headers["x-owner-mac"] ?? "") });
+          res.end(ub.replace("pr1 tamper mail", "pr1 TAMPERED mail"));
+        });
+      });
+      up.end(body);
+    });
+    fs.writeFileSync(c.record, JSON.stringify({ ...readRecord(c), port: mitm.port }), { mode: 0o600 });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token });
+    expect(mitm.requests.length, "precondition: the exchange went through the relay").toBeGreaterThan(0);
+    expect(r.out).not.toContain("TAMPERED");
+    expect(r.out).not.toContain("pr1 tamper mail");
+    expect(r.out).toMatch(/relay owner: .*reply .*(MAC|forged|altered)/i);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("the owner's KEY is in no argv, no environment, no file the hook wrote or removed, and no output; nor is the http_secret", async () => {
+    const c = newCase("key-conf");
+    const token = seedWasmDb(c, "pr1 confidential mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: SECRET }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const { key } = readRecord(c);
+    for (const hook of HOOK_SET) {
+      const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token }, inputFor(hook));
+      expect(r.argv.length, `precondition: the stubs logged ${hook}'s children`).toBeGreaterThan(0);
+      for (const [where, text] of [["argv", r.argv], ["a child's environment", r.env], ["a removed file", r.removed], ["the output", r.out]] as const) {
+        expect(text, `${hook}: the owner key in ${where}`).not.toContain(key);
+        expect(text, `${hook}: the http_secret in ${where}`).not.toContain(SECRET);
+      }
+      const tmp = path.join(c.home, ".tmp");
+      const left = fs.existsSync(tmp) ? fs.readdirSync(tmp).map((f) => { try { return fs.readFileSync(path.join(tmp, f), "utf-8"); } catch { return ""; } }).join("\n") : "";
+      expect(left, `${hook}: nothing left in the temp dir holds the key`).not.toContain(key);
+    }
     await stopDaemon(d.child);
   }, 180_000);
 
-  it("twin: a daemon bound to 127.0.0.1 records its MAIN port (no second listener)", async () => {
-    const c = newCase("peek-twin");
-    seedWasmDb(c);
+  it.each(HOOK_SET)("%s: inherited PROXY settings (http_proxy, HTTP_PROXY, https_proxy, ALL_PROXY; no no_proxy) and a planted ~/.curlrc (proxy + location) receive ZERO requests", async (hook) => {
+    const c = newCase(`proxy-${hook.split(".")[0]}`);
+    const token = seedWasmDb(c, `pr1 proxied mail ${hook}`);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    expect((JSON.parse(fs.readFileSync(c.record, "utf-8")) as { port: number }).port).toBe(d.port);
-    await stopDaemon(d.child);
-  }, 90_000);
-
-  it("a daemon whose Host allowlist does NOT accept 127.0.0.1 (RELAY_HTTP_ALLOWED_HOSTS set to a name) → the peek listener, whose Host check is loopback-only", async () => {
-    const c = newCase("peek-hostlist");
-    seedWasmDb(c);
-    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
-    const d = await startOwnerDaemon(c, "127.0.0.1", { RELAY_HTTP_ALLOWED_HOSTS: "relay.example.internal" });
-    const rec = JSON.parse(fs.readFileSync(c.record, "utf-8")) as { port: number; key: string };
-    expect(rec.port).not.toBe(d.port);
-    const challenge = crypto.randomBytes(16).toString("hex");
-    const res = await fetch(`http://127.0.0.1:${rec.port}/owner-id?c=${challenge}`);
-    expect(res.status).toBe(200);
-    // And the MAIN listener's /owner-id is now Host-checked (it sat before the check).
-    expect((await fetch(`http://127.0.0.1:${d.port}/owner-id?c=${challenge}`)).status, "main /owner-id is Host-checked").toBe(421);
-    await stopDaemon(d.child);
-  }, 90_000);
-
-  it("the peek listener's bind host is a CONSTANT 127.0.0.1: startHttpServer in owner-peek mode refuses any other host", async () => {
-    // A LITERAL specifier (the parser-pin gate refuses a computed one); the assert throws before any setup.
-    const mod = (await import("../src/transport/http.js")) as { startHttpServer: (p: number, h: string, o?: { ownerPeek?: boolean }) => unknown };
-    for (const h of ["0.0.0.0", "::", "::1", "localhost", LAN_V4 ?? "10.0.0.1"]) {
-      expect(() => mod.startHttpServer(0, h, { ownerPeek: true }), h).toThrow(/127\.0\.0\.1/);
-    }
-  });
-
-  it("the owner-peek listener SURVIVES its own listen failure (an async 'error' event): logged, no record, the process lives", () => {
-    const c = newCase("peek-error");
-    fs.writeFileSync(c.cfg, "{}", { mode: 0o600 });
-    const script = path.join(c.home, "peek-error.mjs");
-    fs.writeFileSync(
-      script,
-      `const { startHttpServer } = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "transport", "http.js")).href)});
-       const s = startHttpServer(0, "127.0.0.1", { ownerPeek: true });
-       s.once("listening", () => {
-         s.emit("error", Object.assign(new Error("probe EADDRNOTAVAIL"), { code: "EADDRNOTAVAIL" }));
-         setTimeout(() => { process.stdout.write("alive"); s.close(() => process.exit(0)); }, 200);
-       });`
+    const proxy = await startSpy((req, res) => {
+      res.writeHead(502);
+      res.end();
+    });
+    const purl = `http://127.0.0.1:${proxy.port}`;
+    fs.writeFileSync(path.join(c.home, ".curlrc"), `proxy = "${purl}"\nlocation\n`);
+    const r = await runHook(
+      c,
+      hook,
+      { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), http_proxy: purl, HTTP_PROXY: purl, https_proxy: purl, HTTPS_PROXY: purl, ALL_PROXY: purl, all_proxy: purl, no_proxy: "", NO_PROXY: "" },
+      inputFor(hook)
     );
-    const r = spawnSync(process.execPath, [script], { encoding: "utf-8", env: baseEnv(c), timeout: 30_000 });
-    expect(r.stdout, r.stderr).toBe("alive");
-    expect(r.stderr).toMatch(/the owner-peek listener failed \(probe EADDRNOTAVAIL\)/);
+    expect(proxy.requests, `the proxy saw nothing\n${r.out}`).toEqual([]);
+    expect(mailIn(r.out, `pr1 proxied mail ${hook}`), r.out).toBe(true);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it.each(HOOK_SET)("%s: a HUNG `relay owner peek` is bounded in time: the hook ends inside its budget and names it", async (hook) => {
+    const c = newCase(`hang-${hook.split(".")[0]}`);
+    const token = seedWasmDb(c, "pr1 hang mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "owner peek" }, inputFor(hook));
+    expect(r.argv, "precondition: the hung step ran").toContain("owner peek");
+    expect(r.status, "the hook exited by itself").not.toBeNull();
+    expect(r.ms, `the stub sleeps 30s: the hook must end inside its budget\n${r.out}`).toBeLessThan(hook === "check-relay.sh" ? 10_000 : 5_000);
+    expect(r.out).toMatch(/timed out|no time budget|could not be read/i);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("SessionStart's mail RENDERER (node) on the owner route is bounded too: a hung renderer ends inside the budget, named", async () => {
+    const c = newCase("hang-render");
+    const token = seedWasmDb(c, "pr1 render mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "Pending messages for" });
+    expect(r.argv, "precondition: the renderer ran").toContain("Pending messages for");
+    expect(r.ms, r.out).toBeLessThan(10_000);
+    expect(r.out).toMatch(/timed out|could not be (read|shown|rendered)/i);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("a 7-line answer (an older relay CLI than these hooks) → a named version-skew skip: no sqlite3, no network", async () => {
+    const c = newCase("seven");
+    seedNativeDb(c);
+    const spy = await startSpy((req, res) => res.end("{}"));
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", null), RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port) });
+    expect(spy.requests).toEqual([]);
+    expect(r.sqliteCalls).toEqual([]);
+    expect(r.out).toMatch(/7-line answer[\s\S]*(version skew|update the relay)/i);
   }, 60_000);
+});
+
+describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `http`, SessionStart's credential calls go ONLY to the configured endpoint when it IS the proven owner", () => {
+  it("the configured endpoint IS the owner (127.0.0.1 at the record's port) → SessionStart registers there, as on native", async () => {
+    const c = newCase("cred-owner");
+    const token = seedWasmDb(c, "pr1 cred mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), RELAY_HOOK_DEBUG: "1" });
+    expect(r.out, "the registration call ran (its debug summary)").toMatch(/register_agent reply:/);
+    expect(mailIn(r.out, "pr1 cred mail"), r.out).toBe(true);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("an inherited RELAY_HTTP_HOST/PORT that is NOT the owner → ZERO token bytes there (a recording listener), named skip, mail still read from the owner", async () => {
+    const c = newCase("cred-elsewhere");
+    const token = seedWasmDb(c, "pr1 elsewhere mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const elsewhere = await startSpy((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end("{}");
+    });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(elsewhere.port) });
+    expect(elsewhere.bytes(), "the inherited destination got no token").not.toContain(token);
+    expect(r.out).toMatch(/register through your MCP connection/);
+    expect(mailIn(r.out, "pr1 elsewhere mail"), r.out).toBe(true);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("the door exchange FAILS (a thief on the record's port) → NO credential-bearing call at all, even to a configured endpoint", async () => {
+    const c = newCase("cred-doorfail");
+    const token = seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const thief = await startSpy((req, res) => {
+      res.writeHead(200, { "X-Owner-MAC": "00".repeat(32) });
+      res.end("{}");
+    });
+    fs.writeFileSync(c.record, JSON.stringify({ ...readRecord(c), port: thief.port }), { mode: 0o600 });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(thief.port) });
+    expect(thief.requests.length, `precondition: the door was tried (${r.out})`).toBeGreaterThan(0);
+    expect(thief.bytes(), "no token to the configured endpoint after a failed door").not.toContain(token);
+    await stopDaemon(d.child);
+  }, 120_000);
 });
 
 describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (a structural skip): the REMOTE route is not the owner route", () => {
@@ -726,3 +973,4 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (a structural skip): the
     expect(spy.bytes(), "no http_secret goes to an unproved endpoint").not.toContain(secret);
   }, 120_000);
 });
+
