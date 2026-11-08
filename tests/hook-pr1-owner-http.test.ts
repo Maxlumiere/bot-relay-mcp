@@ -192,7 +192,7 @@ async function dbDump(c: Case): Promise<Record<string, unknown[][]>> {
   const SQL = await initSqlJs();
   const db = new SQL.Database(fs.readFileSync(copy));
   const out: Record<string, unknown[][]> = {};
-  const tables = db.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")[0]?.values.map((r) => String(r[0])) ?? [];
+  const tables = db.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")[0]?.values.map((r: unknown[]) => String(r[0])) ?? [];
   for (const t of tables) {
     const r = db.exec(`SELECT * FROM "${t}" ORDER BY rowid`)[0];
     out[t] = r ? [r.columns, ...r.values] : [];
@@ -922,7 +922,15 @@ fs.writeFileSync(
   { mode: 0o755 }
 );
 const REAL_PS = spawnSync("sh", ["-c", "command -v ps"], { encoding: "utf-8" }).stdout.trim();
-fs.writeFileSync(path.join(STUBS, "ps"), `#!/bin/sh\nprintf 'ps %s\\n' "$*" >> "${ARGV_LOG}"\nif [ -n "$FAKE_PS_HANG" ]; then exec sleep 30; fi\nexec "${REAL_PS}" "$@"\n`, { mode: 0o755 });
+fs.writeFileSync(
+  path.join(STUBS, "ps"),
+  `#!/bin/sh\nprintf 'ps %s\\n' "$*" >> "${ARGV_LOG}"\nif [ -n "$FAKE_PS_HANG" ]; then exec sleep 30; fi\n` +
+    // A SLOW ps over a DEEP chain: every call answers after 0.9s; pid N's parent is N+1 (a "sh"), for 10 levels.
+    `if [ -n "$FAKE_PS_SLOW" ]; then sleep 0.9; p=""; for a in "$@"; do case "$prev" in -p) p="$a" ;; esac; prev="$a"; done\n` +
+    `  case "$*" in *ppid=*) if [ "$p" -lt "$((FAKE_PS_SLOW + 10))" ] 2>/dev/null; then echo "$((p + 1))"; else echo 1; fi ;; *comm=*) echo sh ;; *args=*) echo sh ;; *lstart=*) echo "Thu Oct  1 11:37:33 2026" ;; esac; exit 0; fi\n` +
+    `exec "${REAL_PS}" "$@"\n`,
+  { mode: 0o755 }
+);
 const SQLITE_LOG = path.join(ROOT, "sqlite3.log");
 fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SQLITE_LOG}"\nexit 1\n`, { mode: 0o755 });
 
@@ -1147,6 +1155,19 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     expect(r.argv, "precondition: the hung ps ran").toContain("ps ");
     expect(r.status, "the hook exited by itself").not.toBeNull();
     expect(r.ms, `the stub sleeps 30s: the hook must end inside its 10s budget\n${r.out}`).toBeLessThan(10_000);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("a SLOW ps (0.9s per call) over a 10-level chain: the pid walk is bounded by the SEAMED budget, the hook ends inside it, and names the cut", async () => {
+    const c = newCase("cred-ps-slow");
+    const token = seedWasmDb(c, "pr1 slow ps mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), FAKE_PS_SLOW: String(process.pid) });
+    expect((r.argv.match(/^ps /gm) ?? []).length, "precondition: the walk made several slow ps calls").toBeGreaterThanOrEqual(3);
+    expect(r.status, "the hook exited by itself").not.toBeNull();
+    expect(r.ms, `0.9s x 2 calls x 10 levels = 18s of ps: the hook must end inside its 10s budget\n${r.out}`).toBeLessThan(10_000);
+    expect(r.out, "the cut is named").toMatch(/no time budget left for a process lookup/);
     await stopDaemon(d.child);
   }, 120_000);
 
