@@ -881,6 +881,8 @@ if relay_remote_declared; then
   RELAY_CURL_GUARD=("${RELAY_CURL_REMOTE[@]}")
   [ "$_local_db" = 1 ] && echo "[RELAY] using the remote relay ${HTTP_HOST}; the local DB at ${RELAY_RES_DB_PATH:-?} is not used for credentials." >&2
 elif [ "$_local_db" = 1 ]; then
+  # An explicit host that did not resolve is never sent anything (fail closed); the local DB's door is used. Named.
+  [ -n "${RELAY_HTTP_HOST:-}" ] && [ "${RELAY_HOST_CLASS:-}" = unresolved ] && echo "[RELAY] $(relay_bearer_refusal) to it; this session's credentials go through the local DB's door." >&2
   case "${RELAY_RES_HOOK_DB:-}" in
     http|sqlite3)
       if [ -z "${RELAY_RES_OWNER_ENDPOINT:-}" ]; then

@@ -281,10 +281,12 @@ relay_host_classify() {
     RELAY_HOST_PIN="$h"
     return 0
   fi
+  RELAY_HOST_SECS=0
   if ! relay_budget_for "the relay host check" 2 "${RELAY_HOST_BUDGET:-margin}"; then
     RELAY_HOST_CLASS=unresolved RELAY_HOST_WHY="no time budget left for the relay host check"
     return 0
   fi
+  RELAY_HOST_SECS="$RELAY_STEP_SECS"
   cli="$(relay_helpers_cli)"
   ms=$(( RELAY_STEP_SECS * 1000 - 300 ))
   [ "$ms" -lt 100 ] && ms=100
@@ -317,7 +319,7 @@ relay_curl_remote() {
 relay_bearer_refusal() {
   relay_host_classify
   if [ "${RELAY_HOST_CLASS:-}" = unresolved ]; then
-    printf 'the relay host %s could not be checked (%s): no token is sent' "${RELAY_HTTP_HOST:-127.0.0.1}" "${RELAY_HOST_WHY:-unknown}"
+    printf 'the remote host %s did not resolve within %ss (%s); nothing is sent' "${RELAY_HTTP_HOST:-127.0.0.1}" "${RELAY_HOST_SECS:-0}" "${RELAY_HOST_WHY:-unknown}"
   else
     printf 'no token is sent to the loopback port %s (%s)' "${RELAY_HTTP_PORT:-3777}" "$RELAY_TUNNEL_HINT"
   fi
