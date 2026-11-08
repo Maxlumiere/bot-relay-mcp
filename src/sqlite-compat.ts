@@ -171,7 +171,7 @@ let headerDecidesWarned = false;
 export function resolveOpen(dbPath: string, purpose: "open" | "read"): ResolvedOpen {
   const d = declaredDriver();
   const peek = readDriverHeaderForDriver(dbPath, d.driver);
-  if (peek.kind === "wasm") {
+  if (peek.kind === "wasm" && purpose === "open") {
     if (d.driver === "native" && !headerDecidesWarned) {
       headerDecidesWarned = true;
       log.warn(
@@ -215,7 +215,7 @@ export function resolveOpen(dbPath: string, purpose: "open" | "read"): ResolvedO
   // env declared wasm); an RLYN or legacy header was refused above (an owner never adopts one).
   // An RLYW header HERE (the peek above saw no file, and another process materialized its owned DB since: a birth race)
   // is owner mode too: the owner protocol then refuses this process by name while that owner holds the lock.
-  if (header.kind === "absent" || header.kind === "wasm") return { driver: "wasm", mode: "owner", header };
+  if (header.kind === "absent" || (header.kind === "wasm" && purpose === "open")) return { driver: "wasm", mode: "owner", header };
   // A READ of an unowned file is never an owner open (no owner exists for it): db-header's verdict decided above.
   if (purpose === "read") return { driver: "wasm", mode: "unowned-read", header };
   throw new DbHeaderRefusedError(
