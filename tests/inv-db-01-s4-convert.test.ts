@@ -290,7 +290,7 @@ describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
     expect(bad.status).toBe(2);
   }, 60_000);
 
-  it("Q2: convert-journal is the ONLY native opener of an RLYW file: every native better-sqlite3 construction in src is pinned, and exactly one is in src/convert-journal.ts; and exactly one sql.js construction there (the wasm-only converter)", () => {
+  it("Q2: convert-journal is the ONLY native opener of an RLYW file: every native better-sqlite3 construction in src is pinned, and exactly one is in src/convert-journal.ts; and every sql.js construction in src is listed with its reason (one in convert-journal.ts)", () => {
     const program = srcProgram();
     const sites: string[] = [];
     for (const sf of program.getSourceFiles()) {
@@ -310,16 +310,32 @@ describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
       visit(sf);
     }
     expect(sites.filter((s) => s.startsWith("src/convert-journal.ts")), `the sanctioned RLYW opener (sites: ${JSON.stringify(sites)})`).toHaveLength(1);
-    // The architect's wasm-only ruling: the sql.js converter is the second sanctioned site, the ONE sql.js construction
-    // in src/convert-journal.ts (its load and its fresh verify load share it).
-    const sqljs: string[] = [];
-    const cj = program.getSourceFiles().find((sf) => path.relative(REPO, sf.fileName).split(path.sep).join("/") === "src/convert-journal.ts");
-    const visitSqljs = (n: ts.Node): void => {
-      if (ts.isNewExpression(n) && /\.Database$/.test(n.expression.getText(cj))) sqljs.push(n.getText(cj));
-      ts.forEachChild(n, visitSqljs);
+    // The architect's wasm-only ruling (and 20692413): EVERY sql.js construction in src is listed here with its reason,
+    // so a NEW one fails until it is listed. Only convert-journal's REPLACES a live native/legacy file.
+    const SQLJS_SITES: Record<string, { n: number; why: string }> = {
+      "src/convert-journal.ts::loadImage": { n: 1, why: "the wasm-only converter: the image load and its fresh verify load, under the owner lock; the ONLY sql.js path that replaces a live RLYN/0 file" },
+      "src/sqlite-compat.ts::restampStagedCopy": { n: 1, why: "restore's re-stamp (Q5) of its PRIVATE staged copy, never the live DB" },
+      "src/sqlite-compat.ts::createOwnedWasmDb": { n: 2, why: "the wasm owner: a NEW DB's first (empty) image, and an RLYW file's bytes under its lock" },
+      "src/sqlite-compat.ts::openWasmFromBytes": { n: 1, why: "read-only staging/export reads (openReadOnly, the export source): no write-back" },
     };
-    if (cj) visitSqljs(cj);
-    expect(sqljs, "exactly one sql.js construction in src/convert-journal.ts").toHaveLength(1);
+    const sqljs: Record<string, number> = {};
+    for (const sf of program.getSourceFiles()) {
+      const rel = path.relative(REPO, sf.fileName).split(path.sep).join("/");
+      if (!rel.startsWith("src/") || sf.isDeclarationFile) continue;
+      const visitSqljs = (n: ts.Node): void => {
+        if (ts.isNewExpression(n) && /\.Database$/.test(n.expression.getText(sf))) {
+          let fn: ts.Node | undefined = n.parent;
+          while (fn && !ts.isFunctionDeclaration(fn) && !ts.isSourceFile(fn)) fn = fn.parent;
+          const key = `${rel}::${fn && ts.isFunctionDeclaration(fn) ? fn.name?.text : "<module>"}`;
+          sqljs[key] = (sqljs[key] ?? 0) + 1;
+        }
+        ts.forEachChild(n, visitSqljs);
+      };
+      visitSqljs(sf);
+    }
+    expect(sqljs, "every sql.js construction in src is listed (a new site fails until it is)").toEqual(
+      Object.fromEntries(Object.entries(SQLJS_SITES).map(([k, v]) => [k, v.n]))
+    );
   }, 120_000);
 });
 
