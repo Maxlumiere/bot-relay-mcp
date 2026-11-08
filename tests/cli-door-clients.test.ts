@@ -397,3 +397,79 @@ describe.skipIf(LAN_V4 === null)("PR 4: a REMOTE relay's bearer is hardened (a L
     expect(r3.bytes(), "the local secrets never reach a remote").not.toMatch(/pr4-local-(http|dash)-secret/);
   }, 120_000);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// As ruled on #434's defaults: the token for a remote; per-remote transport secrets; pair through a tunnel; a two-way
+// allowlist.
+describe("#434 rulings: per-remote credentials (every OS)", () => {
+  it("RELAY_AGENT_TOKEN is honoured for a remote ONLY when the environment selected that remote; otherwise only the remote's own vault entry", async () => {
+    const c = newCase("remote-token-rule");
+    seedNativeDb(c);
+    const scoped = path.join(path.dirname(c.db), "agents", "remote-203.0.113.10-3777");
+    fs.mkdirSync(scoped, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(scoped, `${AGENT}.token`), "pr4-the-remotes-own-token-aaaaaaaa\n", { mode: 0o600 });
+    const probe = path.join(c.home, "probe.mjs");
+    fs.writeFileSync(probe, `const m = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "cli", "relay-client.js")).href)});
+process.stdout.write(JSON.stringify({ selected: await m.remoteToken("203.0.113.10", 3777, ${JSON.stringify(AGENT)}, { envSelected: true }), other: await m.remoteToken("203.0.113.10", 3777, ${JSON.stringify(AGENT)}, { envSelected: false }) }));`);
+    const r = spawnSync(process.execPath, [probe], { env: baseEnv(c, { RELAY_AGENT_TOKEN: "pr4-a-local-launcher-token-aaaaaa" }), encoding: "utf-8" });
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout), "env-selected → the env token; a flag-chosen remote → its own vault entry, never the env token").toEqual({ selected: "pr4-a-local-launcher-token-aaaaaa", other: "pr4-the-remotes-own-token-aaaaaaaa" });
+  }, 60_000);
+
+  it("a remote's TRANSPORT secret: its own provisioned file (relay remote set-http-secret / set-dashboard-secret, stdin), or the environment; never this machine's config", async () => {
+    const c = newCase("remote-secret-rule");
+    seedNativeDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ http_secret: `pr4-local-config-secret-${"z".repeat(24)}` }), { mode: 0o600 });
+    const httpSecret = `pr4-remote-http-secret-${crypto.randomBytes(12).toString("hex")}`;
+    const set = spawnSync(process.execPath, [RELAY, "remote", "set-http-secret", "203.0.113.10:3777"], { env: baseEnv(c), input: `${httpSecret}\n`, encoding: "utf-8" });
+    expect(set.status, set.stderr).toBe(0);
+    const probe = path.join(c.home, "probe-secret.mjs");
+    fs.writeFileSync(probe, `const m = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "cli", "relay-client.js")).href)});
+process.stdout.write(JSON.stringify({ file: await m.remoteSecret("203.0.113.10", 3777, "http"), none: await m.remoteSecret("203.0.113.11", 3777, "http") }));`);
+    const r = spawnSync(process.execPath, [probe], { env: baseEnv(c), encoding: "utf-8" });
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout), "the provisioned file; no file and no env → none (never the local config)").toEqual({ file: httpSecret, none: null });
+  }, 60_000);
+
+  it("THE ALLOWLIST, both ways: every tool a verb sends through the door is on it, and every entry is used by some verb", async () => {
+    const { OWNER_DOOR_TOOL_ALLOWLIST } = (await import("../src/owner-endpoint.js")) as { OWNER_DOOR_TOOL_ALLOWLIST: ReadonlySet<string> };
+    const used = new Set<string>();
+    for (const f of fs.readdirSync(path.join(REPO, "src", "cli")).filter((x) => x.endsWith(".ts"))) {
+      const src = fs.readFileSync(path.join(REPO, "src", "cli", f), "utf-8");
+      for (const m of src.matchAll(/localTool\(\s*"([a-z_]+)"/g)) used.add(m[1]!);
+      // the self-test's rpc() wrapper names its tools at its call sites
+      if (f === "test.ts") for (const m of src.matchAll(/rpc\(\s*"([a-z_]+)"/g)) used.add(m[1]!);
+    }
+    expect(used.size, "precondition: the scan sees the verbs' door calls").toBeGreaterThanOrEqual(4);
+    expect([...used].filter((t) => !OWNER_DOOR_TOOL_ALLOWLIST.has(t)), "every door call is allowlisted").toEqual([]);
+    expect([...OWNER_DOOR_TOOL_ALLOWLIST].filter((t) => !used.has(t)), "every allowlist entry is used by some verb").toEqual([]);
+  });
+});
+
+describe("#434 rulings: pair through a trusted tunnel", () => {
+  it("a loopback hub WITH RELAY_HTTP_TRUSTED_TUNNEL_PORT equal to its port is a tunnel: pair proceeds to it (not the loopback refusal); a different port is still refused", async () => {
+    const c = newCase("pair-tunnel");
+    seedNativeDb(c);
+    const hub = await recorder();
+    const out = path.join(c.home, "pair-out.json");
+    const yes = await relayAsync(c, ["pair", `http://127.0.0.1:${hub.port}`, "--name", "pr4-tunnel-pair", "--yes", "--output", out, "--secret-stdin"], { RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(hub.port) }, "pr4-hub-secret-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    expect(yes.stderr, "not refused as a loopback hub").not.toMatch(/pair is for a remote hub/);
+    expect(hub.reqs.length, `the tunnel hub was reached\n${yes.stderr}`).toBeGreaterThan(0);
+    const hub2 = await recorder();
+    const no = await relayAsync(c, ["pair", `http://127.0.0.1:${hub2.port}`, "--name", "pr4-tunnel-pair2", "--yes", "--output", `${out}.2`, "--secret-stdin"], { RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(hub2.port + 1) }, "pr4-hub-secret-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    expect(no.stderr).toMatch(/pair is for a remote hub/);
+    expect(hub2.reqs, "a mismatched opt-in reaches nothing").toEqual([]);
+  }, 120_000);
+});
+
+describe.skipIf(LAN_V4 === null)("#434 rulings: a flag-chosen remote never gets the launcher's RELAY_AGENT_TOKEN (a LAN address; skipped by name where the runner has none)", () => {
+  it("RELAY_AGENT_TOKEN set (a LOCAL relay's), no RELAY_HTTP_HOST, `relay doctor --remote http://<LAN>:<port>` → zero bytes of that token at the remote", async () => {
+    const c = newCase("doctor-flag-remote");
+    seedNativeDb(c);
+    const remote = await recorder(LAN_V4!);
+    const localTok = "pr4-a-local-launcher-token-bbbbbb";
+    await relayAsync(c, ["doctor", "--remote", `http://${LAN_V4}:${remote.port}`], { RELAY_AGENT_TOKEN: localTok });
+    expect(remote.reqs.length, "precondition: the remote was probed").toBeGreaterThan(0);
+    expect(remote.bytes(), "the launcher's token never reaches a flag-chosen remote").not.toContain(localTok);
+  }, 120_000);
+});
