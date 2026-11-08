@@ -18,6 +18,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import crypto from "crypto";
+import http from "http";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
 import { sandboxEnv } from "./_helpers/sandbox-env.js";
@@ -224,6 +225,12 @@ const CURL_LOG = path.join(ROOT, "curl.log");
 fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SQLITE_LOG}"\nexit 1\n`, { mode: 0o755 });
 const REAL_CURL = spawnSync("sh", ["-c", "command -v curl"], { encoding: "utf-8" }).stdout.trim();
 fs.writeFileSync(path.join(STUBS, "curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${CURL_LOG}"\nexec "${REAL_CURL}" "$@"\n`, { mode: 0o755 });
+/** node: `node <relay> where --fields` prints FAKE_WHERE_FILE when set; anything else runs node. */
+fs.writeFileSync(
+  path.join(STUBS, "node"),
+  `#!/bin/sh\ncase "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\nexec "${process.execPath}" "$@"\n`,
+  { mode: 0o755 }
+);
 async function runHook(c: Case, hook: string, extra: Record<string, string>, input = "") {
   fs.rmSync(SQLITE_LOG, { force: true });
   fs.rmSync(CURL_LOG, { force: true });
@@ -321,4 +328,50 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 2: the hooks read a stdio owner's ma
     await stop(o.child);
     expect((await anchorOf(c, AGENT)).agent_pid).toBe(process.pid);
   }, 150_000);
+
+  it("Q8 (as ruled): a FRESH proof immediately precedes the liveness token: an owner SWAPPED after the peek (its next challenge fails) receives no report_liveness", async () => {
+    const c = newCase("live-swap");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const KEY = crypto.randomBytes(16).toString("hex");
+    const TOKEN = "pr2-swap-token-aaaaaaaaaaaaaaaa";
+    let challenges = 0;
+    const posts: string[] = [];
+    const spy = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (d: Buffer) => (body += d));
+      req.on("end", () => {
+        const url = new URL(req.url ?? "/", "http://127.0.0.1");
+        if (url.pathname === "/owner-id") {
+          challenges++;
+          const port = (spy.address() as { port: number }).port;
+          const good = challenges === 1; // the real owner answers the peek's proof; then the port is someone else's
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ mac: good ? mac(KEY, url.searchParams.get("c") ?? "", port) : "00".repeat(32) }));
+          return;
+        }
+        if (url.pathname === "/mcp") {
+          posts.push(body);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify({ messages: [], count: 0, has_more: false, total_pending: 0 }) }] } }));
+          return;
+        }
+        res.writeHead(403);
+        res.end();
+      });
+    });
+    await new Promise<void>((r) => spy.listen(0, "127.0.0.1", () => r()));
+    try {
+      const port = (spy.address() as { port: number }).port;
+      const where = path.join(c.home, "where.txt");
+      fs.writeFileSync(where, ["explicit-db", c.db, "true", "", "", path.join(c.dir, "agents"), "http", `http://127.0.0.1:${port} ${KEY}`].join("\n") + "\n");
+      const r = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: where }, PTU);
+      expect(posts.length, `precondition: the peek was served (${r.out})`).toBeGreaterThanOrEqual(1);
+      expect(posts[0], "the first post is the peek").toContain("get_messages");
+      expect(challenges, "a second, FRESH challenge preceded the liveness send").toBeGreaterThanOrEqual(2);
+      expect(posts.some((b) => b.includes("report_liveness")), "no liveness token went to the swapped owner").toBe(false);
+      expect(posts.slice(1).some((b) => b.includes(TOKEN)), "no token after the failed proof").toBe(false);
+    } finally {
+      await new Promise<void>((r) => spy.close(() => r()));
+    }
+  }, 120_000);
 });
