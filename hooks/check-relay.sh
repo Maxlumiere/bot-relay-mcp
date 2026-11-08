@@ -1166,9 +1166,10 @@ if [ "$SKIP_REGISTER" -eq 0 ] && [ "$RELAY_CRED_OK" = 1 ] && command -v curl >/d
   # v2.14.1 — the agent's OWN process (presence). Best-effort: empty →
   # field omitted → age-based fallback (like host_shell_pids). agent_pid_start
   # is only sent when agent_pid resolved.
-  RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
+  # The lookups take the seamed PRE-MAIL budget (the mail read keeps its reserve); a cut is named on stderr.
+  RELAY_AGENT_PID=$(RELAY_PS_BUDGET=premail relay_agent_pid || printf '')
   RELAY_AGENT_PID_START=""
-  [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
+  [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(RELAY_PS_BUDGET=premail relay_pid_start "$RELAY_AGENT_PID" || printf '')
   # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
   REG_BODY=$({ relay_mint_secret_curl_config || true; relay_curl_token_config "${RELAY_AGENT_TOKEN:-}" || true; } | curl "${RELAY_CURL_GUARD[@]}" -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \

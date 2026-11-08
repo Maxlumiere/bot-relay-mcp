@@ -691,10 +691,17 @@ write_relay_token_to_vault() {
 # dist/index.js entrypoint). Starts from the hook's PARENT (the hook is never
 # the agent). Extensible via RELAY_AGENT_PROCESS_PATTERN. Empty → agent_pid
 # omitted → age-based fallback (graceful). POSIX only (Windows omit).
-# relay_ps ARGS... — `ps ARGS...` bounded in TIME (Codex #418 R2 P2-7): killed at RELAY_PS_SECS (1s) by
-# relay_run_streamed, so a hung ps never holds a hook past its budget; its stdout is the caller's.
+# relay_ps_run CMD... / relay_ps ARGS... — a process lookup bounded in TIME by the hook's SEAMED budget (Codex #418 R2
+# P2-7, as asked at verify): every call first takes relay_budget_for (its own 1s cap from what is left, in mode
+# RELAY_PS_BUDGET: margin by default, premail where the mail read keeps its reserve), then runs under
+# relay_run_streamed at that cap. With no time left the call is refused (124) and relay_budget_for NAMES the cut on
+# stderr; a walk ends at its first refused or empty step. Its stdout is the caller's.
+relay_ps_run() {
+  relay_budget_for "a process lookup (ps)" 1 "${RELAY_PS_BUDGET:-margin}" || return 124
+  relay_run_streamed "$RELAY_STEP_SECS" "$@" 2>/dev/null
+}
 relay_ps() {
-  relay_run_streamed "${RELAY_PS_SECS:-1}" ps "$@"
+  relay_ps_run ps "$@"
 }
 
 relay_agent_pid() {
@@ -704,15 +711,15 @@ relay_agent_pid() {
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*) return ;;
   esac
-  pid=$(relay_ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
-  # Each ps is bounded (relay_ps, 1s): a hung ps answers nothing, which ends the walk at its first step.
+  pid=$(relay_ps -o ppid= -p $$ | tr -d ' ')
+  # Each ps takes the seamed budget (relay_ps): a hung or slow chain ends where the budget does, named.
   while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
-    comm=$(relay_ps -o comm= -p "$pid" 2>/dev/null); comm="${comm##*/}"
+    comm=$(relay_ps -o comm= -p "$pid"); comm="${comm##*/}"
     if printf '%s' "$comm" | grep -qiE "^(${pat})$"; then
-      args=$(relay_ps -o args= -p "$pid" 2>/dev/null)
+      args=$(relay_ps -o args= -p "$pid")
       case "$args" in *dist/index.js*) ;; *) printf '%s' "$pid"; return ;; esac
     fi
-    ppid=$(relay_ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    ppid=$(relay_ps -o ppid= -p "$pid" | tr -d ' ')
     case "$ppid" in ''|*[!0-9]*) break ;; esac
     [ "$ppid" -le 1 ] && break
     pid="$ppid"; depth=$((depth+1))
@@ -732,7 +739,7 @@ RELAY_START_TOKEN_UTC_SUFFIX=' UTC'
 relay_pid_start() {
   local pid="$1" t
   [ -n "$pid" ] || return
-  t=$(relay_run_streamed "${RELAY_PS_SECS:-1}" env TZ=UTC LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  t=$(relay_ps_run env TZ=UTC LC_ALL=C ps -o lstart= -p "$pid" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
   [ -n "$t" ] || return
   printf '%s%s' "$t" "$RELAY_START_TOKEN_UTC_SUFFIX"
 }
@@ -745,7 +752,7 @@ relay_pid_start() {
 relay_pid_start_legacy() {
   local pid="$1"
   [ -n "$pid" ] || return
-  relay_run_streamed "${RELAY_PS_SECS:-1}" env -u TZ LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+  relay_ps_run env -u TZ LC_ALL=C ps -o lstart= -p "$pid" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
 # Is PID a live process on THIS host? The signal-0 probe. It mirrored the old boolean
@@ -874,7 +881,7 @@ relay_pid_chain() {
     *)
       while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
         chain="${chain:+$chain,}$pid"
-        ppid=$(relay_ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        ppid=$(relay_ps -o ppid= -p "$pid" | tr -d ' ')
         case "$ppid" in ''|*[!0-9]*) break ;; esac
         [ "$ppid" -le 1 ] && break
         pid="$ppid"; depth=$((depth+1))
