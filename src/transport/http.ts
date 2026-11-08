@@ -18,7 +18,7 @@ import {
   ApiWakeAgentSchema,
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
-import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors, pendingMetadata, setAgentLivenessAnchor } from "../db.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors, pendingMetadata, setAgentLivenessAnchor, getMessagesWithEffect } from "../db.js";
 import { ownedDbPath } from "../sqlite-compat.js";
 import {
   writeOwnerEndpoint,
@@ -758,6 +758,7 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
           doorReply(res, 400, { ok: false, error: "peek args: only with_content (an integer 0-50)" }, nonce);
           return;
         }
+        getMessagesWithEffect(agent_name, "pending", 50, true); // PROBE: the state-advancing peek
         const meta = pendingMetadata(getDb(), agent_name, { contentFor: (n as number | undefined) ?? 0 });
         doorReply(res, 200, { ok: true, agent: agent_name, ...meta }, nonce);
         return;
