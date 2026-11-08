@@ -239,7 +239,7 @@ const ARGV_LOG = path.join(ROOT, "argv.log");
 const RM_CAPTURE = path.join(ROOT, "rm-capture.log");
 fs.writeFileSync(
   path.join(STUBS, "node"),
-  `#!/bin/sh\nprintf 'node %s\\n' "$*" >> "${ARGV_LOG}"\ncase "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\nexec "${process.execPath}" "$@"\n`,
+  `#!/bin/sh\nprintf 'node %s\\n' "$*" >> "${ARGV_LOG}"\nif [ -n "$FAKE_NODE_HANG" ]; then case "$*" in *"$FAKE_NODE_HANG"*) exec sleep 30 ;; esac; fi\ncase "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\nexec "${process.execPath}" "$@"\n`,
   { mode: 0o755 }
 );
 const REAL_CURL = spawnSync("sh", ["-c", "command -v curl"], { encoding: "utf-8" }).stdout.trim();
@@ -255,12 +255,33 @@ fs.writeFileSync(
 const SQLITE_LOG = path.join(ROOT, "sqlite3.log");
 fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SQLITE_LOG}"\nexit 1\n`, { mode: 0o755 });
 
-function runHook(c: Case, hook: string, extra: Record<string, string>, input = "") {
+/**
+ * The hook, run ASYNCHRONOUSLY: a spy listener lives in THIS process, so a spawnSync would starve it (the event loop
+ * blocked: the hook's request never served, a vacuous "zero bytes received"). Measured on 5771f88: 0 requests.
+ */
+async function runHook(c: Case, hook: string, extra: Record<string, string>, input = "") {
   fs.rmSync(SQLITE_LOG, { force: true });
   const env = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_AGENT_NAME: AGENT, RELAY_TEST_CLOCK: "0", ...extra });
-  const r = spawnSync("bash", [path.join(HOOKS, hook)], { encoding: "utf-8", timeout: 60_000, input, env });
+  const child = spawn("bash", [path.join(HOOKS, hook)], { env, stdio: ["pipe", "pipe", "pipe"] });
+  procs.push(child);
+  let stdout = "";
+  let stderr = "";
+  child.stdout!.on("data", (d: Buffer) => (stdout += d));
+  child.stderr!.on("data", (d: Buffer) => (stderr += d));
+  child.stdin!.end(input);
+  const t0 = Date.now();
+  const status = await new Promise<number | null>((resolve) => {
+    const t = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve(null);
+    }, 60_000);
+    child.once("exit", (code) => {
+      clearTimeout(t);
+      resolve(code);
+    });
+  });
   const sqliteCalls = fs.existsSync(SQLITE_LOG) ? fs.readFileSync(SQLITE_LOG, "utf-8").split("\n").filter(Boolean) : [];
-  return { status: r.status, out: `${r.stdout ?? ""}\n${r.stderr ?? ""}`, stdout: r.stdout ?? "", sqliteCalls };
+  return { status, out: `${stdout}\n${stderr}`, stdout, sqliteCalls, ms: Date.now() - t0 };
 }
 /** A fake `where --fields` answer: an instance on c.db, verdict `line7`, and `line8` (or no 8th line at all). */
 function fakeWhere(c: Case, line7: string, line8: string | null): string {
@@ -281,7 +302,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
       fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
       const d = await startOwnerDaemon(c);
       const input = hook === "check-relay.sh" ? "" : JSON.stringify({ session_id: "s-pr1", hook_event_name: hook === "stop-check.sh" ? "Stop" : "PostToolUse" });
-      const r = runHook(c, hook, { RELAY_AGENT_TOKEN: token }, input);
+      const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token }, input);
       expect(r.sqliteCalls, "never a sqlite3 read on a wasm DB").toEqual([]);
       expect(r.out, `the mail arrives over HTTP\n${r.out}\n${d.stderr()}`).toMatch(new RegExp(`pr1 mail for ${hook.replace(".", "\\.")}|pr1-sender`));
       await stopDaemon(d.child);
@@ -300,7 +321,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
       fs.rmSync(ARGV_LOG, { force: true });
       fs.rmSync(RM_CAPTURE, { force: true });
       const input = hook === "check-relay.sh" ? "" : JSON.stringify({ session_id: "s-pr1", hook_event_name: hook === "stop-check.sh" ? "Stop" : "PostToolUse" });
-      const r = runHook(c, hook, { RELAY_AGENT_TOKEN: token }, input);
+      const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token }, input);
       expect(r.out, `the mail arrives through the secret-protected owner\n${r.out}\n${d.stderr()}`).toMatch(new RegExp(`pr1 secret mail for ${hook.replace(".", "\\.")}|pr1-sender`));
       const argv = fs.existsSync(ARGV_LOG) ? fs.readFileSync(ARGV_LOG, "utf-8") : "";
       expect(argv.length, "precondition: the stubs logged the hook's curl/node runs").toBeGreaterThan(0);
@@ -322,10 +343,29 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
     const unsafe = `pr1-"quoted"-secret-${crypto.randomBytes(16).toString("hex")}`;
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: unsafe }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const r = runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token });
     expect(r.out).toMatch(/http_secret can't be sent safely: it contains a character curl config can't carry/);
     expect(r.out, "the secret is in no hook output").not.toContain(unsafe);
     expect(r.sqliteCalls).toEqual([]);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it.each([
+    ["the http_secret read", "curl-auth-config", /the http_secret could not be read in time/],
+    ["the proof check", "timingSafeEqual", /did not prove the record's key/],
+  ])("a HUNG %s (its node never returns) is bounded in time: the hook ends inside its budget and names it", async (_what, hang, named) => {
+    const c = newCase(`hang-${hang}`);
+    const token = seedWasmDb(c, "pr1 hang mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: SECRET }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    fs.rmSync(ARGV_LOG, { force: true });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: hang });
+    const argv = fs.existsSync(ARGV_LOG) ? fs.readFileSync(ARGV_LOG, "utf-8") : "";
+    expect(argv, "precondition: the hung step ran (the stub saw it)").toContain(hang);
+    expect(r.status, "the hook exited by itself (not killed by the 60s runner)").not.toBeNull();
+    expect(r.ms, `the stub sleeps 30s: the hook must end inside its 10s budget\n${r.out}`).toBeLessThan(10_000);
+    expect(r.out).toMatch(named);
+    expect(r.out).not.toContain(SECRET);
     await stopDaemon(d.child);
   }, 120_000);
 
@@ -334,7 +374,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
     const token = seedWasmDb(c, "pr1 must not arrive");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: SECRET }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const r = runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_SECRET: `wrong-${SECRET}` });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_SECRET: `wrong-${SECRET}` });
     expect(r.out).not.toMatch(/pr1 must not arrive/);
     expect(r.out).toMatch(/remote relay read failed|could not be read|unauthorized/i);
     expect(r.sqliteCalls).toEqual([]);
@@ -349,7 +389,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ mac: "00".repeat(32) }));
     });
-    const r = runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", `http://127.0.0.1:${spy.port} ${KEY}`) });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", `http://127.0.0.1:${spy.port} ${KEY}`) });
     expect(spy.bytes(), "the token never reached the impostor").not.toContain(TOKEN);
     expect(spy.requests.every((q) => q.url.startsWith("/owner-id?c=")), `only the challenge was sent: ${spy.bytes()}`).toBe(true);
     expect(spy.requests.length, "the challenge was sent (the handshake ran)").toBeGreaterThanOrEqual(1);
@@ -367,7 +407,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
       res.end(JSON.stringify({ mac: mac(KEY, old, port) })); // what a cached answer to an earlier challenge would be
     });
     port = spy.port;
-    const r = runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", `http://127.0.0.1:${spy.port} ${KEY}`) });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", `http://127.0.0.1:${spy.port} ${KEY}`) });
     expect(spy.requests.length, "the handshake ran").toBeGreaterThanOrEqual(1);
     expect(spy.requests[0]!.url, "a fresh challenge, not the old one").not.toContain(old);
     expect(spy.bytes()).not.toContain(TOKEN);
@@ -385,7 +425,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
       res.writeHead(302, { Location: `http://127.0.0.1:${target.port}${req.url}` });
       res.end();
     });
-    const r = runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", `http://127.0.0.1:${spy.port} ${KEY}`) });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", `http://127.0.0.1:${spy.port} ${KEY}`) });
     expect(spy.requests.length, "the handshake ran").toBeGreaterThanOrEqual(1);
     expect(target.requests, "the redirect was never followed").toEqual([]);
     expect(spy.bytes() + target.bytes()).not.toContain(TOKEN);
@@ -402,7 +442,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
     const c = newCase("malformed");
     seedNativeDb(c);
     const spy = await startSpy((req, res) => res.end("{}"));
-    const r = runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", line8(spy.port)) });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", line8(spy.port)) });
     expect(spy.requests, "no request at all").toEqual([]);
     expect(r.out).toMatch(/owner (endpoint|record) .*(malformed|invalid|not a loopback)/i);
     expect(r.sqliteCalls).toEqual([]);
@@ -412,7 +452,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
     const c = newCase("seven");
     seedNativeDb(c);
     const spy = await startSpy((req, res) => res.end("{}"));
-    const r = runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", null) });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", null) });
     expect(spy.requests).toEqual([]);
     expect(r.sqliteCalls).toEqual([]);
     expect(r.out).toMatch(/7-line answer[\s\S]*(version skew|update the relay)/i);
