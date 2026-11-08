@@ -494,8 +494,11 @@ describe("hook PR 1: the record TRUST model (cross-user), as ruled", () => {
     await stopDaemon(d.child);
   }, 90_000);
 
-  it("the WRITER is bound to its fd (as ruled): the temp name swapped for another file between create and write → the key lands only in the fd's own file, and NO record is published (every OS, a seam)", () => {
-    const c = newCase("writer-swap");
+  it("the WRITER is bound to its fd (as ruled): the temp name swapped for another file between create and write → the key lands only in the fd's own file, and NO record is published (every OS, a seam; REPEATED x20: an intermittent identity collision must not pass once)", () => {
+    for (let round = 0; round < 20; round++) writerSwapRound(round);
+  }, 300_000);
+  function writerSwapRound(round: number) {
+    const c = newCase(`writer-swap-${round}`);
     fs.writeFileSync(c.db, "");
     const script = path.join(c.home, "swap.mjs");
     const log = path.join(c.home, "swap.log");
@@ -517,7 +520,7 @@ describe("hook PR 1: the record TRUST model (cross-user), as ruled", () => {
     expect(out.threw, "an identity mismatch refuses the publication").toBe(true);
     expect(fs.existsSync(c.record), "no record is published").toBe(false);
     expect(fs.readFileSync(decoyCopy, "utf-8"), "the swapped-in file never receives the key").not.toMatch(/"key"/);
-  }, 60_000);
+  }
 
   it.skipIf(process.platform === "win32")("POSIX: a SYMLINK swapped in for the temp name never receives the key (the write goes through the O_EXCL|O_NOFOLLOW fd)", () => {
     const c = newCase("writer-link");
