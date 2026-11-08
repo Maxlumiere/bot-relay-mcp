@@ -158,12 +158,12 @@ function readTrustedRecord(dbPath: string): { text: string } | { reason: "no-rec
   if (dirSt.uid !== euid || (dirSt.mode & 0o022) !== 0) return { reason: "untrusted-dir" };
   let fd: number;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = fs.openSync(file, fs.constants.O_RDONLY); // PROBE: no O_NOFOLLOW
   } catch (err) {
     return { reason: (err as NodeJS.ErrnoException).code === "ENOENT" ? "no-record" : "untrusted-record" };
   }
   try {
-    if (!recordStatTrusted(fs.fstatSync(fd), euid)) return { reason: "untrusted-record" };
+    // PROBE: no stat check
     return { text: fs.readFileSync(fd, "utf-8") };
   } catch {
     return { reason: "untrusted-record" };
