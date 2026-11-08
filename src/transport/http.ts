@@ -44,6 +44,7 @@ import {
   openDoorRequest,
   sealDoorResponse,
   OWNER_DOOR_PATHS,
+  OWNER_DOOR_TOOL_ALLOWLIST,
   OWNER_PEEK_HOST,
   OWNER_PEEK_REFUSAL,
 } from "../owner-endpoint.js";
@@ -782,7 +783,7 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
       }
     });
   };
-  const doorHandler = (doorPath: "/owner/v1/peek" | "/owner/v1/liveness" | "/owner/v1/register" | "/owner/v1/health" | "/owner/v1/session") => async (req: Request, res: Response) => {
+  const doorHandler = (doorPath: "/owner/v1/peek" | "/owner/v1/liveness" | "/owner/v1/register" | "/owner/v1/health" | "/owner/v1/session" | "/owner/v1/tool") => async (req: Request, res: Response) => {
     if (doorDbPath() === null) {
       res.status(404).json({ error: "this process serves no relay DB" });
       return;
@@ -830,8 +831,16 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
         reply(200, { ok: true, session_id: getAgentAuthData(agent_name)?.session_id ?? null });
         return;
       }
-      const tool = DOOR_TOOLS[doorPath]!;
       const call = args.rpc as { method?: unknown; params?: { name?: unknown; arguments?: unknown } } | undefined;
+      // PR 4 (as ruled): /owner/v1/tool takes ONE tools/call of a tool on the allowlist; anything else is refused.
+      if (doorPath === "/owner/v1/tool") {
+        const name = call?.params?.name;
+        if (typeof name !== "string" || !OWNER_DOOR_TOOL_ALLOWLIST.has(name)) {
+          reply(403, { ok: false, error: `this tool is not allowed through the owner door (allowed: ${[...OWNER_DOOR_TOOL_ALLOWLIST].join(", ")})` });
+          return;
+        }
+      }
+      const tool = doorPath === "/owner/v1/tool" ? String(call?.params?.name) : DOOR_TOOLS[doorPath]!;
       const token = args.agent_token;
       const secret = args.mint_secret;
       if (
@@ -854,6 +863,7 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
   app.post("/owner/v1/register", doorBody, doorHandler("/owner/v1/register"));
   app.post("/owner/v1/health", doorBody, doorHandler("/owner/v1/health"));
   app.post("/owner/v1/session", doorBody, doorHandler("/owner/v1/session"));
+  app.post("/owner/v1/tool", doorBody, doorHandler("/owner/v1/tool"));
 
   app.use(authMiddleware);
 

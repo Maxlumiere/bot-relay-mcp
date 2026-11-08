@@ -111,7 +111,7 @@ function parse(argv: string[]): Args | string {
 }
 
 /** ONE sealed exchange; resolves to the OPENED reply, or rejects with a named reason. */
-function exchange(
+export function doorExchange(
   port: number,
   key: string,
   binding: DoorBinding,
@@ -255,7 +255,7 @@ export async function run(argv: string[]): Promise<number> {
     }
     let reply: { status: number; payload: Record<string, unknown> };
     try {
-      reply = await exchange(v.port, v.key, binding, doorPath, { agent_name: agentName, args }, deadline);
+      reply = await doorExchange(v.port, v.key, binding, doorPath, { agent_name: agentName, args }, deadline);
     } catch (err) {
       return fail((err as Error).message);
     }

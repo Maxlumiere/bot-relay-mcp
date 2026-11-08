@@ -319,6 +319,21 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   const hubBase = `${url.protocol}//${url.host}`;
+  // PR 4 (as ruled): a hub is REMOTE by definition. Its host is CHECKED (src/host-class.ts): a loopback hub (any
+  // spelling) is this machine's own relay, refused by name; an unresolved one gets nothing; a remote one is reached
+  // by a hardened bearer (relay-client: the checked address, no redirect, no proxy).
+  const { routeFor, unresolvedMessage, remotePost, mcpResultOf, toolJson } = await import("./relay-client.js");
+  const hubPort = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+  const hubRoute = await routeFor(url.hostname.replace(/^\[|\]$/g, ""), hubPort, url.protocol === "https:");
+  if (hubRoute.kind === "local") {
+    process.stderr.write(`relay pair: pair is for a remote hub: ${hubBase} is this machine's loopback. Use the local relay directly (relay init).\n`);
+    return 1;
+  }
+  if (hubRoute.kind === "unresolved") {
+    process.stderr.write(`relay pair: ${unresolvedMessage(hubRoute)}\n`);
+    return 1;
+  }
+  const remoteHub = hubRoute;
 
   // PR-D (Codex R1 #3): the config carries credentials, so it only ever goes to a file. Checked BEFORE any network
   // call, so a token is never issued that this run could not store. The write itself is O_EXCL (authoritative).
@@ -406,11 +421,12 @@ export async function run(argv: string[]): Promise<number> {
     // frames, so this is exactly the shape most likely to deliver headers and
     // then stall — the register step was the second unbounded body read.
     return await withDeadline(10_000, "hub register_agent", async (signal) => {
-      const res = await fetch(`${hubBase}/mcp`, {
-        method: "POST",
+      void signal; // the hardened client has its own deadline (below)
+      const r = await remotePost(
+        remoteHub,
+        "/mcp",
         headers,
-        signal,
-        body: JSON.stringify({
+        JSON.stringify({
           jsonrpc: "2.0",
           id: 1,
           method: "tools/call",
@@ -423,14 +439,17 @@ export async function run(argv: string[]): Promise<number> {
             },
           },
         }),
-      });
-      const text = await res.text();
-      // The HTTP transport emits SSE frames; pull the data line when present.
-      const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-      const rpcResp = dataLine ? JSON.parse(dataLine.slice(5).trim()) : JSON.parse(text || "{}");
-      const body = rpcResp?.result?.content?.[0]?.text
-        ? JSON.parse(rpcResp.result.content[0].text)
-        : rpcResp;
+        10_000,
+      );
+      const result = mcpResultOf(r.text);
+      const body: any = result ? (toolJson(result) ?? result) : (() => {
+        try {
+          return JSON.parse(r.text || "{}");
+        } catch {
+          return {};
+        }
+      })();
+      const res = { status: r.status };
       return { status: res.status, body };
     });
   };

@@ -72,14 +72,17 @@ export function addressReachesLoopback(address: string): boolean {
 
 /** Hook PR 1 (as ruled, Q9): the owner-peek listener's only host, a constant. */
 export const OWNER_PEEK_HOST = "127.0.0.1";
-export const OWNER_PEEK_REFUSAL = "this listener serves only the hooks' owner door (POST /owner/v1/peek, /liveness, /register, /health, /session)";
+export const OWNER_PEEK_REFUSAL = "this listener serves only the owner door (POST /owner/v1/peek, /liveness, /register, /health, /session, /tool)";
 export const OWNER_DOOR_PEEK = "/owner/v1/peek";
 export const OWNER_DOOR_LIVENESS = "/owner/v1/liveness";
 export const OWNER_DOOR_REGISTER = "/owner/v1/register";
 export const OWNER_DOOR_HEALTH = "/owner/v1/health";
 /** As ruled (PR 3): ONE agent's own session_id, for the token that authenticates THAT agent. No enumeration. */
 export const OWNER_DOOR_SESSION = "/owner/v1/session";
-export const OWNER_DOOR_PATHS: ReadonlySet<string> = new Set([OWNER_DOOR_PEEK, OWNER_DOOR_LIVENESS, OWNER_DOOR_REGISTER, OWNER_DOOR_HEALTH, OWNER_DOOR_SESSION]);
+/** PR 4 (as ruled): the CLI's credential-bearing tool calls, an ALLOWLIST of exactly the tools its verbs call. */
+export const OWNER_DOOR_TOOL = "/owner/v1/tool";
+export const OWNER_DOOR_TOOL_ALLOWLIST: ReadonlySet<string> = new Set(["send_message", "resolve_messages", "health_check", "register_agent", "get_messages"]);
+export const OWNER_DOOR_PATHS: ReadonlySet<string> = new Set([OWNER_DOOR_PEEK, OWNER_DOOR_LIVENESS, OWNER_DOOR_REGISTER, OWNER_DOOR_HEALTH, OWNER_DOOR_SESSION, OWNER_DOOR_TOOL]);
 
 /** The owner-peek gate, before any parse: the two door endpoints, POST, without an MCP session. */
 export function ownerPeekRouteAllowed(method: string, reqPath: string, hasSession: boolean): boolean {

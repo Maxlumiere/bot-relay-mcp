@@ -485,33 +485,31 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
   const token = process.env.RELAY_AGENT_TOKEN;
   if (token) {
     try {
-      const { body, httpStatus } = await withDeadline(5000, `hub ${base}/mcp token check`, async (signal) => {
-        const res = await fetch(`${base}/mcp`, {
-          method: "POST",
-          signal,
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json, text/event-stream",
-            "X-Agent-Token": token,
-          },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            id: 1,
-            method: "tools/call",
-            params: { name: "health_check", arguments: {} },
-          }),
-        });
-        // SSE body — read inside the bound.
-        const text = await res.text();
-        const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-        const rpcResp = dataLine ? JSON.parse(dataLine.slice(5).trim()) : JSON.parse(text || "{}");
-        const parsed = rpcResp?.result?.content?.[0]?.text
-          ? JSON.parse(rpcResp.result.content[0].text)
-          : rpcResp;
-        // httpStatus is carried OUT of the closure: the response object itself
-        // must not escape, or a caller could drain it past the deadline again.
-        return { body: parsed, httpStatus: res.status };
-      });
+      // PR 4 (as ruled): the token goes through relay-client. A LOOPBACK hub URL (any spelling) is this machine's
+      // relay, reached only through its owner door; a remote hub by a hardened bearer (no redirect, no proxy, the
+      // checked address); an unresolved host gets nothing.
+      const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, mcpResultOf, RelayClientError } = await import("./relay-client.js");
+      const hubPort = hubUrl.port ? Number(hubUrl.port) : hubUrl.protocol === "https:" ? 443 : 80;
+      const route = await routeFor(hubUrl.hostname.replace(/^\[|\]$/g, ""), hubPort, hubUrl.protocol === "https:");
+      if (route.kind === "unresolved") throw new RelayClientError(unresolvedMessage(route));
+      let body: Record<string, unknown> | null;
+      let httpStatus: number;
+      if (route.kind === "local") {
+        const result = await localTool("health_check", {}, { agentToken: token }, { timeoutMs: 5000 });
+        body = toolJson(result);
+        httpStatus = result.isError ? 400 : 200;
+      } else {
+        const r = await remotePost(
+          route,
+          "/mcp",
+          { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Agent-Token": token },
+          JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "health_check", arguments: {} } }),
+          5000,
+        );
+        const result = mcpResultOf(r.text);
+        body = result ? toolJson(result) : null;
+        httpStatus = r.status;
+      }
       if (body?.auth_error === true) {
         results.push({
           name: "token auth",

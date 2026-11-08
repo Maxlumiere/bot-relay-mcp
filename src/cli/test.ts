@@ -55,28 +55,29 @@ export async function run(argv: string[]): Promise<number> {
     const port = typeof addr === "object" && addr ? addr.port : 0;
     const baseUrl = `http://127.0.0.1:${port}`;
 
-    // PR-D: registering a NEW name over HTTP needs the registration secret; the server just created it
-    // beside the self-test's DB. Read in-process at use time and sent as a header (ruling Q2: never argv/env).
+    // PR-D: registering a NEW name needs the registration secret; the server just created it beside the self-test's
+    // DB. Read in-process at use time (ruling Q2: never argv/env).
     const { readMintSecret } = await import("../mint-secret.js");
     const { mintSecretHome } = await import("../mint-gate.js");
     const mintSecret = readMintSecret(mintSecretHome());
-    const mintHeader: Record<string, string> = mintSecret ? { "X-Relay-Secret": mintSecret } : {};
+    // PR 4 (as ruled): the self-test server is LOCAL, so its credential-bearing calls go through its owner door
+    // (relay-client: sealed, the token and the registration secret inside the ciphertext). It writes its owner
+    // record once it is listening: wait for it.
+    const selfDb = process.env.RELAY_DB_PATH!;
+    const { ownerEndpointPath } = await import("../owner-endpoint.js");
+    const recordAt = ownerEndpointPath(selfDb);
+    for (let i = 0; i < 100 && !fs.existsSync(recordAt); i++) await new Promise((r) => setTimeout(r, 50));
+    const { localTool, toolJson } = await import("./relay-client.js");
     async function rpc(tool: string, args: any): Promise<any> {
-      const res = await fetch(`${baseUrl}/mcp`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...mintHeader },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }),
-      });
-      const text = await res.text();
-      const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-      const rpcResp = dataLine ? JSON.parse(dataLine.slice(5).trim()) : JSON.parse(text);
-      if (rpcResp.error) {
-        throw new Error(`MCP error on ${tool}: ${rpcResp.error.message ?? JSON.stringify(rpcResp.error)}`);
-      }
-      if (!rpcResp.result?.content?.[0]?.text) {
-        throw new Error(`unexpected MCP response for ${tool}: ${text.slice(0, 200)}`);
-      }
-      return JSON.parse(rpcResp.result.content[0].text);
+      const result = await localTool(
+        tool,
+        args,
+        { agentToken: typeof args.agent_token === "string" ? args.agent_token : undefined, mintSecret: tool === "register_agent" && mintSecret ? mintSecret : undefined },
+        { dbPath: selfDb, timeoutMs: 10_000 },
+      );
+      const parsed = toolJson(result);
+      if (!parsed) throw new Error(`unexpected tool result for ${tool}: ${JSON.stringify(result).slice(0, 200)}`);
+      return parsed;
     }
 
     // 1. /health probe

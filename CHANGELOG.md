@@ -27,6 +27,16 @@
   - The mail read, its renderer and the hooks' process lookups (`ps`) are bounded by the hook's time budget.
   - A stdio owner is not reachable yet.
 
+### The CLI's credential-bearing commands reach a local relay only through its door
+
+- **Changed:** `relay send`, `relay resolve`, `relay test`, `relay doctor --remote` (its token check) and `relay pair` reach their relay ONE of three ways, decided by checking the relay host (every spelling of loopback counts as loopback):
+  - **a local relay** (loopback) only through its owner door: a sealed `/owner/v1/tool` that runs exactly the tools these commands call (`send_message`, `resolve_messages`, `health_check`, `register_agent`, `get_messages`; anything else is refused), each with its normal authentication. The token and the registration secret travel inside the ciphertext. No valid owner record is a named failure ("restart the relay daemon").
+  - **a remote relay** (an explicit non-loopback host, a hub included) by its bearer, hardened: the request goes to the checked address, no redirect is followed (a 3xx is a named failure), no proxy from the environment is used, and only that remote's credentials are sent (`RELAY_AGENT_TOKEN`, or the remote's own vault entry; a transport secret only from the environment, never this machine's config).
+  - **an unresolved host** gets nothing, named.
+- **Changed:** `relay send` reaches a local relay through `send_message` (the sender's token, the same authentication as the MCP tool) instead of the dashboard endpoint.
+- **Changed:** `relay pair` refuses a loopback hub by name: pairing is for a remote hub.
+- A scan row classifies every HTTP client call site in `src/cli/`, `bin/` and `tools/`; a new one fails CI until it is classified.
+
 ### BREAKING (5.0.0): one wasm mode (the single owner), and `relay convert-journal`
 
 **Upgrade step, once per instance that uses the wasm driver:** close every terminal and relay process that uses the instance (an older relay running the legacy wasm mode holds no lock, so it cannot be detected), then run `relay convert-journal --to wasm`. A native instance needs nothing.
