@@ -27,6 +27,7 @@ import { fileURLToPath, pathToFileURL } from "url";
 import Database from "better-sqlite3";
 import * as compat from "../src/sqlite-compat.js";
 import * as db from "../src/db.js";
+import * as dbHeader from "../src/db-header.js";
 import { exportRelayState, importRelayState } from "../src/backup.js";
 import { srcProgram } from "./_helpers/ts-binding.js";
 import ts from "typescript-legacy";
@@ -46,9 +47,28 @@ let dbPath: string;
 let cfgPath: string;
 const children: ChildProcess[] = [];
 
-type ConvertReport = { converted: boolean; to: "wasm" | "native"; header: string; journal: string; integrity: string; config: string };
+type ConvertReport = {
+  converted: boolean;
+  to: "wasm" | "native";
+  header: string;
+  journal: string;
+  integrity: string;
+  config: string;
+  /** Which converter ran: the native one, or the sql.js one (a host where the native driver does not load). */
+  via?: "native" | "sqljs";
+  /** The sql.js converter's safety copy of the original bytes (in the backups directory). */
+  safetyCopy?: string;
+};
 type ConvertMod = {
-  convertJournal: (opts: { to: "wasm" | "native"; dbPath?: string; _failAfterForTests?: "journal" | "stamp" | "config" }) => Promise<ConvertReport>;
+  convertJournal: (opts: {
+    to: "wasm" | "native";
+    dbPath?: string;
+    _failAfterForTests?: "journal" | "stamp" | "config";
+    /** sql.js converter: run after the image is read and before the identity re-check (another writer meanwhile). */
+    _beforeReplaceForTests?: () => void;
+    /** sql.js converter: replaces the rename of the temp file onto the DB (a planted failure). */
+    _renameForTests?: (from: string, to: string) => void;
+  }) => Promise<ConvertReport>;
 };
 /** The module this slice adds (absent on the base: every row that needs it fails there, by name). */
 async function convertMod(): Promise<ConvertMod> {
@@ -270,7 +290,7 @@ describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
     expect(bad.status).toBe(2);
   }, 60_000);
 
-  it("Q2: convert-journal is the ONLY native opener of an RLYW file: every native better-sqlite3 construction in src is pinned, and exactly one is in src/convert-journal.ts", () => {
+  it("Q2: convert-journal is the ONLY native opener of an RLYW file: every native better-sqlite3 construction in src is pinned, and exactly one is in src/convert-journal.ts; and exactly one sql.js construction there (the wasm-only converter)", () => {
     const program = srcProgram();
     const sites: string[] = [];
     for (const sf of program.getSourceFiles()) {
@@ -290,6 +310,16 @@ describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
       visit(sf);
     }
     expect(sites.filter((s) => s.startsWith("src/convert-journal.ts")), `the sanctioned RLYW opener (sites: ${JSON.stringify(sites)})`).toHaveLength(1);
+    // The architect's wasm-only ruling: the sql.js converter is the second sanctioned site, the ONE sql.js construction
+    // in src/convert-journal.ts (its load and its fresh verify load share it).
+    const sqljs: string[] = [];
+    const cj = program.getSourceFiles().find((sf) => path.relative(REPO, sf.fileName).split(path.sep).join("/") === "src/convert-journal.ts");
+    const visitSqljs = (n: ts.Node): void => {
+      if (ts.isNewExpression(n) && /\.Database$/.test(n.expression.getText(cj))) sqljs.push(n.getText(cj));
+      ts.forEachChild(n, visitSqljs);
+    };
+    if (cj) visitSqljs(cj);
+    expect(sqljs, "exactly one sql.js construction in src/convert-journal.ts").toHaveLength(1);
   }, 120_000);
 });
 
@@ -390,5 +420,123 @@ describe("INV-DB-01 slice 4: the flip: one owner, always (Q3, Q4; BREAKING 5.0.0
     writeCfg({ sqlite_driver: "wasm" });
     await db.initializeDb();
     expect(compat.getActiveDriver()).toBe("wasm");
+  }, 60_000);
+});
+
+/** A DB whose last commits are only in a HOT WAL: a child commits, then kills itself without closing. */
+const HOT = path.join(ROOT, "hot-wal.cjs");
+fs.writeFileSync(
+  HOT,
+  `const D = require(process.argv[2]); const f = process.argv[3];\n` +
+    `let d = new D(f); d.pragma("journal_mode = WAL"); d.exec("CREATE TABLE kept (v TEXT); INSERT INTO kept VALUES ('checkpointed')"); d.close();\n` +
+    `d = new D(f); d.pragma("wal_autocheckpoint = 0"); d.prepare("INSERT INTO kept VALUES ('only-in-the-wal')").run();\n` +
+    `process.kill(process.pid, "SIGKILL");\n`
+);
+const rowCount = (f: string) => readOther(f).rows.length;
+
+describe("INV-DB-01 slice 4: the wasm-only converter (sql.js, native→wasm; the architect's ruling)", () => {
+  const wasmOnly = () => dbHeader._setNativeProbeForTests(() => ({ ok: false, reason: "test: a wasm-only install (npm 12, scripts off)" }));
+  afterEach(() => dbHeader._setNativeProbeForTests(null));
+
+  it.each([
+    ["a legacy (0) DB in DELETE mode", 0, "DELETE"],
+    ["an RLYN DB in WAL mode", NATIVE, "WAL"],
+  ] as const)("%s on a host where native does not load becomes RLYW + DELETE through sql.js, row counts equal, the config says wasm", async (_label, appId, journal) => {
+    makeDb(dbPath, appId, ["a", "b", "c"], journal);
+    writeCfg({ http_port: 3777 });
+    wasmOnly();
+    const r = await (await convertMod()).convertJournal({ to: "wasm" });
+    expect(r.via, "the sql.js converter ran").toBe("sqljs");
+    expect({ header: r.header, journal: r.journal, integrity: r.integrity, config: r.config }).toEqual({ header: "wasm", journal: "1/1", integrity: "ok", config: "wasm" });
+    expect(header(dbPath)).toEqual({ id: WASM, journal: "1/1" });
+    expect(readOther(dbPath)).toEqual({ rows: ["a", "b", "c"], ok: "ok" });
+    expect(sideFiles(dbPath)).toEqual([]);
+    expect(readCfg()).toEqual({ http_port: 3777, sqlite_driver: "wasm" });
+  }, 60_000);
+
+  it("the safety copy is byte-equal to the original, 0600, in the backups directory", async () => {
+    makeDb(dbPath, 0, ["a"], "DELETE");
+    const before = sha(dbPath);
+    writeCfg({});
+    wasmOnly();
+    const r = await (await convertMod()).convertJournal({ to: "wasm" });
+    expect(r.safetyCopy, "the report names the safety copy").toBeTruthy();
+    expect(path.dirname(r.safetyCopy!)).toBe(path.join(caseDir, "backups"));
+    expect(sha(r.safetyCopy!), "byte-equal to the original").toBe(before);
+    if (process.platform !== "win32") expect(fs.statSync(r.safetyCopy!).mode & 0o777).toBe(0o600);
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("a HOT WAL (commits only in -wal) is refused, never dropped: the DB and WAL bytes are unchanged, and the remedy names a checkpoint (skipped on Windows: SIGKILL of self)", async () => {
+    spawnSync(process.execPath, [HOT, path.join(REPO, "node_modules", "better-sqlite3"), dbPath]);
+    expect(fs.existsSync(dbPath + "-wal") && fs.statSync(dbPath + "-wal").size > 0, "precondition: a hot WAL").toBe(true);
+    const dbSha = sha(dbPath);
+    const walSha = sha(dbPath + "-wal");
+    writeCfg({});
+    wasmOnly();
+    await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(/convert-journal refused[\s\S]*-wal[\s\S]*wal_checkpoint\(TRUNCATE\)/);
+    expect(sha(dbPath)).toBe(dbSha);
+    expect(sha(dbPath + "-wal")).toBe(walSha);
+    expect(readCfg()).toEqual({});
+  }, 60_000);
+
+  it.each(["-wal", "-shm"])("an EMPTY %s beside the DB is refused, nothing changed", async (side) => {
+    makeDb(dbPath, 0, ["a"], "DELETE");
+    fs.writeFileSync(dbPath + side, "");
+    const before = sha(dbPath);
+    writeCfg({});
+    wasmOnly();
+    await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(new RegExp(`convert-journal refused[\\s\\S]*${side}`));
+    expect(sha(dbPath)).toBe(before);
+    expect(header(dbPath).id).toBe(0);
+  }, 60_000);
+
+  it("the main file CHANGED between the read and the rename (another writer) is refused, nothing replaced", async () => {
+    makeDb(dbPath, 0, ["a"], "DELETE");
+    writeCfg({});
+    wasmOnly();
+    const write = () => {
+      const d = new Database(dbPath);
+      d.prepare("INSERT INTO kept VALUES ('late')").run();
+      d.close();
+    };
+    await expect((await convertMod()).convertJournal({ to: "wasm", _beforeReplaceForTests: write })).rejects.toThrow(/convert-journal refused[\s\S]*changed/i);
+    expect(header(dbPath).id, "not replaced: still the legacy file").toBe(0);
+    expect(readOther(dbPath).rows, "the late write is intact").toEqual(["a", "late"]);
+    expect(readCfg()).toEqual({});
+  }, 60_000);
+
+  it("a planted RENAME failure leaves the original intact and names the temp file (never a copy over in place)", async () => {
+    makeDb(dbPath, 0, ["a", "b"], "DELETE");
+    const before = sha(dbPath);
+    writeCfg({});
+    wasmOnly();
+    let tmp = "";
+    const fail = (from: string) => {
+      tmp = from;
+      throw Object.assign(new Error("EXDEV: planted rename failure"), { code: "EXDEV" });
+    };
+    const err = await (await convertMod()).convertJournal({ to: "wasm", _renameForTests: fail }).then(() => null, (e: Error) => e);
+    expect(err?.message).toMatch(/convert-journal refused/);
+    expect(tmp, "the rename was attempted with a temp file").not.toBe("");
+    expect(err?.message, "the refusal names the temp").toContain(tmp);
+    expect(path.basename(tmp).startsWith("."), "the temp is a dotfile, outside SQLite's side-file names").toBe(true);
+    expect(sha(dbPath), "the original is intact").toBe(before);
+    expect(readCfg(), "the config is written only after the file").toEqual({});
+  }, 60_000);
+
+  it("twin: wasm→native on a host where native does not load is refused by name (it needs the native driver)", async () => {
+    makeDb(dbPath, WASM, ["a"], "DELETE");
+    writeCfg({ sqlite_driver: "wasm" });
+    wasmOnly();
+    await expect((await convertMod()).convertJournal({ to: "native" })).rejects.toThrow(/convert-journal refused[\s\S]*native driver/);
+    expect(header(dbPath).id).toBe(WASM);
+  }, 60_000);
+
+  it("twin: on a host where native DOES load, native→wasm runs the native converter (no safety copy needed)", async () => {
+    makeDb(dbPath, 0, ["a"], "DELETE");
+    writeCfg({});
+    const r = await (await convertMod()).convertJournal({ to: "wasm" });
+    expect(r.via).toBe("native");
+    expect(rowCount(dbPath)).toBe(1);
   }, 60_000);
 });
