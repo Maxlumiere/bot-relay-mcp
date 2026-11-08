@@ -1625,6 +1625,17 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the de
     await stopDaemon(d.child);
   }, 180_000);
 
+  it("P1-1 (fail closed, named): an explicit host that does NOT resolve gets nothing, and the skip names the host and the deadline", async () => {
+    const c = newCase("r1-unresolved");
+    const env = { RELAY_AGENT_TOKEN: TOKEN, FAKE_PENDING_RC: "3", RELAY_HTTP_HOST: "relay.does-not-resolve.invalid", RELAY_HTTP_PORT: "4777" };
+    const r = await runHook(c, "check-relay.sh", env);
+    const r2 = await runHook(c, "stop-check.sh", env, inputFor("stop-check.sh"));
+    for (const [hook, out] of [["check-relay.sh", r.out], ["stop-check.sh", r2.out]] as const) {
+      expect(out, `${hook}: the skip is named`).toMatch(/the remote host relay\.does-not-resolve\.invalid did not resolve within \d+s[^;]*; nothing (is )?sent/);
+    }
+    expect(r.argv + r2.argv, "no credential-bearing curl ran").not.toMatch(/^curl .*\/mcp/m);
+  }, 120_000);
+
   it("P2-5: a #418 daemon's v2 record beside a native DB → no credential, and the skip names the fix (restart the relay daemon)", async () => {
     const c = newCase("r1-v2-record");
     const token = seedNativeDb(c);
