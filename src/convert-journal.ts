@@ -473,9 +473,13 @@ async function convertViaSqlJs(p: Pinned, configPath: string, opts: ConvertOptio
 
   // The ruling on P1-3 (d): an fd on the ORIGINAL inode is kept through the rename, so a write that lands on it after
   // every check (an idle native handle opened before the conversion) is seen afterwards, never reported as a success.
-  const orig = fs.openSync(target, "r");
+  let orig: number | null = fs.openSync(target, "r");
+  const closeOrig = () => {
+    if (orig !== null) fs.closeSync(orig);
+    orig = null;
+  };
   try {
-    const first = identityOfFd(orig);
+    const first = identityOfFd(orig!);
     // `first.bytes` must stay the original, byte for byte, for the safety copy: loadImage copies it (measured on sql.js
     // 1.14.2: with the array passed directly, the DELETE + RLYW edits changed it, so the "safety copy" was the edited image).
     const img = loadImage(SQL, first.bytes);
@@ -500,7 +504,7 @@ async function convertViaSqlJs(p: Pinned, configPath: string, opts: ConvertOptio
     opts._beforeReplaceForTests?.();
     assertBound(p); // P1-2: the same file, its lock key the lock's, one link
     const now = sideFilesOf(p);
-    if (identityOfFd(orig).id !== first.id || identityOf(target).id !== first.id || now.length > 0) {
+    if (identityOfFd(orig!).id !== first.id || identityOf(target).id !== first.id || now.length > 0) {
       throw new ConvertRefusal(
         `the DB at ${dbPath} changed while it was being converted (another process wrote it${now.length ? `; side files: ${now.join(", ")}` : ""}). ` +
           `${CLOSE_EVERYTHING_FIRST} Nothing was replaced (a safety copy is at ${safetyCopy}).`
@@ -518,6 +522,18 @@ async function convertViaSqlJs(p: Pinned, configPath: string, opts: ConvertOptio
     }
     assertBound(p); // immediately before the rename
     assertStillContained(dbPath); // ADR-0048: the path is still inside the relay's roots
+    if (process.platform === "win32") {
+      // Windows refuses to rename onto a file a handle is open on (EPERM, measured on #401), so there the original is
+      // re-checked through the fd and the fd closed IMMEDIATELY before the rename. Stated residual: on Windows a write
+      // landing in that instant, between this check and the rename, is not detected.
+      if (identityOfFd(orig!).id !== first.id) {
+        throw new ConvertRefusal(
+          `the DB at ${dbPath} changed while it was being converted (another process wrote it). ${CLOSE_EVERYTHING_FIRST} ` +
+            `Nothing was replaced (a safety copy is at ${safetyCopy}).`
+        );
+      }
+      closeOrig();
+    }
     try {
       (opts._renameForTests ?? fs.renameSync)(tmp, target);
     } catch (err) {
@@ -536,7 +552,7 @@ async function convertViaSqlJs(p: Pinned, configPath: string, opts: ConvertOptio
     }
     // P1-3 (d): the ORIGINAL inode, re-read through the kept fd: a write that landed on it since the read is LOST from
     // the converted DB. That is a FAILURE: its bytes are saved beside the safety copy, and the remedy named.
-    const late = identityOfFd(orig);
+    const late = orig === null ? first : identityOfFd(orig); // on Windows the fd was closed before the rename (above)
     if (late.id !== first.id) {
       const saved = writeSafetyCopy(target, late.bytes, "late-write");
       throw new ConvertRefusal(
@@ -549,7 +565,7 @@ async function convertViaSqlJs(p: Pinned, configPath: string, opts: ConvertOptio
     writeDriverDeclaration(configPath, "wasm");
     return verifySqlJs(SQL, p, configPath, counts, true, safetyCopy);
   } finally {
-    fs.closeSync(orig);
+    closeOrig();
   }
 }
 

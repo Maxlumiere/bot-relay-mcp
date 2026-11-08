@@ -843,7 +843,11 @@ describe("INV-DB-01 slice 4, Codex #401 R1 P1-3 (ruled): native openers during a
     expect(readCfg()).toEqual({});
   }, 60_000);
 
-  it("(1d) sql.js: a write that lands on the ORIGINAL file after the identity check (at the rename) is reported as a FAILURE, never a success: the late bytes are saved beside the safety copy, and the remedy is named", async () => {
+  // Windows refuses to rename onto an open file (EPERM, measured on #401), so there the converter closes its fd on the
+  // original immediately before the rename and cannot see a write in that instant: a stated residual. The "CHANGED
+  // between the read and the rename" row covers a write before the final check on every OS.
+  const WIN_NO_FD_ACROSS_RENAME = process.platform === "win32";
+  it.skipIf(WIN_NO_FD_ACROSS_RENAME)("(1d) sql.js: a write that lands on the ORIGINAL file after the identity check (at the rename) is reported as a FAILURE, never a success: the late bytes are saved beside the safety copy, and the remedy is named (skipped on Windows: the stated residual)", async () => {
     makeDb(dbPath, 0, ["a"], "DELETE");
     writeCfg({});
     wasmOnly();
