@@ -139,14 +139,29 @@ interface OwnerRecord {
   pid_start: string | null;
   key: string;
   transport: string;
+  instance_id: string;
+  db_path: string;
 }
-const readRecord = (c: Case) => JSON.parse(fs.readFileSync(c.record, "utf-8")) as OwnerRecord;
+/** Each key's INSTANCE BINDING (as ruled: the record's instance_id + canonical DB path, inside every MAC). */
+const BINDINGS = new Map<string, { instance_id: string; db_path: string }>();
+const bindRecord = (rec: OwnerRecord) => {
+  BINDINGS.set(rec.key, { instance_id: rec.instance_id ?? "", db_path: rec.db_path ?? "" });
+  return rec;
+};
+const readRecord = (c: Case) => bindRecord(JSON.parse(fs.readFileSync(c.record, "utf-8")) as OwnerRecord);
 
 // ---------------------------------------------------------------------------------------------------------------------
 // THE OWNER DOOR, as ruled: a MUTUAL MAC, no bearer credential. "\n" separates fields.
 const hmac = (key: string, text: string) => crypto.createHmac("sha256", Buffer.from(key, "hex")).update(text).digest("hex");
-const reqMac = (key: string, p: string, ts: number, nonce: string, body: string) => hmac(key, `req\n${p}\n${ts}\n${nonce}\n${body}`);
-const respMac = (key: string, nonce: string, status: number, body: string) => hmac(key, `resp\n${nonce}\n${status}\n${body}`);
+const bindingOf = (key: string) => BINDINGS.get(key) ?? { instance_id: "", db_path: "" };
+const reqMac = (key: string, p: string, ts: number, nonce: string, body: string) => {
+  const b = bindingOf(key);
+  return hmac(key, `req\n${b.instance_id}\n${b.db_path}\n${p}\n${ts}\n${nonce}\n${body}`);
+};
+const respMac = (key: string, nonce: string, status: number, body: string) => {
+  const b = bindingOf(key);
+  return hmac(key, `resp\n${b.instance_id}\n${b.db_path}\n${nonce}\n${status}\n${body}`);
+};
 const PEEK = "/owner/v1/peek";
 const LIVENESS = "/owner/v1/liveness";
 interface DoorOpts {
@@ -193,7 +208,8 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
     const rec = readRecord(c);
-    expect(rec).toMatchObject({ v: 2, host: "127.0.0.1", port: d.port, pid: d.child.pid, transport: "http" });
+    expect(rec).toMatchObject({ v: 2, host: "127.0.0.1", port: d.port, pid: d.child.pid, transport: "http", db_path: fs.realpathSync.native(c.db) });
+    expect(typeof rec.instance_id, "the record names its instance (\"\" for an explicit DB path)").toBe("string");
     expect(rec.key).toMatch(KEY_RE);
     if (process.platform === "win32") {
       const { privacyFaults } = (await import("../src/fs-perms.js")) as { privacyFaults: (p: string, m: number) => string[] };
@@ -304,7 +320,7 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     await stopDaemon(d.child);
   }, 90_000);
 
-  it.skipIf(process.platform === "win32")("`relay where --fields`: a valid record → 8 lines, line 7 `http`, line 8 the URL ONLY (the key is never in where's answer)", async () => {
+  it("`relay where --fields`: a valid record → 8 lines, line 7 `http`, line 8 the URL ONLY (the key is never in where's answer); every OS (the pid is not part of validity, as ruled)", async () => {
     const c = newCase("where-http");
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
@@ -333,17 +349,16 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     expect(ownerEndpointVerdict(c.db)).toMatchObject({ ok: false, reason: "lock-free" });
   }, 90_000);
 
-  it.skipIf(process.platform === "win32")("the PID REUSED (a live pid whose start token differs) → not `http` (reason pid-mismatch)", async () => {
+  it("the pid and its start token are INFORMATIONAL (as ruled): a record naming another pid, or a null start, is still valid while the lock is held; the door's MAC proves liveness", async () => {
     const c = newCase("where-pid");
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
     const rec = readRecord(c);
-    fs.writeFileSync(c.record, JSON.stringify({ ...rec, pid: process.pid, pid_start: "a-start-token-that-is-not-this-process's" }), { mode: 0o600 });
-    const w = whereFields(c);
-    expect(w.lines[6]).not.toBe("http");
+    fs.writeFileSync(c.record, JSON.stringify({ ...rec, pid: process.pid, pid_start: null }), { mode: 0o600 });
     const { ownerEndpointVerdict } = (await import("../src/owner-endpoint.js")) as { ownerEndpointVerdict: (db: string) => { ok: boolean; reason?: string } };
-    expect(ownerEndpointVerdict(c.db)).toMatchObject({ ok: false, reason: "pid-mismatch" });
+    expect(ownerEndpointVerdict(c.db)).toMatchObject({ ok: true });
+    expect(whereFields(c).lines[6]).toBe("http");
     await stopDaemon(d.child);
   }, 90_000);
 
@@ -361,6 +376,64 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     expect([...HOOK_DB_VERDICTS]).toEqual(["sqlite3", "skip-declared-wasm", "skip-rlyw", "skip-unreadable", "skip-owner-locked", "http"]);
     const src = fs.readFileSync(path.join(HOOKS, "_vault-helpers.sh"), "utf-8");
     for (const v of HOOK_DB_VERDICTS) expect(src, `the hooks know ${v}`).toMatch(new RegExp(`\\b${v.replace(/-/g, "\\-")}\\)`));
+  });
+});
+
+describe("hook PR 1: the door's REPLAY cache, as ruled (expiry by ts, fail-closed when full, swept by a timer)", () => {
+  type Verify = (p: string, raw: unknown, mac: unknown, nowMs?: number) => { ok: boolean; status?: number; error?: string };
+  async function doorModule() {
+    const m = (await import("../src/owner-endpoint.js")) as {
+      verifyDoorRequest: Verify;
+      writeOwnerEndpoint: (db: string, port: number, t: "http" | "stdio") => string;
+      sweepDoorNonces: (nowMs: number) => void;
+      doorNonceCount: () => number;
+      _resetDoorNoncesForTests: () => void;
+      DOOR_NONCE_CAPACITY: number;
+    };
+    const c = newCase("replay-key");
+    fs.writeFileSync(c.db, "");
+    const key = bindRecord(JSON.parse(fs.readFileSync(m.writeOwnerEndpoint(c.db, 1, "http"), "utf-8")) as OwnerRecord).key;
+    m._resetDoorNoncesForTests();
+    return { m, key };
+  }
+  const signed = (key: string, ts: number, nonce = crypto.randomBytes(16).toString("hex")) => {
+    const body = JSON.stringify({ agent_name: AGENT, args: {}, ts, client_nonce: nonce });
+    return { body, mac: reqMac(key, PEEK, ts, nonce, body) };
+  };
+
+  it("Codex's sequence and every t in the window: a request accepted once is REFUSED at every later instant it would still validate", async () => {
+    const { m, key } = await doorModule();
+    const T = 2_000_000_000;
+    const { body, mac } = signed(key, T);
+    expect(m.verifyDoorRequest(PEEK, body, mac, (T - 30) * 1000).ok, "accepted at the window's first instant").toBe(true);
+    for (let t = (T - 30) * 1000; t <= (T + 30) * 1000 + 999; t += 250) {
+      const r = m.verifyDoorRequest(PEEK, body, mac, t);
+      expect(r.ok, `a replay at ${t - T * 1000}ms from ts`).toBe(false);
+    }
+    // Codex's exact numbers: ts 1030 accepted at 1000.000, replayed at 1060.000.
+    m._resetDoorNoncesForTests();
+    const c2 = signed(key, 1030);
+    expect(m.verifyDoorRequest(PEEK, c2.body, c2.mac, 1_000_000).ok).toBe(true);
+    expect(m.verifyDoorRequest(PEEK, c2.body, c2.mac, 1_060_000).ok, "Codex's replay at 1060").toBe(false);
+  });
+
+  it("a FULL cache refuses (fail closed), never evicting a live nonce; expired nonces are swept without new traffic (a timer)", async () => {
+    const { m, key } = await doorModule();
+    const T = 2_000_000_000;
+    for (let i = 0; i < m.DOOR_NONCE_CAPACITY; i++) {
+      const { body, mac } = signed(key, T);
+      expect(m.verifyDoorRequest(PEEK, body, mac, T * 1000).ok).toBe(true);
+    }
+    const extra = signed(key, T);
+    const r = m.verifyDoorRequest(PEEK, extra.body, extra.mac, T * 1000);
+    expect(r.ok, "the cache is full: refused").toBe(false);
+    expect(r.status).toBe(503);
+    expect(m.doorNonceCount()).toBe(m.DOOR_NONCE_CAPACITY);
+    m.sweepDoorNonces((T + 40) * 1000);
+    expect(m.doorNonceCount(), "every nonce's ts has left the window: swept").toBe(0);
+    const src = fs.readFileSync(path.join(REPO, "src", "owner-endpoint.ts"), "utf-8");
+    expect(src, "a timer sweeps the cache (independent of traffic), unref'd").toMatch(/setInterval\(\s*\(\)\s*=>\s*sweepDoorNonces\([\s\S]{0,80}\.unref\(\)/);
+    m._resetDoorNoncesForTests();
   });
 });
 
@@ -421,6 +494,126 @@ describe("hook PR 1: the record TRUST model (cross-user), as ruled", () => {
     await stopDaemon(d.child);
   }, 90_000);
 
+  it("the WRITER is bound to its fd (as ruled): the temp name swapped for another file between create and write → the key lands only in the fd's own file, and NO record is published (every OS, a seam)", () => {
+    const c = newCase("writer-swap");
+    fs.writeFileSync(c.db, "");
+    const script = path.join(c.home, "swap.mjs");
+    const log = path.join(c.home, "swap.log");
+    const decoyCopy = path.join(c.home, "decoy-was.txt");
+    fs.writeFileSync(
+      script,
+      `import fs from "fs";
+       const m = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "owner-endpoint.js")).href)});
+       // The swap: the temp name now names a DECOY (a second name keeps a view of it past any cleanup).
+       m._setWriterHookForTests((tmp) => { fs.renameSync(tmp, tmp + ".moved"); fs.writeFileSync(tmp, ""); fs.linkSync(tmp, ${JSON.stringify(decoyCopy)}); });
+       let threw = false;
+       try { m.writeOwnerEndpoint(${JSON.stringify(c.db)}, 1234, "http"); } catch { threw = true; }
+       const names = fs.readdirSync(${JSON.stringify(c.dir)});
+       fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify({ threw, names }));`
+    );
+    const r = spawnSync(process.execPath, [script], { encoding: "utf-8", env: baseEnv(c), timeout: 30_000 });
+    expect(r.status, r.stderr).toBe(0);
+    const out = JSON.parse(fs.readFileSync(log, "utf-8")) as { threw: boolean; names: string[] };
+    expect(out.threw, "an identity mismatch refuses the publication").toBe(true);
+    expect(fs.existsSync(c.record), "no record is published").toBe(false);
+    expect(fs.readFileSync(decoyCopy, "utf-8"), "the swapped-in file never receives the key").not.toMatch(/"key"/);
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("POSIX: a SYMLINK swapped in for the temp name never receives the key (the write goes through the O_EXCL|O_NOFOLLOW fd)", () => {
+    const c = newCase("writer-link");
+    fs.writeFileSync(c.db, "");
+    const outside = path.join(c.home, "outside.txt");
+    fs.writeFileSync(outside, "");
+    const script = path.join(c.home, "link.mjs");
+    fs.writeFileSync(
+      script,
+      `import fs from "fs";
+       const m = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "owner-endpoint.js")).href)});
+       m._setWriterHookForTests((tmp) => { fs.rmSync(tmp); fs.symlinkSync(${JSON.stringify(outside)}, tmp); });
+       try { m.writeOwnerEndpoint(${JSON.stringify(c.db)}, 1234, "http"); } catch {}`
+    );
+    const r = spawnSync(process.execPath, [script], { encoding: "utf-8", env: baseEnv(c), timeout: 30_000 });
+    expect(r.status, r.stderr).toBe(0);
+    expect(fs.readFileSync(outside, "utf-8"), "the link's target got no key bytes").toBe("");
+    expect(fs.existsSync(c.record) && fs.lstatSync(c.record).isSymbolicLink(), "no symlink was published as the record").toBe(false);
+  }, 60_000);
+
+  it("the READER is bound to its fd (as ruled): the record swapped for another file after the checks → refused (every OS, a seam)", async () => {
+    const c = newCase("reader-swap");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const m = (await import("../src/owner-endpoint.js")) as {
+      ownerEndpointVerdict: (db: string) => { ok: boolean; reason?: string };
+      _setReaderHookForTests: (fn: ((p: string) => void) | null) => void;
+    };
+    expect(m.ownerEndpointVerdict(c.db), "the control").toMatchObject({ ok: true });
+    m._setReaderHookForTests((p) => {
+      const text = fs.readFileSync(p);
+      fs.rmSync(p);
+      fs.writeFileSync(p, text, { mode: 0o600 });
+    });
+    try {
+      expect(m.ownerEndpointVerdict(c.db)).toMatchObject({ ok: false, reason: "untrusted-record" });
+    } finally {
+      m._setReaderHookForTests(null);
+    }
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it.skipIf(process.platform === "win32")("POSIX (as ruled): the guarantee is FILE-level: a group-writable ANCESTOR does not matter; the IMMEDIATE dir is refused when group/other-writable, unless sticky", async () => {
+    const c = newCase("dirs");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const { ownerEndpointVerdict } = (await import("../src/owner-endpoint.js")) as { ownerEndpointVerdict: (db: string) => { ok: boolean; reason?: string } };
+    const home = fs.statSync(c.home).mode & 0o7777;
+    const dir = fs.statSync(c.dir).mode & 0o7777;
+    try {
+      fs.chmodSync(c.home, 0o777);
+      expect(ownerEndpointVerdict(c.db), "a world-writable ANCESTOR: still trusted").toMatchObject({ ok: true });
+      fs.chmodSync(c.dir, 0o1777);
+      expect(ownerEndpointVerdict(c.db), "a sticky world-writable immediate dir: trusted").toMatchObject({ ok: true });
+      fs.chmodSync(c.dir, 0o777);
+      expect(ownerEndpointVerdict(c.db), "a world-writable immediate dir: refused").toMatchObject({ ok: false, reason: "untrusted-dir" });
+    } finally {
+      fs.chmodSync(c.dir, dir);
+      fs.chmodSync(c.home, home);
+    }
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it.runIf(process.platform === "win32")("Windows (as ruled, option A): the record's dir with a foreign WRITE-capable ACE (Everyone: write) is refused; the default Temp chain is accepted", async () => {
+    const c = newCase("dir-win");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const { ownerEndpointVerdict } = (await import("../src/owner-endpoint.js")) as { ownerEndpointVerdict: (db: string) => { ok: boolean; reason?: string } };
+    expect(ownerEndpointVerdict(c.db), "the default profile/Temp chain: accepted").toMatchObject({ ok: true });
+    const g = spawnSync("icacls", [c.dir, "/grant", "*S-1-1-0:(W)"], { encoding: "utf-8" });
+    expect(g.status, `${g.stdout}${g.stderr}`).toBe(0);
+    expect(ownerEndpointVerdict(c.db)).toMatchObject({ ok: false, reason: "untrusted-dir" });
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("INSTANCE BINDING (as ruled): instance B's record relocated beside instance A's DB is refused (the record names B's DB; the MACs bind A)", async () => {
+    const a = newCase("bind-a");
+    const b = newCase("bind-b");
+    seedWasmDb(a, "pr1 A mail");
+    seedWasmDb(b, "pr1 B mail");
+    for (const c of [a, b]) fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const da = await startOwnerDaemon(a);
+    const db = await startOwnerDaemon(b);
+    fs.writeFileSync(a.record, fs.readFileSync(b.record), { mode: 0o600 });
+    const { ownerEndpointVerdict } = (await import("../src/owner-endpoint.js")) as { ownerEndpointVerdict: (d: string) => { ok: boolean; reason?: string } };
+    expect(ownerEndpointVerdict(a.db)).toMatchObject({ ok: false, reason: "bound-elsewhere" });
+    const r = spawnSync(process.execPath, [RELAY, "owner", "peek", AGENT, "--json", "--with-content", "5", "--timeout-ms", "5000"], { encoding: "utf-8", env: baseEnv(a) });
+    expect(r.status).not.toBe(0);
+    expect(r.stdout + r.stderr, "B's mail is never shown as A's").not.toContain("pr1 B mail");
+    await stopDaemon(da.child);
+    await stopDaemon(db.child);
+  }, 120_000);
+
   it("the record writer sets the owner-only ACL BEFORE any key byte, and an ACL fault publishes NO record (every OS, an injected fault)", () => {
     const c = newCase("acl-order");
     fs.writeFileSync(c.db, "");
@@ -449,7 +642,7 @@ describe("hook PR 1: the record TRUST model (cross-user), as ruled", () => {
   }, 60_000);
 });
 
-describe.skipIf(process.platform === "win32")("hook PR 1: `relay owner peek` (the hooks' client): the door's one exchange, printed as `relay pending --json` prints", () => {
+describe("hook PR 1: `relay owner peek` (the hooks' client): the door's one exchange, printed as `relay pending --json` prints (every OS)", () => {
   it("its JSON has exactly `relay pending --json`'s keys (plus source: owner), with the content; it opens NO DB (a spy with a positive control)", async () => {
     const twin = newCase("owner-cli-twin");
     seedNativeDb(twin);
@@ -478,10 +671,22 @@ describe.skipIf(process.platform === "win32")("hook PR 1: `relay owner peek` (th
     const r = spawnSync(process.execPath, ["--require", spy, RELAY, "owner", "peek", AGENT, "--json", "--with-content", "5", "--timeout-ms", "5000"], { encoding: "utf-8", env: baseEnv(c) });
     expect(r.status, r.stderr).toBe(0);
     const out = JSON.parse(r.stdout) as Record<string, unknown> & { messages: Array<{ content?: string }> };
-    expect(Object.keys(out).filter((k) => k !== "source").sort()).toEqual(pendKeys);
+    expect(Object.keys(out).filter((k) => k !== "source" && k !== "registered").sort()).toEqual(pendKeys);
+    expect(out.registered).toBe(true);
     expect(out.source).toBe("owner");
     expect(out.messages[0]?.content).toBe("pr1 cli mail");
     expect(fs.existsSync(spyLog) ? fs.readFileSync(spyLog, "utf-8") : "", "the client opens NO DB").toBe("");
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("an UNREGISTERED agent (as ruled): the owner answers, so the peek exits 0 with registered:false and EMPTY mail", async () => {
+    const c = newCase("owner-cli-unreg");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const r = spawnSync(process.execPath, [RELAY, "owner", "peek", "pr1-newcomer", "--json", "--timeout-ms", "5000"], { encoding: "utf-8", env: baseEnv(c) });
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ ok: true, registered: false, count: 0, messages: [], source: "owner" });
     await stopDaemon(d.child);
   }, 90_000);
 
@@ -500,7 +705,7 @@ describe.skipIf(process.platform === "win32")("hook PR 1: `relay owner peek` (th
     const r = spawnSync(process.execPath, [RELAY, "owner", "peek", AGENT, "--json", "--timeout-ms", "1500"], { encoding: "utf-8", env: baseEnv(c), timeout: 30_000 });
     expect(Date.now() - t0, "bounded by --timeout-ms (plus node's start)").toBeLessThan(6000);
     expect(r.status).not.toBe(0);
-    expect(r.stderr).toMatch(/relay owner: .*(timed out|no answer)/i);
+    expect(r.stderr).toMatch(/relay owner: .*(timed out|no answer|did not answer)/i);
     await stopDaemon(d.child);
   }, 90_000);
 });
@@ -523,8 +728,9 @@ const UNREACHABLE_BINDS: Array<[string, string | null]> = [
 const PEEK_SECRET = `pr1-peek-secret-${crypto.randomBytes(16).toString("hex")}`;
 
 describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopback owner-peek listener, and the record names it", () => {
-  it.each(UNREACHABLE_BINDS)("a daemon bound to %s: the record names a 127.0.0.1 listener on ANOTHER port whose door answers, MAC'd", async (what, host) => {
-    if (host === null) return void console.warn(`[hook-pr1] skipped by name: no such address on this runner (${what})`);
+  it.skipIf(!V6_LOOPBACK)("a daemon bound to ::1 (IPv6 loopback only; skipped by name where the runner has no ::1)", () => peekListenerRow("::1"), 90_000);
+  it.skipIf(LAN_V4 === null)("a daemon bound to one LAN IPv4 address (skipped by name where the runner has none)", () => peekListenerRow(LAN_V4!), 90_000);
+  async function peekListenerRow(host: string) {
     const c = newCase(`peek-${host.replace(/[^0-9a-z]/gi, "")}`);
     seedWasmDb(c, "pr1 peek-listener mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
@@ -541,11 +747,10 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopbac
       expect(off, "the peek listener is bound to 127.0.0.1 only").toBe("refused");
     }
     await stopDaemon(d.child);
-  }, 90_000);
+  }
 
-  it("the peek listener serves ONLY the two door endpoints: every other route of startHttpServer, /mcp, /owner-id, /health → 403; a WS upgrade is never accepted", async () => {
-    const host = V6_LOOPBACK ? "::1" : LAN_V4;
-    if (host === null) return void console.warn("[hook-pr1] skipped by name: no address 127.0.0.1 cannot reach on this runner");
+  it.skipIf(!V6_LOOPBACK && LAN_V4 === null)("the peek listener serves ONLY the two door endpoints: every other route of startHttpServer, /mcp, /owner-id, /health → 403; a WS upgrade is never accepted (skipped by name with no address 127.0.0.1 cannot reach)", async () => {
+    const host = (V6_LOOPBACK ? "::1" : LAN_V4)!;
     const c = newCase("peek-gate");
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
@@ -720,6 +925,8 @@ fs.writeFileSync(
   `#!/bin/sh\nfor a in "$@"; do case "$a" in -*) ;; *) [ -f "$a" ] && { printf '== %s\\n' "$a"; cat "$a"; printf '\\n'; } >> "${RM_CAPTURE}" ;; esac; done\nexec "${REAL_RM}" "$@"\n`,
   { mode: 0o755 }
 );
+const REAL_PS = spawnSync("sh", ["-c", "command -v ps"], { encoding: "utf-8" }).stdout.trim();
+fs.writeFileSync(path.join(STUBS, "ps"), `#!/bin/sh\nprintf 'ps %s\\n' "$*" >> "${ARGV_LOG}"\nif [ -n "$FAKE_PS_HANG" ]; then exec sleep 30; fi\nexec "${REAL_PS}" "$@"\n`, { mode: 0o755 });
 const SQLITE_LOG = path.join(ROOT, "sqlite3.log");
 fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SQLITE_LOG}"\nexit 1\n`, { mode: 0o755 });
 
@@ -772,9 +979,8 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the o
     await stopDaemon(d.child);
   }, 120_000);
 
-  it.each(HOOK_SET)("%s through the PEEK LISTENER (a daemon 127.0.0.1 cannot reach) → the mail, never sqlite3", async (hook) => {
-    const host = V6_LOOPBACK ? "::1" : LAN_V4;
-    if (host === null) return void console.warn("[hook-pr1] skipped by name: no address 127.0.0.1 cannot reach on this runner");
+  it.skipIf(!V6_LOOPBACK && LAN_V4 === null).each(HOOK_SET)("%s through the PEEK LISTENER (a daemon 127.0.0.1 cannot reach) → the mail, never sqlite3 (skipped by name with no such address)", async (hook) => {
+    const host = (V6_LOOPBACK ? "::1" : LAN_V4)!;
     const c = newCase(`peek-${hook.split(".")[0]}`);
     const token = seedWasmDb(c, `pr1 peek mail for ${hook}`);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
@@ -922,6 +1128,29 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), RELAY_HOOK_DEBUG: "1" });
     expect(r.out, "the registration call ran (its debug summary)").toMatch(/register_agent reply:/);
     expect(mailIn(r.out, "pr1 cred mail"), r.out).toBe(true);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("an UNREGISTERED agent: the door proves the owner, so the gate passes and SessionStart goes on to register (no 'door failed')", async () => {
+    const c = newCase("cred-unreg");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_NAME: "pr1-newcomer", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), RELAY_HOOK_DEBUG: "1" });
+    expect(r.out).not.toMatch(/the owner door failed/);
+    expect(r.out, "the registration call ran").toMatch(/register_agent reply:/);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("SessionStart's process discovery is BOUNDED: a hung `ps` (relay_agent_pid / relay_pid_start) → the hook still ends inside its budget", async () => {
+    const c = newCase("cred-ps-hang");
+    const token = seedWasmDb(c, "pr1 ps mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), FAKE_PS_HANG: "1" });
+    expect(r.argv, "precondition: the hung ps ran").toContain("ps ");
+    expect(r.status, "the hook exited by itself").not.toBeNull();
+    expect(r.ms, `the stub sleeps 30s: the hook must end inside its 10s budget\n${r.out}`).toBeLessThan(10_000);
     await stopDaemon(d.child);
   }, 120_000);
 
