@@ -97,10 +97,11 @@ function seedNativeDb(c: Case): string {
   return r.stdout.trim();
 }
 /** The wasm owner daemon (HTTP, 127.0.0.1). Resolves once /health answers. */
-async function startOwnerDaemon(c: Case): Promise<{ child: ChildProcess; port: number; stderr: () => string }> {
+async function startOwnerDaemon(c: Case, host = "127.0.0.1", extraEnv: Record<string, string> = {}): Promise<{ child: ChildProcess; port: number; stderr: () => string }> {
   const port = await getFreePort();
+  const reach = host === "0.0.0.0" ? "127.0.0.1" : host.includes(":") ? `[${host}]` : host;
   const child = spawn(process.execPath, [DIST_INDEX], {
-    env: baseEnv(c, { RELAY_TRANSPORT: "http", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(port) }),
+    env: baseEnv(c, { RELAY_TRANSPORT: "http", RELAY_HTTP_HOST: host, RELAY_HTTP_PORT: String(port), ...extraEnv }),
     stdio: ["ignore", "pipe", "pipe"],
   });
   procs.push(child);
@@ -109,7 +110,7 @@ async function startOwnerDaemon(c: Case): Promise<{ child: ChildProcess; port: n
   const end = Date.now() + 30_000;
   while (Date.now() < end) {
     if (child.exitCode !== null) break;
-    const ok = await fetch(`http://127.0.0.1:${port}/health`).then((r) => r.ok, () => false);
+    const ok = await fetch(`http://${reach}:${port}/health`).then((r) => r.ok, () => false);
     if (ok && fs.existsSync(c.record)) return { child, port, stderr: () => err };
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -510,3 +511,165 @@ describe("hook PR 1: the record is never deleted by relay code (a scan row)", ()
     expect(hits, "no remove of the record path").toEqual([]);
   }, 120_000);
 });
+
+/**
+ * Hook PR 1, as ruled (Q9): the record ALWAYS points at a listener the hooks reach as 127.0.0.1. A daemon whose main
+ * listener 127.0.0.1 cannot reach (bound to ::1, or to one LAN address) ALSO opens a loopback-only "owner peek"
+ * listener, and the record points there. That listener serves ONLY GET /owner-id and the hooks' get_messages peek.
+ */
+const LAN_V4 = Object.values(os.networkInterfaces()).flat().find((a) => a && a.family === "IPv4" && !a.internal)?.address ?? null;
+const V6_LOOPBACK = await new Promise<boolean>((resolve) => {
+  const srv = http.createServer();
+  srv.once("error", () => resolve(false));
+  srv.listen(0, "::1", () => srv.close(() => resolve(true)));
+});
+const UNREACHABLE_BINDS: Array<[string, string | null, Record<string, string>]> = [
+  ["::1 (IPv6 loopback only)", V6_LOOPBACK ? "::1" : null, {}],
+  ["one LAN IPv4 address (with an http_secret, as a non-loopback bind requires)", LAN_V4, {}],
+];
+const PEEK_SECRET = `pr1-peek-secret-${crypto.randomBytes(16).toString("hex")}`;
+async function mcpCall(base: string, body: unknown, headers: Record<string, string> = {}) {
+  const res = await fetch(`${base}/mcp`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers },
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
+  const text = await res.text();
+  const data = text.split("\n").find((l) => l.startsWith("data: "));
+  let json: any = null;
+  try { json = JSON.parse(data ? data.slice(6) : text); } catch { /* not JSON */ }
+  return { status: res.status, text, json };
+}
+const peekArgs = (token: string) => ({ agent_name: AGENT, status: "pending", limit: 10, peek: true, since: "all", agent_token: token });
+const call = (name: string, args: Record<string, unknown>) => ({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } });
+
+describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → a loopback owner-peek listener, and the record points there", () => {
+  it.each(UNREACHABLE_BINDS)("a daemon bound to %s: the record names a 127.0.0.1 listener on ANOTHER port that proves the key", async (_what, host, env) => {
+    if (host === null) return void console.warn(`[hook-pr1] skipped by name: no such address on this runner (${_what})`);
+    const c = newCase(`peek-${host.replace(/[^0-9a-z]/gi, "")}`);
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c, host, env);
+    const rec = JSON.parse(fs.readFileSync(c.record, "utf-8")) as { host: string; port: number; key: string };
+    expect(rec.host).toBe("127.0.0.1");
+    expect(rec.port, "the record points at the peek listener, not the main one").not.toBe(d.port);
+    const challenge = crypto.randomBytes(16).toString("hex");
+    const res = await fetch(`http://127.0.0.1:${rec.port}/owner-id?c=${challenge}`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ mac: mac(rec.key, challenge, rec.port) });
+    if (host === LAN_V4) {
+      const off = await fetch(`http://${LAN_V4}:${rec.port}/owner-id?c=${challenge}`).then((r) => r.status, () => "refused");
+      expect(off, "the peek listener is bound to 127.0.0.1 only").toBe("refused");
+    }
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it.skipIf(process.platform === "win32").each(UNREACHABLE_BINDS)("a daemon bound to %s: SessionStart reads the agent's mail through the peek listener (the secret included), never sqlite3", async (_what, host, env) => {
+    if (host === null) return void console.warn(`[hook-pr1] skipped by name: no such address on this runner (${_what})`);
+    const c = newCase(`peek-hook-${host.replace(/[^0-9a-z]/gi, "")}`);
+    const token = seedWasmDb(c, "pr1 mail via the peek listener");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c, host, env);
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token });
+    expect(r.out, `${r.out}\n${d.stderr()}`).toMatch(/pr1 mail via the peek listener|pr1-sender/);
+    expect(r.sqliteCalls).toEqual([]);
+    expect(r.out).not.toContain(PEEK_SECRET);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("the peek listener serves ONLY /owner-id and the get_messages peek: every other route, every other tool, any other argument key, a batch, a session, a WS upgrade → refused", async () => {
+    const host = V6_LOOPBACK ? "::1" : LAN_V4;
+    if (host === null) return void console.warn("[hook-pr1] skipped by name: no address 127.0.0.1 cannot reach on this runner");
+    const c = newCase("peek-gate");
+    const token = seedWasmDb(c, "pr1 gate mail");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
+    // A LAN main listener's own Host check must accept the LAN address (the registry is read through it below).
+    const d = await startOwnerDaemon(c, host, host === LAN_V4 ? { RELAY_HTTP_ALLOWED_HOSTS: LAN_V4 } : {});
+    const rec = JSON.parse(fs.readFileSync(c.record, "utf-8")) as { port: number };
+    const peek = `http://127.0.0.1:${rec.port}`;
+    const auth = { "X-Relay-Secret": PEEK_SECRET, "X-Agent-Token": token };
+    // The allowed peek works (the gate is not a wall).
+    const ok = await mcpCall(peek, call("get_messages", peekArgs(token)), auth);
+    expect(ok.status, ok.text).toBe(200);
+    expect(ok.text).toContain("pr1 gate mail");
+    // Every route startHttpServer registers (read from its source), on the peek listener → 403, but the two.
+    const src = fs.readFileSync(path.join(REPO, "src", "transport", "http.ts"), "utf-8");
+    const routes = [...src.matchAll(/app\.(get|post|put|delete|patch|all)\(\s*"([^"]+)"/g)].map((m) => [m[1]!.toUpperCase(), m[2]!] as const);
+    expect(routes.length, "precondition: the route scan found the routes").toBeGreaterThan(15);
+    for (const [method, route] of routes) {
+      if ((method === "GET" && route === "/owner-id") || (method === "POST" && route === "/mcp")) continue;
+      const res = await fetch(`${peek}${route.replace(/:[a-z_]+/gi, "x")}`, { method: method === "ALL" ? "GET" : method, headers: auth, body: method === "GET" ? undefined : "{}" });
+      expect(res.status, `${method} ${route}`).toBe(403);
+    }
+    // Every tool but get_messages (the live registry, from the MAIN listener) → 403.
+    const reach = host.includes(":") ? `[${host}]` : host;
+    const list = await mcpCall(`http://${reach}:${d.port}`, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, auth);
+    const names: string[] = (list.json?.result?.tools ?? []).map((t: { name: string }) => t.name);
+    expect(names.length, `precondition: the registry was read (${list.status} ${list.text.slice(0, 200)})`).toBeGreaterThan(20);
+    for (const name of names.filter((n) => n !== "get_messages")) {
+      const res = await mcpCall(peek, call(name, { agent_name: AGENT, agent_token: token }), auth);
+      expect(res.status, `tools/call ${name}`).toBe(403);
+    }
+    const refused: Array<[string, unknown, Record<string, string>?]> = [
+      ["tools/list", { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }],
+      ["initialize", { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "x", version: "1" } } }],
+      ["ack: true (resolves mail through a read-only door)", call("get_messages", { ...peekArgs(token), ack: true })],
+      ["peek: false", call("get_messages", { ...peekArgs(token), peek: false })],
+      ["peek absent", call("get_messages", (({ peek: _p, ...rest }) => rest)(peekArgs(token)))],
+      ["status other than pending", call("get_messages", { ...peekArgs(token), status: "all" })],
+      ["a batch", [call("get_messages", peekArgs(token))]],
+      ["an mcp-session-id", call("get_messages", peekArgs(token)), { "mcp-session-id": "x" }],
+    ];
+    for (const [what, body, extra] of refused) {
+      const res = await mcpCall(peek, body, { ...auth, ...(extra ?? {}) });
+      expect(res.status, what).toBe(403);
+    }
+    expect((await fetch(`${peek}/mcp`, { headers: auth })).status, "GET /mcp").toBe(403);
+    expect((await fetch(`${peek}/health`)).status, "GET /health").toBe(403);
+    // A WebSocket upgrade bypasses Express: it must be refused at the socket.
+    const upgraded = await new Promise<string>((resolve) => {
+      const req = http.request({ host: "127.0.0.1", port: rec.port, path: "/dashboard/ws", headers: { Connection: "Upgrade", Upgrade: "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": crypto.randomBytes(16).toString("base64") } });
+      req.on("upgrade", () => resolve("upgraded"));
+      req.on("response", (r) => resolve(`status ${r.statusCode}`));
+      req.on("error", () => resolve("refused"));
+      req.end();
+    });
+    expect(upgraded, "a WS upgrade is never accepted").not.toBe("upgraded");
+    // A wrong agent token on the allowed peek: no mail (the auth path is the daemon's own).
+    const wrong = await mcpCall(peek, call("get_messages", peekArgs("wrong-token-aaaaaaaaaaaaaaaa")), { ...auth, "X-Agent-Token": "wrong-token-aaaaaaaaaaaaaaaa" });
+    expect(wrong.text).not.toContain("pr1 gate mail");
+    await stopDaemon(d.child);
+  }, 180_000);
+
+  it("twin: a daemon bound to 127.0.0.1 records its MAIN port (no second listener)", async () => {
+    const c = newCase("peek-twin");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    expect((JSON.parse(fs.readFileSync(c.record, "utf-8")) as { port: number }).port).toBe(d.port);
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("a daemon whose Host allowlist does NOT accept 127.0.0.1 (RELAY_HTTP_ALLOWED_HOSTS set to a name) → the peek listener, whose Host check is loopback-only", async () => {
+    const c = newCase("peek-hostlist");
+    seedWasmDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c, "127.0.0.1", { RELAY_HTTP_ALLOWED_HOSTS: "relay.example.internal" });
+    const rec = JSON.parse(fs.readFileSync(c.record, "utf-8")) as { port: number; key: string };
+    expect(rec.port).not.toBe(d.port);
+    const challenge = crypto.randomBytes(16).toString("hex");
+    const res = await fetch(`http://127.0.0.1:${rec.port}/owner-id?c=${challenge}`);
+    expect(res.status).toBe(200);
+    // And the MAIN listener's /owner-id is now Host-checked (it sat before the check).
+    expect((await fetch(`http://127.0.0.1:${d.port}/owner-id?c=${challenge}`)).status, "main /owner-id is Host-checked").toBe(421);
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("the peek listener's bind host is a CONSTANT 127.0.0.1: startHttpServer in owner-peek mode refuses any other host", async () => {
+    const mod = (await import(pathToFileURL(path.join(REPO, "dist", "transport", "http.js")).href)) as { startHttpServer: (p: number, h: string, o?: { ownerPeek?: boolean }) => unknown };
+    for (const h of ["0.0.0.0", "::", "::1", "localhost", LAN_V4 ?? "10.0.0.1"]) {
+      expect(() => mod.startHttpServer(0, h, { ownerPeek: true }), h).toThrow(/127\.0\.0\.1/);
+    }
+  });
+});
+
