@@ -1323,15 +1323,34 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 3 (as ruled): EVERY local credential
     expect(r.out, "the skip is named").toMatch(/no credential is sent/);
   }, 120_000);
 
-  it("a LOCAL DB and an inherited REMOTE RELAY_HTTP_HOST (a LAN address) → ZERO credential bytes there: a local DB's credentials go only through its door (Codex #418 R1 P1-3's class)", async () => {
-    const c = newCase("p3-local-remote-host");
-    const token = seedNativeDb(c);
+  // As ruled (the route as modified): an EXPLICIT non-loopback RELAY_HTTP_HOST is the remote-client declaration.
+  it.skipIf(LAN_V4 === null)("a REMOTE-configured machine WITH a local DB: the remote gets its bearer, the local door is untouched, and the notice names both (skipped by name where the runner has no LAN address)", async () => {
+    const c = newCase("p3-remote-local");
+    seedNativeDb(c);
     const d = await startOwnerDaemon(c);
-    const spy = await recorder(LAN_V4 ?? "127.0.0.1");
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: LAN_V4 ?? "localhost", RELAY_HTTP_PORT: String(spy.port) });
-    noCredential(spy, token);
-    expect(r.argv, "the credential calls went through the door").toMatch(/owner tool (health_check|register_agent)/);
+    const remoteToken = "pr3-remote-minted-token-aaaaaaaa";
+    const spy = await recorder(LAN_V4!);
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: remoteToken, RELAY_HTTP_HOST: LAN_V4!, RELAY_HTTP_PORT: String(spy.port) });
+    expect(spy.requests.some((q) => q.headers["x-agent-token"] === remoteToken || q.body.includes(remoteToken)), `the remote got its bearer\n${r.out}`).toBe(true);
+    expect(r.argv, "the local door is untouched").not.toMatch(/owner (tool|peek|session|liveness)/);
+    expect(r.out).toMatch(new RegExp(`using the remote relay ${LAN_V4!.replace(/\./g, "\\.")}; the local DB at .* is not used for credentials`));
     await stopDaemon(d.child);
+  }, 120_000);
+
+  it.skipIf(LAN_V4 === null)("a LOCAL instance's token NEVER reaches a remote: the local vault holds one, nothing in the environment, a declared remote → not one byte of it there", async () => {
+    const c = newCase("p3-no-local-token-remote");
+    const localToken = seedNativeDb(c);
+    const vault = path.join(path.dirname(c.db), "agents");
+    fs.mkdirSync(vault, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(vault, `${AGENT}.token`), `${localToken}\n`, { mode: 0o600 });
+    const spy = await recorder(LAN_V4!);
+    const r = await runHook(c, "check-relay.sh", { RELAY_HTTP_HOST: LAN_V4!, RELAY_HTTP_PORT: String(spy.port) });
+    expect(spy.requests.length, `precondition: the remote route ran\n${r.out}`).toBeGreaterThan(0);
+    expect(spy.bytes(), "the local token never reaches the remote").not.toContain(localToken);
+    for (const hook of ["codex/codex-session-start.sh"]) {
+      const r2 = await runHook(c, hook, { RELAY_HTTP_HOST: LAN_V4!, RELAY_HTTP_PORT: String(spy.port) }, JSON.stringify({ session_id: "s-pr3", hook_event_name: "SessionStart" }));
+      expect(spy.bytes(), `${hook}: the local token never reaches the remote\n${r2.out}`).not.toContain(localToken);
+    }
   }, 120_000);
 
   it("an OLD daemon (a native DB, no owner record) → no credential to the configured local endpoint, and the skip names the fix (restart the relay daemon)", async () => {
@@ -1365,6 +1384,24 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 3 (as ruled): EVERY local credential
     expect(r.argv, `the restamp went through the door\n${r.out}`).toMatch(/owner tool report_liveness|owner liveness/);
     await stopDaemon(d.child);
     expect((await agentRow(c, AGENT))?.agent_pid, "the anchor landed").not.toBeNull();
+  }, 120_000);
+
+  it.each([["the SAME session (launch-bound)", true], ["a DIFFERENT session", false]] as const)("codex-session-start.sh on the door route, a launch marker naming %s: the handoff check asks the door (/owner/v1/session), and the register is %s", async (_what, same) => {
+    const c = newCase(`p3-codex-handoff-${same ? "same" : "diff"}`);
+    const token = seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const before = await agentRow(c, AGENT);
+    const sid = String(before?.session_id ?? "");
+    expect(sid, "precondition: the agent has a session").toMatch(/^[0-9a-f-]{8,64}$/);
+    const marker = same ? sid : "0123abcd-0000-4000-8000-000000000000";
+    const spy = await recorder();
+    const r = await runHook(c, "codex/codex-session-start.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port), RELAY_LAUNCH_SESSION: marker }, JSON.stringify({ session_id: "s-pr3", hook_event_name: "SessionStart" }));
+    noCredential(spy, token);
+    expect(r.argv, "the handoff check went through the door").toMatch(/owner session/);
+    if (same) expect(r.argv, `a launch-bound session: NO register (no rotation)\n${r.out}`).not.toMatch(/owner tool register_agent/);
+    else expect(r.argv, `a different session: it registers\n${r.out}`).toMatch(/owner tool register_agent/);
+    await stopDaemon(d.child);
+    if (same) expect((await agentRow(c, AGENT))?.session_id, "the launch-bound session is not rotated").toBe(sid);
   }, 120_000);
 
   it("codex-session-start.sh (NATIVE): registration goes through the door; zero token bytes to the configured endpoint", async () => {

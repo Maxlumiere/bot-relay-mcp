@@ -150,6 +150,7 @@ const PEEK = "/owner/v1/peek";
 const HEALTH = "/owner/v1/health";
 const REGISTER = "/owner/v1/register";
 const LIVENESS = "/owner/v1/liveness";
+const SESSION = "/owner/v1/session";
 interface DoorOpts { key?: string; tamper?: boolean; aadPath?: string; agent?: string }
 /** One sealed exchange; `opened` is the reply's plaintext when it authenticates (null otherwise). */
 async function door(r: Rec, p: string, args: Record<string, unknown>, o: DoorOpts = {}) {
@@ -309,4 +310,36 @@ describe("hook PR 3: the AEAD owner door (every OS)", () => {
     expect(ownerEndpointVerdict(c.db)).toMatchObject({ ok: true });
     await stopDaemon(d.child);
   }, 90_000);
+
 });
+
+describe("hook PR 3, as ruled: /owner/v1/session (ONE agent's own session_id; no enumeration)", () => {
+  it("its own token → exactly {ok, session_id}, the row's; another agent's name, an extra field, or no token → refused, no session_id; nothing but the audit moves", async () => {
+    const c = newCase("aead-session");
+    const { d, rec, token } = await wasmOwner(c);
+    await new Promise((x) => setTimeout(x, 1500));
+    const before = await dbDump(c);
+    const ok = await door(rec, SESSION, { agent_token: token });
+    expect(ok.status, ok.raw).toBe(200);
+    expect(Object.keys(ok.opened ?? {}).sort(), "no other field").toEqual(["ok", "session_id"]);
+    const cols = before.agents![0] as string[];
+    const row = before.agents!.slice(1).find((x) => x[cols.indexOf("name")] === AGENT)!;
+    expect((ok.opened as { session_id: unknown }).session_id).toBe(row[cols.indexOf("session_id")]);
+    // A second agent, then: A's token naming B, an extra field, no token.
+    const reg = await door(rec, REGISTER, { rpc: rpc("register_agent", { name: "pr3-other", role: "r", capabilities: [] }), mint_secret: mintSecretOf(c) }, { agent: "pr3-other" });
+    expect(toolText(reg.opened), "precondition: a second agent").toMatch(/agent_token/);
+    for (const [what, r] of [
+      ["A's token naming B", await door(rec, SESSION, { agent_token: token }, { agent: "pr3-other" })],
+      ["an extra field", await door(rec, SESSION, { agent_token: token, fields: ["role"] })],
+      ["no token", await door(rec, SESSION, {})],
+      ["a wrong token", await door(rec, SESSION, { agent_token: "pr3-not-a-token-aaaaaaaaaaaaaa" })],
+    ] as const) {
+      expect(r.status, `${what}: ${r.raw}`).toBeGreaterThanOrEqual(400);
+      expect(JSON.stringify(r.opened ?? {}), what).not.toMatch(/session_id/);
+    }
+    await stopDaemon(d.child);
+    const after = await dbDump(c);
+    for (const t of ["messages", "mailbox", "agent_cursor"]) expect(after[t], `table ${t} untouched`).toEqual(before[t]);
+  }, 90_000);
+});
+
