@@ -406,8 +406,8 @@ function ownerLockedRefusal(dbPath: string, what: string): { kind: "owner-locked
     return {
       kind: "owner-locked",
       message:
-        `REFUSING ${what} of the DB at '${dbPath}': whether another relay process holds its single-owner lock cannot ` +
-        `be checked here: ${probe.reason}. Fix that, then retry. Nothing was created or opened.`,
+        `REFUSING ${what} of the DB at '${dbPath}': its single-owner lock cannot be checked here: ${probe.reason}. ` +
+        `Fix that, then retry. Nothing was created or opened.`,
     };
   }
   return {

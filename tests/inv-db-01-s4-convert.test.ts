@@ -731,26 +731,17 @@ describe("INV-DB-01 slice 4: the wasm-only converter (sql.js, native→wasm; the
     expect(body).not.toMatch(/\brenameSync\b|\bcopyFileSync\b|_renameForTests|\.convert`|"wx"/);
   }, 120_000);
 
-  it("the step ORDER: the safety copy is on disk BEFORE the first edit: an edit that fails leaves the copy (byte-equal, 0600) and the live file untouched", async () => {
+  it("the step ORDER: the safety copy is on disk BEFORE the first edit: an edit that fails leaves the copy (byte-equal, 0600) and the live file untouched (since R2 the first edit is the in-place header write; before: the sql.js image's journal_mode edit)", async () => {
     makeDb(dbPath, 0, ["a", "b"], "DELETE");
     const before = sha(dbPath);
     writeCfg({});
     wasmOnly();
-    // TEST-ONLY seam: sql.js memoises its module (initSqlJs returns the SAME SQL object to every caller), so patching the
-    // Database prototype here reaches the converter's image. The FIRST edit (journal_mode=DELETE) fails, as a crash
-    // mid-edit would.
-    const SQL = await ((await import("sql.js")) as unknown as { default: () => Promise<{ Database: { prototype: { exec(sql: string): unknown } } }> }).default();
-    const proto = SQL.Database.prototype;
-    const exec = proto.exec;
-    proto.exec = function (this: unknown, sql: string) {
-      if (/journal_mode\s*=\s*DELETE/i.test(sql)) throw new Error("injected: the first edit fails");
-      return exec.call(this, sql);
+    // The seam runs after the safety copy and the final check, immediately before the first header write: a failure
+    // there is a crash at the first edit.
+    const failFirstEdit = () => {
+      throw new Error("injected: the first edit fails");
     };
-    try {
-      await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(/injected: the first edit fails/);
-    } finally {
-      proto.exec = exec;
-    }
+    await expect((await convertMod()).convertJournal({ to: "wasm", _beforePatchForTests: failFirstEdit })).rejects.toThrow(/injected: the first edit fails/);
     const backups = path.join(caseDir, "backups");
     const copies = fs.existsSync(backups) ? fs.readdirSync(backups).filter((f) => f.includes(".pre-convert-")) : [];
     expect(copies, "the safety copy was written before the edit").toHaveLength(1);
