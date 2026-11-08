@@ -256,7 +256,71 @@ resolve_relay_token_path() {
 # relay_remote_declared — 0 when RELAY_HTTP_HOST is an EXPLICIT non-loopback host: the remote-client declaration (hook
 # PR 3, as ruled: no other flag). Its credentials go to that remote by bearer.
 relay_remote_declared() {
-  [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_host_is_loopback "$RELAY_HTTP_HOST"
+  [ -n "${RELAY_HTTP_HOST:-}" ] || return 1
+  relay_host_classify
+  [ "${RELAY_HOST_CLASS:-}" = remote ]
+}
+
+# relay_host_classify — #433 Codex R1 P1-1: classify RELAY_HTTP_HOST ONCE per run (cached) through `relay host-class`
+# (src/host-class.ts: every loopback spelling normalized, a name resolved under a deadline). Sets RELAY_HOST_CLASS
+# (loopback | remote | unresolved), RELAY_HOST_PIN (the CHECKED address: every bearer curl is pinned to it,
+# relay_curl_remote) and RELAY_HOST_WHY. Unresolved is fail-closed: no credential goes to it. Its budget is the
+# margin, or RELAY_HOST_BUDGET (SessionStart: premail).
+relay_host_classify() {
+  [ -n "${RELAY_HOST_CLASS:-}" ] && return 0
+  local h="${RELAY_HTTP_HOST:-127.0.0.1}" cli out ms
+  RELAY_HOST_PIN="" RELAY_HOST_WHY=""
+  # A CANONICAL dotted quad (four decimal octets, no leading zero) is unambiguous: classified here, its own pin.
+  # Every other spelling (numeric forms, IPv6, a name) goes to the normalizing check.
+  local quad='^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$'
+  if [[ "$h" =~ $quad ]]; then
+    case "$h" in
+      127.*|0.0.0.0) RELAY_HOST_CLASS=loopback ;;
+      *) RELAY_HOST_CLASS=remote ;;
+    esac
+    RELAY_HOST_PIN="$h"
+    return 0
+  fi
+  if ! relay_budget_for "the relay host check" 2 "${RELAY_HOST_BUDGET:-margin}"; then
+    RELAY_HOST_CLASS=unresolved RELAY_HOST_WHY="no time budget left for the relay host check"
+    return 0
+  fi
+  cli="$(relay_helpers_cli)"
+  ms=$(( RELAY_STEP_SECS * 1000 - 300 ))
+  [ "$ms" -lt 100 ] && ms=100
+  out=$(relay_run_streamed "$RELAY_STEP_SECS" node "$cli" host-class "$h" --timeout-ms "$ms" 2>/dev/null) || out=""
+  case "$out" in
+    "loopback "*) RELAY_HOST_CLASS=loopback RELAY_HOST_PIN="${out#loopback }" ;;
+    "remote "*) RELAY_HOST_CLASS=remote RELAY_HOST_PIN="${out#remote }" ;;
+    "unresolved "*) RELAY_HOST_CLASS=unresolved RELAY_HOST_WHY="$(printf '%s' "${out#unresolved }" | tr -cd 'A-Za-z0-9 ._:()-' | cut -c1-120)" ;;
+    *) RELAY_HOST_CLASS=unresolved RELAY_HOST_WHY="the relay host check gave no answer" ;;
+  esac
+  case "$RELAY_HOST_PIN" in
+    *[!0-9a-fA-F.:]*) RELAY_HOST_CLASS=unresolved RELAY_HOST_WHY="the checked address is not an IP address" RELAY_HOST_PIN="" ;;
+  esac
+  return 0
+}
+
+# relay_curl_remote — #433 Codex R1 P1-1/P1-4: the arguments EVERY bearer credential curl (a declared remote or a
+# trusted tunnel) starts with, as the array RELAY_CURL_REMOTE: -q FIRST (no curl configuration file), --noproxy '*'
+# (no proxy from the environment), and --resolve pinning the host to its CHECKED address (curl never resolves again).
+relay_curl_remote() {
+  relay_host_classify
+  local pin="${RELAY_HOST_PIN:-}"
+  case "$pin" in *:*) pin="[$pin]" ;; esac
+  RELAY_CURL_REMOTE=(-q --noproxy '*')
+  [ -n "$pin" ] && RELAY_CURL_REMOTE+=(--resolve "${RELAY_HTTP_HOST:-127.0.0.1}:${RELAY_HTTP_PORT:-3777}:${pin}")
+  return 0
+}
+
+# relay_bearer_refusal — the named reason a bearer credential is NOT sent to the configured endpoint.
+relay_bearer_refusal() {
+  relay_host_classify
+  if [ "${RELAY_HOST_CLASS:-}" = unresolved ]; then
+    printf 'the relay host %s could not be checked (%s): no token is sent' "${RELAY_HTTP_HOST:-127.0.0.1}" "${RELAY_HOST_WHY:-unknown}"
+  else
+    printf 'no token is sent to the loopback port %s (%s)' "${RELAY_HTTP_PORT:-3777}" "$RELAY_TUNNEL_HINT"
+  fi
 }
 
 # relay_trusted_tunnel — 0 when RELAY_HTTP_TRUSTED_TUNNEL_PORT opts THIS loopback port in (hook PR 3, as ruled: a
@@ -267,7 +331,8 @@ relay_trusted_tunnel() {
   local t="${RELAY_HTTP_TRUSTED_TUNNEL_PORT:-}" p="${RELAY_HTTP_PORT:-3777}"
   case "$t" in ''|*[!0-9]*) return 1 ;; esac
   [ "$t" = "$p" ] || return 1
-  relay_host_is_loopback "${RELAY_HTTP_HOST:-127.0.0.1}" || return 1
+  relay_host_classify
+  [ "${RELAY_HOST_CLASS:-}" = loopback ] || return 1
   # `relay pending` said exit 3 (no local instance at all): definitive, no resolver needed.
   [ "${RELAY_NO_LOCAL_INSTANCE:-}" = 1 ] && return 0
   [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
@@ -285,22 +350,12 @@ relay_bearer_allowed() {
 # RELAY_TUNNEL_HINT — what a refused loopback bearer names (as ruled: the default skip names the opt-in).
 RELAY_TUNNEL_HINT="a relay reached through an ssh tunnel on this loopback port needs RELAY_HTTP_TRUSTED_TUNNEL_PORT set to that port"
 
-# relay_scope_vault_to_remote — hook PR 3 (as ruled): a local instance's token never reaches a remote. On a declared
-# remote WITH a local DB, or a trusted tunnel, the vault entries this run reads and writes are that remote's own
-# (agents/remote-<host>-<port>/<name>.token), so only a token THAT remote minted is ever sent to it. A declared remote
-# with no local DB keeps the vault beside the would-be instance (only a remote route ever wrote it): unscoped.
+# relay_scope_vault_to_remote — a local instance's token never reaches a remote, and one remote's never reaches
+# another (#433 Codex R1 P1-3): on a declared remote or a trusted tunnel, the vault entries this run reads and writes
+# are THAT destination's own, always (agents/remote-<host>-<port>/<name>.token, whether or not a local DB exists), and
+# its registration secret beside them (relay_mint_secret_file). Nothing unscoped is ever imported into a scope.
 relay_scope_vault_to_remote() {
-  local scoped=0
-  if relay_remote_declared; then
-    # No local instance (relay pending's exit 3) = no local token to keep apart: unscoped, and no resolver needed.
-    if [ "${RELAY_NO_LOCAL_INSTANCE:-}" != 1 ]; then
-      [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
-      [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ] && scoped=1
-    fi
-  elif relay_trusted_tunnel; then
-    scoped=1
-  fi
-  if [ "$scoped" = 1 ]; then
+  if relay_remote_declared || relay_trusted_tunnel; then
     local h="${RELAY_HTTP_HOST:-127.0.0.1}" p="${RELAY_HTTP_PORT:-3777}"
     h="${h//[^A-Za-z0-9_.-]/_}"
     p="${p//[^0-9]/}"
@@ -398,15 +453,6 @@ relay_owner_session() {
   return 0
 }
 
-# relay_host_is_loopback HOST — 0 when HOST names this machine's loopback (or a wildcard bind, which a local client
-# reaches through loopback): 127.0.0.0/8, localhost, ::1, 0.0.0.0, ::.
-relay_host_is_loopback() {
-  case "$1" in
-    127.*|localhost|::1|'[::1]'|0.0.0.0|::|'[::]') return 0 ;;
-  esac
-  return 1
-}
-
 # relay_run_streamed SECS CMD... — CMD killed at SECS (124 = timed out), its stdin, stdout and stderr this function's
 # OWN (no file): for a step that is fed and read through a pipe (a renderer, a parser) and must stay inside the budget.
 relay_run_streamed() {
@@ -502,7 +548,18 @@ relay_reply_summary() {
 relay_mint_secret_file() {
   local db_path
   db_path=$(resolve_relay_db_path 2>/dev/null) || return 1
-  printf '%s\n' "$(dirname "$db_path")/secrets/mint.secret"
+  # #433 Codex R1 P1-2 (as ruled): a REMOTE's registration secret is its own (relay remote set-mint-secret), beside its
+  # vault scope. NEVER the local instance's: no fallback.
+  if [ -n "${RELAY_VAULT_SCOPE:-}" ]; then
+    printf '%s\n' "$(dirname "$db_path")/agents/${RELAY_VAULT_SCOPE}/mint.secret"
+  else
+    printf '%s\n' "$(dirname "$db_path")/secrets/mint.secret"
+  fi
+}
+
+# relay_remote_mint_hint — the named skip when a remote's own secret is absent (as ruled).
+relay_remote_mint_hint() {
+  printf "provision the remote's mint secret: relay remote set-mint-secret %s:%s, reading STDIN" "${RELAY_HTTP_HOST:-127.0.0.1}" "${RELAY_HTTP_PORT:-3777}"
 }
 
 relay_mint_secret_curl_config() {

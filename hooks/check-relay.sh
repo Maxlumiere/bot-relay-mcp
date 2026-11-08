@@ -305,8 +305,9 @@ fi
 # (3-min broken state hit 2026-05-04 during a builder spawn) and makes restart-of-
 # closed-terminal lossless: identity persists even when the operator did not
 # bake RELAY_AGENT_TOKEN into a shell rc file.
-# Hook PR 3 (as ruled): on a declared remote with a local DB, only that remote's own vault entries.
-relay_scope_vault_to_remote
+# Hook PR 3 / #433 R1 (as ruled): on a declared remote or a trusted tunnel, only THAT destination's own vault entries
+# (and registration secret). The host check takes the pre-mail budget here.
+RELAY_HOST_BUDGET=premail relay_scope_vault_to_remote
 if [ -z "${RELAY_AGENT_TOKEN:-}" ]; then
   if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME"); then
     export RELAY_AGENT_TOKEN="$VAULT_TOKEN"
@@ -684,7 +685,7 @@ relay_deliver_remote_mail() {
     return 0
   fi
   # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
-  resp=$({ relay_curl_token_config "$tok" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
+  resp=$({ relay_curl_token_config "$tok" && relay_curl_config_line data "$payload"; } | curl "${RELAY_CURL_REMOTE[@]}" -fsS -m "$RELAY_STEP_SECS" -K - \
     -X POST "http://${host}:${port}/mcp" \
     -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
     2>/dev/null) || { relay_remote_failed "the remote relay did not answer"; return 0; }
@@ -795,6 +796,8 @@ relay_deliver_pending_mail() {
     3)
       RELAY_NO_LOCAL_INSTANCE=1
       if [ -n "${RELAY_HTTP_HOST:-}" ] && relay_bearer_allowed; then
+        # #433 R1: pinned to the checked address, no curl config, no proxy.
+        relay_curl_remote
         # Remote mode: SessionStart's one bearer call (with no local DB it exits after the mail). A trusted tunnel's
         # risk is named here, every session (as ruled).
         relay_remote_declared || echo "[RELAY] bearer to a trusted tunnel on 127.0.0.1:${HTTP_PORT}: if the tunnel drops, another local user could take that port." >&2
@@ -802,7 +805,7 @@ relay_deliver_pending_mail() {
         return 0
       elif [ -n "${RELAY_HTTP_HOST:-}" ]; then
         # Hook PR 3 (as ruled): a loopback bearer is refused (the port-theft class) unless it is a trusted tunnel.
-        relay_remote_failed "no token is sent to the loopback port ${HTTP_PORT} (${RELAY_TUNNEL_HINT})"
+        relay_remote_failed "$(relay_bearer_refusal)"
         return 0
       fi
       # Nothing to read, and no judgement made about the mail.
@@ -873,7 +876,9 @@ _local_db=0
 [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ] && _local_db=1
 if relay_remote_declared; then
   RELAY_CRED_ROUTE=bearer
-  RELAY_CURL_GUARD=()
+  # #433 R1: -q first, no proxy, pinned to the CHECKED address.
+  relay_curl_remote
+  RELAY_CURL_GUARD=("${RELAY_CURL_REMOTE[@]}")
   [ "$_local_db" = 1 ] && echo "[RELAY] using the remote relay ${HTTP_HOST}; the local DB at ${RELAY_RES_DB_PATH:-?} is not used for credentials." >&2
 elif [ "$_local_db" = 1 ]; then
   case "${RELAY_RES_HOOK_DB:-}" in
@@ -1221,6 +1226,10 @@ if [ "$SKIP_REGISTER" -eq 0 ] && [ "$RELAY_CRED_OK" = 1 ] && { [ "$RELAY_CRED_RO
       || REG_BODY="${REG_BODY}
 HTTP_STATUS:000"
   else
+    # #433 R1 P1-2 (as ruled): a remote is presented ITS OWN registration secret only, never the local one.
+    if [ -n "${RELAY_VAULT_SCOPE:-}" ] && ! relay_mint_secret_curl_config >/dev/null 2>&1; then
+      echo "[RELAY] no registration secret for the remote relay: $(relay_remote_mint_hint)." >&2
+    fi
     # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
     REG_BODY=$({ relay_mint_secret_curl_config || true; relay_curl_token_config "${RELAY_AGENT_TOKEN:-}" || true; } | curl "${RELAY_CURL_GUARD[@]}" -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - \
       -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \

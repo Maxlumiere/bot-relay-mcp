@@ -87,6 +87,8 @@ const SUBCOMMANDS = {
   "purge-history": "../dist/cli/purge-history.js",
   "convert-journal": "../dist/cli/convert-journal.js",
   "owner": "../dist/cli/owner.js",
+  "host-class": "../dist/cli/host-class.js",
+  remote: "../dist/cli/remote.js",
   "purge-agents": "../dist/cli/purge-agents.js",
   open: "../dist/cli/open.js",
   "list-instances": "../dist/cli/list-instances.js",

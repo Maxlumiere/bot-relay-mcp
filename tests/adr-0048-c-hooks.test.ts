@@ -205,11 +205,13 @@ describe("ADR-0048 PR C — PostToolUse / Stop take pending's embedded resolutio
   for (const hook of ["post-tool-use-check.sh", "stop-check.sh"]) {
     it(`${hook}, remote mode: the vault token (beside the resolver's DB, via ONE relay where) is used for the remote read`, () => {
       const token = "vaulttok_" + "x".repeat(20);
-      fs.mkdirSync(path.join(RH, "agents"), { recursive: true });
-      fs.writeFileSync(path.join(RH, "agents", `${AGENT}.token`), token + "\n", { mode: 0o600 });
+      // #433 R1 P1-3: a remote's vault entries are its OWN (scoped by destination: host 203.0.113.10, port 1).
+      const dir = path.join(RH, "agents", "remote-203.0.113.10-1");
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(dir, `${AGENT}.token`), token + "\n", { mode: 0o600 });
       fs.writeFileSync(HEALTH_OK, "");
       // A REMOTE relay (curl is a stub). Hook PR 3 (as ruled): only an explicit non-loopback host declares one.
-      const r = runHook(hook, { RELAY_HTTP_HOST: "relay.example.test" }, JSON.stringify({ session_id: "s1" }));
+      const r = runHook(hook, { RELAY_HTTP_HOST: "203.0.113.10" }, JSON.stringify({ session_id: "s1" }));
       // The token reaches curl through its config on STDIN, and never through argv (readable by every user).
       expect(r.curls, r.out).toContain(`cfg: header = "X-Agent-Token: ${token}"`);
       expect(r.curls.filter((l) => !l.startsWith("cfg: ")).join("\n"), r.out).not.toContain(token);
@@ -408,7 +410,7 @@ describe("Codex #291 R1 #1 — SessionStart: the pre-mail steps can never eat th
         RELAY_AGENT_TOKEN: "tok_" + "z".repeat(20),
         // Hook PR 3 (as ruled): a local DB's credential calls go only through its door; the HTTP health check and
         // registration a row times run only for a DECLARED remote (an explicit non-loopback host; curl is a stub).
-        ...(declaredRemote ? { RELAY_HTTP_HOST: "relay.example.test" } : {}),
+        ...(declaredRemote ? { RELAY_HTTP_HOST: "203.0.113.10" } : {}),
         RELAY_HTTP_PORT: "1",
         RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json"),
       },

@@ -338,7 +338,7 @@ function timed(hook: string, tag: string, env: Record<string, string>, input = "
       RELAY_AGENT_NAME: AGENT,
       // A REMOTE relay (curl is a stub: no connection is made). Hook PR 3 (as ruled): only an explicit non-loopback host
       // declares one; a loopback host would be refused as an unopted tunnel.
-      RELAY_HTTP_HOST: "relay.example.test",
+      RELAY_HTTP_HOST: "203.0.113.10",
       RELAY_HTTP_PORT: "1",
       RELAY_HOOK_NOTICE_REMIND_SECS: "0",
       RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json"),
@@ -367,8 +367,10 @@ function expectEveryCallInsideTheBudget(r: ReturnType<typeof timed>, budget: num
 
 function vaultToken(): string {
   const token = "vaulttok_" + "r".repeat(20);
-  fs.mkdirSync(path.join(RH, "agents"), { recursive: true });
-  fs.writeFileSync(path.join(RH, "agents", `${AGENT}.token`), token + "\n", { mode: 0o600 });
+  // #433 R1 P1-3: a remote's vault entries are its OWN (scoped by destination), never the unscoped vault.
+  const dir = path.join(RH, "agents", "remote-203.0.113.10-1");
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(dir, `${AGENT}.token`), token + "\n", { mode: 0o600 });
   return token;
 }
 

@@ -108,6 +108,9 @@ register_at_launch() {
     return 0
   fi
   [ "$route" = door ] || command -v curl >/dev/null 2>&1 || return 0
+  # #433 R1: a bearer to a remote or a tunnel is pinned to the checked address, without curl config or proxy.
+  RELAY_CURL_REMOTE=()
+  [ "$route" = curl ] && command -v relay_curl_remote >/dev/null 2>&1 && relay_curl_remote
 
   # Token: env, else the per-instance vault (shared with the hooks). Optional —
   # an existing active agent needs it to re-register; a brand-new agent's first
@@ -124,7 +127,7 @@ register_at_launch() {
 
   # Daemon reachable? Tight bound — a hung daemon must not delay the launch. (The door's own exchange proves it.)
   if [ "$route" = curl ]; then
-    curl -fsS --connect-timeout 1 --max-time 1 "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1 || return 0
+    curl ${RELAY_CURL_REMOTE[@]+"${RELAY_CURL_REMOTE[@]}"} -fsS --connect-timeout 1 --max-time 1 "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1 || return 0
   fi
 
   # THE POINT: host_shell_pids from THIS process (a child of the launching shell)
@@ -174,7 +177,7 @@ register_at_launch() {
   else
     body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":${args}}}"
     # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
-    reg_body=$({ command -v relay_mint_secret_curl_config >/dev/null 2>&1 && relay_mint_secret_curl_config || true; relay_curl_token_config "$token" || true; } | curl -fsS --connect-timeout 1 --max-time 2 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+    reg_body=$({ command -v relay_mint_secret_curl_config >/dev/null 2>&1 && relay_mint_secret_curl_config || true; relay_curl_token_config "$token" || true; } | curl ${RELAY_CURL_REMOTE[@]+"${RELAY_CURL_REMOTE[@]}"} -fsS --connect-timeout 1 --max-time 2 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
       "${reg_headers[@]}" \
       --data "$body" 2>/dev/null) || return 0
   fi

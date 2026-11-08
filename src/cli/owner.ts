@@ -136,19 +136,24 @@ function exchange(
           } else chunks.push(c);
         });
         res.on("end", () => {
-          const status = res.statusCode ?? 0;
-          let env: Record<string, unknown> = {};
+          // A callback failure REJECTS (never an uncaught exception, never an unsettled promise).
           try {
-            env = JSON.parse(Buffer.concat(chunks).toString("utf-8")) as Record<string, unknown>;
-          } catch {
-            /* not an envelope: it does not open */
+            const status = res.statusCode ?? 0;
+            let env: unknown = null;
+            try {
+              env = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+            } catch {
+              /* not JSON: not an envelope */
+            }
+            const opened = doorOpen(doorKey(key, "resp"), doorResponseAad(binding, doorPath, ts, nonce, status), env);
+            if (opened === null || typeof opened !== "object" || Array.isArray(opened)) {
+              reject(new Error("the owner's reply failed its authentication (a forged or altered reply, or no owner): nothing from it is shown"));
+              return;
+            }
+            resolve({ status, payload: opened as Record<string, unknown> });
+          } catch (err) {
+            reject(new Error(`the owner's reply could not be read (${(err as Error).message})`));
           }
-          const opened = doorOpen(doorKey(key, "resp"), doorResponseAad(binding, doorPath, ts, nonce, status), env);
-          if (opened === null || typeof opened !== "object") {
-            reject(new Error("the owner's reply failed its authentication (a forged or altered reply, or no owner): nothing from it is shown"));
-            return;
-          }
-          resolve({ status, payload: opened as Record<string, unknown> });
         });
         res.on("error", (e) => reject(e));
       },

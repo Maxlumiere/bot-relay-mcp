@@ -31,7 +31,8 @@ import { processStartedAt, startOrNull } from "./liveness.js";
 import { restrictToOwnerWindows, privacyFaults, windowsForeignWriteSids } from "./fs-perms.js";
 import { sameFileIdentity } from "./file-identity.js";
 
-export const OWNER_ENDPOINT_VERSION = 2;
+/** v3 (#433): the AEAD door. A v1 or v2 record (an older daemon) is "old-record": restart the relay daemon. */
+export const OWNER_ENDPOINT_VERSION = 3;
 const KEY = crypto.randomBytes(16).toString("hex"); // this process's owner key: fresh per process, never served
 
 export interface OwnerEndpointRecord {
@@ -247,7 +248,7 @@ export function ownerEndpointVerdict(dbPath: string, instanceId?: string): Owner
   } catch {
     return { ok: false, reason: "bad-record" };
   }
-  if (rec.v === 1) return { ok: false, reason: "old-record" };
+  if (rec.v === 1 || rec.v === 2) return { ok: false, reason: "old-record" };
   if (rec.v !== OWNER_ENDPOINT_VERSION || rec.host !== "127.0.0.1") return { ok: false, reason: "bad-record" };
   if (!Number.isInteger(rec.port) || (rec.port as number) < 1 || (rec.port as number) > 65535) return { ok: false, reason: "bad-record" };
   if (typeof rec.key !== "string" || !/^[0-9a-f]{32}$/.test(rec.key)) return { ok: false, reason: "bad-record" };
@@ -308,7 +309,10 @@ export function doorSeal(key: Buffer, aad: Buffer, plain: unknown): SealedEnvelo
   return { iv: iv.toString("base64"), ct: ct.toString("base64"), tag: c.getAuthTag().toString("base64") };
 }
 /** Open an envelope, or null when it does not authenticate (a wrong key, a tampered byte, another AAD). */
-export function doorOpen(key: Buffer, aad: Buffer, env: Partial<SealedEnvelope>): unknown | null {
+export function doorOpen(key: Buffer, aad: Buffer, envIn: unknown): unknown | null {
+  // Any JSON may arrive (a stale or substituted listener): only a non-null, non-array object is an envelope.
+  if (envIn === null || typeof envIn !== "object" || Array.isArray(envIn)) return null;
+  const env = envIn as Partial<SealedEnvelope>;
   if (typeof env.iv !== "string" || typeof env.ct !== "string" || typeof env.tag !== "string") return null;
   if (!B64_RE.test(env.iv) || !B64_RE.test(env.tag) || (env.ct.length > 0 && !B64_RE.test(env.ct))) return null;
   const iv = Buffer.from(env.iv, "base64");

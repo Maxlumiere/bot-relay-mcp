@@ -458,7 +458,7 @@ http_peek() {
   # The REMOTE route only (a wasm DB's owner is read through its door: relay_owner_read).
   local base="http://${HTTP_HOST}:${HTTP_PORT}"
   relay_budget_for "the remote health probe" 1 margin || return 125
-  if ! curl -fsS -m "$RELAY_STEP_SECS" "${base}/health" >/dev/null 2>&1; then
+  if ! curl "${RELAY_CURL_REMOTE[@]}" -fsS -m "$RELAY_STEP_SECS" "${base}/health" >/dev/null 2>&1; then
     return 1
   fi
 
@@ -491,7 +491,7 @@ print(json.dumps({
   local response
   relay_budget_for "the remote mail read" 2 margin || return 125
   # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
-  response=$({ relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
+  response=$({ relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl "${RELAY_CURL_REMOTE[@]}" -fsS -m "$RELAY_STEP_SECS" -K - \
     -X POST "${base}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
@@ -755,9 +755,11 @@ case "$F1_RC" in
     if [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_bearer_allowed; then
       # Hook PR 3 (as ruled): a loopback bearer is refused (the port-theft class) unless it is a trusted tunnel.
       MODE=remote
-      echo "[RELAY] mail not read: no token is sent to the loopback port ${RELAY_HTTP_PORT:-3777} (${RELAY_TUNNEL_HINT}). Mail may be waiting: call get_messages." >&2
+      echo "[RELAY] mail not read: $(relay_bearer_refusal). Mail may be waiting: call get_messages." >&2
     elif [ -n "${RELAY_HTTP_HOST:-}" ]; then
       MODE=remote
+      # #433 R1: pinned to the checked address, no curl config, no proxy.
+      relay_curl_remote
       # The vault (scoped to the remote when it must be) is beside the resolver's DB: one `relay where`, remote only.
       relay_scope_vault_to_remote
       if [ -z "$AGENT_TOKEN" ]; then

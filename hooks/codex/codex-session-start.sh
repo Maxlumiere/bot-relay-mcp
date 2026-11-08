@@ -200,6 +200,7 @@ sys.stdout.write(json.dumps({
 # On the door route the cold-start handoff check asks the door for THIS agent's own session_id (/owner/v1/session, as
 # ruled: one name, its own token, no enumeration) instead of discover_agents.
 CODEX_ROUTE=curl
+RELAY_CURL_REMOTE=()
 if command -v relay_owner_tool >/dev/null 2>&1 && command -v relay_where_load >/dev/null 2>&1 && ! relay_remote_declared; then
   CODEX_CLI="$HOOKS_DIR/../bin/relay"
   CODEX_ROUTE=none
@@ -224,6 +225,9 @@ if command -v relay_owner_tool >/dev/null 2>&1 && command -v relay_where_load >/
     emit_context_and_exit
   fi
 fi
+
+# #433 R1: a bearer to a remote or a tunnel is pinned to the checked address, without curl config or proxy.
+[ "$CODEX_ROUTE" = curl ] && command -v relay_curl_remote >/dev/null 2>&1 && relay_curl_remote
 
 # curl is required to register on the curl route; without it, still emit the inbox nudge so the
 # model checks mail (its own get_messages call surfaces any error).
@@ -278,7 +282,7 @@ relay_token_config() { command -v relay_curl_token_config >/dev/null 2>&1 && rel
 # can never make us skip (no cross-agent leakage).
 SKIP_REGISTER_HANDOFF=0
 if [ "$CODEX_ROUTE" = curl ] && relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$'; then
-  DISCOVER_BODY=$(relay_token_config | curl -fsS --connect-timeout 1 --max-time 2 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  DISCOVER_BODY=$(relay_token_config | curl ${RELAY_CURL_REMOTE[@]+"${RELAY_CURL_REMOTE[@]}"} -fsS --connect-timeout 1 --max-time 2 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"discover_agents","arguments":{}}}' 2>/dev/null) || DISCOVER_BODY=""
   if [ -n "$DISCOVER_BODY" ] && command -v python3 >/dev/null 2>&1; then
@@ -313,7 +317,11 @@ if [ "$SKIP_REGISTER_HANDOFF" -eq 0 ]; then
   REG_BODY=""
   if [ "$CODEX_ROUTE" = curl ]; then
     # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
-    REG_BODY=$({ command -v relay_mint_secret_curl_config >/dev/null 2>&1 && relay_mint_secret_curl_config || true; relay_token_config || true; } | curl -s -m 4 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+    # #433 R1 P1-2 (as ruled): a remote is presented ITS OWN registration secret only, never the local one.
+    if [ -n "${RELAY_VAULT_SCOPE:-}" ] && command -v relay_mint_secret_curl_config >/dev/null 2>&1 && ! relay_mint_secret_curl_config >/dev/null 2>&1; then
+      echo "[RELAY] no registration secret for the remote relay: $(relay_remote_mint_hint)." >&2
+    fi
+    REG_BODY=$({ command -v relay_mint_secret_curl_config >/dev/null 2>&1 && relay_mint_secret_curl_config || true; relay_token_config || true; } | curl ${RELAY_CURL_REMOTE[@]+"${RELAY_CURL_REMOTE[@]}"} -s -m 4 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
       "${REG_HEADERS[@]}" \
       -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":${CODEX_REG_ARGS}}}" \
       2>/dev/null)

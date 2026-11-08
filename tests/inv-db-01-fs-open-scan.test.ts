@@ -68,6 +68,7 @@ const INVENTORY: Record<string, Entry> = {
   "src/convert-journal.ts::writeDriverDeclaration::writeFileSync": { n: 1, source: "a temp file (wx) beside that config, renamed onto it" },
   "src/owner-endpoint.ts::readTrustedRecord::openSync": { n: 1, source: "the owner endpoint record, a dotfile next to the database file (.<name>.relay-owner.json, not a DB-family name), opened O_NOFOLLOW for its trust checks (fstat) and its read" },
   "src/owner-endpoint.ts::readTrustedRecord::readFileSync": { n: 1, source: "the owner endpoint record, read through its trusted descriptor after the identity check" },
+  "src/cli/remote.ts::writePrivateFile::openSync": { n: 1, source: "a NEW temp file (O_CREAT|O_EXCL|O_NOFOLLOW, 0600) beside a remote's mint.secret (agents/remote-<host>-<port>/, not a DB-family name): made private and verified through its one descriptor, written, fsync'd, renamed" },
   "src/owner-endpoint.ts::writeOwnerEndpoint::openSync": { n: 1, source: "a NEW temp file (O_CREAT|O_EXCL|O_NOFOLLOW, 0600) beside the owner endpoint record: protected and verified through its one descriptor, which then receives the key; renamed onto the record" },
   "src/config.ts::loadConfig::readFileSync": { n: 1, source: "config.json (getConfigPath())" },
   "src/config.ts::readConfigFileKeys::readFileSync": { n: 1, source: "config.json (getConfigPath())" },
