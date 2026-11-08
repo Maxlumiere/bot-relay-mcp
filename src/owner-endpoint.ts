@@ -99,7 +99,12 @@ function protectPrivate(p: string, fd: number): string[] {
   const faults = restrictToOwnerWindows(p, false);
   return faults.length > 0 ? faults : privacyFaults(p, 0o600);
 }
-const sameFile = (a: fs.Stats, b: fs.Stats) => a.dev === b.dev && a.ino === b.ino;
+/**
+ * Identity by (dev, ino) as BigInts: Node's numeric ino is a double, and an NTFS file id (64 bits, sequence bits high)
+ * exceeds 2^53, so two files can round to the same number (INFERRED from a Windows CI pass of a swap). Exact only.
+ */
+const statId = (s: fs.BigIntStats) => `${s.dev}:${s.ino}`;
+const sameFile = (a: fs.BigIntStats, b: fs.BigIntStats) => statId(a) === statId(b);
 const euidNow = () => (typeof process.geteuid === "function" ? process.geteuid() : -1);
 
 /**
@@ -129,10 +134,10 @@ export function writeOwnerEndpoint(dbPath: string, port: number, transport: Owne
     if (writerHookForTests) writerHookForTests(tmp);
     const faults = protectPrivate(tmp, fd);
     if (faults.length > 0) throw new Error(`the record's temp file could not be made owner-only: ${faults.join("; ")}`);
-    const st = fs.fstatSync(fd);
-    const lst = fs.lstatSync(tmp);
-    if (!lst.isFile() || lst.isSymbolicLink() || !sameFile(st, lst) || st.nlink !== 1) throw new Error("the record's temp file changed under its writer (its name no longer names the file it created)");
-    if (process.platform !== "win32" && (st.uid !== euidNow() || (st.mode & 0o077) !== 0)) throw new Error("the record's temp file is not private to this user");
+    const st = fs.fstatSync(fd, { bigint: true });
+    const lst = fs.lstatSync(tmp, { bigint: true });
+    if (!lst.isFile() || lst.isSymbolicLink() || !sameFile(st, lst) || st.nlink !== 1n) throw new Error("the record's temp file changed under its writer (its name no longer names the file it created)");
+    if (process.platform !== "win32" && (st.uid !== BigInt(euidNow()) || (st.mode & 0o077n) !== 0n)) throw new Error("the record's temp file is not private to this user");
     fs.writeSync(fd, JSON.stringify(record) + "\n");
     fs.fsyncSync(fd);
     fs.closeSync(fd);
@@ -202,17 +207,17 @@ function readTrustedRecord(dbPath: string): { text: string } | { reason: "no-rec
     return { reason: (err as NodeJS.ErrnoException).code === "ENOENT" ? "no-record" : "untrusted-record" };
   }
   try {
-    const st = fs.fstatSync(fd);
+    const st = fs.fstatSync(fd, { bigint: true });
     if (process.platform === "win32") {
       const lst = fs.lstatSync(file);
-      if (!st.isFile() || lst.isSymbolicLink() || st.nlink !== 1 || privacyFaults(file, 0o600).length > 0) return { reason: "untrusted-record" };
-    } else if (!recordStatTrusted(st, euidNow())) {
+      if (!st.isFile() || lst.isSymbolicLink() || st.nlink !== 1n || privacyFaults(file, 0o600).length > 0) return { reason: "untrusted-record" };
+    } else if (!recordStatTrusted({ isFile: () => st.isFile(), nlink: Number(st.nlink), uid: Number(st.uid), mode: Number(st.mode) }, euidNow())) {
       return { reason: "untrusted-record" };
     }
     if (readerHookForTests) readerHookForTests(file);
-    let now: fs.Stats;
+    let now: fs.BigIntStats;
     try {
-      now = fs.statSync(file);
+      now = fs.statSync(file, { bigint: true });
     } catch {
       return { reason: "untrusted-record" };
     }
