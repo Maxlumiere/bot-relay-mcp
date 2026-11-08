@@ -171,6 +171,12 @@ function registerExtra(c: Case, name: string): string {
   expect(r.status, r.stderr).toBe(0);
   return r.stdout.trim();
 }
+/** Windows: an owner-only ACL on each path (what the trusted writers set); a no-op elsewhere (the modes do it). */
+async function privatize(...items: Array<[string, boolean]>): Promise<void> {
+  if (process.platform !== "win32") return;
+  const { restrictToOwnerWindows } = (await import("../src/fs-perms.js")) as { restrictToOwnerWindows: (p: string, isDir: boolean) => string[] };
+  for (const [p, isDir] of items) expect(restrictToOwnerWindows(p, isDir), `precondition: ${p} made private`).toEqual([]);
+}
 /** A recording listener on `host`: every request (method, url, headers, body). */
 async function recorder(host = "127.0.0.1", handler?: (req: http.IncomingMessage, res: http.ServerResponse) => void, atPort = 0) {
   const reqs: Array<{ method: string; url: string; headers: http.IncomingHttpHeaders; body: string }> = [];
@@ -411,6 +417,7 @@ describe("#434 rulings: per-remote credentials (every OS)", () => {
     const scoped = path.join(path.dirname(c.db), "agents", "remote-203.0.113.10-3777");
     fs.mkdirSync(scoped, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(scoped, `${AGENT}.token`), "pr4-the-remotes-own-token-aaaaaaaa\n", { mode: 0o600 });
+    await privatize([path.dirname(scoped), true], [scoped, true], [path.join(scoped, `${AGENT}.token`), false]);
     const probe = path.join(c.home, "probe.mjs");
     fs.writeFileSync(probe, `const m = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "cli", "relay-client.js")).href)});
 process.stdout.write(JSON.stringify({ selected: await m.remoteToken("203.0.113.10", 3777, ${JSON.stringify(AGENT)}, { envSelected: true }), other: await m.remoteToken("203.0.113.10", 3777, ${JSON.stringify(AGENT)}, { envSelected: false }) }));`);
@@ -598,16 +605,17 @@ process.stdout.write(JSON.stringify({ at: await send(65536), over: await send(65
 describe("#434 R1 P2-4: a remote's credential files are read through a trusted chain", () => {
   const linkDir = (target: string, link: string) => fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
   const scopeOf = (c: Case, host: string) => path.join(c.dir, "agents", `remote-${host}-3777`);
-  const putToken = (dir: string, tok: string) => {
+  const putToken = async (dir: string, tok: string) => {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(dir, `${AGENT}.token`), `${tok}\n`, { mode: 0o600 });
+    await privatize([path.dirname(dir), true], [dir, true], [path.join(dir, `${AGENT}.token`), false]);
   };
   const ask = (c: Case, host: string) => probeAsync(c, `process.stdout.write(JSON.stringify({ tok: await m.remoteToken(${JSON.stringify(host)}, 3777, ${JSON.stringify(AGENT)}, { envSelected: false }) }));`);
 
   it("control: a private scope → its token; a scope that is a LINK to the local agents dir → nothing (the local token is never read); a link to ANOTHER remote's scope → refused", async () => {
     const c = newCase("scope-chain");
     seedNativeDb(c);
-    putToken(scopeOf(c, "203.0.113.10"), "pr4-remote-a-own-token-aaaaaaaa");
+    await putToken(scopeOf(c, "203.0.113.10"), "pr4-remote-a-own-token-aaaaaaaa");
     const ok = await ask(c, "203.0.113.10");
     expect(JSON.parse(ok.stdout || "{}").tok, `control: a private scope's token (${ok.stderr})`).toBe("pr4-remote-a-own-token-aaaaaaaa");
     // the local vault: agents/<agent>.token; remote-203.0.113.20 → a link to agents/ itself
@@ -625,9 +633,9 @@ describe("#434 R1 P2-4: a remote's credential files are read through a trusted c
     const c = newCase("scope-swap");
     seedNativeDb(c);
     const scope = scopeOf(c, "203.0.113.10");
-    putToken(scope, "pr4-remote-a-own-token-aaaaaaaa");
+    await putToken(scope, "pr4-remote-a-own-token-aaaaaaaa");
     const decoy = path.join(c.dir, "agents", "decoy");
-    putToken(decoy, "pr4-a-planted-decoy-token-aaaaaa");
+    await putToken(decoy, "pr4-a-planted-decoy-token-aaaaaa");
     const r = await probeAsync(c, `const { renameSync } = await import("node:fs");
 m._setScopeReadHookForTests(() => { renameSync(${JSON.stringify(scope)}, ${JSON.stringify(scope + ".orig")}); renameSync(${JSON.stringify(decoy)}, ${JSON.stringify(scope)}); });
 process.stdout.write(JSON.stringify({ tok: await m.remoteToken("203.0.113.10", 3777, ${JSON.stringify(AGENT)}, { envSelected: false }) }));`);
@@ -636,11 +644,25 @@ process.stdout.write(JSON.stringify({ tok: await m.remoteToken("203.0.113.10", 3
     expect(r.stderr).toMatch(/replaced|changed/i);
   }, 60_000);
 
+  it.skipIf(process.platform !== "win32")("WINDOWS, an inheritable foreign ACE (Everyone RX) on a remote's scope → its token is refused, named, nothing returned", async () => {
+    const c = newCase("scope-acl");
+    seedNativeDb(c);
+    const scope = scopeOf(c, "203.0.113.10");
+    await putToken(scope, "pr4-remote-a-own-token-aaaaaaaa");
+    const okFirst = await ask(c, "203.0.113.10");
+    expect(JSON.parse(okFirst.stdout || "{}").tok, `control: the private scope's token (${okFirst.stderr})`).toBe("pr4-remote-a-own-token-aaaaaaaa");
+    const g = spawnSync("icacls", [scope, "/grant", "*S-1-1-0:(OI)(CI)(RX)"], { encoding: "utf-8" });
+    expect(g.status, `precondition: the foreign ACE was granted: ${g.stdout}${g.stderr}`).toBe(0);
+    const r = await ask(c, "203.0.113.10");
+    expect(JSON.parse(r.stdout || "{}").tok ?? null, "a scope other accounts can read yields nothing").toBeNull();
+    expect(r.stderr, "named").toMatch(/refusing the remote credential/);
+  }, 60_000);
+
   it.skipIf(process.platform === "win32")("POSIX: a scope readable by others, or a token file readable by others → refused, named", async () => {
     const c = newCase("scope-priv");
     seedNativeDb(c);
     const scope = scopeOf(c, "203.0.113.10");
-    putToken(scope, "pr4-remote-a-own-token-aaaaaaaa");
+    await putToken(scope, "pr4-remote-a-own-token-aaaaaaaa");
     fs.chmodSync(path.join(scope, `${AGENT}.token`), 0o644);
     const file = await ask(c, "203.0.113.10");
     expect(JSON.parse(file.stdout || "{}").tok ?? null).toBeNull();
