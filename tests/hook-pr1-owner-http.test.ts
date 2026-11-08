@@ -1589,7 +1589,20 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the de
       const e = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_TEST_CLOCK: "0", RELAY_CODEX_LAUNCHER: stub, ...env });
       delete e.RELAY_AGENT_NAME;
       const binDir = hooksDir === HOOKS ? path.join(REPO, "bin") : path.join(path.dirname(hooksDir), "bin");
-      return spawnSync("bash", [path.join(binDir, "codex-relay"), AGENT], { env: e, encoding: "utf-8", timeout: 60_000 });
+      // ASYNC: the spies live in THIS process; spawnSync would starve them (the request never recorded).
+      return await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+        const child = spawn("bash", [path.join(binDir, "codex-relay"), AGENT], { env: e, stdio: ["ignore", "pipe", "pipe"] });
+        procs.push(child);
+        let stdout = "";
+        let stderr = "";
+        child.stdout!.on("data", (d: Buffer) => (stdout += d));
+        child.stderr!.on("data", (d: Buffer) => (stderr += d));
+        const t = setTimeout(() => child.kill("SIGKILL"), 60_000);
+        child.once("close", (status) => {
+          clearTimeout(t);
+          resolve({ status, stdout, stderr });
+        });
+      });
     }
     return runHook(c, entry, env, entry.includes("codex") ? JSON.stringify({ session_id: "s-r2", hook_event_name: "SessionStart" }) : inputFor(entry), hooksDir);
   }
