@@ -979,9 +979,11 @@ const SQLITE_LOG = path.join(ROOT, "sqlite3.log");
 fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SQLITE_LOG}"\nexit 1\n`, { mode: 0o755 });
 
 /** The hook, run ASYNCHRONOUSLY (a spy in this process must not be starved by a spawnSync). */
-async function runHook(c: Case, hook: string, extra: Record<string, string>, input = "", hooksDir = HOOKS) {
+async function runHook(c: Case, hook: string, extra: Record<string, string>, input = "", hooksDir = HOOKS, flat = false) {
   for (const f of [SQLITE_LOG, ARGV_LOG, ENV_LOG, RM_CAPTURE]) fs.rmSync(f, { force: true });
   const env = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_AGENT_NAME: AGENT, RELAY_TEST_CLOCK: "0", ...extra });
+  // flat: NO DB or config override at all: the instance is AUTO-DISCOVERED (HOME/.bot-relay/relay.db), as on a user's machine.
+  if (flat) for (const k of ["RELAY_DB_PATH", "RELAY_CONFIG_PATH", "RELAY_INSTANCE_ID", "RELAY_HOME"]) delete env[k];
   const child = spawn("bash", [path.join(hooksDir, hook)], { env, stdio: ["pipe", "pipe", "pipe"] });
   procs.push(child);
   let stdout = "";
@@ -1501,7 +1503,12 @@ function pinnedRemoteHooks(): string {
   const root = path.join(ROOT, "pinned-remote");
   fs.rmSync(root, { recursive: true, force: true }); // a failed earlier build leaves nothing half-made behind
   fs.cpSync(HOOKS, path.join(root, "hooks"), { recursive: true });
-  fs.symlinkSync(path.join(REPO, "bin"), path.join(root, "bin"));
+  // A REAL bin dir (a symlinked one would send `bin/../hooks` to the REAL hooks): the launcher copied, `relay` linked
+  // (node follows the link to the real dist).
+  fs.mkdirSync(path.join(root, "bin"));
+  fs.copyFileSync(path.join(REPO, "bin", "codex-relay"), path.join(root, "bin", "codex-relay"));
+  fs.chmodSync(path.join(root, "bin", "codex-relay"), 0o755);
+  fs.symlinkSync(path.join(REPO, "bin", "relay"), path.join(root, "bin", "relay"));
   const helpers = path.join(root, "hooks", "_vault-helpers.sh");
   const src = fs.readFileSync(helpers, "utf-8");
   expect(src, "precondition: the host check is ONE function").toMatch(/^relay_host_classify\(\) \{/m);
@@ -1573,25 +1580,78 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the de
     expect(b.bytes(), `control: B's own token reaches B\n${r.out}`).toContain(tokB);
   }, 120_000);
 
-  it("P1-4: a tunnel's (and a pinned remote's) credential calls ignore every proxy and curl config: zero bytes at a proxy from http_proxy or ~/.curlrc", async () => {
-    const c = newCase("r1-proxy");
+  // #433 R2 P3-4: per ENTRY POINT, a fresh credential-bearing request at the target AND zero at the proxy.
+  const ENTRY_POINTS = ["check-relay.sh", "stop-check.sh", "post-tool-use-check.sh", "codex/codex-session-start.sh", "bin/codex-relay"] as const;
+  async function runEntry(c: Case, entry: (typeof ENTRY_POINTS)[number], env: Record<string, string>, hooksDir = HOOKS) {
+    if (entry === "bin/codex-relay") {
+      const stub = path.join(c.home, "codex-stub.sh");
+      fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const e = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_TEST_CLOCK: "0", RELAY_CODEX_LAUNCHER: stub, ...env });
+      delete e.RELAY_AGENT_NAME;
+      const binDir = hooksDir === HOOKS ? path.join(REPO, "bin") : path.join(path.dirname(hooksDir), "bin");
+      return spawnSync("bash", [path.join(binDir, "codex-relay"), AGENT], { env: e, encoding: "utf-8", timeout: 60_000 });
+    }
+    return runHook(c, entry, env, entry.includes("codex") ? JSON.stringify({ session_id: "s-r2", hook_event_name: "SessionStart" }) : inputFor(entry), hooksDir);
+  }
+  it.each(ENTRY_POINTS)("P1-4 / R2 P3-4 (%s): a trusted tunnel's credential call reaches the TARGET, and a proxy (http_proxy, HTTP_PROXY, ALL_PROXY, ~/.curlrc) gets ZERO requests", async (entry) => {
+    const c = newCase(`r2-proxy-${entry.replace(/[^a-z0-9]/gi, "")}`);
     const target = await spy();
     const proxy = await spy();
     fs.writeFileSync(path.join(c.home, ".curlrc"), `proxy = "http://127.0.0.1:${proxy.port}"\n`);
-    const proxyEnv = { http_proxy: `http://127.0.0.1:${proxy.port}`, HTTP_PROXY: `http://127.0.0.1:${proxy.port}`, ALL_PROXY: `http://127.0.0.1:${proxy.port}` };
-    const env = { RELAY_AGENT_TOKEN: TOKEN, FAKE_PENDING_RC: "3", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(target.port), RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(target.port), ...proxyEnv };
-    for (const hook of ["check-relay.sh", "stop-check.sh", "post-tool-use-check.sh", "codex/codex-session-start.sh"]) {
-      await runHook(c, hook, env, hook.includes("codex") ? JSON.stringify({ session_id: "s-r1", hook_event_name: "SessionStart" }) : inputFor(hook));
-    }
-    expect(target.requests.length, "precondition: the tunnel was reached").toBeGreaterThan(0);
-    expect(proxy.requests.length, `zero requests at the proxy: ${proxy.bytes().slice(0, 300)}`).toBe(0);
-    // The pinned remote, too.
-    const c2 = newCase("r1-proxy-remote");
-    seedNativeDb(c2);
-    fs.writeFileSync(path.join(c2.home, ".curlrc"), `proxy = "http://127.0.0.1:${proxy.port}"\n`);
-    await runHook(c2, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, RELAY_HTTP_HOST: REMOTE_NAME, RELAY_HTTP_PORT: String(target.port), ...proxyEnv }, "", pinnedRemoteHooks());
-    expect(proxy.requests.length, "zero requests at the proxy from the remote route").toBe(0);
-  }, 180_000);
+    const tok = `pr3-proxy-token-${crypto.randomBytes(8).toString("hex")}`;
+    const env = {
+      RELAY_AGENT_TOKEN: tok, FAKE_PENDING_RC: "3", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(target.port), RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(target.port),
+      http_proxy: `http://127.0.0.1:${proxy.port}`, HTTP_PROXY: `http://127.0.0.1:${proxy.port}`, ALL_PROXY: `http://127.0.0.1:${proxy.port}`,
+    };
+    const r = await runEntry(c, entry, env);
+    expect(target.requests.some((q) => q.body.includes(tok) || JSON.stringify(q.headers).includes(tok)), `${entry}: a credential-bearing request reached the target\n${"out" in r ? r.out : `${r.stdout}\n${r.stderr}`}`).toBe(true);
+    expect(proxy.requests.length, `${entry}: zero requests at the proxy`).toBe(0);
+  }, 120_000);
+
+  it.each(ENTRY_POINTS.filter((e) => e !== "stop-check.sh" && e !== "post-tool-use-check.sh"))("P1-4 / R2 P3-4 (%s, the PINNED remote): its credential call reaches the remote, and the proxy gets ZERO requests", async (entry) => {
+    const c = newCase(`r2-proxy-remote-${entry.replace(/[^a-z0-9]/gi, "")}`);
+    seedNativeDb(c);
+    const target = await spy();
+    const proxy = await spy();
+    fs.writeFileSync(path.join(c.home, ".curlrc"), `proxy = "http://127.0.0.1:${proxy.port}"\n`);
+    const tok = `pr3-remote-proxy-token-${crypto.randomBytes(8).toString("hex")}`;
+    const env = { RELAY_AGENT_TOKEN: tok, RELAY_HTTP_HOST: REMOTE_NAME, RELAY_HTTP_PORT: String(target.port), http_proxy: `http://127.0.0.1:${proxy.port}`, HTTP_PROXY: `http://127.0.0.1:${proxy.port}`, ALL_PROXY: `http://127.0.0.1:${proxy.port}` };
+    await runEntry(c, entry, env, pinnedRemoteHooks());
+    expect(target.requests.some((q) => q.body.includes(tok) || JSON.stringify(q.headers).includes(tok)), `${entry}: a credential-bearing request reached the pinned remote`).toBe(true);
+    expect(proxy.requests.length, `${entry}: zero requests at the proxy`).toBe(0);
+  }, 120_000);
+
+  // #433 R2 P1-1: relay pending's exit 3 is a ROUTING policy, not evidence that no local DB exists. An AUTO-DISCOVERED
+  // flat DB (no RELAY_DB_PATH, no RELAY_INSTANCE_ID), a loopback host and a matching tunnel opt-in: the local vault's
+  // UNSCOPED token must never go over the tunnel.
+  const flatCase = (tag: string): Case => {
+    const home = fs.mkdtempSync(path.join(ROOT, `${tag}-`));
+    const dir = path.join(home, ".bot-relay");
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return { home, dir, db: path.join(dir, "relay.db"), cfg: path.join(dir, "config.json"), record: path.join(dir, ".relay.db.relay-owner.json") };
+  };
+  it.each(["check-relay.sh", "stop-check.sh", "post-tool-use-check.sh", "codex/codex-session-start.sh"])("R2 P1-1 (%s): an AUTO-DISCOVERED local DB + a tunnel opt-in: the local vault's token never goes over the tunnel", async (hook) => {
+    const c = flatCase(`r2-flat-${hook.replace(/[^a-z0-9]/gi, "")}`);
+    const localTok = seedNativeDb(c);
+    fs.mkdirSync(path.join(c.dir, "agents"), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(c.dir, "agents", `${AGENT}.token`), `${localTok}\n`, { mode: 0o600 });
+    const tunnel = await spy();
+    const env = { RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(tunnel.port), RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(tunnel.port) };
+    const r = await runHook(c, hook, env, hook.includes("codex") ? JSON.stringify({ session_id: "s-r2", hook_event_name: "SessionStart" }) : inputFor(hook), HOOKS, true);
+    expect(tunnel.bytes(), `${hook}: the local token never reaches the tunnel\n${r.out}`).not.toContain(localTok);
+  }, 120_000);
+
+  it("R2 P1-1: `relay owner peek` uses a LOCAL-ONLY resolver: an auto-discovered instance works with RELAY_HTTP_HOST set", async () => {
+    const c = flatCase("r2-owner-flat");
+    seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const env = baseEnv(c, { RELAY_HTTP_HOST: "203.0.113.10", RELAY_HTTP_PORT: "4777" });
+    for (const k of ["RELAY_DB_PATH", "RELAY_CONFIG_PATH", "RELAY_INSTANCE_ID", "RELAY_HOME"]) delete env[k];
+    const r = spawnSync(process.execPath, [RELAY, "owner", "peek", AGENT, "--json", "--timeout-ms", "4000"], { env, encoding: "utf-8", timeout: 30_000 });
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ ok: true, source: "owner" });
+    await stopDaemon(d.child);
+  }, 120_000);
 
   it("P1-1 (pinning): a declared remote's bearer goes to the CHECKED address (curl --resolve): the pinned remote is reached, the local door untouched", async () => {
     const c = newCase("r1-pinned");

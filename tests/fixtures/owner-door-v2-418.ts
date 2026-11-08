@@ -6,8 +6,9 @@
 /**
  * A FROZEN copy of the owner door's v2 protocol as hook PR 1 (#418, 5ae03d8) shipped it: the record shape, the
  * client's record gate, the HMAC request/reply texts, the server's request check and reply MAC, and the client's
- * exchange. The ONLY edits from src/owner-endpoint.ts and src/cli/owner.ts at 5ae03d8: the process-global key and
- * binding are parameters, and the replay cache is per server. Used for the version-skew rows (#433 Codex R1 P2-5): a
+ * exchange. The ONLY edits from src/owner-endpoint.ts and src/cli/owner.ts at 5ae03d8: the process-global key,
+ * binding and replay map are parameters (one replay map per server); the verifier is otherwise verbatim (its shape
+ * checks, its 30 s window, its 2 s skew, its bounded replay cache). Used for the version-skew rows (#433 Codex R1 P2-5): a
  * v2 daemon with the new client, and a v3 record with the v2 client.
  */
 import crypto from "crypto";
@@ -47,10 +48,56 @@ export function macEqual(a: string, b: string): boolean {
   return x.length === 32 && y.length === 32 && crypto.timingSafeEqual(x, y);
 }
 
-/** A #418 daemon's door (POST /owner/v1/peek): its request check and MAC'd reply. Counts every request it receives. */
+// --- #418's request VERIFIER, verbatim (src/owner-endpoint.ts verifyDoorRequest at 5ae03d8). Substitutions only:
+// KEY -> key, ownBinding -> b, the module's seenNonces map -> `seen` (one per server), sweepDoorNonces -> sweep(seen).
+export const DOOR_WINDOW_SECS_418 = 30;
+const DOOR_SKEW_SECS = 2;
+export const DOOR_NONCE_CAPACITY_418 = 4096;
+const NONCE_RE = /^[0-9a-f]{32}$/;
+const AGENT_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+function sweep(seen: Map<string, number>, nowMs: number): void {
+  for (const [n, exp] of seen) if (exp <= nowMs) seen.delete(n);
+}
+export function verifyDoorRequest418(
+  key: string,
+  b: DoorBinding418,
+  seen: Map<string, number>,
+  p: string,
+  rawBody: unknown,
+  macHeader: unknown,
+  nowMs = Date.now(),
+): { ok: true; req: { agent_name: string; args: Record<string, unknown>; ts: number; nonce: string } } | { ok: false; status: number; error: string; nonce?: string } {
+  if (typeof rawBody !== "string" || rawBody.length === 0) return { ok: false, status: 400, error: "the door takes a text/plain JSON body" };
+  let body: { agent_name?: unknown; args?: unknown; ts?: unknown; client_nonce?: unknown };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return { ok: false, status: 400, error: "the body is not JSON" };
+  }
+  if (body === null || typeof body !== "object") return { ok: false, status: 400, error: "the body is not an object" };
+  const nonce = typeof body.client_nonce === "string" && NONCE_RE.test(body.client_nonce) ? body.client_nonce : undefined;
+  if (!nonce) return { ok: false, status: 400, error: "client_nonce must be 32 hex characters" };
+  if (!Number.isInteger(body.ts)) return { ok: false, status: 400, error: "ts must be an integer (unix seconds)", nonce };
+  if (typeof body.agent_name !== "string" || !AGENT_RE.test(body.agent_name)) return { ok: false, status: 400, error: "agent_name is not a valid agent name", nonce };
+  if (body.args === null || typeof body.args !== "object" || Array.isArray(body.args)) return { ok: false, status: 400, error: "args must be an object", nonce };
+  const ts = body.ts as number;
+  if (typeof macHeader !== "string" || !macEqual(macHeader, doorMac(key, doorRequestText(b, p, ts, nonce, rawBody)))) {
+    return { ok: false, status: 401, error: "the request MAC does not verify (a wrong key, or a request bound to another instance)", nonce };
+  }
+  if (Math.abs(Math.floor(nowMs / 1000) - ts) > DOOR_WINDOW_SECS_418) return { ok: false, status: 401, error: "the request is outside the time window", nonce };
+  if (seen.has(nonce)) return { ok: false, status: 401, error: "the request was replayed (its nonce was seen)", nonce };
+  if (seen.size >= DOOR_NONCE_CAPACITY_418) {
+    sweep(seen, nowMs);
+    if (seen.size >= DOOR_NONCE_CAPACITY_418) return { ok: false, status: 503, error: "the door's replay cache is full: try again shortly", nonce };
+  }
+  seen.set(nonce, (ts + DOOR_WINDOW_SECS_418 + DOOR_SKEW_SECS) * 1000);
+  return { ok: true, req: { agent_name: body.agent_name, args: body.args as Record<string, unknown>, ts, nonce } };
+}
+
+/** A #418 daemon's door (POST /owner/v1/peek): the verbatim verifier above, then its MAC'd reply. Counts requests. */
 export function startDoorServer418(key: string, b: DoorBinding418, reply: Record<string, unknown>): Promise<{ server: http.Server; port: number; requests: () => number }> {
   let n = 0;
-  const seen = new Set<string>();
+  const seen = new Map<string, number>();
   const server = http.createServer((req, res) => {
     n++;
     let raw = "";
@@ -63,29 +110,12 @@ export function startDoorServer418(key: string, b: DoorBinding418, reply: Record
         res.setHeader("Content-Type", "text/plain");
         res.end(text);
       };
-      let body: { ts?: unknown; client_nonce?: unknown } = {};
-      try {
-        body = JSON.parse(raw) as typeof body;
-      } catch {
-        send(400, { ok: false, error: "the body is not JSON" });
+      const v = verifyDoorRequest418(key, b, seen, req.url ?? "", raw, req.headers["x-owner-mac"]);
+      if (!v.ok) {
+        send(v.status, { ok: false, error: v.error }, v.nonce);
         return;
       }
-      const nonce = typeof body.client_nonce === "string" && /^[0-9a-f]{32}$/.test(body.client_nonce) ? body.client_nonce : undefined;
-      if (!nonce || !Number.isInteger(body.ts)) {
-        send(400, { ok: false, error: "client_nonce / ts" });
-        return;
-      }
-      const mac = req.headers["x-owner-mac"];
-      if (typeof mac !== "string" || !macEqual(mac, doorMac(key, doorRequestText(b, req.url ?? "", body.ts as number, nonce, raw)))) {
-        send(401, { ok: false, error: "the request MAC does not verify" }, nonce);
-        return;
-      }
-      if (seen.has(nonce)) {
-        send(401, { ok: false, error: "replayed" }, nonce);
-        return;
-      }
-      seen.add(nonce);
-      send(200, reply, nonce);
+      send(200, reply, v.req.nonce);
     });
   });
   return new Promise((r) => server.listen(0, "127.0.0.1", () => r({ server, port: (server.address() as { port: number }).port, requests: () => n })));

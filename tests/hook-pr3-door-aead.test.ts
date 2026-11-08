@@ -486,6 +486,22 @@ describe("#433 Codex R1 P3-6: a non-object reply is a NAMED failure, never an ex
 });
 
 describe("#433 Codex R1 P2-5: the record and protocol are version 3; a skew either way is named (the #418 v2 protocol, frozen)", () => {
+  it("CONTROL (v2 ↔ v2, #433 R2 P3-3): the #418 client and the #418 door agree (200); a request at ts=0 gets the original verifier's 401 (outside the time window)", async () => {
+    const { startDoorServer418, exchange418 } = await import("./fixtures/owner-door-v2-418.js");
+    const key = crypto.randomBytes(16).toString("hex");
+    const b = { instance_id: "", db_path: "/x/relay.db" };
+    const old = await startDoorServer418(key, b, { ok: true, registered: true });
+    servers.push(old.server);
+    const n1 = crypto.randomBytes(16).toString("hex");
+    const ok = await exchange418(old.port, key, b, PEEK, { agent_name: AGENT, args: {}, ts: Math.floor(Date.now() / 1000), client_nonce: n1 }, n1);
+    expect(ok.status).toBe(200);
+    expect(ok.payload).toMatchObject({ ok: true });
+    const n0 = crypto.randomBytes(16).toString("hex");
+    const stale = await exchange418(old.port, key, b, PEEK, { agent_name: AGENT, args: {}, ts: 0, client_nonce: n0 }, n0);
+    expect(stale.status, "the original verifier's window").toBe(401);
+    expect(String(stale.payload.error)).toMatch(/outside the time window/);
+  });
+
   it("a new daemon writes v3; the #418 client's gate refuses it (bad-record) and its v2 exchange cannot pass the new door", async () => {
     const c = newCase("skew-new-daemon");
     const { d, rec } = await wasmOwner(c);
@@ -538,4 +554,39 @@ describe("#433 Codex R1 P1-2 (as ruled): `relay remote set-mint-secret <host:por
       expect(fs.readFileSync(victim, "utf-8"), "its target is untouched").toBe("untouched");
     }
   }, 60_000);
+});
+
+describe("#433 R2 P1-2: a remote's mint.secret directory chain is private and verified BEFORE its temp file exists", () => {
+  it("at the instant the temp file is created, the scope dir and its agents dir are already private (Windows: an INHERITED foreign ACE removed first; POSIX: 0700); the file ends private", async () => {
+    const m = (await import("../src/cli/remote.js")) as unknown as {
+      writeRemoteMintSecret: (dir: string, secret: string) => void;
+      _setCreateHookForTests: (fn: ((tmp: string) => void) | null) => void;
+    };
+    const { privacyFaults } = (await import("../src/fs-perms.js")) as { privacyFaults: (p: string, maxMode: number) => string[] };
+    const base = fs.mkdtempSync(path.join(ROOT, "rmint-chain-"));
+    const agents = path.join(base, "agents");
+    fs.mkdirSync(agents, { recursive: true });
+    if (process.platform === "win32") {
+      // An inheritable foreign ACE on the parent: a new child would inherit Everyone's read.
+      const g = spawnSync("icacls", [agents, "/grant", "*S-1-1-0:(OI)(CI)(RX)"], { encoding: "utf-8" });
+      expect(g.status, `precondition: the foreign ACE was granted: ${g.stdout}${g.stderr}`).toBe(0);
+    } else {
+      fs.chmodSync(agents, 0o755);
+    }
+    expect(privacyFaults(agents, 0o700).length, "precondition: the parent is NOT private").toBeGreaterThan(0);
+    const dir = path.join(agents, "remote-203.0.113.10-3777");
+    let atCreate: { dir: string[]; agents: string[] } | null = null;
+    m._setCreateHookForTests(() => {
+      atCreate = { dir: privacyFaults(dir, 0o700), agents: privacyFaults(agents, 0o700) };
+    });
+    try {
+      m.writeRemoteMintSecret(dir, `pr3-chain-secret-${crypto.randomBytes(16).toString("hex")}`);
+    } finally {
+      m._setCreateHookForTests(null);
+    }
+    expect(atCreate, "precondition: the create seam ran").not.toBeNull();
+    expect(atCreate!.dir, "the scope dir was private BEFORE the temp file existed").toEqual([]);
+    expect(atCreate!.agents, "and its agents dir").toEqual([]);
+    expect(privacyFaults(path.join(dir, "mint.secret"), 0o600), "the file ends private").toEqual([]);
+  });
 });
