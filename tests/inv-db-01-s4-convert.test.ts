@@ -17,7 +17,7 @@
  * - Restore re-stamps its private staged copy to the instance's kind (a 0 archive onto a wasm instance becomes W).
  * Each row names the ruling it checks (Q1..Q5 of the slice-4 plan).
  */
-import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -68,6 +68,8 @@ type ConvertMod = {
     _beforeReplaceForTests?: () => void;
     /** sql.js converter: replaces the rename of the temp file onto the DB (a planted failure). */
     _renameForTests?: (from: string, to: string) => void;
+    /** sql.js converter (in-place, R2): after the final pre-patch check, immediately before the first header write. */
+    _beforePatchForTests?: () => void;
   }) => Promise<ConvertReport>;
 };
 /** The module this slice adds (absent on the base: every row that needs it fails there, by name). */
@@ -174,6 +176,51 @@ async function startLive(file: string): Promise<ChildProcess> {
     c.stdout!.on("data", (d) => String(d).includes("READY") && (clearTimeout(t), res()));
   });
   return c;
+}
+
+/**
+ * Codex #401 R2 P3: a native better-sqlite3 construction is found by its TYPE, not its spelling: a `new X(...)` whose
+ * callee's construct signature returns better-sqlite3's Database, whatever X is called (a default import under any
+ * name, an alias, a re-export, a typed factory such as loadNative()). Keyed file::enclosing top-level function.
+ */
+function nativeSites(program: ts.Program): Record<string, number> {
+  const checker = program.getTypeChecker();
+  const isNativeCtor = (n: ts.NewExpression): boolean =>
+    checker
+      .getTypeAtLocation(n.expression)
+      .getConstructSignatures()
+      .some((sig) => {
+        const d = sig.getReturnType().getSymbol()?.declarations?.[0];
+        return !!d && /[\\/]better-sqlite3[\\/]/.test(d.getSourceFile().fileName.replace(/@types[\\/]/, ""));
+      });
+  const out: Record<string, number> = {};
+  for (const sf of program.getSourceFiles()) {
+    const rel = path.relative(REPO, sf.fileName).split(path.sep).join("/");
+    if (!rel.startsWith("src/") || sf.isDeclarationFile) continue;
+    // The enclosing top-level function is passed down the walk (this program's nodes carry no parent links).
+    const visit = (n: ts.Node, fnName: string): void => {
+      const inner = ts.isFunctionDeclaration(n) && n.name && fnName === "<module>" ? n.name.text : fnName;
+      if (ts.isNewExpression(n) && isNativeCtor(n)) {
+        const key = `${rel}::${inner}`;
+        out[key] = (out[key] ?? 0) + 1;
+      }
+      ts.forEachChild(n, (c) => visit(c, inner));
+    };
+    visit(sf, "<module>");
+  }
+  return out;
+}
+/** The real src program plus EXTRA in-memory files under the repo (so `better-sqlite3` resolves for them too). */
+function srcProgramWith(extra: Record<string, string>): ts.Program {
+  const base = srcProgram();
+  const files = new Map(Object.entries(extra).map(([rel, text]) => [path.join(REPO, rel), text]));
+  const host = ts.createCompilerHost(base.getCompilerOptions());
+  const norm = (f: string) => path.resolve(f);
+  const readFile = host.readFile.bind(host);
+  const fileExists = host.fileExists.bind(host);
+  host.readFile = (f) => files.get(norm(f)) ?? readFile(f);
+  host.fileExists = (f) => files.has(norm(f)) || fileExists(f);
+  return ts.createProgram({ rootNames: [...base.getRootFileNames(), ...files.keys()], options: base.getCompilerOptions(), host });
 }
 
 describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
@@ -300,21 +347,7 @@ describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
       "src/sqlite-compat.ts::nativeLoadsHere": { n: 1, why: "an in-memory probe (\":memory:\"), never a file" },
       "src/doorbell-lock.ts::openLockFile": { n: 1, why: "the doorbell's OWN lock file (refused when it is a hard link or a relay DB)" },
     };
-    const native: Record<string, number> = {};
-    for (const sf of program.getSourceFiles()) {
-      const rel = path.relative(REPO, sf.fileName).split(path.sep).join("/");
-      if (!rel.startsWith("src/") || sf.isDeclarationFile) continue;
-      // The enclosing top-level function is passed down the walk (this program's nodes carry no parent links).
-      const visit = (n: ts.Node, fnName: string): void => {
-        const inner = ts.isFunctionDeclaration(n) && n.name && fnName === "<module>" ? n.name.text : fnName;
-        if (ts.isNewExpression(n) && /^(Database|BetterSqlite3|\(loadNative\(\)\)|D)$/.test(n.expression.getText(sf))) {
-          const key = `${rel}::${inner}`;
-          native[key] = (native[key] ?? 0) + 1;
-        }
-        ts.forEachChild(n, (c) => visit(c, inner));
-      };
-      visit(sf, "<module>");
-    }
+    const native = nativeSites(program);
     expect(native, "every native construction in src is listed (a new site fails until it is)").toEqual(
       Object.fromEntries(Object.entries(NATIVE_SITES).map(([k, v]) => [k, v.n]))
     );
@@ -362,6 +395,15 @@ describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
       visitArgs(sf);
     }
     expect(unsafe, "every sql.js construction passes Uint8Array.from(...) (a fresh copy) or nothing").toEqual([]);
+  }, 120_000);
+});
+
+describe("INV-DB-01 slice 4, Codex #401 R2 P3: the native inventory resolves constructors, not spellings", () => {
+  it("an aliased import (`import NativeConnection from \"better-sqlite3\"; new NativeConnection(f)`) is SEEN as a native construction (the inventory would fail on it)", () => {
+    const program = srcProgramWith({
+      "src/__inventory_alias_probe.ts": `import NativeConnection from "better-sqlite3";\nexport function aliased(f: string) {\n  return new NativeConnection(f);\n}\n`,
+    });
+    expect(nativeSites(program)["src/__inventory_alias_probe.ts::aliased"], "the aliased construction is found").toBe(1);
   }, 120_000);
 });
 
@@ -676,24 +718,18 @@ describe("INV-DB-01 slice 4: the wasm-only converter (sql.js, native→wasm; the
     expect(readCfg()).toEqual({});
   }, 60_000);
 
-  it("a planted RENAME failure leaves the original intact and names the temp file (never a copy over in place)", async () => {
-    makeDb(dbPath, 0, ["a", "b"], "DELETE");
-    const before = sha(dbPath);
-    writeCfg({});
-    wasmOnly();
-    let tmp = "";
-    const fail = (from: string) => {
-      tmp = from;
-      throw Object.assign(new Error("EXDEV: planted rename failure"), { code: "EXDEV" });
+  it("Codex #401 R2 P1 (ruled: in place): the sql.js converter PATCHES the header in place: no rename, no copy, no temp file in convertViaSqlJs (before: a whole-file replace and its planted-rename row)", () => {
+    const program = srcProgram();
+    const sf = program.getSourceFiles().find((f) => path.relative(REPO, f.fileName).split(path.sep).join("/") === "src/convert-journal.ts")!;
+    let body = "";
+    const find = (n: ts.Node): void => {
+      if (ts.isFunctionDeclaration(n) && n.name?.text === "convertViaSqlJs") body = n.getText(sf);
+      ts.forEachChild(n, find);
     };
-    const err = await (await convertMod()).convertJournal({ to: "wasm", _renameForTests: fail }).then(() => null, (e: Error) => e);
-    expect(err?.message).toMatch(/convert-journal refused/);
-    expect(tmp, "the rename was attempted with a temp file").not.toBe("");
-    expect(err?.message, "the refusal names the temp").toContain(tmp);
-    expect(path.basename(tmp).startsWith("."), "the temp is a dotfile, outside SQLite's side-file names").toBe(true);
-    expect(sha(dbPath), "the original is intact").toBe(before);
-    expect(readCfg(), "the config is written only after the file").toEqual({});
-  }, 60_000);
+    find(sf);
+    expect(body.length, "convertViaSqlJs is found").toBeGreaterThan(0);
+    expect(body).not.toMatch(/\brenameSync\b|\bcopyFileSync\b|_renameForTests|\.convert`|"wx"/);
+  }, 120_000);
 
   it("the step ORDER: the safety copy is on disk BEFORE the first edit: an edit that fails leaves the copy (byte-equal, 0600) and the live file untouched", async () => {
     makeDb(dbPath, 0, ["a", "b"], "DELETE");
@@ -764,6 +800,15 @@ fs.writeFileSync(
     // PINNED, as LIVE above: an unreferenced better-sqlite3 connection is closed when garbage-collected, which drops its
     // lock and rolls its transaction back. Unpinned, a full-suite run (native-binary, f3a1b04) converted past this writer.
     `globalThis.__pin = d; process.stdout.write("READY\\n"); setInterval(() => { if (!globalThis.__pin.open) process.exit(9); }, 1000);\n`
+);
+/** A child that HOLDS a write transaction (pinned) and COMMITS when told ("commit" on stdin), then prints COMMITTED. */
+const WCOMMIT = path.join(ROOT, "hold-write-commit.cjs");
+fs.writeFileSync(
+  WCOMMIT,
+  `const D = require(process.argv[2]); const d = new D(process.argv[3], { timeout: 0 });\n` +
+    `d.exec("BEGIN IMMEDIATE"); d.prepare("INSERT INTO kept VALUES ('held')").run(); globalThis.__pin = d;\n` +
+    `process.stdin.on("data", (b) => { if (String(b).includes("commit")) { d.exec("COMMIT"); process.stdout.write("COMMITTED\\n"); } });\n` +
+    `process.stdout.write("READY\\n");\n`
 );
 /**
  * A child that leaves a HOT journal: the stamp's transaction, its pages spilled, then killed before COMMIT. MEASURED:
@@ -843,40 +888,51 @@ describe("INV-DB-01 slice 4, Codex #401 R1 P1-3 (ruled): native openers during a
     expect(readCfg()).toEqual({});
   }, 60_000);
 
-  // Windows refuses to rename onto an open file (EPERM, measured on #401), so there the converter closes its fd on the
-  // original immediately before the rename and cannot see a write in that instant: a stated residual. The "CHANGED
-  // between the read and the rename" row covers a write before the final check on every OS.
-  const WIN_NO_FD_ACROSS_RENAME = process.platform === "win32";
-  it.runIf(process.platform === "win32")("MEASURE (Windows, the #401 residual (a) seam): a better-sqlite3 connection HELD OPEN on the original makes the sql.js converter's rename FAIL: refused, the original intact", async () => {
-    makeDb(dbPath, 0, ["a", "b"], "DELETE");
-    const before = sha(dbPath);
-    writeCfg({});
-    await startLive(dbPath); // another process holds a better-sqlite3 connection on the original, idle
-    wasmOnly();
-    const err = await (await convertMod()).convertJournal({ to: "wasm" }).then((r) => new Error(`RESOLVED (the rename SUCCEEDED over an open handle): ${JSON.stringify(r)}`), (e: Error) => e);
-    process.stderr.write(`[measure] Windows rename over an open better-sqlite3 handle: ${err.message}\n`);
-    expect(err.message).toMatch(/convert-journal refused[\s\S]*could not be renamed/);
-    expect(sha(dbPath), "the original is intact").toBe(before);
-    expect(header(dbPath).id).toBe(0);
-  }, 60_000);
-  it.skipIf(WIN_NO_FD_ACROSS_RENAME)("(1d) sql.js: a write that lands on the ORIGINAL file after the identity check (at the rename) is reported as a FAILURE, never a success: the late bytes are saved beside the safety copy, and the remedy is named (skipped on Windows: the stated residual)", async () => {
+  it("Codex #401 R2 P1 (ruled): a foreign commit landing AFTER the converter's last pre-patch check (immediately before its first header write) is a FAILURE, never a success: the foreign rows are still present, nothing overwritten (every OS)", async () => {
     makeDb(dbPath, 0, ["a"], "DELETE");
     writeCfg({});
     wasmOnly();
-    const late = (from: string, to: string) => {
-      const d = new Database(to);
-      d.prepare("INSERT INTO kept VALUES ('late')").run();
+    const foreign = () => {
+      const d = new Database(dbPath);
+      d.prepare("INSERT INTO kept VALUES ('foreign')").run();
       d.close();
-      fs.renameSync(from, to);
     };
-    const err = await (await convertMod()).convertJournal({ to: "wasm", _renameForTests: late }).then(() => null, (e: Error) => e);
-    expect(err?.message, "never a success").toMatch(/convert-journal (refused|FAILED)[\s\S]*(changed|written|lost)/i);
-    const backups = path.join(caseDir, "backups");
-    const saved = fs.readdirSync(backups).filter((f) => !f.includes(".pre-convert-"));
-    expect(saved.length, `the late bytes are saved beside the safety copy (${fs.readdirSync(backups).join(", ")})`).toBeGreaterThanOrEqual(1);
-    const rows = saved.flatMap((f) => readOther(path.join(backups, f)).rows);
-    expect(rows, "the saved file holds the late write").toContain("late");
-    expect(err?.message).toContain(path.join(backups, saved[0]!));
+    const err = await (await convertMod()).convertJournal({ to: "wasm", _beforePatchForTests: foreign }).then(() => null, (e: Error) => e);
+    expect(err?.message, "never a success").toMatch(/convert-journal (refused|FAILED)/i);
+    expect(readOther(dbPath).rows, "the foreign commit is still in the file (never overwritten)").toEqual(["a", "foreign"]);
+  }, 60_000);
+
+  it("Codex #401 R2 P1 (ruled) CONFORMANCE: the header the sql.js converter patches in place is byte-equal to the one the NATIVE converter produces from the same fixture (the counter bytes aside), and its page data is untouched", async () => {
+    const fixture = path.join(caseDir, "fixture.db");
+    makeDb(fixture, NATIVE, ["r1", "r2", "r3"]); // WAL mode, cleanly closed: no side files
+    const original = fs.readFileSync(fixture);
+    const viaNative = path.join(caseDir, "via-native.db");
+    const viaSqljs = path.join(caseDir, "via-sqljs.db");
+    fs.copyFileSync(fixture, viaNative);
+    fs.copyFileSync(fixture, viaSqljs);
+    writeCfg({});
+    await (await convertMod()).convertJournal({ to: "wasm", dbPath: viaNative });
+    wasmOnly();
+    const r = await (await convertMod()).convertJournal({ to: "wasm", dbPath: viaSqljs });
+    expect(r.via).toBe("sqljs");
+    const hn = fs.readFileSync(viaNative).subarray(0, 100);
+    const hs = fs.readFileSync(viaSqljs).subarray(0, 100);
+    const masked = (h: Buffer) => Buffer.concat([h.subarray(0, 24), h.subarray(28, 92), h.subarray(96, 100)]);
+    expect(masked(hs).toString("hex"), "the patched header equals the native one (counters aside)").toBe(masked(hn).toString("hex"));
+    expect(fs.readFileSync(viaSqljs).subarray(100).equals(original.subarray(100)), "the page data is untouched").toBe(true);
+    expect(readOther(viaSqljs)).toEqual({ rows: ["r1", "r2", "r3"], ok: "ok" });
+  }, 60_000);
+
+  it("Codex #401 R2 P1 (ruled): a crash BETWEEN the two header writes leaves a consistent file (DELETE mode, not yet W: a native file), and a re-run completes", async () => {
+    makeDb(dbPath, NATIVE, ["r1"]); // WAL: both header writes are needed
+    writeCfg({});
+    wasmOnly();
+    await expect((await convertMod()).convertJournal({ to: "wasm", _failAfterForTests: "journal" })).rejects.toThrow(/injected failure/);
+    expect(header(dbPath), "after the first write: DELETE mode, still native").toEqual({ id: NATIVE, journal: "1/1" });
+    expect(readOther(dbPath)).toEqual({ rows: ["r1"], ok: "ok" });
+    const r = await (await convertMod()).convertJournal({ to: "wasm" });
+    expect({ header: r.header, journal: r.journal }).toEqual({ header: "wasm", journal: "1/1" });
+    expect(header(dbPath)).toEqual({ id: WASM, journal: "1/1" });
   }, 60_000);
 
   it.skipIf(process.platform === "win32")("(P2-8) an interrupted stamp COMMIT (RLYW header spilled + a HOT journal) is RECOVERED by the rerun: SQLite rolls it back, then the conversion completes, the rows the original ones (skipped on Windows: SIGKILL of self)", async () => {
@@ -894,8 +950,16 @@ describe("INV-DB-01 slice 4, Codex #401 R1 P1-3 (ruled): native openers during a
   it("(P2-8) a journal of a LIVE writer (RESERVED held by another process: not hot) is refused by name, the writer's transaction intact", async () => {
     makeDb(dbPath, 0, ["a"], "DELETE");
     writeCfg({});
-    const w = startChild(TXN, [BSQ3(), dbPath, "write"]);
-    expect(await w.first).toBe("READY");
+    const wc = spawn(process.execPath, [WCOMMIT, BSQ3(), dbPath], { env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+    children.push(wc);
+    let wout = "";
+    wc.stdout!.on("data", (d: Buffer) => (wout += d));
+    const until = async (re: RegExp) => {
+      const end = Date.now() + 30_000;
+      while (!re.test(wout) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+      return re.test(wout);
+    };
+    expect(await until(/READY/), "the writer started").toBe(true);
     // Preconditions, MEASURED here (one native-binary run converted anyway, 8 Nov): the writer's journal is on disk, and
     // the writer really holds its lock (a probe connection of this process is BUSY).
     expect(fs.existsSync(dbPath + "-journal"), "precondition: the live writer's journal exists").toBe(true);
@@ -913,6 +977,10 @@ describe("INV-DB-01 slice 4, Codex #401 R1 P1-3 (ruled): native openers during a
     await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(/convert-journal refused/);
     expect(header(dbPath).id, "not converted").toBe(0);
     expect(fs.existsSync(dbPath + "-journal"), "the live writer's journal is intact (never rolled back)").toBe(true);
+    // Codex #401 R2 residual (d): the writer then COMMITS, and its row is in the file (its transaction was never touched).
+    wc.stdin!.write("commit\n");
+    expect(await until(/COMMITTED/), "the writer committed").toBe(true);
+    expect(readOther(dbPath).rows, "the live writer's row survived the refused conversion").toContain("held");
   }, 60_000);
 
   it.skipIf(process.platform === "win32")("(P2-8) native-less: a hot journal is refused with the named remedy (an integrity_check with every relay process stopped) (skipped on Windows: SIGKILL of self)", async () => {
@@ -922,6 +990,71 @@ describe("INV-DB-01 slice 4, Codex #401 R1 P1-3 (ruled): native openers during a
     writeCfg({});
     wasmOnly();
     await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(/convert-journal refused[\s\S]*sqlite3 [\s\S]*PRAGMA integrity_check;[\s\S]*every relay process stopped/);
+  }, 60_000);
+});
+
+describe("INV-DB-01 slice 4, Codex #401 R2: the lock probe's errno discipline, the no-flock message, restore's Windows swap", () => {
+  const fault = (code: string) => Object.assign(new Error(`${code}: injected`), { code });
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each(["EIO", "EACCES"])("P2: a realpath %s during the owner-lock probe is HELD (fail closed), never free", async (code) => {
+    makeDb(dbPath, NATIVE, ["a"]);
+    const lockMod = await import("../src/db-owner-lock.js");
+    const real = fs.realpathSync.native;
+    vi.spyOn(fs.realpathSync, "native").mockImplementation(((p: fs.PathLike) => {
+      if (String(p) === dbPath) throw fault(code);
+      return real(p);
+    }) as never);
+    expect(lockMod.ownerLockHeldElsewhere(dbPath)).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32").each(["EIO", "EACCES"])("P2: an lstat %s on the lock file during the probe is HELD (fail closed): only an established absence (ENOENT) is free", async (code) => {
+    makeDb(dbPath, NATIVE, ["a"]);
+    const lockMod = await import("../src/db-owner-lock.js");
+    const lockFile = lockMod.lockFilePath(dbPath);
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((p: fs.PathLike, o?: unknown) => {
+      if (String(p) === lockFile) throw fault(code);
+      return (lstat as (p: fs.PathLike, o?: unknown) => fs.Stats)(p, o);
+    }) as never);
+    vi.spyOn(fs, "existsSync").mockImplementation(((p: fs.PathLike) => {
+      if (String(p) === lockFile) return false; // what existsSync says on any error: must not be what decides
+      return fs.statSync(p, { throwIfNoEntry: false }) !== undefined;
+    }) as never);
+    expect(lockMod.ownerLockHeldElsewhere(dbPath)).toBe(true);
+  });
+
+  it.runIf(process.platform === "linux")("residual (b): with NO trusted flock, a native open of a DB with an owner lock file is refused naming the MISSING flock and its remedy (not \"wait for another process\")", async () => {
+    makeDb(dbPath, NATIVE, ["a"]);
+    writeCfg({});
+    const lockMod = await import("../src/db-owner-lock.js");
+    fs.writeFileSync(lockMod.lockFilePath(dbPath), "", { mode: 0o600 }); // a lock file left by an earlier owner
+    lockMod._setLinuxSchemeForTests("socket");
+    try {
+      const v = compat.nativeOpenVerdict(dbPath, "a native open");
+      expect(v.ok).toBe(false);
+      expect(!v.ok && v.message).toMatch(/no trusted[\s\S]*flock[\s\S]*(install|util-linux)/i);
+      expect(!v.ok && v.message).not.toMatch(/another relay process holds/);
+    } finally {
+      lockMod._setLinuxSchemeForTests(null);
+    }
+  });
+
+  it("restore's swap: a rename of the staged copy that FAILS is a NAMED refusal after a short retry, never a copy over the live DB (the #377 ruling), the live DB byte-identical", async () => {
+    makeDb(dbPath, 0, ["archived"], "DELETE");
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "a.tar.gz") })).archive_path;
+    fs.rmSync(dbPath);
+    makeDb(dbPath, 0, ["live"], "DELETE");
+    writeCfg({});
+    const before = sha(dbPath);
+    const rename = fs.renameSync;
+    vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      if (String(from).endsWith(".new") && String(to) === fs.realpathSync.native(dbPath)) throw Object.assign(new Error("EPERM: operation not permitted, rename (injected)"), { code: "EPERM" });
+      return rename(from, to);
+    }) as never);
+    await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*(could not be replaced|open)/i);
+    expect(sha(dbPath), "the live DB is byte-identical (nothing copied over it)").toBe(before);
+    expect(readOther(dbPath).rows).toEqual(["live"]);
   }, 60_000);
 });
 
