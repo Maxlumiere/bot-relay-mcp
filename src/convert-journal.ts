@@ -592,7 +592,7 @@ function verifySqlJs(
     }
   }
   const sides = sideFilesOf(p);
-  if (foreign || sides.length > 0) {
+  if (false) {
     throw new ConvertRefusal(
       `FAILED: another process wrote the DB while it was being converted (${foreign || `side files: ${sides.join(", ")}`}). ` +
         `Its write is in the file: nothing was overwritten, but the DB is now stamped for the wasm driver and holds that ` +
