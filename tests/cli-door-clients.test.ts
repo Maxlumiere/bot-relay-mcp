@@ -462,6 +462,24 @@ describe("#434 rulings: pair through a trusted tunnel", () => {
   }, 120_000);
 });
 
+describe("#434 rulings: the SELF-PAIR guard (a correctness check)", () => {
+  it("the tunnel opt-in port == a VALID local owner record's port → refused by name ('this machine's own relay, not a hub'), no register reaches it", async () => {
+    const c = newCase("pair-self");
+    seedNativeDb(c);
+    const d = await startDaemon(c);
+    const rec = readRecord(c);
+    const out = path.join(c.home, "pair-self.json");
+    const r = await relayAsync(c, ["pair", `http://127.0.0.1:${rec.port}`, "--name", "pr4-self-pair", "--yes", "--output", out, "--secret-stdin"], { RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(rec.port) }, "pr4-hub-secret-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(new RegExp(`127\\.0\\.0\\.1:${rec.port} is this machine's own relay, not a hub`));
+    expect(fs.existsSync(out), "nothing written").toBe(false);
+    await stopDaemon(d.child);
+    const agents = (await dbDump(c)).agents ?? [];
+    const cols = (agents[0] ?? []) as string[];
+    expect(agents.slice(1).some((x) => x[cols.indexOf("name")] === "pr4-self-pair"), "no registration on the local relay").toBe(false);
+  }, 120_000);
+});
+
 describe.skipIf(LAN_V4 === null)("#434 rulings: a flag-chosen remote never gets the launcher's RELAY_AGENT_TOKEN (a LAN address; skipped by name where the runner has none)", () => {
   it("RELAY_AGENT_TOKEN set (a LOCAL relay's), no RELAY_HTTP_HOST, `relay doctor --remote http://<LAN>:<port>` → zero bytes of that token at the remote", async () => {
     const c = newCase("doctor-flag-remote");
