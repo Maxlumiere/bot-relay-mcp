@@ -323,12 +323,12 @@ describe("hook PR 3: the AEAD owner door (every OS)", () => {
     expect(row[cols.indexOf("agent_pid")]).toBe(4242);
   }, 90_000);
 
-  it("a NATIVE daemon writes the v2 record too, and its door answers (validity without an owner lock: trust + binding + the reply)", async () => {
+  it("a NATIVE daemon writes the record too (version 3), and its door answers (validity without an owner lock: trust + binding + the reply)", async () => {
     const c = newCase("aead-native");
     const token = seedNativeDb(c);
     const d = await startDaemon(c);
     const rec = readRecord(c);
-    expect(rec.v).toBe(2);
+    expect(rec.v).toBe(3);
     const r = await door(rec, HEALTH, { rpc: rpc("health_check", {}), agent_token: token });
     expect(r.status, r.raw).toBe(200);
     expect(r.opened).not.toBeNull();
@@ -398,6 +398,22 @@ describe("hook PR 3 (#433 macOS): a process-lookup cut is never hidden (every OS
 // #433 Codex R1 (REDs, every OS): the host check, a null reply, the record version, the remote mint secret.
 const runRelay = (c: Case, args: string[], input = "", extra: Record<string, string> = {}) =>
   spawnSync(process.execPath, [RELAY, ...args], { env: baseEnv(c, extra), input, encoding: "utf-8", timeout: 30_000 });
+/** ASYNC: a server in THIS process must keep answering while the CLI runs (spawnSync would starve it). */
+function runRelayAsync(c: Case, args: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [RELAY, ...args], { env: baseEnv(c), stdio: ["ignore", "pipe", "pipe"] });
+    procs.push(child);
+    let stdout = "";
+    let stderr = "";
+    child.stdout!.on("data", (d: Buffer) => (stdout += d));
+    child.stderr!.on("data", (d: Buffer) => (stderr += d));
+    const t = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    child.once("close", (status) => {
+      clearTimeout(t);
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
 /** Point the record at another port: an atomic 0600 rewrite by the record's own user (the trust model holds). */
 function retarget(c: Case, rec: Record<string, unknown>): void {
   const tmp = `${c.record}.re-${crypto.randomBytes(3).toString("hex")}`;
@@ -460,7 +476,7 @@ describe("#433 Codex R1 P3-6: a non-object reply is a NAMED failure, never an ex
       servers.push(srv);
       await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
       retarget(c, { ...rec, port: (srv.address() as { port: number }).port });
-      const r = runRelay(c, ["owner", "peek", AGENT, "--json", "--timeout-ms", "4000"]);
+      const r = await runRelayAsync(c, ["owner", "peek", AGENT, "--json", "--timeout-ms", "4000"]);
       expect(r.status, `${body}: ${r.stderr}`).toBe(1);
       expect(r.stderr, body).toMatch(/relay owner: the owner's reply failed its authentication/);
       expect(r.stderr, body).not.toMatch(/TypeError|at .*\.js:\d+/);
@@ -491,7 +507,7 @@ describe("#433 Codex R1 P2-5: the record and protocol are version 3; a skew eith
     const old = await startDoorServer418(key, b, { ok: true, registered: true, count: 0, messages: [] });
     servers.push(old.server);
     retarget(c, record418(old.port, key, b));
-    const r = runRelay(c, ["owner", "peek", AGENT, "--json", "--timeout-ms", "4000"]);
+    const r = await runRelayAsync(c, ["owner", "peek", AGENT, "--json", "--timeout-ms", "4000"]);
     expect(r.status, r.stderr).toBe(1);
     expect(r.stderr).toMatch(/old-record\).*restart the relay daemon/);
     expect(old.requests(), "no exchange with the old daemon").toBe(0);

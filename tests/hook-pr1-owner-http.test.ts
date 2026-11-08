@@ -230,13 +230,13 @@ async function dbDump(c: Case): Promise<Record<string, unknown[][]>> {
 }
 
 describe("hook PR 1: the owner record and the owner door (every OS)", () => {
-  it("a wasm DAEMON owner writes its v2 record after listening (POSIX 0600; Windows owner-only ACL), never deleted; GET /owner-id is retired", async () => {
+  it("a wasm DAEMON owner writes its record (version 3, #433) after listening (POSIX 0600; Windows owner-only ACL), never deleted; GET /owner-id is retired", async () => {
     const c = newCase("record");
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
     const rec = readRecord(c);
-    expect(rec).toMatchObject({ v: 2, host: "127.0.0.1", port: d.port, pid: d.child.pid, transport: "http", db_path: fs.realpathSync.native(c.db) });
+    expect(rec).toMatchObject({ v: 3, host: "127.0.0.1", port: d.port, pid: d.child.pid, transport: "http", db_path: fs.realpathSync.native(c.db) });
     expect(typeof rec.instance_id, "the record names its instance (\"\" for an explicit DB path)").toBe("string");
     expect(rec.key).toMatch(KEY_RE);
     if (process.platform === "win32") {
@@ -1499,6 +1499,7 @@ let PINNED_HOOKS = "";
 function pinnedRemoteHooks(): string {
   if (PINNED_HOOKS) return PINNED_HOOKS;
   const root = path.join(ROOT, "pinned-remote");
+  fs.rmSync(root, { recursive: true, force: true }); // a failed earlier build leaves nothing half-made behind
   fs.cpSync(HOOKS, path.join(root, "hooks"), { recursive: true });
   fs.symlinkSync(path.join(REPO, "bin"), path.join(root, "bin"));
   const helpers = path.join(root, "hooks", "_vault-helpers.sh");
