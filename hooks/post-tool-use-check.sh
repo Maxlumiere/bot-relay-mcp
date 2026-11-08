@@ -749,15 +749,20 @@ case "$F1_RC" in
     fi
     ;;
   3)
-    if [ -n "${RELAY_HTTP_HOST:-}" ] && relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS" && ! relay_bearer_allowed; then
+    # relay pending's exit 3: no local instance at all (the tunnel gate and the vault scope need no resolver for it).
+    RELAY_NO_LOCAL_INSTANCE=1
+    if [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_bearer_allowed; then
       # Hook PR 3 (as ruled): a loopback bearer is refused (the port-theft class) unless it is a trusted tunnel.
       MODE=remote
       echo "[RELAY] mail not read: no token is sent to the loopback port ${RELAY_HTTP_PORT:-3777} (${RELAY_TUNNEL_HINT}). Mail may be waiting: call get_messages." >&2
-    elif [ -n "${RELAY_HTTP_HOST:-}" ] && relay_bearer_allowed; then
+    elif [ -n "${RELAY_HTTP_HOST:-}" ]; then
       MODE=remote
-      # The vault location is the resolver's answer (loaded just above), scoped to the remote when it must be.
+      # The vault (scoped to the remote when it must be) is beside the resolver's DB: one `relay where`, remote only.
       relay_scope_vault_to_remote
-      [ -z "$AGENT_TOKEN" ] && relay_hydrate_token
+      if [ -z "$AGENT_TOKEN" ]; then
+        relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"
+        relay_hydrate_token
+      fi
       SUMMARY=$(http_peek)
       case $? in
         0) READ_OK=1 ;;

@@ -268,6 +268,8 @@ relay_trusted_tunnel() {
   case "$t" in ''|*[!0-9]*) return 1 ;; esac
   [ "$t" = "$p" ] || return 1
   relay_host_is_loopback "${RELAY_HTTP_HOST:-127.0.0.1}" || return 1
+  # `relay pending` said exit 3 (no local instance at all): definitive, no resolver needed.
+  [ "${RELAY_NO_LOCAL_INSTANCE:-}" = 1 ] && return 0
   [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
   [ "${RELAY_RES_KIND:-error}" = error ] && return 1
   [ "${RELAY_RES_EXISTS:-}" = true ] && return 1
@@ -290,8 +292,11 @@ RELAY_TUNNEL_HINT="a relay reached through an ssh tunnel on this loopback port n
 relay_scope_vault_to_remote() {
   local scoped=0
   if relay_remote_declared; then
-    [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
-    [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ] && scoped=1
+    # No local instance (relay pending's exit 3) = no local token to keep apart: unscoped, and no resolver needed.
+    if [ "${RELAY_NO_LOCAL_INSTANCE:-}" != 1 ]; then
+      [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
+      [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ] && scoped=1
+    fi
   elif relay_trusted_tunnel; then
     scoped=1
   fi

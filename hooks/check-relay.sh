@@ -793,7 +793,11 @@ relay_deliver_pending_mail() {
       esac
       ;;
     3)
+      RELAY_NO_LOCAL_INSTANCE=1
       if [ -n "${RELAY_HTTP_HOST:-}" ] && relay_bearer_allowed; then
+        # Remote mode: SessionStart's one bearer call (with no local DB it exits after the mail). A trusted tunnel's
+        # risk is named here, every session (as ruled).
+        relay_remote_declared || echo "[RELAY] bearer to a trusted tunnel on 127.0.0.1:${HTTP_PORT}: if the tunnel drops, another local user could take that port." >&2
         relay_deliver_remote_mail
         return 0
       elif [ -n "${RELAY_HTTP_HOST:-}" ]; then
@@ -886,11 +890,8 @@ elif [ "$_local_db" = 1 ]; then
       ;;
     *) _cred_why="the relay CLI's DB verdict (${RELAY_RES_HOOK_DB:-none}) has no owner door" ;;
   esac
-elif relay_trusted_tunnel; then
-  RELAY_CRED_ROUTE=bearer
-  RELAY_CURL_GUARD=()
-  echo "[RELAY] bearer to a trusted tunnel on 127.0.0.1:${HTTP_PORT}: if the tunnel drops, another local user could take that port." >&2
 else
+  # (A trusted tunnel needs NO local DB, and with none this hook delivered its mail and exited above.)
   _cred_why="no local relay DB, and no declared remote RELAY_HTTP_HOST (${RELAY_TUNNEL_HINT})"
 fi
 [ "$RELAY_CRED_ROUTE" != none ] && RELAY_CRED_OK=1
