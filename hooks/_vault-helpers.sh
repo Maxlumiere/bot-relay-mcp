@@ -858,7 +858,12 @@ write_relay_token_to_vault() {
 # stderr; a walk ends at its first refused or empty step. Its stdout is the caller's.
 relay_ps_run() {
   relay_budget_for "a process lookup (ps)" 1 "${RELAY_PS_BUDGET:-margin}" || return 124
-  relay_run_streamed "$RELAY_STEP_SECS" "$@" 2>/dev/null
+  local rc=0
+  relay_run_streamed "$RELAY_STEP_SECS" "$@" 2>/dev/null || rc=$?
+  # A lookup killed by its step deadline is a CUT like a skipped one, and a cut is named: silent, the caller (a pid
+  # walk) reads an empty answer and stops as if the chain had ended.
+  [ "$rc" -eq 124 ] && echo "[bot-relay] a process lookup (ps) did not finish within ${RELAY_STEP_SECS}s: the process walk stops there." >&2
+  return "$rc"
 }
 relay_ps() {
   relay_ps_run ps "$@"
