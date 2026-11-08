@@ -302,7 +302,7 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
  * edits change it), so it is given a COPY: the caller's bytes stay exactly what was read.
  */
 function loadImage(SQL: any, bytes: Uint8Array): any {
-  return new SQL.Database(Uint8Array.from(bytes));
+  return new SQL.Database(bytes);
 }
 /** integrity_check and every table's row count, on a loaded image. */
 function inventory(img: any): { integrity: string; counts: Record<string, number> } {
