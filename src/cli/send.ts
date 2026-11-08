@@ -135,7 +135,7 @@ export async function run(argv: string[]): Promise<number> {
     host = process.env.RELAY_HTTP_HOST || host;
     port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
   }
-  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteToken, RelayClientError } = await import("./relay-client.js");
+  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteToken, remoteSecret, envSelects, RelayClientError } = await import("./relay-client.js");
   const route = await routeFor(host, port);
   if (route.kind === "unresolved") {
     process.stderr.write(`relay send: ${unresolvedMessage(route)}\n`);
@@ -154,7 +154,7 @@ export async function run(argv: string[]): Promise<number> {
   const envToken = process.env.RELAY_AGENT_TOKEN;
   if (route.kind === "remote") {
     // A REMOTE gets only ITS credential: RELAY_AGENT_TOKEN, or its own vault scope. Never the local vault.
-    token = await remoteToken(route.host, route.port, from);
+    token = await remoteToken(route.host, route.port, from, { envSelected: envSelects(route.host) });
     if (!token) {
       process.stderr.write(
         `relay send: no token for "${from}" on the remote relay ${route.host}:${route.port}: set RELAY_AGENT_TOKEN ` +
@@ -265,10 +265,10 @@ export async function run(argv: string[]): Promise<number> {
   let text = "";
   try {
     if (route.kind === "remote") {
-      // /api/send-message is operator-authed (ADR-0006): a remote's operator secret comes ONLY from the environment
-      // (RELAY_DASHBOARD_SECRET), never this machine's config.
+      // /api/send-message is operator-authed (ADR-0006): a remote's operator secret is ITS OWN (relay remote
+      // set-dashboard-secret) or RELAY_DASHBOARD_SECRET, never this machine's config.
       const headers: Record<string, string> = { "Content-Type": "application/json" };
-      const secret = process.env.RELAY_DASHBOARD_SECRET || null;
+      const secret = await remoteSecret(route.host, route.port, "dashboard");
       if (secret) headers["Authorization"] = `Bearer ${secret}`;
       const payload = JSON.stringify({ from, to: args.to, content: args.content, priority: args.priority, from_agent_token: token });
       ({ status, text } = await remotePost(route, "/api/send-message", headers, payload));

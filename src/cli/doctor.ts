@@ -488,7 +488,7 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
       // PR 4 (as ruled): the token goes through relay-client. A LOOPBACK hub URL (any spelling) is this machine's
       // relay, reached only through its owner door; a remote hub by a hardened bearer (no redirect, no proxy, the
       // checked address); an unresolved host gets nothing.
-      const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, mcpResultOf, RelayClientError } = await import("./relay-client.js");
+      const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, mcpResultOf, remoteToken, envSelects, RelayClientError } = await import("./relay-client.js");
       const hubPort = hubUrl.port ? Number(hubUrl.port) : hubUrl.protocol === "https:" ? 443 : 80;
       const route = await routeFor(hubUrl.hostname.replace(/^\[|\]$/g, ""), hubPort, hubUrl.protocol === "https:");
       if (route.kind === "unresolved") throw new RelayClientError(unresolvedMessage(route));
@@ -499,10 +499,14 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
         body = toolJson(result);
         httpStatus = result.isError ? 400 : 200;
       } else {
+        // As ruled on #434: a flag-chosen remote never gets the launcher's RELAY_AGENT_TOKEN (it usually belongs to the
+        // LOCAL relay): only when RELAY_HTTP_HOST names this hub; otherwise the hub's own vault entry.
+        const remoteTok = await remoteToken(route.host, route.port, process.env.RELAY_AGENT_NAME ?? "", { envSelected: envSelects(route.host) });
+        if (!remoteTok) throw new RelayClientError(`no token for this hub: RELAY_AGENT_TOKEN is used only when RELAY_HTTP_HOST names the hub; otherwise its own vault entry (agents/remote-${route.host}-${route.port}/<agent>.token)`);
         const r = await remotePost(
           route,
           "/mcp",
-          { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Agent-Token": token },
+          { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Agent-Token": remoteTok },
           JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "health_check", arguments: {} } }),
           5000,
         );

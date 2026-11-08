@@ -19,7 +19,12 @@ import crypto from "crypto";
 import { restrictToOwnerWindows, privacyFaults } from "../fs-perms.js";
 import { sameFileIdentity } from "../file-identity.js";
 
-const USAGE = "Usage: relay remote set-mint-secret <host:port>   (the secret on STDIN)\n";
+const USAGE =
+  "Usage: relay remote set-mint-secret <host:port>        (the remote's registration secret, on STDIN)\n" +
+  "       relay remote set-http-secret <host:port>        (the remote's transport secret, on STDIN)\n" +
+  "       relay remote set-dashboard-secret <host:port>   (the remote's operator secret, on STDIN)\n";
+/** Each subcommand's file in the remote's scope (as ruled: per-remote provisioned secrets). */
+const SECRET_FILES: Readonly<Record<string, string>> = { "set-mint-secret": "mint.secret", "set-http-secret": "http.secret", "set-dashboard-secret": "dashboard.secret" };
 /** The hooks' scope name for a remote (hooks/_vault-helpers.sh relay_scope_vault_to_remote): keep them identical. */
 export const remoteScope = (host: string, port: string): string => `remote-${host.replace(/[^A-Za-z0-9_.-]/g, "_")}-${port.replace(/[^0-9]/g, "")}`;
 
@@ -108,16 +113,17 @@ function writePrivateFile(file: string, data: string, dirId: fs.BigIntStats): vo
   fs.renameSync(tmp, file);
 }
 /** Store a remote's registration secret at <dir>/mint.secret: the directory chain private FIRST, then the file. */
-export function writeRemoteMintSecret(dir: string, secret: string): string {
+export function writeRemoteMintSecret(dir: string, secret: string, fileName = "mint.secret"): string {
   const dirId = securePrivateChain(dir);
-  const file = path.join(dir, "mint.secret");
+  const file = path.join(dir, fileName);
   writePrivateFile(file, `${secret}\n`, dirId);
   return file;
 }
 
 export async function run(argv: string[]): Promise<number> {
   const [sub, target, ...rest] = argv;
-  if (sub !== "set-mint-secret") return fail(`unknown subcommand ${JSON.stringify(sub ?? "")}\n${USAGE}`, 2);
+  const fileName = SECRET_FILES[sub ?? ""];
+  if (!fileName) return fail(`unknown subcommand ${JSON.stringify(sub ?? "")}\n${USAGE}`, 2);
   if (rest.length > 0) return fail(`the secret is read from STDIN, never argv (got ${rest.length} extra argument(s))\n${USAGE}`, 2);
   const m = /^([A-Za-z0-9_.:-]{1,253}):([0-9]{1,5})$/.exec(target ?? "");
   if (!m) return fail(`a <host:port> is required\n${USAGE}`, 2);
@@ -135,10 +141,10 @@ export async function run(argv: string[]): Promise<number> {
   if (r.kind === "error") return fail(`no relay instance to store it in (${r.reason})`);
   const dir = path.join(path.dirname(r.dbPath), "agents", remoteScope(host, port));
   try {
-    writeRemoteMintSecret(dir, secret);
+    writeRemoteMintSecret(dir, secret, fileName);
   } catch (err) {
     return fail((err as Error).message);
   }
-  process.stdout.write(`relay remote: the mint secret for ${host}:${port} is stored (${path.join(dir, "mint.secret")})\n`);
+  process.stdout.write(`relay remote: the ${fileName.replace(".secret", "")} secret for ${host}:${port} is stored (${path.join(dir, fileName)})\n`);
   return 0;
 }

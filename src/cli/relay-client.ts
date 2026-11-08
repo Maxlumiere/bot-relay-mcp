@@ -148,25 +148,43 @@ export function mcpResultOf(text: string): { content?: Array<{ text?: string }>;
   }
 }
 
-/**
- * The agent token for a REMOTE: RELAY_AGENT_TOKEN (operator-explicit), else that remote's OWN vault scope
- * (agents/remote-<host>-<port>/<agent>.token beside the local instance's vault), never the local vault.
- */
-export async function remoteToken(host: string, port: number, agent: string): Promise<string | null> {
-  const env = process.env.RELAY_AGENT_TOKEN;
-  if (typeof env === "string" && /^[A-Za-z0-9_=.-]{8,128}$/.test(env)) return env;
-  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(agent)) return null;
+/** One line from a file in a remote's own scope (agents/remote-<host>-<port>/<name>), or null. */
+async function scopedLine(host: string, port: number, name: string): Promise<string | null> {
   try {
     const { resolveInstance } = await import("../instance.js");
     const r = resolveInstance({});
     if (r.kind === "error") return null;
-    const file = path.join(path.dirname(r.dbPath), "agents", remoteScope(host, String(port)), `${agent}.token`);
+    const file = path.join(path.dirname(r.dbPath), "agents", remoteScope(host, String(port)), name);
     const st = fs.lstatSync(file);
     if (!st.isFile() || st.isSymbolicLink()) return null;
-    const t = fs.readFileSync(file, "utf-8").split("\n")[0]!.trim();
-    return /^[A-Za-z0-9_=.-]{8,128}$/.test(t) ? t : null;
+    return fs.readFileSync(file, "utf-8").split("\n")[0]!.trim();
   } catch {
     return null;
   }
+}
+/**
+ * The agent token for a REMOTE (as ruled on #434): RELAY_AGENT_TOKEN ONLY when the SAME environment selected that
+ * remote (RELAY_HTTP_HOST names it: `envSelected`), because a launcher-set token usually belongs to the LOCAL relay;
+ * otherwise that remote's OWN vault entry (agents/remote-<host>-<port>/<agent>.token). Never the local vault.
+ */
+export async function remoteToken(host: string, port: number, agent: string, opts: { envSelected: boolean }): Promise<string | null> {
+  const env = process.env.RELAY_AGENT_TOKEN;
+  if (opts.envSelected && typeof env === "string" && /^[A-Za-z0-9_=.-]{8,128}$/.test(env)) return env;
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(agent)) return null;
+  const t = await scopedLine(host, port, `${agent}.token`);
+  return t !== null && /^[A-Za-z0-9_=.-]{8,128}$/.test(t) ? t : null;
+}
+/** Did the ENVIRONMENT select this remote (RELAY_HTTP_HOST names this host)? */
+export const envSelects = (host: string): boolean => (process.env.RELAY_HTTP_HOST ?? "") === host;
+/**
+ * A REMOTE's transport secret (as ruled): its own provisioned file (`relay remote set-http-secret` /
+ * `set-dashboard-secret`: agents/remote-<host>-<port>/<kind>.secret), else the environment (RELAY_HTTP_SECRET /
+ * RELAY_DASHBOARD_SECRET). NEVER this machine's config.
+ */
+export async function remoteSecret(host: string, port: number, kind: "http" | "dashboard"): Promise<string | null> {
+  const f = await scopedLine(host, port, `${kind}.secret`);
+  if (f !== null && f.length >= 16 && /^[!-~]+$/.test(f)) return f;
+  const env = kind === "http" ? process.env.RELAY_HTTP_SECRET : process.env.RELAY_DASHBOARD_SECRET;
+  return env ? env : null;
 }
 export const randomId = () => crypto.randomBytes(8).toString("hex");

@@ -106,7 +106,7 @@ export async function run(argv: string[]): Promise<number> {
     host = process.env.RELAY_HTTP_HOST || host;
     port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
   }
-  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteToken, mcpResultOf } = await import("./relay-client.js");
+  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteToken, remoteSecret, envSelects, mcpResultOf } = await import("./relay-client.js");
   const route = await routeFor(host, port);
   if (route.kind === "unresolved") {
     process.stderr.write(`relay resolve: ${unresolvedMessage(route)}\n`);
@@ -123,7 +123,7 @@ export async function run(argv: string[]): Promise<number> {
   const envToken = process.env.RELAY_AGENT_TOKEN;
   if (route.kind === "remote") {
     // A REMOTE gets only ITS credential: RELAY_AGENT_TOKEN, or its own vault scope. Never the local vault.
-    token = await remoteToken(route.host, route.port, agent);
+    token = await remoteToken(route.host, route.port, agent, { envSelected: envSelects(route.host) });
     if (!token) {
       process.stderr.write(
         `relay resolve: no token for "${agent}" on the remote relay ${route.host}:${route.port}: set RELAY_AGENT_TOKEN ` +
@@ -217,10 +217,10 @@ export async function run(argv: string[]): Promise<number> {
   let envelope: { success?: boolean; error?: string; resolved_ids?: unknown; resolved_count?: unknown; note?: string } | null = null;
   try {
     if (route.kind === "remote") {
-      // /mcp is the agent transport: a remote's transport secret comes ONLY from the environment (RELAY_HTTP_SECRET),
-      // never this machine's config.
+      // /mcp is the agent transport: a remote's transport secret is ITS OWN (relay remote set-http-secret) or
+      // RELAY_HTTP_SECRET, never this machine's config.
       const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Agent-Token": token };
-      const secret = process.env.RELAY_HTTP_SECRET || null;
+      const secret = await remoteSecret(route.host, route.port, "http");
       if (secret) headers["Authorization"] = `Bearer ${secret}`;
       const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "resolve_messages", arguments: { agent_name: agent, message_ids: args.messageIds } } });
       const r = await remotePost(route, "/mcp", headers, body);

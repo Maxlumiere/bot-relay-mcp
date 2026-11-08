@@ -325,15 +325,19 @@ export async function run(argv: string[]): Promise<number> {
   const { routeFor, unresolvedMessage, remotePost, mcpResultOf, toolJson } = await import("./relay-client.js");
   const hubPort = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
   const hubRoute = await routeFor(url.hostname.replace(/^\[|\]$/g, ""), hubPort, url.protocol === "https:");
-  if (hubRoute.kind === "local") {
-    process.stderr.write(`relay pair: pair is for a remote hub: ${hubBase} is this machine's loopback. Use the local relay directly (relay init).\n`);
+  // As ruled on #434: a loopback hub is refused by name UNLESS RELAY_HTTP_TRUSTED_TUNNEL_PORT equals its port (a hub
+  // reached through an ssh tunnel): then it is a remote pinned to 127.0.0.1.
+  const tunnelPort = process.env.RELAY_HTTP_TRUSTED_TUNNEL_PORT;
+  const isTunnel = hubRoute.kind === "local" && typeof tunnelPort === "string" && /^[0-9]{1,5}$/.test(tunnelPort) && Number(tunnelPort) === hubPort;
+  if (hubRoute.kind === "local" && !isTunnel) {
+    process.stderr.write(`relay pair: pair is for a remote hub: ${hubBase} is this machine's loopback. Use the local relay directly (relay init), or set RELAY_HTTP_TRUSTED_TUNNEL_PORT to this port for a hub reached through a tunnel.\n`);
     return 1;
   }
   if (hubRoute.kind === "unresolved") {
     process.stderr.write(`relay pair: ${unresolvedMessage(hubRoute)}\n`);
     return 1;
   }
-  const remoteHub = hubRoute;
+  const remoteHub = hubRoute.kind === "remote" ? hubRoute : { kind: "remote" as const, host: url.hostname.replace(/^\[|\]$/g, ""), port: hubPort, ip: "127.0.0.1", secure: url.protocol === "https:" };
 
   // PR-D (Codex R1 #3): the config carries credentials, so it only ever goes to a file. Checked BEFORE any network
   // call, so a token is never issued that this run could not store. The write itself is O_EXCL (authoritative).
