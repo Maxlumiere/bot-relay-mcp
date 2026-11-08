@@ -229,59 +229,48 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     expect(r.stderr).toMatch(/"type": ?"http"/);
   }, 30_000);
 
-  it("twin: a LEGACY (0) DB under env-wasm keeps working over stdio, as today (no lock, unstamped): two REAL stdio servers each acknowledge a tool call", async () => {
+  it("slice 4 (BREAKING 5.0.0): a LEGACY (0) DB under env-wasm is REFUSED over stdio, naming `relay convert-journal`, and stays unstamped (before: two stdio servers each acknowledged, no lock)", async () => {
     makeDb(dbPath, 0);
-    const connect = async (tag: string) => {
-      const transport = new StdioClientTransport({
-        command: process.execPath,
-        args: [DIST_INDEX],
-        env: { PATH: process.env.PATH ?? "", HOME: caseDir, USERPROFILE: caseDir, RELAY_DB_PATH: dbPath, RELAY_CONFIG_PATH: cfgPath, RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "1", RELAY_SQLITE_DRIVER: "wasm", ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
-        stderr: "pipe",
-      });
-      const client = new Client({ name: `legacy-${tag}`, version: "0" }, { capabilities: {} });
-      await client.connect(transport);
-      return client;
-    };
-    const [a, b] = [await connect("a"), await connect("b")];
-    try {
-      for (const [c, name] of [[a, "legacy-a"], [b, "legacy-b"]] as const) {
-        const r = (await c.callTool({ name: "register_agent", arguments: { name, role: "r", capabilities: [] } })) as { isError?: boolean; content?: Array<{ text?: string }> };
-        expect(r.isError, `${name}: ${JSON.stringify(r.content)}`).not.toBe(true);
-      }
-      const later = (await a.callTool({ name: "health_check", arguments: {} })) as { isError?: boolean };
-      expect(later.isError, "a later call is acknowledged too").not.toBe(true);
-    } finally {
-      await a.close();
-      await b.close();
-    }
+    const before = sha(dbPath);
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [DIST_INDEX],
+      env: { PATH: process.env.PATH ?? "", HOME: caseDir, USERPROFILE: caseDir, RELAY_DB_PATH: dbPath, RELAY_CONFIG_PATH: cfgPath, RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "1", RELAY_SQLITE_DRIVER: "wasm", ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
+      stderr: "pipe",
+    });
+    let stderr = "";
+    transport.stderr?.on("data", (d: Buffer) => (stderr += d));
+    const client = new Client({ name: "legacy-refused", version: "0" }, { capabilities: {} });
+    const outcome = await client
+      .connect(transport)
+      .then(() => client.callTool({ name: "register_agent", arguments: { name: "legacy-a", role: "r", capabilities: [] } }))
+      .then((r) => JSON.stringify(r), (e: Error) => `rejected: ${e.message}`);
+    await client.close().catch(() => undefined);
+    expect(`${outcome}\n${stderr}`, "the refusal names the remedy").toMatch(/relay convert-journal/);
+    expect(outcome, "no tool call is acknowledged").not.toMatch(/"isError":false|registered/i);
     expect(idOf(dbPath), "never stamped").toBe("0");
+    expect(sha(dbPath), "the legacy file is untouched").toBe(before);
   }, 60_000);
 
-  it("(2) legacy env-wasm never stamps RLYW: env-only wasm on a NEW path creates an unstamped DB", async () => {
+  it("(2) slice 4 (BREAKING 5.0.0): env-only wasm on a NEW path is the single owner: the DB is born RLYW (before: unstamped, the legacy mode)", async () => {
     process.env.RELAY_SQLITE_DRIVER = "wasm";
     await db.initializeDb();
     db.closeDb();
-    expect(idOf(dbPath)).toBe("0");
+    expect(idOf(dbPath)).toBe(String(WASM));
   });
 
-  it("(2) an owner never ADOPTS a legacy (0) file: declared wasm on an existing 0 DB stays 0, with a named warning", async () => {
+  it("(2) an owner never ADOPTS a legacy (0) file: declared wasm on an existing 0 DB is REFUSED by name, naming `relay convert-journal`, and stays 0 (slice 4; before: opened in the legacy mode, warned)", async () => {
     makeDb(dbPath, 0);
     declareWasm();
-    const warn = vi.spyOn(log, "warn");
-    await db.initializeDb();
-    db.closeDb();
+    await expect(db.initializeDb()).rejects.toThrow(/never adopts[\s\S]*relay convert-journal --to wasm/);
     expect(idOf(dbPath)).toBe("0");
-    expect(warn.mock.calls.map((c) => c.map(String).join(" ")).join("\n")).toMatch(/legacy .*not adopted|not adopt/i);
   });
 
-  it("(3) the instance declaration WINS over a contradicting env, which warns: declared wasm + env native → an owner (RLYW)", async () => {
+  it("(3) slice 4 (BREAKING 5.0.0): a CONTRADICTING env is refused by name: declared wasm + env native → no open, nothing created (before: the instance won, warned)", async () => {
     declareWasm();
     process.env.RELAY_SQLITE_DRIVER = "native";
-    const warn = vi.spyOn(log, "warn");
-    await db.initializeDb();
-    db.closeDb();
-    expect(idOf(dbPath)).toBe(String(WASM));
-    expect(warn.mock.calls.map((c) => c.map(String).join(" ")).join("\n")).toMatch(/RELAY_SQLITE_DRIVER=native .*instance.*wins/i);
+    await expect(db.initializeDb()).rejects.toThrow(/RELAY_SQLITE_DRIVER=native contradicts this instance's sqlite_driver "wasm"[\s\S]*unset/);
+    expect(fs.existsSync(dbPath)).toBe(false);
   });
 
   it("Q-B: an RLYW DB with a native handle already counted (opened past the header check) → the header still decides, with NO fs open", async () => {
@@ -384,17 +373,13 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     db.registerAgent("still-owner", "r", []); // and this owner still writes
   }, 60_000);
 
-  it("a LEGACY connection never writes onto a file that became OWNED after it opened (stamped RLYW by an owner): refused, the owner's file untouched", async () => {
+  it("slice 4: NO unlocked (legacy) wasm connection can exist to write onto a file another owner stamps: env-only wasm on an existing 0 DB is refused at open, the file untouched (before: a legacy connection opened, and its write was refused later)", async () => {
     makeDb(dbPath, 0);
-    process.env.RELAY_SQLITE_DRIVER = "wasm"; // legacy: env-only
-    await db.initializeDb();
-    expect(compat.getActiveDriver(), "precondition: a legacy wasm connection").toBe("wasm");
-    const other = path.join(caseDir, "owned.db");
-    makeDb(other, WASM);
-    fs.renameSync(other, dbPath); // an owner's file now sits at the name
-    const theirs = sha(dbPath);
-    expect(() => db.registerAgent("legacy-after", "r", [])).toThrow(/now owned by the wasm driver's single owner/);
-    expect(sha(dbPath), "the owner's file is untouched").toBe(theirs);
+    process.env.RELAY_SQLITE_DRIVER = "wasm"; // env-only
+    const before = sha(dbPath);
+    await expect(db.initializeDb()).rejects.toThrow(/relay convert-journal/);
+    expect(compat.getActiveDriver(), "no wasm connection was made").not.toBe("wasm");
+    expect(sha(dbPath), "the file is untouched").toBe(before);
   });
 
   it("a RESTORE of an owned DB while ANOTHER process owns it is refused by name, and the owner's file is untouched", async () => {

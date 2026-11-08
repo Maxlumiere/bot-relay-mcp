@@ -164,7 +164,7 @@ let headerDecidesWarned = false;
  * - legacy (0) and RLYN: native only; a wasm declaration on one is refused by name (`relay convert-journal`, slice 4);
  * - RLYN, foreign, and the in-process driver mixes: as in 2a/2b-i (refused or warned by name).
  */
-export function resolveOpen(dbPath: string): ResolvedOpen {
+export function resolveOpen(dbPath: string, purpose: "open" | "read" = "open"): ResolvedOpen {
   const d = declaredDriver();
   const peek = readDriverHeaderForDriver(dbPath, d.driver);
   if (peek.kind === "wasm") {
@@ -180,8 +180,9 @@ export function resolveOpen(dbPath: string): ResolvedOpen {
   }
   // INV-DB-01 slice 4 (BREAKING 5.0.0): a wasm OPEN (always its single owner) of an existing native (RLYN) or legacy
   // (unstamped) DB is refused by name, whatever declared wasm: an owner never adopts a file it did not stamp, and the
-  // legacy no-owner mode is retired. (Read-only wasm reads, such as backup staging, keep db-header's verdict.)
-  if (d.driver === "wasm" && (peek.kind === "legacy" || peek.kind === "native")) {
+  // legacy no-owner mode is retired. A READ (configuredDriver: a backup's or a restore's driver pick for a file it
+  // only reads) keeps db-header's verdict, as before.
+  if (purpose === "open" && d.driver === "wasm" && (peek.kind === "legacy" || peek.kind === "native")) {
     const kind = peek.kind === "native" ? "a native relay database (RLYN)" : "a legacy (unstamped) relay database";
     const nativeHere = nativeLoadsHere();
     throw new DbHeaderRefusedError(
@@ -209,7 +210,8 @@ export function resolveOpen(dbPath: string): ResolvedOpen {
   if (d.driver === "native") return { driver: "native", mode: "native", header };
   // INV-DB-01 slice 4: wasm is ALWAYS its single owner. A NEW DB is created stamped for it (whether the instance or the
   // env declared wasm); an RLYN or legacy header was refused above (an owner never adopts one).
-  if (header.kind === "absent") return { driver: "wasm", mode: "owner", header };
+  // A READ is never an owner open: its caller uses only the driver (it reads the file with it, under db-header's verdict).
+  if (header.kind === "absent" || purpose === "read") return { driver: "wasm", mode: "owner", header };
   throw new DbHeaderRefusedError(
     `REFUSING the wasm driver on the DB at '${dbPath}': its header (${header.kind}) is not one a wasm owner may open. ` +
       `Convert it once, with every relay process stopped: \`relay convert-journal --to wasm\`.`
@@ -217,8 +219,9 @@ export function resolveOpen(dbPath: string): ResolvedOpen {
 }
 /**
  * INV-DB-01 slice 4 (Q5): the driver kind a restore's staged copy must carry: the instance's declaration (its
- * sqlite_driver, else RELAY_SQLITE_DRIVER on a silent instance) ?? the live DB's header kind ?? native. A declaration
- * that disagrees with the live header is refused by name (the instance could not open its own DB).
+ * sqlite_driver, else RELAY_SQLITE_DRIVER on a silent instance) ?? the live DB's header kind ?? native. A live RLYW DB
+ * is wasm whatever the declarations (the header decides, as in resolveOpen). A wasm declaration on a live RLYN or
+ * legacy DB is refused by name (the instance could not open its own DB).
  */
 export function restoreTargetDriver(srcDbPath: string): SqliteDriver {
   const d = declaredDriver(); // a contradicting env override is refused here
@@ -226,7 +229,8 @@ export function restoreTargetDriver(srcDbPath: string): SqliteDriver {
   const live = fs.existsSync(srcDbPath) ? readDriverHeader(srcDbPath) : null;
   const liveKind: SqliteDriver | null =
     live === null ? null : live.kind === "wasm" ? "wasm" : live.kind === "native" || live.kind === "legacy" ? "native" : null;
-  if (declared !== null && liveKind !== null && declared !== liveKind) {
+  if (liveKind === "wasm") return "wasm"; // the header decides
+  if (declared === "wasm" && liveKind === "native") {
     throw new Error(
       `restore refused: this instance declares sqlite_driver "${declared}" but its live DB at '${srcDbPath}' is ` +
         `${live?.kind}: the two disagree, so the instance could not open its own DB. Convert the DB first ` +
@@ -1091,7 +1095,7 @@ async function createOwnedWasmDb(dbPath: string, header: DriverHeader): Promise<
     }
     let lock: OwnerLock;
     try {
-      lock = await acquireOwnerLock(dbPath, { initialBytes });
+      lock = await acquireOwnerLock(dbPath, { initialBytes, ...(containmentCheck ? { beforeCreate: containmentCheck } : {}) });
     } catch (err) {
       if (err instanceof OwnerLockError && /could not be locked/.test(err.message)) {
         throw new OwnerLockError(
@@ -1194,6 +1198,15 @@ export function assertMaintenanceSingleLink(dbPath: string, what: string): void 
         `them by the file's inode), then retry.`
     );
   }
+}
+
+/**
+ * INV-DB-01 slice 4 (ADR-0048): db.ts installs its containment re-check (assertStillContained) here, so the owner's
+ * creation of a NEW DB runs it before writing (this module cannot import db.ts: db.ts imports it).
+ */
+let containmentCheck: ((dbPath: string) => void) | null = null;
+export function _installContainmentCheck(fn: (dbPath: string) => void): void {
+  containmentCheck = fn;
 }
 
 /** Test-only: awaited in a wasm open right after sql.js loads (another process may own or create the file meanwhile). */
@@ -1452,7 +1465,7 @@ export function driverOf(db: CompatDatabase): SqliteDriver {
  */
 export function configuredDriver(dbPath?: string): SqliteDriver {
   // 2b-ii: with a DB path, the header decides (an RLYW file is read with the wasm driver whatever the declarations).
-  return dbPath ? resolveOpen(dbPath).driver : getDriverType();
+  return dbPath ? resolveOpen(dbPath, "read").driver : getDriverType();
 }
 
 /**

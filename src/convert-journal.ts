@@ -28,7 +28,7 @@ import { readDriverHeader, RELAY_APP_ID_NATIVE, RELAY_APP_ID_WASM } from "./db-h
 import { holdOwnerForMaintenance, checkpointBeforeRestoreSwap } from "./sqlite-compat.js";
 import { readSqliteDriverAt, configPathOverride, getConfigPath } from "./config.js";
 import { colocatedConfigPathFor } from "./instance.js";
-import { getDbPath } from "./db.js";
+import { getDbPath, assertStillContained } from "./db.js";
 
 export type ConvertTarget = "wasm" | "native";
 export interface ConvertReport {
@@ -41,6 +41,8 @@ export interface ConvertReport {
   journal: string;
   integrity: string;
   config: string;
+  /** Which converter ran. */
+  via: "native";
 }
 type Step = "journal" | "stamp" | "config";
 export interface ConvertOptions {
@@ -61,10 +63,20 @@ class ConvertRefusal extends Error {
   }
 }
 
-/** The ONE sanctioned native construction of a file that may be RLYW: only under its single-owner lock (see above). */
+/**
+ * The ONE sanctioned native construction of a file that may be RLYW: only under its single-owner lock (see above).
+ * Like every relay DB open (ADR-0048), the path's containment is re-checked AFTER the open; a failure closes it.
+ */
 function openForConversion(file: string, readonly: boolean): BetterSqlite3.Database {
   const D = createRequire(import.meta.url)("better-sqlite3") as typeof BetterSqlite3;
-  return new D(file, { readonly, fileMustExist: true });
+  const db = new D(file, { readonly, fileMustExist: true });
+  try {
+    assertStillContained(file);
+  } catch (err) {
+    db.close();
+    throw err;
+  }
+  return db;
 }
 
 const journalBytes = (file: string): string => {
@@ -154,16 +166,15 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
     if (opts._failAfterForTests === step) throw new Error(`injected failure after the ${step} step`);
   };
 
-  const before = readDriverHeader(dbPath); // this process holds no handle on it: one fs read
-  if (before.kind === "foreign" || before.kind === "unrecognised") {
-    throw new ConvertRefusal(`the file at ${dbPath} is not a relay database (${before.kind}). Nothing was changed.`);
-  }
-  if (before.kind === "absent") throw new ConvertRefusal(`the DB at ${dbPath} is empty. Nothing to convert.`);
-
-  // The single-owner lock: refused while a wasm owner is live, and kept for the whole conversion. It also refuses a DB
-  // with more than one hard link (each name would be its own key).
+  // The single-owner lock BEFORE any read: refused while a wasm owner is live, and kept for the whole conversion. It
+  // also refuses a DB with more than one hard link (each name would be its own key).
   const lock = await holdOwnerForMaintenance(dbPath, "convert-journal");
   try {
+    const before = readDriverHeader(dbPath); // this process holds no handle on it: one fs read
+    if (before.kind === "foreign" || before.kind === "unrecognised") {
+      throw new ConvertRefusal(`the file at ${dbPath} is not a relay database (${before.kind}). Nothing was changed.`);
+    }
+    if (before.kind === "absent") throw new ConvertRefusal(`the DB at ${dbPath} is empty. Nothing to convert.`);
     if (before.kind === "wasm") {
       // An RLYW file has no side file while no owner runs (DELETE mode, a clean close): any is an anomaly.
       const sides = sideFiles(dbPath);
@@ -264,7 +275,7 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
           `integrity ${integrity}, config ${config}. Run it again; if this repeats, restore the safety backup.`
       );
     }
-    return { converted, to, dbPath, configPath, header: after.kind, journal, integrity, config };
+    return { converted, to, dbPath, configPath, header: after.kind, journal, integrity, config, via: "native" };
   } finally {
     lock.release();
   }

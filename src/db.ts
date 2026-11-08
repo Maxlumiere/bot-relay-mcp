@@ -63,6 +63,7 @@ import {
   openNativeDb,
   isOpenNative,
   assertNativeByPathAllowed,
+  _installContainmentCheck,
 } from "./sqlite-compat.js";
 import { stampNativeHeader } from "./db-header.js";
 import { log } from "./logger.js";
@@ -99,6 +100,9 @@ export function assertStillContained(dbPath: string): void {
     throw new Error(`REFUSING the relay DB after opening it: ${c.reason}`);
   }
 }
+
+// INV-DB-01 slice 4 (ADR-0048): the wasm owner runs this before it CREATES a new DB (sqlite-compat cannot import db.ts).
+_installContainmentCheck(assertStillContained);
 
 /** Whether a name exists at the DB path (lstat: a stat, never an open of the file). */
 function dbNameExists(dbPath: string): boolean {

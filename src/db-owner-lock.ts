@@ -92,8 +92,16 @@ export function _setAfterMaterializeHookForTests(fn: (() => void) | null): void 
  * LEAVES the created DB in place and names it, with its size (INV-DB-01 slice 3: relay code never unlinks a DB file;
  * an unlink checked by identity could still remove a file that replaced it between the check and the unlink).
  */
-export function materializeDb(dbPath: string, initialBytes: Uint8Array, verifyCreated?: (dbPath: string) => void): void {
+export function materializeDb(
+  dbPath: string,
+  initialBytes: Uint8Array,
+  verifyCreated?: (dbPath: string) => void,
+  beforeCreate?: (dbPath: string) => void
+): void {
   if (fs.existsSync(dbPath)) return;
+  // INV-DB-01 slice 4 (ADR-0048): the path's containment is checked BEFORE the first byte is written, so a directory
+  // swapped for a symlink out of the relay's roots gets no DB (nor a temp) created through it.
+  beforeCreate?.(dbPath);
   const tmp = path.join(path.dirname(dbPath), `.${path.basename(dbPath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.new`);
   let created = false;
   try {
@@ -504,6 +512,8 @@ export interface AcquireOptions {
   verifyCreated?: (dbPath: string) => void;
   /** The first image of an absent DB (already stamped): materialized atomically before the lock is taken. */
   initialBytes?: Uint8Array;
+  /** Runs right before an absent DB is materialized (a throw refuses, nothing written): the containment check. */
+  beforeCreate?: (dbPath: string) => void;
   /** The platform the ENABLE gate judges (default: this one), so the gate is testable for any platform on any OS. The
    * primitive is always this OS's own. */
   platform?: NodeJS.Platform;
@@ -519,7 +529,7 @@ export async function acquirePrimitive(dbPath: string, opts: AcquireOptions = {}
   assertLocalFilesystem(dbPath); // before anything is materialized or locked
   let lastReason = "held by another process";
   for (let i = 0; i < attempts; i++) {
-    if (opts.initialBytes) materializeDb(dbPath, opts.initialBytes, opts.verifyCreated);
+    if (opts.initialBytes) materializeDb(dbPath, opts.initialBytes, opts.verifyCreated, opts.beforeCreate);
     afterMaterializeHook?.();
     const key = lockKey(dbPath);
     const own = HELD.get(key);
