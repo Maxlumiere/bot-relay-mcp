@@ -754,14 +754,16 @@ fs.writeFileSync(
     `catch (e) { process.stdout.write("REFUSED " + String(e && e.message || e).split("\\n")[0] + "\\n"); process.exit(3); }\n` +
     `setInterval(() => {}, 1000);\n`
 );
-/** A child that opens the DB natively and HOLDS a transaction: "read" (SHARED) or "write" (RESERVED, a journal on disk). */
+/** A child that opens the DB natively and HOLDS a transaction: "read" (SHARED) or "write" (RESERVED, a journal on disk); its connection pinned. */
 const TXN = path.join(ROOT, "hold-txn.cjs");
 fs.writeFileSync(
   TXN,
   `const D = require(process.argv[2]); const d = new D(process.argv[3], { timeout: 0 });\n` +
     `if (process.argv[4] === "write") { d.exec("BEGIN IMMEDIATE"); d.prepare("INSERT INTO kept VALUES ('held')").run(); }\n` +
     `else { d.exec("BEGIN"); d.prepare("SELECT * FROM kept").all(); }\n` +
-    `process.stdout.write("READY\\n"); setInterval(() => {}, 1000);\n`
+    // PINNED, as LIVE above: an unreferenced better-sqlite3 connection is closed when garbage-collected, which drops its
+    // lock and rolls its transaction back. Unpinned, a full-suite run (native-binary, f3a1b04) converted past this writer.
+    `globalThis.__pin = d; process.stdout.write("READY\\n"); setInterval(() => { if (!globalThis.__pin.open) process.exit(9); }, 1000);\n`
 );
 /**
  * A child that leaves a HOT journal: the stamp's transaction, its pages spilled, then killed before COMMIT. MEASURED:
