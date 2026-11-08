@@ -290,7 +290,7 @@ describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
     expect(bad.status).toBe(2);
   }, 60_000);
 
-  it("Q2: convert-journal is the ONLY native opener of an RLYW file: every native better-sqlite3 construction in src is pinned, and exactly one is in src/convert-journal.ts; and every sql.js construction in src is listed with its reason (one in convert-journal.ts)", () => {
+  it("Q2: convert-journal is the ONLY native opener of an RLYW file: every native better-sqlite3 construction in src is pinned, and exactly one is in src/convert-journal.ts; and every sql.js construction in src is listed with its reason (one in convert-journal.ts) and passes a fresh copy", () => {
     const program = srcProgram();
     const sites: string[] = [];
     for (const sf of program.getSourceFiles()) {
@@ -336,6 +336,24 @@ describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
     expect(sqljs, "every sql.js construction in src is listed (a new site fails until it is)").toEqual(
       Object.fromEntries(Object.entries(SQLJS_SITES).map(([k, v]) => [k, v.n]))
     );
+    // sql.js ADOPTS the array it is given: measured on sql.js 1.14.2, the image's edits change it. So every construction
+    // passes a FRESH copy (or nothing): no caller's buffer can ever be edited behind its back (the converter's safety
+    // copy was once the edited image). Checked at the construction itself, whatever the callers do.
+    const unsafe: string[] = [];
+    for (const sf of program.getSourceFiles()) {
+      const rel = path.relative(REPO, sf.fileName).split(path.sep).join("/");
+      if (!rel.startsWith("src/") || sf.isDeclarationFile) continue;
+      const visitArgs = (n: ts.Node): void => {
+        if (ts.isNewExpression(n) && /\.Database$/.test(n.expression.getText(sf))) {
+          const args = n.arguments ?? [];
+          const ok = args.length === 0 || (args.length === 1 && /^Uint8Array\.from\(/.test(args[0]!.getText(sf)));
+          if (!ok) unsafe.push(`${rel}: ${n.getText(sf)}`);
+        }
+        ts.forEachChild(n, visitArgs);
+      };
+      visitArgs(sf);
+    }
+    expect(unsafe, "every sql.js construction passes Uint8Array.from(...) (a fresh copy) or nothing").toEqual([]);
   }, 120_000);
 });
 
