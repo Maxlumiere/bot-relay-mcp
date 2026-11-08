@@ -389,7 +389,8 @@ describe("Codex #291 R1 #1 — SessionStart: the pre-mail steps can never eat th
       { mode: 0o755 },
     );
   }
-  function timedRun(whereSecs: number) {
+  /** `declaredRemote`: the HTTP pre-mail steps (health, registration) run only for a declared remote (hook PR 3). */
+  function timedRun(whereSecs: number, declaredRemote = false) {
     slowStubs(whereSecs);
     fs.rmSync(SLOW_NODE_LOG, { force: true });
     fs.rmSync(CURL_CAPS, { force: true });
@@ -406,8 +407,8 @@ describe("Codex #291 R1 #1 — SessionStart: the pre-mail steps can never eat th
         RELAY_AGENT_NAME: AGENT,
         RELAY_AGENT_TOKEN: "tok_" + "z".repeat(20),
         // Hook PR 3 (as ruled): a local DB's credential calls go only through its door; the HTTP health check and
-        // registration this row times run only for a DECLARED remote (an explicit non-loopback host; curl is a stub).
-        RELAY_HTTP_HOST: "relay.example.test",
+        // registration a row times run only for a DECLARED remote (an explicit non-loopback host; curl is a stub).
+        ...(declaredRemote ? { RELAY_HTTP_HOST: "relay.example.test" } : {}),
         RELAY_HTTP_PORT: "1",
         RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json"),
       },
@@ -419,7 +420,7 @@ describe("Codex #291 R1 #1 — SessionStart: the pre-mail steps can never eat th
     return { secs, out, verbs, caps, verdict: (/\[RELAY\] VERDICT=[^\n]*/.exec(out) ?? [""])[0] };
   }
   it("a slow resolver (3s) + a 2s health check + a 4s registration: done inside the 10s budget, the mail read still ran, the skip is DEGRADED", () => {
-    const r = timedRun(3);
+    const r = timedRun(3, true);
     expect(r.secs, r.out).toBeLessThan(9.5);
     expect(r.verbs, "the mail read ran").toContain("pending");
     expect(r.verdict, r.out).toMatch(/VERDICT=DEGRADED[^\n]*no time budget left for/);

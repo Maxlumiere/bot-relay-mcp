@@ -325,6 +325,11 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     const d = await startOwnerDaemon(c);
     const { key } = readRecord(c);
     await new Promise((r) => setTimeout(r, 1500));
+    // A FIRST authentication stamps once (established_at, first_authed_at, the registration-recovery handle): a bearer
+    // call before the snapshot takes those, so the door's call and its /mcp twin below are compared as equals.
+    const prime = await fetch(`http://127.0.0.1:${d.port}/mcp`, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Agent-Token": token }, body: JSON.stringify(rpc("report_liveness", { agent_name: AGENT, agent_pid: 4141, agent_pid_start: "t-prime", agent_token: token })) });
+    expect(prime.status, await prime.clone().text()).toBe(200);
+    await new Promise((r) => setTimeout(r, 500));
     const before = await dbDump(c);
     const live = { agent_name: AGENT, agent_pid: 4242, agent_pid_start: "t0", agent_token: token };
     const extra = await door(d.port, key, LIVENESS, { rpc: rpc("report_liveness", live), agent_token: token, status: "busy" });
