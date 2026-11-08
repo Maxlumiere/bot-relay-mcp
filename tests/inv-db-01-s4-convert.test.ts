@@ -558,6 +558,36 @@ describe("INV-DB-01 slice 4: the wasm-only converter (sql.js, native→wasm; the
     expect(readCfg(), "the config is written only after the file").toEqual({});
   }, 60_000);
 
+  it("the step ORDER: the safety copy is on disk BEFORE the first edit: an edit that fails leaves the copy (byte-equal, 0600) and the live file untouched", async () => {
+    makeDb(dbPath, 0, ["a", "b"], "DELETE");
+    const before = sha(dbPath);
+    writeCfg({});
+    wasmOnly();
+    // TEST-ONLY seam: sql.js memoises its module (initSqlJs returns the SAME SQL object to every caller), so patching the
+    // Database prototype here reaches the converter's image. The FIRST edit (journal_mode=DELETE) fails, as a crash
+    // mid-edit would.
+    const SQL = await ((await import("sql.js")) as unknown as { default: () => Promise<{ Database: { prototype: { exec(sql: string): unknown } } }> }).default();
+    const proto = SQL.Database.prototype;
+    const exec = proto.exec;
+    proto.exec = function (this: unknown, sql: string) {
+      if (/journal_mode\s*=\s*DELETE/i.test(sql)) throw new Error("injected: the first edit fails");
+      return exec.call(this, sql);
+    };
+    try {
+      await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(/injected: the first edit fails/);
+    } finally {
+      proto.exec = exec;
+    }
+    const backups = path.join(caseDir, "backups");
+    const copies = fs.existsSync(backups) ? fs.readdirSync(backups).filter((f) => f.includes(".pre-convert-")) : [];
+    expect(copies, "the safety copy was written before the edit").toHaveLength(1);
+    const copy = path.join(backups, copies[0]!);
+    expect(sha(copy), "byte-equal to the original").toBe(before);
+    if (process.platform !== "win32") expect(fs.statSync(copy).mode & 0o777).toBe(0o600);
+    expect(sha(dbPath), "the live file is untouched").toBe(before);
+    expect(readCfg(), "nothing declared").toEqual({});
+  }, 60_000);
+
   it("twin: wasm→native on a host where native does not load is refused by name (it needs the native driver)", async () => {
     makeDb(dbPath, WASM, ["a"], "DELETE");
     writeCfg({ sqlite_driver: "wasm" });
