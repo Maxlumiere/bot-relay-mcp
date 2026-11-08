@@ -847,6 +847,18 @@ describe("INV-DB-01 slice 4, Codex #401 R1 P1-3 (ruled): native openers during a
   // original immediately before the rename and cannot see a write in that instant: a stated residual. The "CHANGED
   // between the read and the rename" row covers a write before the final check on every OS.
   const WIN_NO_FD_ACROSS_RENAME = process.platform === "win32";
+  it.runIf(process.platform === "win32")("MEASURE (Windows, the #401 residual (a) seam): a better-sqlite3 connection HELD OPEN on the original makes the sql.js converter's rename FAIL: refused, the original intact", async () => {
+    makeDb(dbPath, 0, ["a", "b"], "DELETE");
+    const before = sha(dbPath);
+    writeCfg({});
+    await startLive(dbPath); // another process holds a better-sqlite3 connection on the original, idle
+    wasmOnly();
+    const err = await (await convertMod()).convertJournal({ to: "wasm" }).then((r) => new Error(`RESOLVED (the rename SUCCEEDED over an open handle): ${JSON.stringify(r)}`), (e: Error) => e);
+    process.stderr.write(`[measure] Windows rename over an open better-sqlite3 handle: ${err.message}\n`);
+    expect(err.message).toMatch(/convert-journal refused[\s\S]*could not be renamed/);
+    expect(sha(dbPath), "the original is intact").toBe(before);
+    expect(header(dbPath).id).toBe(0);
+  }, 60_000);
   it.skipIf(WIN_NO_FD_ACROSS_RENAME)("(1d) sql.js: a write that lands on the ORIGINAL file after the identity check (at the rename) is reported as a FAILURE, never a success: the late bytes are saved beside the safety copy, and the remedy is named (skipped on Windows: the stated residual)", async () => {
     makeDb(dbPath, 0, ["a"], "DELETE");
     writeCfg({});
