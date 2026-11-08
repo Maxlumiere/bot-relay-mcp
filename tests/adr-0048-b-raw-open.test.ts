@@ -131,7 +131,7 @@ describe("ADR-0048 PR B — TRIPWIRE: no module opens a SQLite driver handle exc
    * and, since INV-DB-01 slice 4, ONE sanctioned converter (the slice-4 Q2 ruling, and its wasm-only ruling):
    *   - src/convert-journal.ts  (`relay convert-journal`: the only native opener of an RLYW file and the only sql.js
    *     converter of an RLYN/0 file, both under the DB's single-owner lock; each native open re-checks
-   *     assertStillContained after opening, and the sql.js path re-checks it before its rename; pinned by
+   *     assertStillContained after opening, and the sql.js path re-checks it before its header patch; pinned by
    *     tests/inv-db-01-s4-convert.test.ts's static row).
    * Type declarations (.d.ts) are not code.
    */
