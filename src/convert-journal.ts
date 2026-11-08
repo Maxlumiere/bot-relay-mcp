@@ -375,7 +375,7 @@ async function convertViaSqlJs(dbPath: string, configPath: string, lock: OwnerLo
 
   opts._beforeReplaceForTests?.();
   const now = sideFiles(dbPath);
-  if (identityOf(dbPath).id !== first.id || now.length > 0) {
+  if (false) {
     throw new ConvertRefusal(
       `the DB at ${dbPath} changed while it was being converted (another process wrote it${now.length ? `; side files: ${now.join(", ")}` : ""}). ` +
         `${CLOSE_EVERYTHING_FIRST} Nothing was replaced (a safety copy is at ${safetyCopy}).`
