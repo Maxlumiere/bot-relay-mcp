@@ -42,9 +42,43 @@ export function ownerEndpointPath(dbPath: string): string {
   return path.join(path.dirname(real), `.${path.basename(real)}.relay-owner.json`);
 }
 
-/** A bind address that a client reaches as 127.0.0.1 (the record's host is always 127.0.0.1). */
-export function bindCoversLoopback(host: string): boolean {
-  return ["127.0.0.1", "localhost", "0.0.0.0", "::", "::ffff:127.0.0.1"].includes(host);
+/**
+ * A BOUND address (server.address().address, never the requested host) that a client reaches as 127.0.0.1: the IPv4
+ * loopback, or every IPv4 address. "::" is NOT counted (a v6-only socket does not take 127.0.0.1), nor ::1.
+ */
+export function addressReachesLoopback(address: string): boolean {
+  return address === "127.0.0.1" || address === "0.0.0.0" || address === "::ffff:127.0.0.1";
+}
+
+/** Hook PR 1 (as ruled, Q9): the owner-peek listener's only host, a constant. */
+export const OWNER_PEEK_HOST = "127.0.0.1";
+export const OWNER_PEEK_REFUSAL = "this listener serves only the hooks' mail peek (GET /owner-id, and get_messages with peek: true)";
+
+/** The owner-peek gate, before any parse: GET /owner-id, or POST /mcp without a session. */
+export function ownerPeekRouteAllowed(method: string, reqPath: string, hasSession: boolean): boolean {
+  if (method === "GET" && reqPath === "/owner-id") return true;
+  return method === "POST" && reqPath === "/mcp" && !hasSession;
+}
+
+/** The ONLY argument keys the hooks' peek sends (as ruled: any other key, `ack` included, is refused). Sorted. */
+const PEEK_KEYS = ["agent_name", "agent_token", "limit", "peek", "since", "status"];
+
+/**
+ * The owner-peek gate, after the parse: exactly ONE JSON-RPC object, `tools/call` of `get_messages`, whose arguments
+ * carry exactly the peek's keys, with `peek: true` and `status: "pending"`.
+ */
+export function ownerPeekBodyAllowed(body: unknown): boolean {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return false;
+  const b = body as { jsonrpc?: unknown; method?: unknown; params?: unknown };
+  if (b.jsonrpc !== "2.0" || b.method !== "tools/call") return false;
+  if (b.params === null || typeof b.params !== "object" || Array.isArray(b.params)) return false;
+  const p = b.params as { name?: unknown; arguments?: unknown };
+  if (p.name !== "get_messages") return false;
+  if (p.arguments === null || typeof p.arguments !== "object" || Array.isArray(p.arguments)) return false;
+  const a = p.arguments as Record<string, unknown>;
+  const keys = Object.keys(a).sort();
+  if (keys.length !== PEEK_KEYS.length || keys.some((k, i) => k !== PEEK_KEYS[i])) return false;
+  return a.peek === true && a.status === "pending";
 }
 
 /**

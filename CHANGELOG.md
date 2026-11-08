@@ -4,7 +4,7 @@
 
 ### The hooks read a wasm database's mail over HTTP from its daemon owner
 
-- **Added:** a wasm database's DAEMON owner writes an owner endpoint record beside it once it is listening (`.<db>.relay-owner.json`: mode 0600, the host 127.0.0.1, its port, its pid and start, a per-owner key; never deleted, overwritten by the next owner). Only a bind that 127.0.0.1 reaches gets one.
+- **Added:** a wasm database's DAEMON owner writes an owner endpoint record beside it once it is listening (`.<db>.relay-owner.json`: mode 0600, the host 127.0.0.1, its port, its pid and start, a per-owner key; never deleted, overwritten by the next owner). The record always names a listener the hooks reach as 127.0.0.1. A daemon that 127.0.0.1 cannot reach (e.g. bound to `::1` or a LAN address, or with a Host allowlist that leaves 127.0.0.1 out) also opens a second listener on 127.0.0.1 that answers only `/owner-id` and the hooks' mail read (every other request gets 403, a WebSocket upgrade is closed). `/owner-id` is Host-checked.
 - **Added:** `GET /owner-id?c=<challenge>` (no authentication, no secret served) answers HMAC-SHA256(key, challenge ‖ port), so a client holding the record can prove it is talking to the owner before it sends a credential.
 - **Changed:** `relay where --fields` prints an 8th line: the owner endpoint (`http://127.0.0.1:<port> <key>`), set only when line 7 is the new verdict `http`: a wasm database whose record is valid (the owner lock held, the pid alive with the same start). It is empty for every other verdict. An older relay CLI's 7-line answer is a named version-skew skip in the hooks.
 - **Changed:** the SessionStart, PostToolUse and Stop hooks read that owner's mail over HTTP (a `get_messages` peek):
