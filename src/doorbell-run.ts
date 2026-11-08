@@ -40,6 +40,7 @@
  * fault, DB unreadable, log refused) · 2 = usage · 4 = another live doorbell holds this instance
  * (EXIT_ALREADY_RUNNING; the instance lock, F5).
  */
+import { fileIdentityKey } from "./file-identity.js";
 import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
@@ -144,8 +145,8 @@ function ownInstallDir(): string {
 function sidecarIds(dbPath: string): { wal: string | null; shm: string | null } {
   const id = (p: string): string | null => {
     try {
-      const st = fs.lstatSync(p);
-      return st.isFile() ? `${st.dev}:${st.ino}` : null;
+      const st = fs.lstatSync(p, { bigint: true });
+      return st.isFile() ? fileIdentityKey(st) : null;
     } catch {
       return null;
     }

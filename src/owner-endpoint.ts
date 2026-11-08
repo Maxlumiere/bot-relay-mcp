@@ -28,6 +28,7 @@ import crypto from "crypto";
 import { probeOwnerLock } from "./db-owner-lock.js";
 import { processStartedAt, startOrNull } from "./liveness.js";
 import { restrictToOwnerWindows, privacyFaults, windowsForeignWriteSids } from "./fs-perms.js";
+import { sameFileIdentity } from "./file-identity.js";
 
 export const OWNER_ENDPOINT_VERSION = 2;
 const KEY = crypto.randomBytes(16).toString("hex"); // this process's owner key: fresh per process, never served
@@ -99,12 +100,8 @@ function protectPrivate(p: string, fd: number): string[] {
   const faults = restrictToOwnerWindows(p, false);
   return faults.length > 0 ? faults : privacyFaults(p, 0o600);
 }
-/**
- * Identity by (dev, ino) as BigInts: Node's numeric ino is a double, and an NTFS file id (64 bits, sequence bits high)
- * exceeds 2^53, so two files can round to the same number (INFERRED from a Windows CI pass of a swap). Exact only.
- */
-const statId = (s: fs.BigIntStats) => `${s.dev}:${s.ino}`;
-const sameFile = (a: fs.BigIntStats, b: fs.BigIntStats) => statId(a) === statId(b);
+/** Identity by exact (dev, ino) BigInts (src/file-identity.ts). */
+const sameFile = (a: fs.BigIntStats, b: fs.BigIntStats) => sameFileIdentity(a, b);
 const euidNow = () => (typeof process.geteuid === "function" ? process.geteuid() : -1);
 
 /**

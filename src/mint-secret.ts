@@ -27,6 +27,7 @@
  *     SYSTEM tolerated), read by path (a residual: no handle-based ACL read here, bounded by the parent chain).
  *     A chain fault is a MintSecretError naming the path (and the uid, mode or SID): the gate fails CLOSED.
  */
+import { sameFileIdentity } from "./file-identity.js";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
@@ -76,9 +77,9 @@ function posixFault(p: string, st: fs.Stats, kind: "dir" | "file"): string | nul
  */
 const windowsChainCache = new Map<string, string[]>();
 function windowsFaults(p: string): string[] {
-  let st: fs.Stats;
+  let st: fs.BigIntStats;
   try {
-    st = fs.lstatSync(p);
+    st = fs.lstatSync(p, { bigint: true });
   } catch (err) {
     return [`${p}: ${(err as Error).message}`];
   }
@@ -196,7 +197,14 @@ export function readMintSecret(instanceDir: string): string | null {
   // (MEASURED on windows-2022 CI: a symlink at this path was read and its value accepted). Refuse a link or a
   // non-file here, on every OS; then the opened file must be the SAME file (dev + ino), so a swap between the
   // lstat and the open is refused too.
-  const pre = lstatOrNull(file);
+  // Exact BigInt identity (src/file-identity.ts): a numeric ino can round two files to one number.
+  let pre: fs.BigIntStats | null;
+  try {
+    pre = fs.lstatSync(file, { bigint: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    pre = null;
+  }
   if (pre === null) return null;
   if (pre.isSymbolicLink()) throw new MintSecretError(`${file} is a symlink: refusing to read the registration secret through it`);
   if (!pre.isFile()) throw new MintSecretError(`${file} is not a regular file`);
@@ -210,9 +218,9 @@ export function readMintSecret(instanceDir: string): string | null {
     throw err;
   }
   try {
-    const post = fs.fstatSync(fd);
+    const post = fs.fstatSync(fd, { bigint: true });
     if (!post.isFile()) throw new MintSecretError(`${file} is not a regular file`);
-    if (post.ino !== pre.ino || post.dev !== pre.dev) throw new MintSecretError(`${file} changed while it was being opened: refusing it`);
+    if (!sameFileIdentity(post, pre)) throw new MintSecretError(`${file} changed while it was being opened: refusing it`);
     // Codex R1 #2: the chain that controls these bytes must be private to this user, or the value may be planted.
     const chain = mintSecretChainFaults(instanceDir, fd);
     if (chain.length > 0) throw new MintSecretError(`the registration secret is not private to this user, so it is refused: ${chain.join("; ")}`);
