@@ -217,8 +217,11 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     await expect(openRawRelayDb(dbPath, { readonly: true })).rejects.toThrow(/"type": ?"http"/);
   });
 
-  it("a STDIO server on an RLYW DB exits non-zero, with a copy-pasteable HTTP client config", async () => {
+  it("slice 4 (amended 2b-ii): a STDIO server on an RLYW DB while ANOTHER process owns it exits non-zero, naming the single-process rule, with NO HTTP hint (before: every stdio server on an RLYW DB was refused, with an HTTP hint)", async () => {
     makeDb(dbPath, WASM);
+    declareWasm();
+    const a = startOwner();
+    expect(await a.first).toBe("READY");
     const r = spawnSync(process.execPath, [DIST_INDEX], {
       // Past the stdin guard (it would exit on a closed stdin before the DB is considered).
       env: { ...process.env, RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "1" },
@@ -227,7 +230,10 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
       timeout: 20_000,
     });
     expect(r.status, r.stderr).not.toBe(0);
-    expect(r.stderr).toMatch(/"type": ?"http"/);
+    expect(r.stderr).toMatch(/another relay process owns this wasm DB; wasm is single-process/);
+    expect(r.stderr).not.toMatch(/"type": ?"http"/);
+    a.child.stdin!.write("exit\n");
+    await waitExitOf(a.child);
   }, 30_000);
 
   it("slice 4 (BREAKING 5.0.0): a LEGACY (0) DB under env-wasm is REFUSED over stdio, naming `relay convert-journal`, and stays unstamped (before: two stdio servers each acknowledged, no lock)", async () => {

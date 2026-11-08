@@ -366,10 +366,13 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
     }
     const config = String(readSqliteDriverAt(fs.realpathSync.native(configPath)).value);
     const want = { header: to, journal: to === "wasm" ? JOURNAL_BYTES_DELETE : JOURNAL_BYTES_WAL, integrity: "ok", config: to };
-    if (after.kind !== want.header || journal !== want.journal || integrity !== "ok" || config !== to || sideFilesOf(p).length > 0) {
+    // A DELETE-mode (wasm) file has no side file after its last close; a WAL one legitimately has -wal/-shm after the
+    // read-only verify open (it cannot remove them), so only the wasm target is checked for them.
+    const leftover = to === "wasm" ? sideFilesOf(p) : [];
+    if (after.kind !== want.header || journal !== want.journal || integrity !== "ok" || config !== to || leftover.length > 0) {
       throw new ConvertRefusal(
         `the conversion did not verify: header ${after.kind} (want ${want.header}), journal ${journal} (want ${want.journal}), ` +
-          `integrity ${integrity}, config ${config}, side files [${sideFilesOf(p).join(", ")}]. Run it again; if this repeats, restore the safety backup.`
+          `integrity ${integrity}, config ${config}, side files [${leftover.join(", ")}]. Run it again; if this repeats, restore the safety backup.`
       );
     }
     return { converted, to, dbPath, configPath, header: after.kind, journal, integrity, config, via: "native" };

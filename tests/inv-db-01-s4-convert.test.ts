@@ -878,8 +878,23 @@ describe("INV-DB-01 slice 4, Codex #401 R1 P1-3 (ruled): native openers during a
     writeCfg({});
     const w = startChild(TXN, [BSQ3(), dbPath, "write"]);
     expect(await w.first).toBe("READY");
+    // Preconditions, MEASURED here (one native-binary run converted anyway, 8 Nov): the writer's journal is on disk, and
+    // the writer really holds its lock (a probe connection of this process is BUSY).
+    expect(fs.existsSync(dbPath + "-journal"), "precondition: the live writer's journal exists").toBe(true);
+    const probe = new Database(dbPath, { timeout: 0 });
+    let busy = "";
+    try {
+      probe.exec("BEGIN IMMEDIATE");
+      probe.exec("ROLLBACK");
+    } catch (e) {
+      busy = (e as { code?: string }).code ?? String(e);
+    } finally {
+      probe.close();
+    }
+    expect(busy, "precondition: the writer holds RESERVED (this probe is BUSY)").toBe("SQLITE_BUSY");
     await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(/convert-journal refused/);
     expect(header(dbPath).id, "not converted").toBe(0);
+    expect(fs.existsSync(dbPath + "-journal"), "the live writer's journal is intact (never rolled back)").toBe(true);
   }, 60_000);
 
   it.skipIf(process.platform === "win32")("(P2-8) native-less: a hot journal is refused with the named remedy (an integrity_check with every relay process stopped) (skipped on Windows: SIGKILL of self)", async () => {
