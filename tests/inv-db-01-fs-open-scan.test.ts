@@ -64,7 +64,7 @@ const INVENTORY: Record<string, Entry> = {
   "src/backup.ts::exportRelayState::writeFileSync": { n: 2, source: "config.json and manifest.json in staging" },
   "src/backup.ts::importRelayState::readFileSync": { n: 1, source: "manifest.json in staging" },
   // --- config, keys, tokens, instance metadata ---
-  "src/convert-journal.ts::writeDriverDeclaration::readFileSync": { n: 1, source: "the DB's own instance config.json (its canonical referent)" },
+  "src/convert-journal.ts::writeDriverDeclaration::readFileSync": { n: 1, source: "the instance config.json beside the database (its canonical referent)" },
   "src/convert-journal.ts::writeDriverDeclaration::writeFileSync": { n: 1, source: "a temp file (wx) beside that config, renamed onto it" },
   "src/config.ts::loadConfig::readFileSync": { n: 1, source: "config.json (getConfigPath())" },
   "src/config.ts::readConfigFileKeys::readFileSync": { n: 1, source: "config.json (getConfigPath())" },

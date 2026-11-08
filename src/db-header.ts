@@ -37,6 +37,9 @@ import { log } from "./logger.js";
 
 export const RELAY_APP_ID_NATIVE = 0x524c594e; // "RLYN"
 export const RELAY_APP_ID_WASM = 0x524c5957; // "RLYW"
+/** SQLite header bytes 18-19 ("write/read version"): 1/1 is a rollback-journal (DELETE) file, 2/2 a WAL file. */
+export const JOURNAL_BYTES_DELETE = "1/1"; // CIDR-ALLOWLIST: SQLite header bytes 18-19, not an IP range
+export const JOURNAL_BYTES_WAL = "2/2"; // CIDR-ALLOWLIST: SQLite header bytes 18-19, not an IP range
 
 const SQLITE_MAGIC = Buffer.from("SQLite format 3\0", "latin1");
 const HEADER_BYTES = 100;

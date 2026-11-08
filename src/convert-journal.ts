@@ -25,7 +25,7 @@ import path from "path";
 import crypto from "crypto";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
-import { readDriverHeader, nativeDriverLoads, RELAY_APP_ID_NATIVE, RELAY_APP_ID_WASM } from "./db-header.js";
+import { readDriverHeader, nativeDriverLoads, RELAY_APP_ID_NATIVE, RELAY_APP_ID_WASM, JOURNAL_BYTES_DELETE, JOURNAL_BYTES_WAL } from "./db-header.js";
 import { holdOwnerForMaintenance, checkpointBeforeRestoreSwap, loadSqlJs } from "./sqlite-compat.js";
 import type { OwnerLock } from "./db-owner-lock.js";
 import { readSqliteDriverAt, configPathOverride, getConfigPath } from "./config.js";
@@ -214,7 +214,7 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
     let converted = false;
     if (to === "wasm") {
       if (before.kind !== "wasm") {
-        if (journalBytes(dbPath) !== "1/1") {
+        if (journalBytes(dbPath) !== JOURNAL_BYTES_DELETE) {
           const db = openForConversion(dbPath, false);
           try {
             db.pragma("journal_mode = DELETE"); // outside a transaction
@@ -233,7 +233,7 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
           db.close();
         }
         converted = true;
-      } else if (journalBytes(dbPath) !== "1/1") {
+      } else if (journalBytes(dbPath) !== JOURNAL_BYTES_DELETE) {
         // An RLYW file is always DELETE-mode; a WAL bit here is an anomaly this conversion does not guess at.
         throw new ConvertRefusal(`the wasm-owned DB at ${dbPath} is not in DELETE journal mode (${journalBytes(dbPath)}). Nothing was changed.`);
       }
@@ -251,7 +251,7 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
         converted = true;
       }
       fail("stamp");
-      if (journalBytes(dbPath) !== "2/2") {
+      if (journalBytes(dbPath) !== JOURNAL_BYTES_WAL) {
         const db = openForConversion(dbPath, false);
         try {
           db.pragma("journal_mode = WAL");
@@ -282,7 +282,7 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
       v.close();
     }
     const config = String(readSqliteDriverAt(fs.realpathSync.native(configPath)).value);
-    const want = { header: to, journal: to === "wasm" ? "1/1" : "2/2", integrity: "ok", config: to };
+    const want = { header: to, journal: to === "wasm" ? JOURNAL_BYTES_DELETE : JOURNAL_BYTES_WAL, integrity: "ok", config: to };
     if (after.kind !== want.header || journal !== want.journal || integrity !== "ok" || config !== to) {
       throw new ConvertRefusal(
         `the conversion did not verify: header ${after.kind} (want ${want.header}), journal ${journal} (want ${want.journal}), ` +
@@ -430,7 +430,7 @@ function verifySqlJs(
   }
   const config = String(readSqliteDriverAt(realOrResolved(configPath)).value);
   const countsOk = counts === null || JSON.stringify(inv.counts) === JSON.stringify(counts);
-  if (id !== RELAY_APP_ID_WASM || journal !== "1/1" || inv.integrity !== "ok" || !countsOk || config !== "wasm") {
+  if (id !== RELAY_APP_ID_WASM || journal !== JOURNAL_BYTES_DELETE || inv.integrity !== "ok" || !countsOk || config !== "wasm") {
     throw new ConvertRefusal(
       `the conversion did not verify: application_id 0x${id.toString(16)}, journal ${journal}, integrity ${inv.integrity}, ` +
         `row counts ${countsOk ? "equal" : `${JSON.stringify(inv.counts)} (want ${JSON.stringify(counts)})`}, config ${config}.` +

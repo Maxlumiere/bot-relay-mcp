@@ -41,6 +41,7 @@ import {
   readDriverHeader,
   RELAY_APP_ID_WASM,
   RELAY_APP_ID_NATIVE,
+  JOURNAL_BYTES_DELETE,
   httpClientHint,
   _installNativeProbe,
   type DriverHeader,
@@ -256,7 +257,7 @@ export async function restampStagedCopy(file: string, kind: SqliteDriver): Promi
   const id = bytes.length >= 72 ? bytes.readUInt32BE(68) : 0;
   const journal = bytes.length >= 20 ? `${bytes[18]}/${bytes[19]}` : "";
   if (kind === "wasm") {
-    if (id === RELAY_APP_ID_WASM && journal === "1/1") return;
+    if (id === RELAY_APP_ID_WASM && journal === JOURNAL_BYTES_DELETE) return;
     const SQL = await loadSqlJs();
     const db = new SQL.Database(bytes);
     let image: Uint8Array;
@@ -281,7 +282,7 @@ export async function restampStagedCopy(file: string, kind: SqliteDriver): Promi
   }
   const after = fs.readFileSync(file);
   const okId = after.readUInt32BE(68) === (kind === "wasm" ? RELAY_APP_ID_WASM : RELAY_APP_ID_NATIVE);
-  const okJournal = kind !== "wasm" || `${after[18]}/${after[19]}` === "1/1";
+  const okJournal = kind !== "wasm" || `${after[18]}/${after[19]}` === JOURNAL_BYTES_DELETE;
   if (!okId || !okJournal) {
     throw new Error(`restore refused: the staged copy could not be re-stamped for the ${kind} driver (header or journal bytes wrong). Nothing was replaced.`);
   }
