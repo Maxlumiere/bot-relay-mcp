@@ -128,7 +128,7 @@ describe("ADR-0048 PR B — TRIPWIRE: no module opens a SQLite driver handle exc
    *     re-check has nothing to guard. Ruling ecf50062; exception accepted in c79321c9.
    *     That the state dir is the RESOLVED instance's is pinned in
    *     tests/doorbell-pr5-heartbeat.test.ts ("the lock lives in the RESOLVED instance's state dir").
-   * and, since INV-DB-01 slice 4, ONE sanctioned converter (architect Q2 ruling, and its wasm-only ruling):
+   * and, since INV-DB-01 slice 4, ONE sanctioned converter (the slice-4 Q2 ruling, and its wasm-only ruling):
    *   - src/convert-journal.ts  (`relay convert-journal`: the only native opener of an RLYW file and the only sql.js
    *     converter of an RLYN/0 file, both under the DB's single-owner lock; each native open re-checks
    *     assertStillContained after opening, and the sql.js path re-checks it before its rename; pinned by

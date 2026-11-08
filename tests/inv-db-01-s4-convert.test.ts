@@ -310,7 +310,7 @@ describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
       visit(sf);
     }
     expect(sites.filter((s) => s.startsWith("src/convert-journal.ts")), `the sanctioned RLYW opener (sites: ${JSON.stringify(sites)})`).toHaveLength(1);
-    // The architect's wasm-only ruling (and 20692413): EVERY sql.js construction in src is listed here with its reason,
+    // The slice-4 wasm-only ruling: EVERY sql.js construction in src is listed here with its reason,
     // so a NEW one fails until it is listed. Only convert-journal's REPLACES a live native/legacy file.
     const SQLJS_SITES: Record<string, { n: number; why: string }> = {
       "src/convert-journal.ts::loadImage": { n: 1, why: "the wasm-only converter: the image load and its fresh verify load, under the owner lock; the ONLY sql.js path that replaces a live RLYN/0 file" },
@@ -450,7 +450,7 @@ fs.writeFileSync(
 );
 const rowCount = (f: string) => readOther(f).rows.length;
 
-describe("INV-DB-01 slice 4: the wasm-only converter (sql.js, native→wasm; the architect's ruling)", () => {
+describe("INV-DB-01 slice 4: the wasm-only converter (sql.js, native→wasm; the slice-4 ruling)", () => {
   const wasmOnly = () => dbHeader._setNativeProbeForTests(() => ({ ok: false, reason: "test: a wasm-only install (npm 12, scripts off)" }));
   afterEach(() => dbHeader._setNativeProbeForTests(null));
 
