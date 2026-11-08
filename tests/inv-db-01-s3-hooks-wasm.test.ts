@@ -247,7 +247,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS || !REAL_SQLITE)("INV-DB-01 slice 3: SessionSt
     expect(r.sqliteCalls, r.out).toEqual([]);
     expect(r.notices.length, r.out).toBe(1);
     expect(r.notices[0]).toContain(fixture === "rlyw" ? "skip-rlyw" : "skip-declared-wasm");
-    expect(r.notices[0]).toContain("Hooks deliver no mail on a wasm instance; use the HTTP owner.");
+    expect(r.notices[0]).toContain("Hooks read a wasm DB's mail only through its running owner, and no relay process owns it now");
     expect(r.notices[0]).toContain(DB());
   });
 

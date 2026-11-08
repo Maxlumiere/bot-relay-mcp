@@ -52,7 +52,8 @@ export function addressReachesLoopback(address: string): boolean {
 
 /** Hook PR 1 (as ruled, Q9): the owner-peek listener's only host, a constant. */
 export const OWNER_PEEK_HOST = "127.0.0.1";
-export const OWNER_PEEK_REFUSAL = "this listener serves only the hooks' mail peek (GET /owner-id, and get_messages with peek: true)";
+export const OWNER_PEEK_REFUSAL =
+  "this listener serves only the hooks (GET /owner-id, get_messages with peek: true, and report_liveness)";
 
 /** The owner-peek gate, before any parse: GET /owner-id, or POST /mcp without a session. */
 export function ownerPeekRouteAllowed(method: string, reqPath: string, hasSession: boolean): boolean {
@@ -63,9 +64,14 @@ export function ownerPeekRouteAllowed(method: string, reqPath: string, hasSessio
 /** The ONLY argument keys the hooks' peek sends (as ruled: any other key, `ack` included, is refused). Sorted. */
 const PEEK_KEYS = ["agent_name", "agent_token", "limit", "peek", "since", "status"];
 
+/** Hook PR 2 (as ruled, Q8): report_liveness's ONLY keys (agent_pid_start optional). */
+const LIVENESS_KEYS = new Set(["agent_name", "agent_pid", "agent_pid_start", "agent_token"]);
+
 /**
- * The owner-peek gate, after the parse: exactly ONE JSON-RPC object, `tools/call` of `get_messages`, whose arguments
- * carry exactly the peek's keys, with `peek: true` and `status: "pending"`.
+ * The owner-peek gate, after the parse: exactly ONE JSON-RPC object, `tools/call` of either
+ * - `get_messages` whose arguments carry exactly the peek's keys, with `peek: true` and `status: "pending"`; or
+ * - `report_liveness` (hook PR 2, Q8: the wasm liveness self-heal) whose arguments carry only its keys: a string
+ *   agent_name and agent_token, an INTEGER agent_pid, and optionally a string agent_pid_start.
  */
 export function ownerPeekBodyAllowed(body: unknown): boolean {
   if (body === null || typeof body !== "object" || Array.isArray(body)) return false;
@@ -73,9 +79,14 @@ export function ownerPeekBodyAllowed(body: unknown): boolean {
   if (b.jsonrpc !== "2.0" || b.method !== "tools/call") return false;
   if (b.params === null || typeof b.params !== "object" || Array.isArray(b.params)) return false;
   const p = b.params as { name?: unknown; arguments?: unknown };
-  if (p.name !== "get_messages") return false;
   if (p.arguments === null || typeof p.arguments !== "object" || Array.isArray(p.arguments)) return false;
   const a = p.arguments as Record<string, unknown>;
+  if (p.name === "report_liveness") {
+    if (Object.keys(a).some((k) => !LIVENESS_KEYS.has(k))) return false;
+    if (typeof a.agent_name !== "string" || typeof a.agent_token !== "string" || !Number.isInteger(a.agent_pid)) return false;
+    return a.agent_pid_start === undefined || typeof a.agent_pid_start === "string";
+  }
+  if (p.name !== "get_messages") return false;
   const keys = Object.keys(a).sort();
   if (keys.length !== PEEK_KEYS.length || keys.some((k, i) => k !== PEEK_KEYS[i])) return false;
   return a.peek === true && a.status === "pending";

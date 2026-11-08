@@ -588,6 +588,51 @@ print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":
   return 0
 }
 
+# liveness_self_heal_owner — hook PR 2 (as ruled, Q8): the wasm liveness self-heal, on the PROVED owner route only
+# (relay_owner_prove set RELAY_OWNER_PORT in this run, right before the mail peek: the PR 1 daemon and the PR 2 stdio
+# listener alike). The gate moves OFF the DB: a per-(instance, agent) cache (0600, in the hook state dir) of the last
+# SUCCESSFULLY reported (pid, start). Current == cache -> no-op, ZERO network calls. Otherwise ONE report_liveness over
+# the proved port (token and secret on curl's stdin, inside the budget, no /health probe); on success the cache is
+# written. The cache is only a hint: a wrong one costs at most one idempotent call.
+liveness_self_heal_owner() {
+  [ -n "$AGENT_TOKEN" ] && [ -n "${RELAY_OWNER_PORT:-}" ] && [ -n "${RELAY_RES_DB_PATH:-}" ] || return 0
+  command -v relay_agent_pid >/dev/null 2>&1 || return 0
+  relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$' || return 0
+  local cur_pid cur_start key sdir cache want have payload resp
+  cur_pid=$(relay_agent_pid 2>/dev/null || printf '')
+  case "$cur_pid" in ''|*[!0-9]*) return 0 ;; esac
+  cur_start=$(relay_pid_start "$cur_pid" 2>/dev/null || printf '')
+  key=$(printf '%s' "${RELAY_RES_DB_PATH:-}" | cksum 2>/dev/null | cut -d' ' -f1)
+  case "$key" in ''|*[!0-9]*) return 0 ;; esac
+  # Its OWN state dir (the global STATE_DIR is set later in this hook than this call): the same directory.
+  sdir="${RELAY_HOME:-$HOME/.bot-relay}/hook-state"
+  cache="$sdir/liveness-owner-${key}-${AGENT_NAME}"
+  want="$cur_pid $cur_start"
+  if [ -f "$cache" ] && [ ! -L "$cache" ]; then
+    IFS= read -r have < "$cache" 2>/dev/null || have=""
+    [ "$have" = "$want" ] && return 0
+  fi
+  payload=$(AN="$AGENT_NAME" AT="$AGENT_TOKEN" PID="$cur_pid" ST="$cur_start" python3 -c '
+import json, os
+args = {"agent_name": os.environ["AN"], "agent_pid": int(os.environ["PID"]), "agent_token": os.environ["AT"]}
+st = os.environ.get("ST", "")
+if st:
+    args["agent_pid_start"] = st
+print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"report_liveness","arguments":args}}))
+' 2>/dev/null) || return 0
+  relay_budget_for "the liveness restamp" 2 margin || return 0
+  # The token (header AND body) and the http_secret ride curl's config on STDIN, never argv.
+  resp=$({ relay_owner_secret_curl_config; relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
+    -X POST "http://127.0.0.1:${RELAY_OWNER_PORT}/mcp" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" 2>/dev/null) || return 0
+  case "$resp" in *'"isError":true'*|*'"isError": true'*) return 0 ;; esac
+  case "$resp" in *'\"success\": true'*|*'\"success\":true'*) ;; *) return 0 ;; esac
+  mkdir -p "$sdir" 2>/dev/null || return 0
+  ( umask 077; printf '%s\n' "$want" > "$cache.$$" 2>/dev/null && mv -f "$cache.$$" "$cache" 2>/dev/null ) || rm -f "$cache.$$" 2>/dev/null
+  return 0
+}
+
 # --- Damper helpers -------------------------------------------------------------
 # notice_is_damped returns 0 (suppress) ONLY on positive evidence: a readable
 # state file holding the SAME fingerprint, with an mtime inside the window and
@@ -797,6 +842,10 @@ if [ "$MODE" = local ] && [ "$READ_OK" -eq 1 ]; then
     relay_hydrate_token
   fi
   liveness_self_heal "$F1_DB"
+fi
+# Hook PR 2 (Q8): the wasm instance's self-heal, over the owner route this run PROVED (never a native read).
+if [ "$MODE" = remote ] && [ "$READ_OK" -eq 1 ] && [ -n "${RELAY_OWNER_PORT:-}" ]; then
+  liveness_self_heal_owner
 fi
 
 # THE ONLY UPGRADE. Positive evidence is a mailbox read that SUCCEEDED. An empty

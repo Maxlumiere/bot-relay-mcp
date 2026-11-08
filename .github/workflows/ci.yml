@@ -388,6 +388,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: npx vitest run tests/hook-pr1-owner-http.test.ts --reporter=verbose
 
+      - name: Hook PR 2 a stdio owner's mail and liveness over its loopback listener (Windows)
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/hook-pr2-stdio-owner.test.ts --reporter=verbose
+
   # REQUIRED CHECK. macOS launchd side-effect guard. The Ubuntu jobs structurally CANNOT catch a test that shells
   # to real `launchctl` — init.ts's daemon bootstrap is darwin-gated, so a `runInit` test that forgets
   # RELAY_SKIP_DAEMON silently installs a real launchd KeepAlive service + a :3777 daemon on a contributor's Mac
@@ -462,6 +466,10 @@ jobs:
       - name: Hook PR 1 mail over HTTP from a daemon owner (macOS)
         if: ${{ !cancelled() }}
         run: npx vitest run tests/hook-pr1-owner-http.test.ts --reporter=verbose
+
+      - name: Hook PR 2 a stdio owner's mail and liveness over its loopback listener (macOS)
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/hook-pr2-stdio-owner.test.ts --reporter=verbose
 
       - name: Timing bars, serial and isolated (failed-auth loop + availability)
         # Latency bars run ALONE after the tests; scripts/run-timing-bars.mjs asserts the EXACT set ran and passed.

@@ -16,6 +16,8 @@
  * - "skip-unreadable": a declaration (the caller's, or the DB's own instance's) or the header could not be read or
  *   judged (fail closed);
  * - "skip-owner-locked": another process holds the DB's single-owner lock (a conversion, or an owner with no record);
+ * - "skip-no-endpoint" (hook PR 2, Q5): a wasm DB whose owner lock IS held but with no valid owner endpoint record:
+ *   the owner has no hook endpoint (its loopback listener could not open, an older relay, or a conversion holds it);
  * - "http" (hook PR 1): a wasm DB (declared, RLYW, or its owner lock held) whose owner endpoint record is VALID: the
  *   hooks read its mail over HTTP from that owner (line 8 of `relay where --fields` is "URL KEY").
  *
@@ -25,8 +27,17 @@
 import { readDriverHeader } from "./db-header.js";
 import { nativeOpenVerdict } from "./sqlite-compat.js";
 import { validOwnerEndpoint } from "./owner-endpoint.js";
+import { probeOwnerLock } from "./db-owner-lock.js";
 
-export const HOOK_DB_VERDICTS = ["sqlite3", "skip-declared-wasm", "skip-rlyw", "skip-unreadable", "skip-owner-locked", "http"] as const;
+export const HOOK_DB_VERDICTS = [
+  "sqlite3",
+  "skip-declared-wasm",
+  "skip-rlyw",
+  "skip-unreadable",
+  "skip-owner-locked",
+  "skip-no-endpoint",
+  "http",
+] as const;
 export type HookDbVerdict = (typeof HOOK_DB_VERDICTS)[number];
 
 /**
@@ -39,6 +50,8 @@ export function hookDbAnswer(dbPath: string): { verdict: HookDbVerdict; endpoint
     try {
       const e = validOwnerEndpoint(dbPath);
       if (e) return { verdict: "http", endpoint: `${e.url} ${e.key}` };
+      // Hook PR 2 (Q5): an owner IS running (the lock is held) yet no valid record names its endpoint: say so.
+      if (probeOwnerLock(dbPath).state === "held") return { verdict: "skip-no-endpoint", endpoint: "" };
     } catch {
       /* no valid record: the wasm verdict stands */
     }

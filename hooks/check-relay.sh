@@ -731,7 +731,8 @@ relay_deliver_pending_mail() {
     RELAY_MAIL_MODE="no-native-db-read"
     # Only the two wasm verdicts say "a wasm instance" (Codex #391 R1): the others do not know what the instance is.
     case "${RELAY_RES_HOOK_DB:-}" in
-      skip-declared-wasm|skip-rlyw) why="hooks deliver no mail on a wasm instance (DB verdict: ${RELAY_RES_HOOK_DB}); use the HTTP owner" ;;
+      skip-declared-wasm|skip-rlyw) why="hooks deliver no mail on a wasm instance with no running owner (DB verdict: ${RELAY_RES_HOOK_DB}): no relay process owns it now" ;;
+      skip-no-endpoint) why="hooks read no mail: the owner has no hook endpoint (DB verdict: skip-no-endpoint)" ;;
       *) why="hooks read no mail: the relay CLI's DB verdict (${RELAY_RES_HOOK_DB:-none}) is not one they act on" ;;
     esac
     relay_mail_verdict "CANNOT-JUDGE" "$why" mail

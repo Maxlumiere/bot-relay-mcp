@@ -165,10 +165,11 @@ relay_hook_db_native_ok() {
   # Only the two wasm verdicts may say "a wasm instance": the others do not know what the instance is.
   then="The hooks read nothing from this DB with sqlite3."
   case "${RELAY_RES_HOOK_DB:-}" in
-    skip-declared-wasm) why="the instance declares sqlite_driver \"wasm\""; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
-    skip-rlyw) why="the DB is stamped for the wasm driver's single owner (RLYW)"; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
+    skip-declared-wasm) why="the instance declares sqlite_driver \"wasm\""; then="Hooks read a wasm DB's mail only through its running owner, and no relay process owns it now: start one (a stdio session or the HTTP daemon)." ;;
+    skip-rlyw) why="the DB is stamped for the wasm driver's single owner (RLYW)"; then="Hooks read a wasm DB's mail only through its running owner, and no relay process owns it now: start one (a stdio session or the HTTP daemon)." ;;
     skip-unreadable) why="the instance's sqlite_driver or the DB header could not be read or judged (fail closed)" ;;
     skip-owner-locked) why="another relay process holds the DB's single-owner lock (a wasm owner, or a conversion running)" ;;
+    skip-no-endpoint) why="the DB's wasm owner is running, but the owner has no hook endpoint (its loopback listener could not open, it is an older relay, or a conversion holds the lock)"; then="Mail may be waiting: call get_messages." ;;
     http) why="the DB belongs to a wasm owner"; then="The hooks read its mail over HTTP from that owner, and nothing else from this DB." ;;
     "(7-line answer)") why="the relay CLI gave a 7-line answer: CLI/hook version skew (update the relay and its hooks together)" ;;
     "(6-line answer)") why="the relay CLI gave a 6-line answer: CLI/hook version skew (update the relay and its hooks together)" ;;
