@@ -281,6 +281,29 @@ describe("INV-BACKUP-01: the wasm export refuses what it cannot read completely,
     expect(statOf(dbPath)).toEqual(before);
   });
 
+  // INV-DB-01 slice 4 (asked at review): a HOT WAL, not only an empty one. sql.js cannot replay a WAL, so an export that
+  // read only the main file would silently miss the commits in it.
+  it.skipIf(process.platform === "win32")("a HOT -wal beside a native DB (commits only in the WAL) is REFUSED by name before any read; the main file and the WAL bytes are unchanged (skipped on Windows: SIGKILL of self)", async () => {
+    await makeSourceDb();
+    const child = path.join(os.tmpdir(), `inv-backup-01-hot-${process.pid}.cjs`);
+    fs.writeFileSync(
+      child,
+      `const D = require(process.argv[2]); const d = new D(process.argv[3]); d.pragma("wal_autocheckpoint = 0");\n` +
+        `d.exec("CREATE TABLE hot_only_in_wal (v TEXT); INSERT INTO hot_only_in_wal VALUES ('committed')");\n` +
+        `process.kill(process.pid, "SIGKILL");\n`
+    );
+    spawnSync(process.execPath, [child, path.join(process.cwd(), "node_modules", "better-sqlite3"), dbPath]);
+    expect(fs.existsSync(dbPath + "-wal") && fs.statSync(dbPath + "-wal").size > 0, "precondition: a hot (non-empty) WAL").toBe(true);
+    const before = statOf(dbPath);
+    const wal = statOf(dbPath + "-wal");
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    const { exportRelayState } = await import("../src/backup.js");
+    await expect(exportRelayState({ destinationPath: path.join(root, "hot.tar.gz") })).rejects.toThrow(/a -wal file is beside the DB/);
+    expect(fs.existsSync(path.join(root, "hot.tar.gz")), "no archive").toBe(false);
+    expect(statOf(dbPath), "the main file is unchanged").toEqual(before);
+    expect(statOf(dbPath + "-wal"), "the WAL is unchanged (never dropped, never replayed)").toEqual(wal);
+  });
+
   it("a NATIVE open during the snapshot (it creates -shm) is caught by the AFTER-check: refused, and no archive is written", async () => {
     await makeSourceDb();
     process.env.RELAY_SQLITE_DRIVER = "wasm";
