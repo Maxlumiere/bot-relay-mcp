@@ -337,7 +337,7 @@ describe("PR 4: a LOCAL relay's CLI credentials go ONLY through its door (every 
     expect(s.status).not.toBe(0);
     expect(s.stderr).toMatch(/did not resolve/);
     const spy = await recorder();
-    const p = await relayAsync(c, ["pair", `http://127.0.0.1:${spy.port}`, "--name", "pr4-pair", "--yes", "--secret-stdin"], {}, "pr4-hub-secret-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    const p = await relayAsync(c, ["pair", `http://127.0.0.1:${spy.port}`, "--name", "pr4-pair", "--yes", "--output", path.join(c.home, "pair-loop.json"), "--secret-stdin"], {}, "pr4-hub-secret-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
     expect(p.status).not.toBe(0);
     expect(p.stderr).toMatch(/pair is for a remote hub/);
     expect(spy.bytes()).not.toMatch(/pr4-hub-secret/);
