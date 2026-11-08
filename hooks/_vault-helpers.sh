@@ -285,7 +285,7 @@ relay_owner_prove() {
   RELAY_OWNER_PORT="" RELAY_OWNER_ERR=""
   url="${ep%% *}"
   key="${ep#* }"
-  if [ "$url" = "$ep" ] || ! relay_whole_match "$url" '^http://127\.0\.0\.1:[0-9]{1,5}$' || ! relay_whole_match "$key" '^[0-9a-f]{32}$'; then
+  if [ "$url" = "$ep" ] || ! relay_whole_match "$url" '^http://[^/]+:[0-9]{1,5}$' || ! relay_whole_match "$key" '^[0-9a-f]{32}$'; then
     RELAY_OWNER_ERR="the owner endpoint record's line is malformed or not a loopback URL (it must be http://127.0.0.1:<port> and a 32-hex key)"
     return 2
   fi
