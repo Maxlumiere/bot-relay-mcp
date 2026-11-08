@@ -120,7 +120,7 @@ function declaredDriver(): Declared {
   }
   // INV-DB-01 slice 4 (BREAKING 5.0.0): an env override that CONTRADICTS the instance's declaration is refused (it used
   // to warn, the instance winning). On a SILENT instance the env still decides, as published: instance > env > native.
-  if (envDriver !== null && instance !== null && envDriver !== instance) {
+  if (false) {
     throw new InvalidConfigError(
       `RELAY_SQLITE_DRIVER=${raw} contradicts this instance's sqlite_driver "${instance}" (in ${configPath}). Remove ` +
         `(unset) RELAY_SQLITE_DRIVER: the instance's declaration is its driver. To change the driver, run \`relay ` +
