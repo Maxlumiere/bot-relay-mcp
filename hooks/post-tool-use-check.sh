@@ -530,9 +530,10 @@ liveness_self_heal() {
   [ -z "$AGENT_TOKEN" ] && return 0
   command -v relay_agent_pid >/dev/null 2>&1 || return 0
   local cur_pid cur_start stored_pid stored_start
-  cur_pid=$(relay_agent_pid 2>/dev/null || printf '')
+  # The walkers' stderr is relay_ps's NAMED cut (nothing else): never discarded.
+  cur_pid=$(relay_agent_pid || printf '')
   [ -z "$cur_pid" ] && return 0
-  cur_start=$(relay_pid_start "$cur_pid" 2>/dev/null || printf '')
+  cur_start=$(relay_pid_start "$cur_pid" || printf '')
   # Read the stored anchor from the DB F1 read; if unavailable we can't compute
   # the gate → skip (SessionStart still carries the anchor).
   { [ -n "$db" ] && [ -f "$db" ]; } || return 0

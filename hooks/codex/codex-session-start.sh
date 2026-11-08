@@ -235,7 +235,8 @@ CAPS_JSON=$(build_caps_json)
 # Best-effort: empty / [] → the field is omitted (graceful — registration never
 # fails over the handshake, Tether falls back to name matching). Byte-parity with
 # check-relay.sh so a Codex agent's host_id agrees with the extension's reader.
-RELAY_HOST_PID_CHAIN=$(relay_pid_chain 2>/dev/null || printf '')
+# The walkers' stderr is relay_ps's NAMED cut (nothing else): never discarded.
+RELAY_HOST_PID_CHAIN=$(relay_pid_chain || printf '')
 [ "$RELAY_HOST_PID_CHAIN" = "[]" ] && RELAY_HOST_PID_CHAIN=""
 RELAY_HOST_GUID=$(relay_machine_guid 2>/dev/null || printf '')
 # terminal_title_ref: only sent when the launcher exports RELAY_TERMINAL_TITLE
@@ -256,9 +257,9 @@ if [ -n "$RELAY_TERMINAL_TITLE_VALUE" ] && ! [[ "$RELAY_TERMINAL_TITLE_VALUE" =~
 fi
 
 # v2.14.1 — capture the agent's own process for presence (best-effort).
-RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
+RELAY_AGENT_PID=$(relay_agent_pid || printf '')
 RELAY_AGENT_PID_START=""
-[ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
+[ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" || printf '')
 
 # The token is never a header in argv: it rides curl's config on STDIN (relay_curl_token_config, from
 # _vault-helpers.sh). Without the helpers no token is sent, and the register fails loudly instead.

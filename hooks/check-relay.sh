@@ -1202,7 +1202,8 @@ if [ "$SKIP_REGISTER" -eq 0 ] && [ "$RELAY_CRED_OK" = 1 ] && { [ "$RELAY_CRED_RO
   REG_HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
   # Tether v0.3 PID-handshake: best-effort PID chain + machine GUID. Empty/[] →
   # the field is omitted (graceful — registration never fails over the handshake).
-  RELAY_HOST_PID_CHAIN=$(relay_pid_chain 2>/dev/null || printf '')
+  # Its stderr is relay_ps's NAMED cut (it prints nothing else): never discarded. The pre-mail budget, as the lookups below.
+  RELAY_HOST_PID_CHAIN=$(RELAY_PS_BUDGET=premail relay_pid_chain || printf '')
   [ "$RELAY_HOST_PID_CHAIN" = "[]" ] && RELAY_HOST_PID_CHAIN=""
   RELAY_HOST_GUID=$(relay_machine_guid 2>/dev/null || printf '')
   # v2.14.1 — the agent's OWN process (presence). Best-effort: empty →
