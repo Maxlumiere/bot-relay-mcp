@@ -92,8 +92,16 @@ export function _setAfterMaterializeHookForTests(fn: (() => void) | null): void 
  * LEAVES the created DB in place and names it, with its size (INV-DB-01 slice 3: relay code never unlinks a DB file;
  * an unlink checked by identity could still remove a file that replaced it between the check and the unlink).
  */
-export function materializeDb(dbPath: string, initialBytes: Uint8Array, verifyCreated?: (dbPath: string) => void): void {
+export function materializeDb(
+  dbPath: string,
+  initialBytes: Uint8Array,
+  verifyCreated?: (dbPath: string) => void,
+  beforeCreate?: (dbPath: string) => void
+): void {
   if (fs.existsSync(dbPath)) return;
+  // INV-DB-01 slice 4 (ADR-0048): the path's containment is checked BEFORE the first byte is written, so a directory
+  // swapped for a symlink out of the relay's roots gets no DB (nor a temp) created through it.
+  beforeCreate?.(dbPath);
   const tmp = path.join(path.dirname(dbPath), `.${path.basename(dbPath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.new`);
   let created = false;
   try {
@@ -504,6 +512,8 @@ export interface AcquireOptions {
   verifyCreated?: (dbPath: string) => void;
   /** The first image of an absent DB (already stamped): materialized atomically before the lock is taken. */
   initialBytes?: Uint8Array;
+  /** Runs right before an absent DB is materialized (a throw refuses, nothing written): the containment check. */
+  beforeCreate?: (dbPath: string) => void;
   /** The platform the ENABLE gate judges (default: this one), so the gate is testable for any platform on any OS. The
    * primitive is always this OS's own. */
   platform?: NodeJS.Platform;
@@ -519,7 +529,7 @@ export async function acquirePrimitive(dbPath: string, opts: AcquireOptions = {}
   assertLocalFilesystem(dbPath); // before anything is materialized or locked
   let lastReason = "held by another process";
   for (let i = 0; i < attempts; i++) {
-    if (opts.initialBytes) materializeDb(dbPath, opts.initialBytes, opts.verifyCreated);
+    if (opts.initialBytes) materializeDb(dbPath, opts.initialBytes, opts.verifyCreated, opts.beforeCreate);
     afterMaterializeHook?.();
     const key = lockKey(dbPath);
     const own = HELD.get(key);
@@ -592,6 +602,82 @@ export function assertLockIntact(dbPath: string): void {
   const h = HELD.get(key);
   if (!h) throw new OwnerLockError(`this process no longer holds the single-owner lock for ${dbPath}`);
   assertEntryIntact(key, h, dbPath);
+}
+
+/**
+ * INV-DB-01 slice 4 (the ruling on Codex #401 R1 P1-3 (a)): is the DB's single-owner lock HELD by ANOTHER process (a
+ * live wasm owner, or a conversion)? SYNCHRONOUS (the native openers are) and NON-CREATING: a lock file that does not
+ * exist was never taken, so nothing is probed (a native-only install never touches it); an existing one is probed
+ * with the platform's own primitive, released at once (macOS: O_EXLOCK|O_NONBLOCK; Linux: the trusted flock -n; Windows:
+ * a client open of the owner's named pipe). This process's own hold (re-entrant) is not "another". A probe that cannot
+ * decide is "held" (fail closed), by name in the caller's refusal.
+ */
+export type OwnerLockProbe = { state: "free" } | { state: "held" } | { state: "undecidable"; reason: string };
+export function ownerLockHeldElsewhere(dbPath: string): boolean {
+  return probeOwnerLock(dbPath).state !== "free";
+}
+/** Codex #401 R2 P2: "free" ONLY on an ESTABLISHED absence (ENOENT); any other error is undecidable (fail closed). */
+export function probeOwnerLock(dbPath: string): OwnerLockProbe {
+  const code = (err: unknown) => (err as NodeJS.ErrnoException).code ?? (err as Error).message;
+  let real: string;
+  try {
+    real = fs.realpathSync.native(dbPath);
+  } catch (err) {
+    if (code(err) === "ENOENT") return { state: "free" }; // no DB: nothing is owned
+    return { state: "undecidable", reason: `the DB path could not be resolved (${code(err)})` };
+  }
+  if (holdsOwnerLock(real)) return { state: "free" };
+  if (process.platform === "win32") {
+    try {
+      fs.closeSync(fs.openSync(primitiveName(lockKey(real)), "r+"));
+      return { state: "held" }; // a server answers: an owner holds the pipe
+    } catch (err) {
+      const c = code(err);
+      if (c === "ENOENT") return { state: "free" };
+      if (c === "EBUSY" || c === "EPIPE") return { state: "held" };
+      return { state: "undecidable", reason: `the owner's named pipe could not be probed (${c})` };
+    }
+  }
+  const file = lockFilePath(real);
+  try {
+    fs.lstatSync(file);
+  } catch (err) {
+    if (code(err) === "ENOENT") return { state: "free" }; // never taken: nothing to probe, nothing created
+    return { state: "undecidable", reason: `its lock file ${file} could not be checked (${code(err)})` };
+  }
+  if (process.platform === "darwin") {
+    let fd: number;
+    try {
+      fd = openLockFile(file, fs.constants.O_RDWR | fs.constants.O_NONBLOCK | O_EXLOCK_DARWIN);
+    } catch (err) {
+      const c = code(err);
+      if (c === "EAGAIN" || c === "EWOULDBLOCK") return { state: "held" };
+      return { state: "undecidable", reason: `its lock file ${file} could not be probed (${c})` };
+    }
+    fs.closeSync(fd);
+    return { state: "free" };
+  }
+  try {
+    assertLinuxFlock(real);
+  } catch {
+    return {
+      state: "undecidable",
+      reason: `there is no trusted system \`flock\` on this host to check its lock file ${file}; install util-linux's flock (/usr/bin/flock)`,
+    };
+  }
+  let fd: number;
+  try {
+    fd = openLockFile(file, fs.constants.O_RDWR);
+  } catch (err) {
+    return { state: "undecidable", reason: `its lock file ${file} could not be opened (${code(err)})` };
+  }
+  try {
+    return flockFd(fd, file) ? { state: "free" } : { state: "held" };
+  } catch (err) {
+    return { state: "undecidable", reason: (err as Error).message };
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /** Whether THIS process holds the owner lock for the DB at `dbPath` (the wasm persist checks it before every write). */

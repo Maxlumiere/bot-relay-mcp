@@ -41,8 +41,8 @@ import { withDeadline } from "./http-deadline.js";
 import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
 import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
-import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, resolveOpen, isOwnedDb, holdOwnerForMaintenance, checkpointBeforeRestoreSwap, assertMaintenanceSingleLink, assertNativeByPathAllowed, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
-import { assertDriverHeaderAllows, nativeHandleCount, isDbFamilyMember, isInHeldNativeFamily, beginWasmUse, endWasmUse, assertNoNativeHandle } from "./db-header.js";
+import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, resolveOpen, isOwnedDb, holdOwnerForMaintenance, checkpointBeforeRestoreSwap, assertMaintenanceSingleLink, assertNativeByPathAllowed, restoreTargetDriver, restampStagedCopy, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
+import { assertDriverHeaderAllows, nativeHandleCount, isDbFamilyMember, isInHeldNativeFamily, beginWasmUse, endWasmUse, assertNoNativeHandle, RELAY_APP_ID_WASM } from "./db-header.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
@@ -298,7 +298,7 @@ async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<
     }
     return d;
   }
-  const resolved = resolveOpen(srcDbPath);
+  const resolved = resolveOpen(srcDbPath, "read"); // a cold export only READS the file
   const d = resolved.driver;
   // INV-DB-01 slice 3: a COLD native export is a non-owner native opener: the one predicate (both declarations).
   if (d === "native") assertNativeByPathAllowed(srcDbPath, "a cold native export");
@@ -311,8 +311,23 @@ async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<
   try {
     if (resolved.mode === "owner") owner = await holdOwnerForMaintenance(srcDbPath, "backup");
     for (let attempt = 1; ; attempt++) {
+      // Codex #401 R1 P2-4: a retry RE-RESOLVES ownership (the file may have become owned since the first read): an
+      // owned file is never read without its lock (refused, by name, while another process holds it).
+      if (attempt > 1 && d === "wasm" && !owner && resolveOpen(srcDbPath, "read").mode === "owner") {
+        owner = await holdOwnerForMaintenance(srcDbPath, "backup");
+      }
       const source = await openExportSource(srcDbPath, d);
       try {
+        // ...and the image actually loaded must agree: an RLYW image without its lock held is refused.
+        if (d === "wasm" && !owner) {
+          const id = Number((source.db.prepare("PRAGMA application_id").get() as { application_id?: number } | undefined)?.application_id ?? 0) >>> 0;
+          if (id === RELAY_APP_ID_WASM >>> 0) {
+            throw new Error(
+              `backup refused: the DB at '${srcDbPath}' became owned (stamped RLYW) while it was being read, and this export ` +
+                `does not hold its single-owner lock. Retry; while a relay process owns it, back it up through that process.`
+            );
+          }
+        }
         snapshotToFile(source.db, snapshotDbPath);
         exportReadHook?.();
         if (d !== "wasm") return d;
@@ -780,6 +795,10 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // EXPLICITLY (openReadOnly never infers): the LIVE connection's when one is open (peekDb: a read that opens
     // nothing), else the configured driver, which is the one this process would instantiate (#190 r3). No main-DB
     // init, so a corrupt archive manufactures no state.
+    // INV-DB-01 slice 4 (Q5): the staged copy is RE-STAMPED to the instance's kind (its declaration, else the live
+    // header, else native; a disagreement refuses) by the instance's own driver, BEFORE it is validated: a backup made
+    // before a conversion still restores. Re-validated below (integrity) and by its header check.
+    await restampStagedCopy(extractedDbPath, restoreTargetDriver(getDbPath()));
     const live = peekDb();
     // 2b-ii: the staged copy is read with the driver ITS header calls for (an RLYW archive is read with wasm).
     const probeDriver: SqliteDriver = live ? driverOf(live) : configuredDriver(extractedDbPath);
@@ -833,10 +852,8 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // before the rename, leaving a gap where a concurrent daemon startup or
     // a signal-interrupted restore would see no DB at the expected path.
     //
-    // Windows note: Node's `fs.renameSync` on Windows throws EPERM when the
-    // destination already exists. Fall back to copy-then-unlink — NOT
-    // atomic on Windows, but documented and the best POSIX-API equivalent
-    // we can offer without shelling out to MoveFileExW.
+    // Windows note: a rename onto a file another process holds open fails there (EPERM); the swap retries briefly,
+    // then refuses by name (below). It never copies over the live DB.
     await beforeRestoreSwapHook?.(srcDbPath);
     // Codex #385 R2 P1-2: an OWNED DB is replaced only while this restore's acquisition still holds the lock and its
     // lock file is still the file at its name (removed or replaced, another process may own and have written the DB).
@@ -864,15 +881,27 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       fs.rmSync(newPath, { force: true }); // this restore's own staged copy (never a DB-family name)
       throw err;
     }
-    try {
-      fs.renameSync(newPath, target);
-    } catch (err) {
-      if (process.platform === "win32") {
-        // Windows fallback: non-atomic replace. Documented behavior.
-        fs.copyFileSync(newPath, target);
-        fs.unlinkSync(newPath);
-      } else {
-        throw err;
+    // INV-DB-01 slice 4 (the #377 ruling, Codex #401 R2 walk): the swap is the atomic rename ONLY. On Windows a rename
+    // onto a file another process holds open fails; a short retry, then a NAMED refusal: never a copy over the live
+    // DB (a crash mid-copy would leave it torn, recoverable only by hand from the safety backup).
+    const waits = process.platform === "win32" ? [25, 50, 100, 200] : [];
+    for (let i = 0; ; i++) {
+      try {
+        fs.renameSync(newPath, target);
+        break;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code ?? "";
+        if (process.platform === "win32" && ["EPERM", "EBUSY", "EACCES"].includes(code) && i < waits.length) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waits[i]);
+          continue;
+        }
+        fs.rmSync(newPath, { force: true }); // this restore's own staged copy (never a DB-family name)
+        throw new Error(
+          `restore refused: the staged copy could not be replaced onto ${target} (${code || (err as Error).message})` +
+            (process.platform === "win32" ? `: another process may have the DB open (Windows cannot replace an open file)` : "") +
+            `. Nothing was replaced: the live DB is unchanged (its safety backup is at ${previousBackupPath}). Stop every ` +
+            `process using it, then retry.`
+        );
       }
     }
 

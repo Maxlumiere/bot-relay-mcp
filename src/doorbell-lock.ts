@@ -43,7 +43,7 @@ import fs from "fs";
 import path from "path";
 import Database from "better-sqlite3";
 import { ensurePrivateDir } from "./doorbell-log.js";
-import { isInClaimedFamily } from "./db-header.js";
+import { isInClaimedFamily, readDriverHeader } from "./db-header.js";
 
 export const LOCK_DB_FILENAME = "doorbell.lock.db";
 /** PR 7 (§v6, ruling ffcaf608 D2): a watch generation's lock file name (src/watch-wake.ts: watchLockFile). */
@@ -60,6 +60,17 @@ function openLockFile(lockPath: string): InstanceType<typeof Database> {
   // that aliases (by identity) a relay DB this process has open, natively or through wasm, is never opened.
   if (isInClaimedFamily(lockPath)) {
     throw new Error(`${lockPath}: refusing to open it as a lock: it is (an alias of) a relay database this process has open, natively or through wasm`);
+  }
+  // INV-DB-01 slice 4 (Codex #391 R1 P2-6): the claims above cover only THIS process. A lock file is never a second name
+  // of another file, and never a relay database (RLYN or RLYW): either is refused here, before any native open, so a
+  // hard link named like a lock can never put BEGIN EXCLUSIVE on another process's (wasm-owned) relay DB.
+  const st = fs.lstatSync(lockPath);
+  if (st.nlink > 1) {
+    throw new Error(`${lockPath}: refusing to open it as a lock: it has ${st.nlink} hard links (a lock file has one); it may be another file, even a relay database`);
+  }
+  const h = readDriverHeader(lockPath);
+  if (h.kind === "native" || h.kind === "wasm") {
+    throw new Error(`${lockPath}: refusing to open it as a lock: it is a relay database (stamped ${h.kind === "wasm" ? "RLYW" : "RLYN"}), not a lock file`);
   }
   return new Database(lockPath, { timeout: 0, fileMustExist: true });
 }

@@ -109,15 +109,16 @@ describe("#171 backup/restore on the wasm driver + cross-driver interop", () => 
     expect(hasMessage, "the message must survive backup+restore under wasm").toBe(true);
   }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
 
-  it("a NATIVE-made archive restores under WASM (interop: consumer switches to wasm post-npm-12)", async () => {
-    // INV-DB-01 slice 2a: this fixture is written by a NATIVE relay init (so its header is stamped native) and read by the
-    // wasm driver in the same process, where native loads: the header now refuses that (the measured mix). The row
-    // models the case wasm-on-native is still allowed for, a process where the native driver cannot load.
+  it("a NATIVE-made archive restores onto a FRESH wasm-only install (no live DB): re-stamped RLYW (slice 4 Q5; before: restored over a live native DB, read by wasm)", async () => {
+    // INV-DB-01 slice 4 (BREAKING 5.0.0): a wasm instance never opens a live native DB, so the interop case is a fresh
+    // wasm install restoring an archive made natively. Restore re-stamps the staged copy for the wasm owner (sql.js).
     const header = await import("../src/db-header.js");
     header._setNativeProbeForTests(() => ({ ok: false, reason: "test: a wasm-only install (npm 12, scripts off)" }));
     try {
       const archive = await seedAndBackup("native");
+      fs.rmSync((await import("../src/db.js")).getDbPath()); // a fresh install: no live DB
       const { agents, hasMessage } = await restoreAndRead(archive, "wasm");
+      expect(fs.readFileSync((await import("../src/db.js")).getDbPath()).readUInt32BE(68), "re-stamped for its owner").toBe(0x524c5957);
       expect(agents).toEqual(["wbr-alpha", "wbr-beta"]);
       expect(hasMessage).toBe(true);
     } finally {
@@ -125,7 +126,7 @@ describe("#171 backup/restore on the wasm driver + cross-driver interop", () => 
     }
   }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.
 
-  it("INV-DB-01 slice 2a twin, WITHOUT the seam: native loads here, so a wasm restore of a native-made archive is REFUSED by the header (named, with the remedy), and the live DB is untouched", async () => {
+  it("slice 4 (Q5) twin: a wasm declaration over a LIVE native DB refuses the restore by name (the two disagree), and the live DB is untouched (before: refused by the header check)", async () => {
     const archive = await seedAndBackup("native");
     const liveDb = (await import("../src/db.js")).getDbPath();
     expect(fs.readFileSync(liveDb).readInt32BE(68), "precondition: the live DB is stamped native").toBe(0x524c594e);
@@ -133,14 +134,17 @@ describe("#171 backup/restore on the wasm driver + cross-driver interop", () => 
     process.env.RELAY_SQLITE_DRIVER = "wasm";
     closeDb();
     const err = (await importRelayState(archive, { force: true }).then(() => null, (e: Error) => e)) as Error | null;
-    expect(err?.name).toBe("DbHeaderRefusedError");
-    expect(err?.message).toMatch(/REFUSING the wasm driver .*Unset RELAY_SQLITE_DRIVER .*run native: the file is native\./);
+    expect(err?.message).toMatch(/restore refused: this instance declares sqlite_driver "wasm" but its live DB .* is native: the two disagree[\s\S]*relay convert-journal --to wasm/);
     expect(fs.readFileSync(liveDb).equals(before), "the live DB is byte-identical").toBe(true);
   }, 60000);
 
-  it("a WASM-made archive restores under NATIVE (interop: consumer switches back)", async () => {
+  it("a WASM-made archive restores onto an instance CONVERTED back to native: re-stamped RLYN (slice 4 Q5; before: the env switch alone)", async () => {
+    // INV-DB-01 slice 4: switching back is `relay convert-journal --to native` (the RLYW header decides otherwise).
     const archive = await seedAndBackup("wasm");
+    delete process.env.RELAY_SQLITE_DRIVER;
+    await (await import("../src/convert-journal.js")).convertJournal({ to: "native" });
     const { agents, hasMessage } = await restoreAndRead(archive, "native");
+    expect(fs.readFileSync((await import("../src/db.js")).getDbPath()).readUInt32BE(68), "re-stamped native").toBe(0x524c594e);
     expect(agents).toEqual(["wbr-alpha", "wbr-beta"]);
     expect(hasMessage).toBe(true);
   }, 60000); // per-test timeout (#210): heavy WASM SQLite work; 60s bounded budget so CPU contention on the release machine can't time it out. Not an SLA.

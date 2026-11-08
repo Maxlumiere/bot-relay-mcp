@@ -148,14 +148,14 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
     expect(appIdOf(dbPath)).toBe(NATIVE);
   });
 
-  it("wasm on a native-stamped DB is REFUSED when native loads here, with the remedy, and the file is untouched", async () => {
+  it("wasm on a native-stamped DB is REFUSED when native loads here, with BOTH remedies (run native, or convert), and the file is untouched (slice 4: the message names relay convert-journal)", async () => {
     makeDb(dbPath, NATIVE);
     const before = sha(dbPath);
     process.env.RELAY_SQLITE_DRIVER = "wasm";
     await expect(compat.initializeDb(dbPath)).rejects.toThrow(
-      /REFUSING the wasm driver .*native relay database.*Unset RELAY_SQLITE_DRIVER .*run native: the file is native\./
+      /REFUSING the wasm driver .*native relay database \(RLYN\).*never adopts[\s\S]*unset RELAY_SQLITE_DRIVER[\s\S]*relay convert-journal --to wasm/
     );
-    await expect(db.initializeDb()).rejects.toThrow(/run native: the file is native/);
+    await expect(db.initializeDb()).rejects.toThrow(/relay convert-journal --to wasm/);
     expect(sha(dbPath), "the refused file is byte-identical").toBe(before);
   });
 
@@ -168,7 +168,7 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
     expect(appIdOf(dbPath)).toBe(NATIVE);
     process.env.RELAY_CONFIG_PATH = path.join(caseDir, "b", "config.json");
     process.env.RELAY_SQLITE_DRIVER = "wasm";
-    await expect(db.initializeDb()).rejects.toThrow(/the file is native/);
+    await expect(db.initializeDb()).rejects.toThrow(/native relay database \(RLYN\)[\s\S]*relay convert-journal/); // slice 4 wording
   });
 
   it("wasm BY PATH on a native-stamped DB (a cold wasm export source) is refused too", async () => {
@@ -176,19 +176,13 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
     await expect(compat.openExportSource(dbPath, "wasm")).rejects.toThrow(/REFUSING the wasm driver/);
   });
 
-  it("native cannot load here: wasm on a native-stamped DB proceeds as before, with ONE loud warning naming the risk", async () => {
+  it("slice 4 (BREAKING 5.0.0): native cannot load here: wasm on a native-stamped DB is REFUSED too, naming relay convert-journal, and the file is untouched (before: opened, with ONE loud warning)", async () => {
     makeDb(dbPath, NATIVE);
+    const before = sha(dbPath);
     header._setNativeProbeForTests(() => ({ ok: false, reason: "Could not locate the bindings file" }));
     process.env.RELAY_SQLITE_DRIVER = "wasm";
-    const warn = vi.spyOn(log, "warn");
-    const opened = await compat.initializeDb(dbPath);
-    expect(compat.driverOf(opened)).toBe("wasm");
-    expect(opened.prepare("SELECT v FROM kept").get()).toEqual({ v: "row-1" });
-    compat.closeInitializedDb();
-    await compat.initializeDb(dbPath);
-    const named = warnings(warn).filter((m) => /stamped native, but the native driver cannot load/.test(m));
-    expect(named, "warned once per process").toHaveLength(1);
-    expect(named[0]).toMatch(/Could not locate the bindings file.*AT RISK: another install with a working native driver.*convert-journal/);
+    await expect(compat.initializeDb(dbPath)).rejects.toThrow(/REFUSING the wasm driver .*native relay database \(RLYN\).*never adopts[\s\S]*unset RELAY_SQLITE_DRIVER[\s\S]*relay convert-journal --to wasm/);
+    expect(sha(dbPath), "the refused file is byte-identical").toBe(before);
   });
 
   it("slice 2b-ii: a WASM-stamped DB refuses every NATIVE-only opener (by path too, with the HTTP client config), untouched; the initializer opens it as its owner (the header decides)", async () => {
@@ -358,7 +352,7 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
     it("P2-6: a refused compat init is not cached: a retry with the driver fixed re-evaluates", async () => {
       makeDb(dbPath, NATIVE);
       process.env.RELAY_SQLITE_DRIVER = "wasm";
-      await expect(compat.initializeDb(dbPath)).rejects.toThrow(/run native: the file is native/);
+      await expect(compat.initializeDb(dbPath)).rejects.toThrow(/relay convert-journal --to wasm/); // slice 4 wording
       delete process.env.RELAY_SQLITE_DRIVER;
       const opened = await compat.initializeDb(dbPath);
       expect(compat.driverOf(opened)).toBe("native");
@@ -479,13 +473,13 @@ describe("INV-DB-01 slice 2a: the DB header decides the driver", () => {
     });
   });
 
-  it("twin: a LEGACY DB under the wasm driver opens as before (slice 1's warning) and is NOT stamped", async () => {
+  it("slice 4 (BREAKING 5.0.0) twin: a LEGACY DB under the wasm driver is REFUSED by name, naming relay convert-journal, and is NOT stamped (before: opened, slice 1's warning)", async () => {
     makeDb(dbPath, 0);
+    const before = sha(dbPath);
     process.env.RELAY_SQLITE_DRIVER = "wasm";
-    await db.initializeDb();
-    db.getDb().prepare("INSERT INTO kept VALUES ('row-2')").run();
-    db.closeDb();
-    expect(appIdOf(dbPath), "only a native init stamps").toBe(0);
+    await expect(db.initializeDb()).rejects.toThrow(/legacy \(unstamped\) relay database[\s\S]*relay convert-journal --to wasm/);
+    expect(appIdOf(dbPath), "never stamped").toBe(0);
+    expect(sha(dbPath)).toBe(before);
   });
 
   it("twin: a cold export of a legacy DB never stamps it (nor changes a byte)", async () => {

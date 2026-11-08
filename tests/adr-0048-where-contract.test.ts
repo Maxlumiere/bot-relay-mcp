@@ -159,13 +159,22 @@ describe("ADR-0048 — the daemon re-checks containment AFTER create (TOCTOU)", 
   // escaped path. The WASM handle used to flush its image on close(), creating the
   // DB outside the roots at the moment of refusal; the DB file was also chmod'ed
   // (through the swapped path) before the re-check.
-  for (const driver of ["wasm", "native"] as const) {
-    it(`${driver}: the refusal writes NOTHING outside the roots (no flush, no chmod of the escaped DB)`, async () => {
-      const saved = { HOME: process.env.HOME, RELAY_DB_PATH: process.env.RELAY_DB_PATH, D: process.env.RELAY_SQLITE_DRIVER };
+  // INV-DB-01 slice 4: "wasm-declared" is the instance's sqlite_driver "wasm" with no env: the single OWNER, which
+  // CREATES a new DB on disk while it opens (the legacy env-only wasm opened in memory). Its creation must not follow
+  // the swapped path either.
+  for (const mode of ["wasm", "wasm-declared", "native"] as const) {
+    const driver = mode === "native" ? "native" : "wasm";
+    it(`${mode}: the refusal writes NOTHING outside the roots (no flush, no chmod of the escaped DB)`, async () => {
+      const saved = { HOME: process.env.HOME, RELAY_DB_PATH: process.env.RELAY_DB_PATH, D: process.env.RELAY_SQLITE_DRIVER, C: process.env.RELAY_CONFIG_PATH };
       process.env.HOME = HOME;
-      process.env.RELAY_SQLITE_DRIVER = driver;
-      const dir = path.join(HOME, `racy-${driver}`);
-      const lazyDir = path.join(HOME, `racy-${driver}-lazy`);
+      if (mode === "wasm-declared") {
+        const cfg = path.join(ROOT, "declared-wasm-config.json");
+        fs.writeFileSync(cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+        process.env.RELAY_CONFIG_PATH = cfg;
+        delete process.env.RELAY_SQLITE_DRIVER;
+      } else process.env.RELAY_SQLITE_DRIVER = driver;
+      const dir = path.join(HOME, `racy-${mode}`);
+      const lazyDir = path.join(HOME, `racy-${mode}-lazy`);
       const dbPath = path.join(dir, "relay.db");
       process.env.RELAY_DB_PATH = dbPath;
       const db = await import("../src/db.js");
@@ -231,6 +240,8 @@ describe("ADR-0048 — the daemon re-checks containment AFTER create (TOCTOU)", 
         else process.env.RELAY_DB_PATH = saved.RELAY_DB_PATH;
         if (saved.D === undefined) delete process.env.RELAY_SQLITE_DRIVER;
         else process.env.RELAY_SQLITE_DRIVER = saved.D;
+        if (saved.C === undefined) delete process.env.RELAY_CONFIG_PATH;
+        else process.env.RELAY_CONFIG_PATH = saved.C;
       }
     });
   }

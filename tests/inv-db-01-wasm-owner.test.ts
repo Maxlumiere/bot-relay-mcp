@@ -10,7 +10,8 @@
  *   stamped RLYW (it appears complete, by a link), persists atomically (temp + rename) under the lock, and refuses a
  *   persist when the file was replaced by another writer.
  * - A second process on an owned DB is refused by name; the owner's exit releases it.
- * - Native-only openers and a stdio server on an RLYW DB are refused, with a copy-pasteable HTTP client config.
+ * - Native-only openers on an RLYW DB are refused, with a copy-pasteable HTTP client config. A stdio server may be the
+ *   owner (slice 4 amends 2b-ii); a second one is refused by name.
  * - Legacy env-wasm (`RELAY_SQLITE_DRIVER=wasm` with no instance declaration) never stamps RLYW; an owner never adopts
  *   a legacy (0) file. A declaration that the env contradicts wins, and the env warns.
  * Processes are real (children running dist/), each recorded by pid and killed at the end.
@@ -29,7 +30,7 @@ import * as lockMod from "../src/db-owner-lock.js";
 import * as compat from "../src/sqlite-compat.js";
 import * as db from "../src/db.js";
 import { openRawRelayDb } from "../src/cli/_instance-db.js";
-import { exportRelayState, importRelayState, _setBeforeRestoreSwapForTests } from "../src/backup.js";
+import { exportRelayState, importRelayState, _setBeforeRestoreSwapForTests, _setExportReadHookForTests } from "../src/backup.js";
 import { log } from "../src/logger.js";
 import { _takeFsSpyViolations } from "./_setup/no-fs-on-held-db.js";
 
@@ -216,8 +217,11 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     await expect(openRawRelayDb(dbPath, { readonly: true })).rejects.toThrow(/"type": ?"http"/);
   });
 
-  it("a STDIO server on an RLYW DB exits non-zero, with a copy-pasteable HTTP client config", async () => {
+  it("slice 4 (amended 2b-ii): a STDIO server on an RLYW DB while ANOTHER process owns it exits non-zero, naming the single-process rule, with NO HTTP hint (before: every stdio server on an RLYW DB was refused, with an HTTP hint)", async () => {
     makeDb(dbPath, WASM);
+    declareWasm();
+    const a = startOwner();
+    expect(await a.first).toBe("READY");
     const r = spawnSync(process.execPath, [DIST_INDEX], {
       // Past the stdin guard (it would exit on a closed stdin before the DB is considered).
       env: { ...process.env, RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "1" },
@@ -226,62 +230,54 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
       timeout: 20_000,
     });
     expect(r.status, r.stderr).not.toBe(0);
-    expect(r.stderr).toMatch(/"type": ?"http"/);
+    expect(r.stderr).toMatch(/another relay process owns this wasm DB; wasm is single-process/);
+    expect(r.stderr).not.toMatch(/"type": ?"http"/);
+    a.child.stdin!.write("exit\n");
+    await waitExitOf(a.child);
   }, 30_000);
 
-  it("twin: a LEGACY (0) DB under env-wasm keeps working over stdio, as today (no lock, unstamped): two REAL stdio servers each acknowledge a tool call", async () => {
+  it("slice 4 (BREAKING 5.0.0): a LEGACY (0) DB under env-wasm is REFUSED over stdio, naming `relay convert-journal`, and stays unstamped (before: two stdio servers each acknowledged, no lock)", async () => {
     makeDb(dbPath, 0);
-    const connect = async (tag: string) => {
-      const transport = new StdioClientTransport({
-        command: process.execPath,
-        args: [DIST_INDEX],
-        env: { PATH: process.env.PATH ?? "", HOME: caseDir, USERPROFILE: caseDir, RELAY_DB_PATH: dbPath, RELAY_CONFIG_PATH: cfgPath, RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "1", RELAY_SQLITE_DRIVER: "wasm", ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
-        stderr: "pipe",
-      });
-      const client = new Client({ name: `legacy-${tag}`, version: "0" }, { capabilities: {} });
-      await client.connect(transport);
-      return client;
-    };
-    const [a, b] = [await connect("a"), await connect("b")];
-    try {
-      for (const [c, name] of [[a, "legacy-a"], [b, "legacy-b"]] as const) {
-        const r = (await c.callTool({ name: "register_agent", arguments: { name, role: "r", capabilities: [] } })) as { isError?: boolean; content?: Array<{ text?: string }> };
-        expect(r.isError, `${name}: ${JSON.stringify(r.content)}`).not.toBe(true);
-      }
-      const later = (await a.callTool({ name: "health_check", arguments: {} })) as { isError?: boolean };
-      expect(later.isError, "a later call is acknowledged too").not.toBe(true);
-    } finally {
-      await a.close();
-      await b.close();
-    }
+    const before = sha(dbPath);
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [DIST_INDEX],
+      env: { PATH: process.env.PATH ?? "", HOME: caseDir, USERPROFILE: caseDir, RELAY_DB_PATH: dbPath, RELAY_CONFIG_PATH: cfgPath, RELAY_TRANSPORT: "stdio", RELAY_SKIP_TTY_CHECK: "1", RELAY_SQLITE_DRIVER: "wasm", ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) },
+      stderr: "pipe",
+    });
+    let stderr = "";
+    transport.stderr?.on("data", (d: Buffer) => (stderr += d));
+    const client = new Client({ name: "legacy-refused", version: "0" }, { capabilities: {} });
+    const outcome = await client
+      .connect(transport)
+      .then(() => client.callTool({ name: "register_agent", arguments: { name: "legacy-a", role: "r", capabilities: [] } }))
+      .then((r) => JSON.stringify(r), (e: Error) => `rejected: ${e.message}`);
+    await client.close().catch(() => undefined);
+    expect(`${outcome}\n${stderr}`, "the refusal names the remedy").toMatch(/relay convert-journal/);
+    expect(outcome, "no tool call is acknowledged").not.toMatch(/"isError":false|registered/i);
     expect(idOf(dbPath), "never stamped").toBe("0");
+    expect(sha(dbPath), "the legacy file is untouched").toBe(before);
   }, 60_000);
 
-  it("(2) legacy env-wasm never stamps RLYW: env-only wasm on a NEW path creates an unstamped DB", async () => {
+  it("(2) slice 4 (BREAKING 5.0.0): env-only wasm on a NEW path is the single owner: the DB is born RLYW (before: unstamped, the legacy mode)", async () => {
     process.env.RELAY_SQLITE_DRIVER = "wasm";
     await db.initializeDb();
     db.closeDb();
-    expect(idOf(dbPath)).toBe("0");
+    expect(idOf(dbPath)).toBe(String(WASM));
   });
 
-  it("(2) an owner never ADOPTS a legacy (0) file: declared wasm on an existing 0 DB stays 0, with a named warning", async () => {
+  it("(2) an owner never ADOPTS a legacy (0) file: declared wasm on an existing 0 DB is REFUSED by name, naming `relay convert-journal`, and stays 0 (slice 4; before: opened in the legacy mode, warned)", async () => {
     makeDb(dbPath, 0);
     declareWasm();
-    const warn = vi.spyOn(log, "warn");
-    await db.initializeDb();
-    db.closeDb();
+    await expect(db.initializeDb()).rejects.toThrow(/never adopts[\s\S]*relay convert-journal --to wasm/);
     expect(idOf(dbPath)).toBe("0");
-    expect(warn.mock.calls.map((c) => c.map(String).join(" ")).join("\n")).toMatch(/legacy .*not adopted|not adopt/i);
   });
 
-  it("(3) the instance declaration WINS over a contradicting env, which warns: declared wasm + env native → an owner (RLYW)", async () => {
+  it("(3) slice 4 (BREAKING 5.0.0): a CONTRADICTING env is refused by name: declared wasm + env native → no open, nothing created (before: the instance won, warned)", async () => {
     declareWasm();
     process.env.RELAY_SQLITE_DRIVER = "native";
-    const warn = vi.spyOn(log, "warn");
-    await db.initializeDb();
-    db.closeDb();
-    expect(idOf(dbPath)).toBe(String(WASM));
-    expect(warn.mock.calls.map((c) => c.map(String).join(" ")).join("\n")).toMatch(/RELAY_SQLITE_DRIVER=native .*instance.*wins/i);
+    await expect(db.initializeDb()).rejects.toThrow(/RELAY_SQLITE_DRIVER=native contradicts this instance's sqlite_driver "wasm"[\s\S]*unset/);
+    expect(fs.existsSync(dbPath)).toBe(false);
   });
 
   it("Q-B: an RLYW DB with a native handle already counted (opened past the header check) → the header still decides, with NO fs open", async () => {
@@ -384,17 +380,13 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     db.registerAgent("still-owner", "r", []); // and this owner still writes
   }, 60_000);
 
-  it("a LEGACY connection never writes onto a file that became OWNED after it opened (stamped RLYW by an owner): refused, the owner's file untouched", async () => {
+  it("slice 4: NO unlocked (legacy) wasm connection can exist to write onto a file another owner stamps: env-only wasm on an existing 0 DB is refused at open, the file untouched (before: a legacy connection opened, and its write was refused later)", async () => {
     makeDb(dbPath, 0);
-    process.env.RELAY_SQLITE_DRIVER = "wasm"; // legacy: env-only
-    await db.initializeDb();
-    expect(compat.getActiveDriver(), "precondition: a legacy wasm connection").toBe("wasm");
-    const other = path.join(caseDir, "owned.db");
-    makeDb(other, WASM);
-    fs.renameSync(other, dbPath); // an owner's file now sits at the name
-    const theirs = sha(dbPath);
-    expect(() => db.registerAgent("legacy-after", "r", [])).toThrow(/now owned by the wasm driver's single owner/);
-    expect(sha(dbPath), "the owner's file is untouched").toBe(theirs);
+    process.env.RELAY_SQLITE_DRIVER = "wasm"; // env-only
+    const before = sha(dbPath);
+    await expect(db.initializeDb()).rejects.toThrow(/relay convert-journal/);
+    expect(compat.getActiveDriver(), "no wasm connection was made").not.toBe("wasm");
+    expect(sha(dbPath), "the file is untouched").toBe(before);
   });
 
   it("a RESTORE of an owned DB while ANOTHER process owns it is refused by name, and the owner's file is untouched", async () => {
@@ -410,6 +402,117 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     a.child.stdin!.write("exit\n");
     await waitExitOf(a.child);
   }, 60_000);
+
+  it("slice 4 (the unowned-read boundary): a COLD EXPORT of an RLYW DB while ANOTHER process owns it still takes the owner lock: refused by name, no archive, the owner's file untouched (the cold export only READS, but an owned file is never read without its lock)", async () => {
+    makeDb(dbPath, WASM);
+    declareWasm();
+    const a = startOwner();
+    expect(await a.first).toBe("READY");
+    const theirs = sha(dbPath);
+    fs.rmSync(cfgPath); // this process: no declaration; the header (RLYW) still makes it owned
+    process.env.RELAY_SQLITE_DRIVER = "wasm"; // and a wasm READ purpose, the case "unowned-read" must not cover
+    const dest = path.join(caseDir, "while-owned.tar.gz");
+    await expect(exportRelayState({ destinationPath: dest })).rejects.toThrow(/backup refused: .*owned by a live relay process/);
+    expect(fs.existsSync(dest), "no archive").toBe(false);
+    expect(sha(dbPath), "the owner's file is untouched").toBe(theirs);
+    a.child.stdin!.write("exit\n");
+    await waitExitOf(a.child);
+    // Twin: with the owner gone, the same cold export runs (under the lock it now takes itself).
+    const ok = await exportRelayState({ destinationPath: path.join(caseDir, "after-owner.tar.gz") });
+    expect(fs.existsSync(ok.archive_path)).toBe(true);
+  }, 60_000);
+
+  it("Codex #401 R1 P2-4: an export RETRY re-resolves ownership: a file that becomes RLYW after the first (unowned) read, while ANOTHER process holds its owner lock, is refused, never read without the lock", async () => {
+    makeDb(dbPath, WASM);
+    declareWasm();
+    const a = startOwner();
+    expect(await a.first).toBe("READY");
+    fs.rmSync(cfgPath); // this process: no declaration
+    process.env.RELAY_SQLITE_DRIVER = "wasm";
+    // The owner's file is swapped for a LEGACY copy (the owner still holds the lock for the name), so the export
+    // starts unowned; its first read then swaps an RLYW image back in, so the torn-read check forces a retry.
+    const owned = path.join(caseDir, "owned-image.db");
+    fs.copyFileSync(dbPath, owned);
+    const legacy = path.join(caseDir, "legacy-image.db");
+    makeDb(legacy, 0);
+    fs.renameSync(legacy, dbPath);
+    let swapped = false;
+    _setExportReadHookForTests(() => {
+      if (swapped) return;
+      swapped = true;
+      fs.renameSync(owned, dbPath);
+    });
+    const dest = path.join(caseDir, "retry.tar.gz");
+    try {
+      await expect(exportRelayState({ destinationPath: dest })).rejects.toThrow(/(backup refused: .*owned by a live relay process|owned by another relay process)/);
+    } finally {
+      _setExportReadHookForTests(null);
+    }
+    expect(swapped, "precondition: the first read ran, and the file became RLYW").toBe(true);
+    expect(fs.existsSync(dest), "no archive").toBe(false);
+    a.child.stdin!.write("exit\n");
+    await waitExitOf(a.child);
+  }, 60_000);
+
+  // --- the stdio OWNER (the ruling on Codex #401 R1, amending 2b-ii: exclusion is the lock's job) ---
+  const stdioEnv = (): Record<string, string> => ({
+    PATH: process.env.PATH ?? "",
+    HOME: caseDir,
+    USERPROFILE: caseDir,
+    RELAY_DB_PATH: dbPath,
+    RELAY_CONFIG_PATH: cfgPath,
+    RELAY_TRANSPORT: "stdio",
+    RELAY_SKIP_TTY_CHECK: "1",
+    RELAY_SQLITE_DRIVER: "wasm",
+    ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+  });
+  /** A REAL stdio server and one tool call: its outcome text and stderr. The client is returned for the caller to close. */
+  async function stdioCall(tag: string): Promise<{ outcome: string; stderr: () => string; close: () => Promise<void> }> {
+    const transport = new StdioClientTransport({ command: process.execPath, args: [DIST_INDEX], env: stdioEnv(), stderr: "pipe" });
+    let err = "";
+    transport.stderr?.on("data", (d: Buffer) => (err += d));
+    const client = new Client({ name: `stdio-${tag}`, version: "0" }, { capabilities: {} });
+    const outcome = await client
+      .connect(transport)
+      .then(() => client.callTool({ name: "register_agent", arguments: { name: `stdio-${tag}`, role: "r", capabilities: [] } }))
+      .then((r) => JSON.stringify(r), (e: Error) => `rejected: ${e.message}`);
+    return { outcome, stderr: () => err, close: () => client.close().catch(() => undefined) };
+  }
+  const acked = (outcome: string) => outcome.startsWith("{") && !/"isError":true/.test(outcome);
+
+  it("stdio owner (1): a single stdio server under env-wasm on a NEW DB OWNS it: born RLYW, and a tool call is acknowledged (amends 2b-ii, which refused every stdio wasm owner)", async () => {
+    fs.writeFileSync(cfgPath, "{}", { mode: 0o600 }); // a silent instance: the env declares wasm
+    const one = await stdioCall("one");
+    try {
+      expect(acked(one.outcome), `${one.outcome}\n${one.stderr()}`).toBe(true);
+    } finally {
+      await one.close();
+    }
+    expect(idOf(dbPath), "born stamped for its owner").toBe(String(WASM));
+  }, 60_000);
+
+  it("stdio owner (2)+(3): a SECOND stdio server while the first owns is refused with the single-process text (no HTTP hint implying a daemon); after the first exits, the next one acquires", async () => {
+    fs.writeFileSync(cfgPath, "{}", { mode: 0o600 }); // a silent instance: the env declares wasm
+    const one = await stdioCall("first");
+    let closedOne = false;
+    try {
+      expect(acked(one.outcome), `${one.outcome}\n${one.stderr()}`).toBe(true);
+      const two = await stdioCall("second");
+      await two.close();
+      expect(acked(two.outcome), "the second is never acknowledged").toBe(false);
+      expect(`${two.outcome}\n${two.stderr()}`).toMatch(/another relay process owns this wasm DB; wasm is single-process: close it, or run one HTTP daemon and point every client at it/);
+      await one.close();
+      closedOne = true;
+      const three = await stdioCall("third");
+      try {
+        expect(acked(three.outcome), `after the first exits, the next acquires\n${three.outcome}\n${three.stderr()}`).toBe(true);
+      } finally {
+        await three.close();
+      }
+    } finally {
+      if (!closedOne) await one.close();
+    }
+  }, 90_000);
 
   // --- Codex #385 R2, each a RED on the source it reviewed ---
 

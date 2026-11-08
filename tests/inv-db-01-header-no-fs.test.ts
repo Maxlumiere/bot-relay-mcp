@@ -30,6 +30,8 @@ import { _takeFsSpyViolations } from "./_setup/no-fs-on-held-db.js";
 import { pathToFileURL } from "url";
 
 const NATIVE = 0x524c594e;
+/** INV-DB-01 slice 4: a wasm connection is always its single owner, so the wasm rows below open an RLYW (owned) file. */
+const WASM = 0x524c5957;
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "s2bi-")));
 const KEYS = ["HOME", "USERPROFILE", "RELAY_CONFIG_PATH", "RELAY_INSTANCE_ID", "RELAY_SQLITE_DRIVER", "RELAY_DB_PATH"] as const;
@@ -166,9 +168,7 @@ describe("INV-DB-01 2b-i: a native process never fs-opens a DB-family file", () 
   });
 
   it("a native open of a file this process holds through a WRITABLE wasm connection is refused by name (the reverse in-process mix)", async () => {
-    makeWalDb(dbPath, 0);
-    fs.rmSync(dbPath + "-wal", { force: true });
-    fs.rmSync(dbPath + "-shm", { force: true });
+    makeRollbackDb(dbPath, WASM); // slice 4: was a legacy (0) file in the retired legacy mode; now an owned one
     process.env.RELAY_SQLITE_DRIVER = "wasm";
     await compat.initializeDb(dbPath);
     await expect(openRawRelayDb(dbPath, { readonly: true })).rejects.toThrow(
@@ -223,10 +223,10 @@ describe("INV-DB-01 2b-i: a native process never fs-opens a DB-family file", () 
     });
 
     it("P1-2: a native open while a WASM init is between its awaits is refused by name (the init holds its claim from before its first await)", async () => {
-      makeRollbackDb(dbPath, 0);
+      makeRollbackDb(dbPath, WASM); // slice 4: was a legacy (0) file; a wasm init is now always an owner's
       process.env.RELAY_SQLITE_DRIVER = "wasm";
       const init = compat.initializeDb(dbPath); // not awaited: it is now inside its awaits
-      expect(() => compat.openNativeDb(dbPath, { readonly: true }, { kind: "legacy" })).toThrow(/a wasm connection to that file is open, or opening, in this process/);
+      expect(() => compat.openNativeDb(dbPath, { readonly: true }, { kind: "wasm" })).toThrow(/a wasm connection to that file is open, or opening, in this process/);
       const w = await init;
       expect(compat.driverOf(w)).toBe("wasm");
       expect(header.nativeHandleCount(dbPath)).toBe(0);
@@ -377,7 +377,7 @@ describe("INV-DB-01 2b-i: a native process never fs-opens a DB-family file", () 
     });
 
     it.each(["close", "discard"] as const)("inherited: a wasm %s whose underlying close THROWS after closing still releases the claim (the handle is dead): a native open then works", async (how) => {
-      makeRollbackDb(dbPath, 0);
+      makeRollbackDb(dbPath, WASM); // slice 4: was a legacy (0) file; a wasm connection is now always an owner's
       process.env.RELAY_SQLITE_DRIVER = "wasm";
       const w = await compat.initializeDb(dbPath);
       const rawWasm = (w as unknown as { db: { close(): void } }).db;
@@ -392,23 +392,27 @@ describe("INV-DB-01 2b-i: a native process never fs-opens a DB-family file", () 
       } catch {
         /* the injected failure */
       }
-      const n = compat.openNativeDb(dbPath, { readonly: true }, { kind: "legacy" });
+      const n = compat.openNativeDb(dbPath, { readonly: true }, { kind: "wasm" });
       n.close();
     });
 
     // POSIX-only, as the doorbell itself: its state dir must be private (mode 0700), which Windows cannot express.
     it.skipIf(!POSIX)("inherited: the doorbell's lock DB refuses a path that aliases a relay DB this process has claimed (a hard link under the lock's name)", async () => {
-      makeRollbackDb(dbPath, 0);
+      makeRollbackDb(dbPath, WASM); // slice 4: was a legacy (0) file; a wasm init is now always an owner's
       const stateDir = path.join(caseDir, "state");
       fs.mkdirSync(stateDir, { mode: 0o700 });
       fs.linkSync(dbPath, path.join(stateDir, "doorbell.lock.db"));
       process.env.RELAY_SQLITE_DRIVER = "wasm";
-      const init = compat.initializeDb(dbPath); // its claim is recorded before its first await
+      // slice 4: imported FIRST, so the doorbell call runs while the init's claim is held (synchronously after the init
+      // begins, before its first await). An owner init now rejects soon after (the hard link), releasing the claim.
       const { acquireInstanceLock } = await import("../src/doorbell-lock.js");
+      const init = compat.initializeDb(dbPath); // its claim is recorded before its first await
       expect(() => acquireInstanceLock(stateDir, { pid: process.pid, proc_start: null, host_id: null })).toThrow(
         /refusing to open it as a lock: it is .* relay database this process has open/
       );
-      await init;
+      // slice 4: the owner then refuses the hard-linked DB itself (its lock is keyed by one name); before, the legacy
+      // open (no owner) succeeded.
+      await expect(init).rejects.toThrow(/hard link/);
     });
   });
 });

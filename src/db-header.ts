@@ -37,6 +37,9 @@ import { log } from "./logger.js";
 
 export const RELAY_APP_ID_NATIVE = 0x524c594e; // "RLYN"
 export const RELAY_APP_ID_WASM = 0x524c5957; // "RLYW"
+/** SQLite header bytes 18-19 ("write/read version"): 1/1 is a rollback-journal (DELETE) file, 2/2 a WAL file. */
+export const JOURNAL_BYTES_DELETE = "1/1"; // CIDR-ALLOWLIST: SQLite header bytes 18-19, not an IP range
+export const JOURNAL_BYTES_WAL = "2/2"; // CIDR-ALLOWLIST: SQLite header bytes 18-19, not an IP range
 
 const SQLITE_MAGIC = Buffer.from("SQLite format 3\0", "latin1");
 const HEADER_BYTES = 100;
@@ -305,6 +308,10 @@ export function _setNativeProbeForTests(fn: (() => ProbeResult) | null): void {
   if (!process.env.VITEST) throw new Error("_setNativeProbeForTests is test-only: VITEST is not set");
   testProbe = fn;
 }
+/** Whether the native driver loads in THIS process (the installed probe; never opens a DB file). */
+export function nativeDriverLoads(): ProbeResult {
+  return nativeProbe();
+}
 function nativeProbe(): ProbeResult {
   const fn = testProbe ?? installedProbe;
   if (!fn) throw new Error("internal: no native-driver probe is installed (src/sqlite-compat.ts installs it when loaded)");
@@ -341,7 +348,7 @@ export function driverHeaderVerdict(dbPath: string, header: DriverHeader, driver
           `[db] WARNING: the DB at '${dbPath}' is stamped native, but the native driver cannot load in this process ` +
           `(${probe.reason}), so the wasm driver opens it, as before the stamp existed. AT RISK: another install with a ` +
           `working native driver writing this same file at the same time loses commits (the two drivers must never ` +
-          `share a file). Run only wasm processes on it; a later release adds \`relay db convert-journal\` to convert it.`,
+          `share a file). Run only wasm processes on it. To convert it, make the native driver load once, then run \`relay convert-journal --to wasm\`.`,
       };
     }
     case "wasm":
