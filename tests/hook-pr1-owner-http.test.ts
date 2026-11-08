@@ -1222,7 +1222,11 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
     const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), FAKE_PS_SLOW: String(process.pid) });
-    expect((r.argv.match(/^ps /gm) ?? []).length, "precondition: the walk made several slow ps calls").toBeGreaterThanOrEqual(3);
+    // >= 2 slow calls (0.9 s each) show the stub's deep chain is being walked. How many fit depends on what the hook
+    // spent before the walk (hook PR 3 puts door exchanges, each a node start, ahead of it; on macOS CI only 2 fit:
+    // job 128871210203). The DISCRIMINATING bar is below: the cut is NAMED (only relay_ps_run prints it, so the budget,
+    // not the chain's end, stopped the walk) and the hook ended inside its budget.
+    expect((r.argv.match(/^ps /gm) ?? []).length, "precondition: the walk made several slow ps calls").toBeGreaterThanOrEqual(2);
     expect(r.status, "the hook exited by itself").not.toBeNull();
     expect(r.ms, `0.9s x 2 calls x 10 levels = 18s of ps: the hook must end inside its 10s budget\n${r.out}`).toBeLessThan(10_000);
     expect(r.out, "the cut is named").toMatch(/no time budget left for a process lookup/);
