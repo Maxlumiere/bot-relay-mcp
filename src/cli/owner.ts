@@ -11,7 +11,8 @@
  *   relay owner tool <register_agent|health_check|report_liveness> --args-json JSON [--with-recovery-token] [--timeout-ms MS]
  *   (the args are NOT secret: name, role, capabilities, pids. Credentials never ride argv: a token key in them is refused.)
  *   relay owner session <agent> [--timeout-ms MS]   (as ruled: that ONE agent's session_id, for its own token)
- * - It resolves the instance as `relay pending` does and opens NO database. It reads the record under the trust model
+ * - It resolves the LOCAL instance (the resolver alone: a remote RELAY_HTTP_HOST never redirects it) and opens NO
+ *   database. It reads the record under the trust model
  *   and takes the key from it; the key never passes through a shell, the environment, argv or another file.
  * - ONE exchange with node's http client to 127.0.0.1:<the record's port> (no proxy, no redirect, no curl
  *   configuration). The request is AES-256-GCM sealed (its AAD binds the path, ts, nonce and this instance); the reply
@@ -43,7 +44,6 @@ import {
   OWNER_DOOR_HEALTH,
   OWNER_DOOR_SESSION,
 } from "../owner-endpoint.js";
-import { decidePendingSource } from "./pending.js";
 
 const AGENT_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const TOOL_PATH: Readonly<Record<string, string>> = {
@@ -196,9 +196,14 @@ export async function run(argv: string[]): Promise<number> {
     process.exit(1);
   }, a.timeoutMs);
   try {
-    const { source, resolution } = await decidePendingSource(null);
-    if (source.kind !== "local") return fail(`no local relay instance to read (${source.reason})`);
-    const instanceId = resolution && resolution.kind === "instance" ? resolution.id : "";
+    // #433 R2 P1-1: a LOCAL-ONLY resolver. The owner door is this machine's instance, whatever RELAY_HTTP_HOST says
+    // (relay pending's source decision routes an auto-discovered instance remote when it is set): the resolver's DB.
+    const { resolveInstance } = await import("../instance.js");
+    const resolution = resolveInstance({});
+    if (resolution.kind === "error") return fail(`no local relay instance (${resolution.reason})`);
+    if (!fs.existsSync(resolution.dbPath)) return fail(`no local relay DB at ${resolution.dbPath}`);
+    const source = { dbPath: resolution.dbPath };
+    const instanceId = resolution.kind === "instance" ? resolution.id : "";
     const v = ownerEndpointVerdict(source.dbPath, instanceId);
     if (!v.ok) return fail(`no trusted owner endpoint for ${source.dbPath} (${v.reason}): restart the relay daemon if it is running`);
     // The client's OWN binding (never the record's): a record relocated from another instance cannot pass for this one.
@@ -277,7 +282,7 @@ export async function run(argv: string[]): Promise<number> {
         ok: true,
         agent: a.target,
         db_path: source.dbPath,
-        resolution: resolution ? serializeResolution(resolution) : null,
+        resolution: serializeResolution(resolution),
         session_bound: registered ? p.session_bound : false,
         count: registered ? p.count : 0,
         top_priority: registered ? p.top_priority : null,

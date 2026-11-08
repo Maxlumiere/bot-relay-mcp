@@ -37,23 +37,47 @@ async function readStdin(limit: number): Promise<string> {
   }
   return Buffer.concat(chunks).toString("utf-8");
 }
-/** A private directory this user owns, no symlink, no group/other write (POSIX): created 0700 when absent. */
-function ensurePrivateDir(dir: string): void {
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const st = fs.lstatSync(dir);
-  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`${dir} is not a real directory`);
-  if (process.platform !== "win32") {
-    if (typeof process.geteuid === "function" && st.uid !== process.geteuid()) throw new Error(`${dir} is not owned by you`);
-    fs.chmodSync(dir, 0o700);
+let createHookForTests: ((tmp: string) => void) | null = null;
+/** TEST ONLY: called right after the temp file is created (the directory must already be private then). */
+export function _setCreateHookForTests(fn: ((tmp: string) => void) | null): void {
+  createHookForTests = fn;
+}
+const euidNow = () => (typeof process.geteuid === "function" ? process.geteuid() : null);
+
+/**
+ * #433 R2 P1-2: the directory CHAIN (the scope dir and its agents dir) made private, trusted and verified BEFORE any
+ * file exists in it: created 0700 when absent; no symlink; owned by this user; POSIX 0700 (verified after the chmod);
+ * Windows an owner-only ACL (restrictToOwnerWindows, as the local mint secret's chain), verified (privacyFaults), so a
+ * new file can inherit no foreign access. Returns the scope dir's identity, re-checked after the create.
+ */
+function securePrivateChain(dir: string): fs.BigIntStats {
+  for (const d of [path.dirname(dir), dir]) {
+    fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+    const st = fs.lstatSync(d);
+    if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`${d} is not a real directory (a symlink?): refusing it`);
+    if (process.platform === "win32") {
+      const restricted = restrictToOwnerWindows(d, true);
+      const faults = restricted.length > 0 ? restricted : privacyFaults(d, 0o700);
+      if (faults.length > 0) throw new Error(`${d} could not be made private (${faults.join("; ")})`);
+    } else {
+      const euid = euidNow();
+      if (euid !== null && st.uid !== euid) throw new Error(`${d} is not owned by you`);
+      fs.chmodSync(d, 0o700);
+      if ((fs.lstatSync(d).mode & 0o077) !== 0) throw new Error(`${d} could not be made private (mode)`);
+    }
   }
+  return fs.lstatSync(dir, { bigint: true });
 }
 /** The trusted-writer pattern (as the owner record's): one descriptor from O_EXCL create to fsync, then rename. */
-function writePrivateFile(file: string, data: string): void {
+function writePrivateFile(file: string, data: string, dirId: fs.BigIntStats): void {
   const dir = path.dirname(file);
   const tmp = path.join(dir, `.${path.basename(file)}.${crypto.randomBytes(6).toString("hex")}.tmp`);
   const fd = fs.openSync(tmp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
   let ok = false;
   try {
+    if (createHookForTests) createHookForTests(tmp);
+    // The directory is still the one made private (a replaced directory is refused).
+    if (!sameFileIdentity(fs.lstatSync(dir, { bigint: true }), dirId)) throw new Error(`${dir} was replaced while the secret was being written`);
     if (process.platform === "win32") {
       const faults = [...restrictToOwnerWindows(tmp, false), ...privacyFaults(tmp, 0o600)];
       if (faults.length > 0) throw new Error(`the file could not be made private (${faults.join("; ")})`);
@@ -83,6 +107,13 @@ function writePrivateFile(file: string, data: string): void {
   }
   fs.renameSync(tmp, file);
 }
+/** Store a remote's registration secret at <dir>/mint.secret: the directory chain private FIRST, then the file. */
+export function writeRemoteMintSecret(dir: string, secret: string): string {
+  const dirId = securePrivateChain(dir);
+  const file = path.join(dir, "mint.secret");
+  writePrivateFile(file, `${secret}\n`, dirId);
+  return file;
+}
 
 export async function run(argv: string[]): Promise<number> {
   const [sub, target, ...rest] = argv;
@@ -104,8 +135,7 @@ export async function run(argv: string[]): Promise<number> {
   if (r.kind === "error") return fail(`no relay instance to store it in (${r.reason})`);
   const dir = path.join(path.dirname(r.dbPath), "agents", remoteScope(host, port));
   try {
-    ensurePrivateDir(dir);
-    writePrivateFile(path.join(dir, "mint.secret"), `${secret}\n`);
+    writeRemoteMintSecret(dir, secret);
   } catch (err) {
     return fail((err as Error).message);
   }

@@ -318,7 +318,8 @@ sys.stdout.write("%d\x1f%s\x1f%s" % (n, who, top))
 # token means the remote read reports it cannot authenticate, as before.
 relay_hydrate_token() {
   [ -n "$AGENT_TOKEN" ] && return 0
-  relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"
+  # Once per run: the tunnel gate may already have asked it.
+  [ -n "${RELAY_RES_HOOK_DB:-}" ] || { relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"; }
   local t
   if t=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
     AGENT_TOKEN="$t"
@@ -490,8 +491,9 @@ case "$F1_RC" in
     fi
     ;;
   3)
-    # relay pending's exit 3: no local instance at all (the tunnel gate and the vault scope need no resolver for it).
-    RELAY_NO_LOCAL_INSTANCE=1
+    # #433 R2 P1-1: exit 3 is a routing policy, not "no local DB": a loopback host's tunnel gate needs the RESOLVER's
+    # answer (exists=false), asked once here under the margin budget. A declared remote needs none.
+    [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_remote_declared && relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"
     if [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_bearer_allowed; then
       # Hook PR 3 (as ruled): a loopback bearer is refused (the port-theft class) unless it is a trusted tunnel.
       MODE=remote

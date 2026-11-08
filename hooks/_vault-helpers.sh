@@ -335,8 +335,8 @@ relay_trusted_tunnel() {
   [ "$t" = "$p" ] || return 1
   relay_host_classify
   [ "${RELAY_HOST_CLASS:-}" = loopback ] || return 1
-  # `relay pending` said exit 3 (no local instance at all): definitive, no resolver needed.
-  [ "${RELAY_NO_LOCAL_INSTANCE:-}" = 1 ] && return 0
+  # #433 R2 P1-1: "no local DB" is ONLY the resolver's own answer (exists=false). relay pending's exit 3 is a ROUTING
+  # policy (an auto-discovered DB can still exist), never evidence of absence.
   [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
   [ "${RELAY_RES_KIND:-error}" = error ] && return 1
   [ "${RELAY_RES_EXISTS:-}" = true ] && return 1

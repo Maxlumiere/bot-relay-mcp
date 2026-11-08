@@ -794,7 +794,6 @@ relay_deliver_pending_mail() {
       esac
       ;;
     3)
-      RELAY_NO_LOCAL_INSTANCE=1
       if [ -n "${RELAY_HTTP_HOST:-}" ] && relay_bearer_allowed; then
         # #433 R1: pinned to the checked address, no curl config, no proxy.
         relay_curl_remote
