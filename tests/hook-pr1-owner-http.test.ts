@@ -151,38 +151,66 @@ const bindRecord = (rec: OwnerRecord) => {
 const readRecord = (c: Case) => bindRecord(JSON.parse(fs.readFileSync(c.record, "utf-8")) as OwnerRecord);
 
 // ---------------------------------------------------------------------------------------------------------------------
-// THE OWNER DOOR, as ruled: a MUTUAL MAC, no bearer credential. "\n" separates fields.
-const hmac = (key: string, text: string) => crypto.createHmac("sha256", Buffer.from(key, "hex")).update(text).digest("hex");
+// THE OWNER DOOR (hook PR 3, as ruled after Codex #418 R2): AES-256-GCM requests and replies under HKDF(owner key),
+// the AAD binding path, ts, nonce and the instance (+ status on replies); no bearer credential. "\n" separates fields.
 const bindingOf = (key: string) => BINDINGS.get(key) ?? { instance_id: "", db_path: "" };
-const reqMac = (key: string, p: string, ts: number, nonce: string, body: string) => {
+const doorKeyOf = (key: string, dir: "req" | "resp") => Buffer.from(crypto.hkdfSync("sha256", Buffer.from(key, "hex"), Buffer.alloc(0), `relay-owner-door v1 ${dir}`, 32));
+const reqAad = (key: string, p: string, ts: number, nonce: string) => {
   const b = bindingOf(key);
-  return hmac(key, `req\n${b.instance_id}\n${b.db_path}\n${p}\n${ts}\n${nonce}\n${body}`);
+  return Buffer.from(`req\n${p}\n${ts}\n${nonce}\n${b.instance_id}\n${b.db_path}`);
 };
-const respMac = (key: string, nonce: string, status: number, body: string) => {
+const respAad = (key: string, p: string, ts: number, nonce: string, status: number) => {
   const b = bindingOf(key);
-  return hmac(key, `resp\n${b.instance_id}\n${b.db_path}\n${nonce}\n${status}\n${body}`);
+  return Buffer.from(`resp\n${p}\n${ts}\n${nonce}\n${b.instance_id}\n${b.db_path}\n${status}`);
 };
+function sealWith(k: Buffer, aad: Buffer, plain: unknown) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv("aes-256-gcm", k, iv);
+  c.setAAD(aad);
+  const ct = Buffer.concat([c.update(JSON.stringify(plain), "utf-8"), c.final()]);
+  return { iv: iv.toString("base64"), ct: ct.toString("base64"), tag: c.getAuthTag().toString("base64") };
+}
+function openWith(k: Buffer, aad: Buffer, raw: string): unknown | null {
+  try {
+    const env = JSON.parse(raw) as { iv: string; ct: string; tag: string };
+    const d = crypto.createDecipheriv("aes-256-gcm", k, Buffer.from(env.iv, "base64"));
+    d.setAAD(aad);
+    d.setAuthTag(Buffer.from(env.tag, "base64"));
+    return JSON.parse(Buffer.concat([d.update(Buffer.from(env.ct, "base64")), d.final()]).toString("utf-8"));
+  } catch {
+    return null;
+  }
+}
+/** A sealed request body, as a client with the key builds it (aadPath: sealed for ANOTHER path; sealKey: another key). */
+function sealedBody(key: string, p: string, ts: number, nonce: string, args: Record<string, unknown>, o: { aadPath?: string; sealKey?: string; tamper?: boolean } = {}): string {
+  const env = sealWith(doorKeyOf(o.sealKey ?? key, "req"), reqAad(key, o.aadPath ?? p, ts, nonce), { agent_name: AGENT, args });
+  if (o.tamper) {
+    const ct = Buffer.from(env.ct, "base64");
+    ct[0] = ct[0]! ^ 0xff;
+    env.ct = ct.toString("base64");
+  }
+  return JSON.stringify({ ts, client_nonce: nonce, ...env });
+}
 const PEEK = "/owner/v1/peek";
 const LIVENESS = "/owner/v1/liveness";
+const rpc = (name: string, args: Record<string, unknown>) => ({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } });
 interface DoorOpts {
   ts?: number;
   nonce?: string;
   body?: string;
-  mac?: string;
+  aadPath?: string;
+  sealKey?: string;
+  tamper?: boolean;
 }
-/** One door exchange, as a client with the key would make it. macOk: the reply carries the owner's response MAC. */
+/** One door exchange, as a client with the key would make it. sealedOk: the reply OPENS (authenticates); text: its plaintext then. */
 async function door(port: number, key: string, p: string, args: Record<string, unknown>, o: DoorOpts = {}) {
   const ts = o.ts ?? Math.floor(Date.now() / 1000);
   const nonce = o.nonce ?? crypto.randomBytes(16).toString("hex");
-  const body = o.body ?? JSON.stringify({ agent_name: AGENT, args, ts, client_nonce: nonce });
-  const res = await fetch(`http://127.0.0.1:${port}${p}`, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain", "X-Owner-MAC": o.mac ?? reqMac(key, p, ts, nonce, body) },
-    body,
-  });
-  const text = await res.text();
-  const got = res.headers.get("x-owner-mac");
-  return { status: res.status, text, nonce, macOk: got !== null && got === respMac(key, nonce, res.status, text) };
+  const body = o.body ?? sealedBody(key, p, ts, nonce, args, o);
+  const res = await fetch(`http://127.0.0.1:${port}${p}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body });
+  const raw = await res.text();
+  const opened = openWith(doorKeyOf(key, "resp"), respAad(key, p, ts, nonce, res.status), raw);
+  return { status: res.status, text: opened !== null ? JSON.stringify(opened) : raw, raw, nonce, sealedOk: opened !== null };
 }
 /** The whole DB, from a COPY read with sql.js (never an open of the live file): every table's rows, in order. */
 async function dbDump(c: Case): Promise<Record<string, unknown[][]>> {
@@ -224,7 +252,7 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     expect(fs.existsSync(c.record), "the record is never deleted, even on a clean exit").toBe(true);
   }, 90_000);
 
-  it("POST /owner/v1/peek: a MAC'd request gets the agent's pending set with a reply MAC; no bearer credential is asked for or used", async () => {
+  it("POST /owner/v1/peek: a sealed request gets the agent's pending set in a sealed reply; no bearer credential is asked for or used", async () => {
     const c = newCase("door-peek");
     seedWasmDb(c, "pr1 door mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: `pr1-door-secret-${"x".repeat(32)}` }), { mode: 0o600 });
@@ -232,7 +260,8 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     const { key } = readRecord(c);
     const r = await door(d.port, key, PEEK, { with_content: 5 });
     expect(r.status, r.text).toBe(200);
-    expect(r.macOk, "the reply is MAC'd with the owner key").toBe(true);
+    expect(r.sealedOk, "the reply is sealed under the owner's response key").toBe(true);
+    expect(r.raw, "no mail in plaintext on the wire").not.toContain("pr1 door mail");
     const body = JSON.parse(r.text) as { ok: boolean; registered: boolean; count: number; messages: Array<{ from_agent?: string; content?: string }> };
     expect(body).toMatchObject({ ok: true, registered: true, count: 1 });
     expect(body.messages[0]?.content).toBe("pr1 door mail");
@@ -240,21 +269,19 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     await stopDaemon(d.child);
   }, 90_000);
 
-  it("the door REFUSES: a wrong MAC, a stale or future ts, a replayed nonce, a tampered body, another path's MAC, a malformed nonce: none reveals mail", async () => {
+  it("the door REFUSES: the wrong key, a stale or future ts, a replayed nonce, a tampered ciphertext, a request sealed for another path, a malformed nonce: none reveals mail", async () => {
     const c = newCase("door-refuse");
     seedWasmDb(c, "pr1 refused mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
     const { key } = readRecord(c);
     const now = Math.floor(Date.now() / 1000);
-    const nonce = crypto.randomBytes(16).toString("hex");
-    const goodBody = JSON.stringify({ agent_name: AGENT, args: { with_content: 5 }, ts: now, client_nonce: nonce });
     const cases: Array<[string, Promise<{ status: number; text: string }>]> = [
-      ["a wrong MAC", door(d.port, key, PEEK, { with_content: 5 }, { mac: "00".repeat(32) })],
+      ["the wrong key", door(d.port, key, PEEK, { with_content: 5 }, { sealKey: crypto.randomBytes(16).toString("hex") })],
       ["a stale ts (60s old)", door(d.port, key, PEEK, { with_content: 5 }, { ts: now - 60 })],
       ["a future ts (60s ahead)", door(d.port, key, PEEK, { with_content: 5 }, { ts: now + 60 })],
-      ["a tampered body", door(d.port, key, PEEK, {}, { ts: now, nonce: crypto.randomBytes(16).toString("hex"), mac: reqMac(key, PEEK, now, nonce, goodBody) })],
-      ["the liveness path's MAC on peek", door(d.port, key, PEEK, { with_content: 5 }, { mac: reqMac(key, LIVENESS, now, nonce, goodBody), ts: now, nonce, body: goodBody })],
+      ["a tampered ciphertext", door(d.port, key, PEEK, { with_content: 5 }, { tamper: true })],
+      ["sealed for the liveness path, posted to peek", door(d.port, key, PEEK, { with_content: 5 }, { aadPath: LIVENESS })],
       ["a malformed nonce", door(d.port, key, PEEK, { with_content: 5 }, { nonce: "zz" })],
     ];
     for (const [what, p] of cases) {
@@ -265,9 +292,8 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     // A replay: the SAME request twice. The first is served; the second is refused (its nonce was seen).
     const rts = Math.floor(Date.now() / 1000);
     const rnonce = crypto.randomBytes(16).toString("hex");
-    const rbody = JSON.stringify({ agent_name: AGENT, args: { with_content: 5 }, ts: rts, client_nonce: rnonce });
-    const send = () =>
-      fetch(`http://127.0.0.1:${d.port}${PEEK}`, { method: "POST", headers: { "Content-Type": "text/plain", "X-Owner-MAC": reqMac(key, PEEK, rts, rnonce, rbody) }, body: rbody });
+    const rbody = sealedBody(key, PEEK, rts, rnonce, { with_content: 5 });
+    const send = () => fetch(`http://127.0.0.1:${d.port}${PEEK}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: rbody });
     const first = await send();
     expect(first.status, await first.clone().text()).toBe(200);
     const again = await send();
@@ -292,23 +318,25 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     await stopDaemon(d.child);
   }, 90_000);
 
-  it("POST /owner/v1/liveness restamps ONLY agent_pid / agent_pid_start / host_id; any other argument key is refused", async () => {
+  it("POST /owner/v1/liveness runs report_liveness (its own token check): it restamps ONLY agent_pid / agent_pid_start / host_id (+ the dispatcher's audit row); any other argument key is refused", async () => {
     const c = newCase("door-live");
-    seedWasmDb(c);
+    const token = seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
     const { key } = readRecord(c);
     await new Promise((r) => setTimeout(r, 1500));
     const before = await dbDump(c);
-    const extra = await door(d.port, key, LIVENESS, { agent_pid: 4242, agent_pid_start: "t0", status: "busy" });
+    const live = { agent_name: AGENT, agent_pid: 4242, agent_pid_start: "t0", agent_token: token };
+    const extra = await door(d.port, key, LIVENESS, { rpc: rpc("report_liveness", live), agent_token: token, status: "busy" });
     expect(extra.status, `an extra key: ${extra.text}`).toBeGreaterThanOrEqual(400);
-    const r = await door(d.port, key, LIVENESS, { agent_pid: 4242, agent_pid_start: "t0" });
+    const r = await door(d.port, key, LIVENESS, { rpc: rpc("report_liveness", live), agent_token: token });
     expect(r.status, r.text).toBe(200);
-    expect(r.macOk).toBe(true);
+    expect(r.sealedOk).toBe(true);
+    expect(r.text, "the tool answered (not an error)").not.toMatch(/isError\\?"?:\s*true/);
     await new Promise((r2) => setTimeout(r2, 500));
     const after = await dbDump(c);
     for (const t of Object.keys(before)) {
-      if (t === "agents") continue;
+      if (t === "agents" || t === "audit_log") continue; // the dispatcher audits every tool call, as on /mcp
       expect(after[t], `table ${t} untouched by the liveness door`).toEqual(before[t]);
     }
     const cols = before.agents![0] as string[];
@@ -380,10 +408,10 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
 });
 
 describe("hook PR 1: the door's REPLAY cache, as ruled (expiry by ts, fail-closed when full, swept by a timer)", () => {
-  type Verify = (p: string, raw: unknown, mac: unknown, nowMs?: number) => { ok: boolean; status?: number; error?: string };
+  type Verify = (p: string, raw: unknown, nowMs?: number) => { ok: boolean; status?: number; error?: string };
   async function doorModule() {
     const m = (await import("../src/owner-endpoint.js")) as {
-      verifyDoorRequest: Verify;
+      openDoorRequest: Verify;
       writeOwnerEndpoint: (db: string, port: number, t: "http" | "stdio") => string;
       sweepDoorNonces: (nowMs: number) => void;
       doorNonceCount: () => number;
@@ -396,36 +424,33 @@ describe("hook PR 1: the door's REPLAY cache, as ruled (expiry by ts, fail-close
     m._resetDoorNoncesForTests();
     return { m, key };
   }
-  const signed = (key: string, ts: number, nonce = crypto.randomBytes(16).toString("hex")) => {
-    const body = JSON.stringify({ agent_name: AGENT, args: {}, ts, client_nonce: nonce });
-    return { body, mac: reqMac(key, PEEK, ts, nonce, body) };
-  };
+  const signed = (key: string, ts: number, nonce = crypto.randomBytes(16).toString("hex")) => ({ body: sealedBody(key, PEEK, ts, nonce, {}) });
 
   it("Codex's sequence and every t in the window: a request accepted once is REFUSED at every later instant it would still validate", async () => {
     const { m, key } = await doorModule();
     const T = 2_000_000_000;
-    const { body, mac } = signed(key, T);
-    expect(m.verifyDoorRequest(PEEK, body, mac, (T - 30) * 1000).ok, "accepted at the window's first instant").toBe(true);
+    const { body } = signed(key, T);
+    expect(m.openDoorRequest(PEEK, body, (T - 30) * 1000).ok, "accepted at the window's first instant").toBe(true);
     for (let t = (T - 30) * 1000; t <= (T + 30) * 1000 + 999; t += 250) {
-      const r = m.verifyDoorRequest(PEEK, body, mac, t);
+      const r = m.openDoorRequest(PEEK, body, t);
       expect(r.ok, `a replay at ${t - T * 1000}ms from ts`).toBe(false);
     }
     // Codex's exact numbers: ts 1030 accepted at 1000.000, replayed at 1060.000.
     m._resetDoorNoncesForTests();
     const c2 = signed(key, 1030);
-    expect(m.verifyDoorRequest(PEEK, c2.body, c2.mac, 1_000_000).ok).toBe(true);
-    expect(m.verifyDoorRequest(PEEK, c2.body, c2.mac, 1_060_000).ok, "Codex's replay at 1060").toBe(false);
+    expect(m.openDoorRequest(PEEK, c2.body, 1_000_000).ok).toBe(true);
+    expect(m.openDoorRequest(PEEK, c2.body, 1_060_000).ok, "Codex's replay at 1060").toBe(false);
   });
 
   it("a FULL cache refuses (fail closed), never evicting a live nonce; expired nonces are swept without new traffic (a timer)", async () => {
     const { m, key } = await doorModule();
     const T = 2_000_000_000;
     for (let i = 0; i < m.DOOR_NONCE_CAPACITY; i++) {
-      const { body, mac } = signed(key, T);
-      expect(m.verifyDoorRequest(PEEK, body, mac, T * 1000).ok).toBe(true);
+      const { body } = signed(key, T);
+      expect(m.openDoorRequest(PEEK, body, T * 1000).ok).toBe(true);
     }
     const extra = signed(key, T);
-    const r = m.verifyDoorRequest(PEEK, extra.body, extra.mac, T * 1000);
+    const r = m.openDoorRequest(PEEK, extra.body, T * 1000);
     expect(r.ok, "the cache is full: refused").toBe(false);
     expect(r.status).toBe(503);
     expect(m.doorNonceCount()).toBe(m.DOOR_NONCE_CAPACITY);
@@ -739,7 +764,7 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopbac
     expect(rec.port, "the record names the peek listener, not the main one").not.toBe(d.port);
     const r = await door(rec.port, rec.key, PEEK, { with_content: 5 });
     expect(r.status, r.text).toBe(200);
-    expect(r.macOk).toBe(true);
+    expect(r.sealedOk).toBe(true);
     expect(r.text).toContain("pr1 peek-listener mail");
     if (host === LAN_V4) {
       const off = await fetch(`http://${LAN_V4}:${rec.port}${PEEK}`, { method: "POST", body: "{}" }).then((x) => x.status, () => "refused");
@@ -886,7 +911,7 @@ interface Spy {
   requests: Array<{ method: string; url: string; headers: http.IncomingHttpHeaders; body: string }>;
   bytes: () => string;
 }
-async function startSpy(handler: (req: http.IncomingMessage, res: http.ServerResponse, body: string) => void): Promise<Spy> {
+async function startSpy(handler: (req: http.IncomingMessage, res: http.ServerResponse, body: string) => void, host = "127.0.0.1"): Promise<Spy> {
   const requests: Spy["requests"] = [];
   const server = http.createServer((req, res) => {
     let body = "";
@@ -897,7 +922,7 @@ async function startSpy(handler: (req: http.IncomingMessage, res: http.ServerRes
     });
   });
   servers.push(server);
-  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  await new Promise<void>((r) => server.listen(0, host, () => r()));
   const port = (server.address() as { port: number }).port;
   return { port, requests, bytes: () => requests.map((q) => `${q.method} ${q.url}\n${JSON.stringify(q.headers)}\n${q.body}`).join("\n") };
 }
@@ -1007,7 +1032,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the o
     const d = await startOwnerDaemon(c);
     const forged = JSON.stringify({ ok: true, registered: true, session_bound: false, count: 1, top_priority: "high", messages: [{ id: "x", from_agent: "pr1-sender", content: "FORGED-MAIL-INJECTION", created_at: "now", priority: "high" }] });
     const thief = await startSpy((req, res) => {
-      res.writeHead(200, { "Content-Type": "text/plain", "X-Owner-MAC": "00".repeat(32) });
+      res.writeHead(200, { "Content-Type": "text/plain" });
       res.end(forged);
     });
     fs.writeFileSync(c.record, JSON.stringify({ ...readRecord(c), port: thief.port }), { mode: 0o600 });
@@ -1022,19 +1047,30 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the o
     await stopDaemon(d.child);
   }, 120_000);
 
-  it("a TAMPERED reply (relayed from the real owner, its body altered, the owner's MAC kept) → nothing from it is shown", async () => {
+  it("a TAMPERED reply (relayed from the real owner, one ciphertext byte flipped, its tag kept) → nothing from it is shown", async () => {
     const c = newCase("tamper");
     const token = seedWasmDb(c, "pr1 tamper mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
     const relayTo = d.port;
+    let tampered = 0;
     const mitm = await startSpy((req, res, body) => {
       const up = http.request({ host: "127.0.0.1", port: relayTo, path: req.url, method: req.method, headers: req.headers }, (ur) => {
         let ub = "";
         ur.on("data", (x: Buffer) => (ub += x));
         ur.on("end", () => {
-          res.writeHead(ur.statusCode ?? 500, { "Content-Type": "text/plain", "X-Owner-MAC": String(ur.headers["x-owner-mac"] ?? "") });
-          res.end(ub.replace("pr1 tamper mail", "pr1 TAMPERED mail"));
+          res.writeHead(ur.statusCode ?? 500, { "Content-Type": "text/plain" });
+          let out = ub;
+          try {
+            const env = JSON.parse(ub) as { ct: string };
+            const ct = Buffer.from(env.ct, "base64");
+            ct[ct.length - 1] = ct[ct.length - 1]! ^ 0x01;
+            out = JSON.stringify({ ...env, ct: ct.toString("base64") });
+            tampered++;
+          } catch {
+            /* not an envelope: relayed as is */
+          }
+          res.end(out);
         });
       });
       up.end(body);
@@ -1042,7 +1078,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the o
     fs.writeFileSync(c.record, JSON.stringify({ ...readRecord(c), port: mitm.port }), { mode: 0o600 });
     const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token });
     expect(mitm.requests.length, "precondition: the exchange went through the relay").toBeGreaterThan(0);
-    expect(r.out).not.toContain("TAMPERED");
+    expect(tampered, "precondition: a sealed reply was tampered").toBeGreaterThan(0);
     expect(r.out).not.toContain("pr1 tamper mail");
     expect(r.out).toMatch(/relay owner: .*reply .*(MAC|forged|altered)/i);
     await stopDaemon(d.child);
@@ -1136,6 +1172,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     const d = await startOwnerDaemon(c);
     const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), RELAY_HOOK_DEBUG: "1" });
     expect(r.out, "the registration call ran (its debug summary)").toMatch(/register_agent reply:/);
+    expect(r.argv, "hook PR 3: it ran THROUGH the door").toMatch(/owner tool register_agent/);
     expect(mailIn(r.out, "pr1 cred mail"), r.out).toBe(true);
     await stopDaemon(d.child);
   }, 120_000);
@@ -1176,7 +1213,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     await stopDaemon(d.child);
   }, 120_000);
 
-  it("an inherited RELAY_HTTP_HOST/PORT that is NOT the owner → ZERO token bytes there (a recording listener), named skip, mail still read from the owner", async () => {
+  it("an inherited LOCAL RELAY_HTTP_HOST/PORT that is NOT the owner → ZERO token bytes there (a recording listener); hook PR 3: registration goes THROUGH the door; mail still read from the owner", async () => {
     const c = newCase("cred-elsewhere");
     const token = seedWasmDb(c, "pr1 elsewhere mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
@@ -1187,7 +1224,8 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     });
     const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(elsewhere.port) });
     expect(elsewhere.bytes(), "the inherited destination got no token").not.toContain(token);
-    expect(r.out).toMatch(/register through your MCP connection/);
+    expect(r.argv, "hook PR 3: the registration ran through the door").toMatch(/owner tool register_agent/);
+    expect(r.out).toMatch(/register_agent reply:/);
     expect(mailIn(r.out, "pr1 elsewhere mail"), r.out).toBe(true);
     await stopDaemon(d.child);
   }, 120_000);
@@ -1198,7 +1236,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
     const thief = await startSpy((req, res) => {
-      res.writeHead(200, { "X-Owner-MAC": "00".repeat(32) });
+      res.writeHead(200, { "Content-Type": "text/plain" });
       res.end("{}");
     });
     fs.writeFileSync(c.record, JSON.stringify({ ...readRecord(c), port: thief.port }), { mode: 0o600 });
@@ -1206,6 +1244,146 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     expect(thief.requests.length, `precondition: the door was tried (${r.out})`).toBeGreaterThan(0);
     expect(thief.bytes(), "no token to the configured endpoint after a failed door").not.toContain(token);
     await stopDaemon(d.child);
+  }, 120_000);
+});
+
+describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 3 (as ruled): EVERY local credential call goes through the owner door; with no door, none is sent (POSIX)", () => {
+  const recorder = (host = "127.0.0.1") =>
+    startSpy((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(req.url === "/health" ? "{}" : JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify({ success: true, auth_error: false }) }] } }));
+    }, host);
+  const noCredential = (spy: Spy, ...secrets: string[]) => {
+    for (const x of secrets) expect(spy.bytes(), "no credential byte reaches the configured endpoint").not.toContain(x);
+    expect(spy.requests.every((q) => q.headers["x-agent-token"] === undefined && q.headers["x-relay-secret"] === undefined && q.headers.authorization === undefined), "no bearer header").toBe(true);
+  };
+  const agentRow = async (c: Case, name: string) => {
+    const t = (await dbDump(c)).agents ?? [];
+    const cols = (t[0] ?? []) as string[];
+    const row = t.slice(1).find((x) => x[cols.indexOf("name")] === name);
+    return row ? Object.fromEntries(cols.map((k, i) => [k, row[i]])) : null;
+  };
+  const mintSecretIn = (c: Case): string => {
+    const hits: string[] = [];
+    const walk = (d: string) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const f = path.join(d, e.name);
+        if (e.isDirectory()) walk(f);
+        else if (e.name === "mint.secret") hits.push(f);
+      }
+    };
+    walk(c.home);
+    expect(hits.length, "precondition: the daemon made its registration secret").toBeGreaterThan(0);
+    return fs.readFileSync(hits[0]!, "utf-8").trim();
+  };
+
+  it("NATIVE: a configured LOCAL endpoint that is not the daemon gets ZERO token bytes; SessionStart's health check and registration run THROUGH the door", async () => {
+    const c = newCase("p3-native-reg");
+    const token = seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const spy = await recorder();
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port), RELAY_HOOK_DEBUG: "1" });
+    noCredential(spy, token);
+    expect(r.argv, "the health check went through the door").toMatch(/owner tool health_check/);
+    expect(r.argv, "the registration went through the door").toMatch(/owner tool register_agent/);
+    expect(r.out).toMatch(/register_agent reply:/);
+    expect(r.out).not.toMatch(/REGISTER_FAILED|AUTH_FAILED/);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it.each(["native", "wasm"] as const)("%s FIRST-TIME registration (a new name, no token) goes through the door: the agent is registered, and the registration secret never reaches the configured endpoint", async (kind) => {
+    const c = newCase(`p3-first-${kind}`);
+    if (kind === "native") seedNativeDb(c);
+    else {
+      seedWasmDb(c);
+      fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
+    }
+    const d = await startOwnerDaemon(c);
+    const spy = await recorder();
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_NAME: "pr3-newcomer", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port), RELAY_HOOK_DEBUG: "1" });
+    noCredential(spy, mintSecretIn(c));
+    expect(r.argv).toMatch(/owner tool register_agent/);
+    await stopDaemon(d.child);
+    expect(await agentRow(c, "pr3-newcomer"), `the newcomer is registered:\n${r.out}`).not.toBeNull();
+  }, 120_000);
+
+  it.each(["skip-rlyw", "skip-declared-wasm", "skip-owner-locked", "skip-unreadable", "(7-line answer)", "(6-line answer)"])("verdict %s: ZERO credential bytes to a configured local endpoint, and the skip is named", async (verdict) => {
+    const c = newCase(`p3-skip-${verdict.replace(/[^a-z0-9]/gi, "")}`);
+    seedWasmDb(c);
+    const spy = await recorder();
+    let where: string;
+    if (verdict === "(7-line answer)") where = fakeWhere(c, "skip-rlyw", null);
+    else if (verdict === "(6-line answer)") {
+      where = path.join(c.home, "where-6.txt");
+      fs.writeFileSync(where, ["explicit-db", c.db, "true", "", "", path.join(c.dir, "agents")].join("\n") + "\n");
+    } else where = fakeWhere(c, verdict, "");
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port), FAKE_WHERE_FILE: where });
+    expect(r.argv, "precondition: the hook ran its relay CLI").toContain("where --fields");
+    noCredential(spy, TOKEN);
+    expect(r.out, "the skip is named").toMatch(/no credential is sent/);
+  }, 120_000);
+
+  it("a LOCAL DB and an inherited REMOTE RELAY_HTTP_HOST (a LAN address) → ZERO credential bytes there: a local DB's credentials go only through its door (Codex #418 R1 P1-3's class)", async () => {
+    const c = newCase("p3-local-remote-host");
+    const token = seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const spy = await recorder(LAN_V4 ?? "127.0.0.1");
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: LAN_V4 ?? "localhost", RELAY_HTTP_PORT: String(spy.port) });
+    noCredential(spy, token);
+    expect(r.argv, "the credential calls went through the door").toMatch(/owner tool (health_check|register_agent)/);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("an OLD daemon (a native DB, no owner record) → no credential to the configured local endpoint, and the skip names the fix (restart the relay daemon)", async () => {
+    const c = newCase("p3-old-daemon");
+    const token = seedNativeDb(c);
+    const spy = await recorder();
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port) });
+    noCredential(spy, token);
+    expect(r.out).toMatch(/restart the relay daemon/);
+  }, 120_000);
+
+  it("NATIVE: a PORT THIEF on the record's port gets no credential (every credential call is its own sealed exchange)", async () => {
+    const c = newCase("p3-native-thief");
+    const token = seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const thief = await recorder();
+    fs.writeFileSync(c.record, JSON.stringify({ ...readRecord(c), port: thief.port }), { mode: 0o600 });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(thief.port) });
+    expect(thief.requests.length, `precondition: the door was tried (${r.out})`).toBeGreaterThan(0);
+    noCredential(thief, token);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("NATIVE PostToolUse: the liveness restamp goes through the door (zero token bytes to the configured endpoint) and lands", async () => {
+    const c = newCase("p3-ptu-live");
+    const token = seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const spy = await recorder();
+    const r = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port) }, inputFor("post-tool-use-check.sh"));
+    noCredential(spy, token);
+    expect(r.argv, `the restamp went through the door\n${r.out}`).toMatch(/owner tool report_liveness|owner liveness/);
+    await stopDaemon(d.child);
+    expect((await agentRow(c, AGENT))?.agent_pid, "the anchor landed").not.toBeNull();
+  }, 120_000);
+
+  it("codex-session-start.sh (NATIVE): registration goes through the door; zero token bytes to the configured endpoint", async () => {
+    const c = newCase("p3-codex");
+    const token = seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const spy = await recorder();
+    const r = await runHook(c, "codex/codex-session-start.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port), RELAY_LAUNCH_SESSION: "0123abcd-0000-4000-8000-000000000000" }, JSON.stringify({ session_id: "s-pr3", hook_event_name: "SessionStart" }));
+    noCredential(spy, token);
+    expect(r.argv, `the registration went through the door\n${r.out}`).toMatch(/owner tool register_agent/);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it.skipIf(LAN_V4 === null)("REMOTE mode (no local DB; RELAY_HTTP_HOST a LAN address) keeps its bearer, as today, and makes no door call (skipped by name where the runner has none)", async () => {
+    const c = newCase("p3-remote");
+    const spy = await recorder(LAN_V4!);
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, RELAY_HTTP_HOST: LAN_V4!, RELAY_HTTP_PORT: String(spy.port) });
+    expect(spy.requests.some((q) => q.headers["x-agent-token"] === TOKEN || q.body.includes(TOKEN)), `the remote endpoint got its bearer token\n${r.out}`).toBe(true);
+    expect(r.argv).not.toMatch(/owner tool/);
   }, 120_000);
 });
 
