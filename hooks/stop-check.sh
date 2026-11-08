@@ -336,9 +336,13 @@ http_peek() {
   # of this hook's budget (relay_budget_for); with no time left it is skipped
   # (exit 125: this runs in a $(...) subshell, so the caller records the skip;
   # DEGRADED "no time budget left for the remote read", in the verdict below).
-  relay_budget_for "the remote health probe" 1 margin || return 125
-  if ! curl -fsS -m "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
-    return 1
+  # Hook PR 1: NOT on the proved owner route (relay_owner_prove set RELAY_OWNER_PORT): the /owner-id proof already
+  # showed the owner live, and the owner-peek listener refuses /health (it is not on its allowlist).
+  if [ -z "${RELAY_OWNER_PORT:-}" ] || [ "$HTTP_PORT" != "$RELAY_OWNER_PORT" ]; then
+    relay_budget_for "the remote health probe" 1 margin || return 125
+    if ! curl -fsS -m "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
+      return 1
+    fi
   fi
 
   local payload
