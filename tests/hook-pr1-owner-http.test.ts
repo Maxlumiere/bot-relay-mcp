@@ -316,6 +316,19 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
     120_000
   );
 
+  it("an http_secret curl config CANNOT carry (a quote) is declined BY NAME: the hook says it can't be sent safely, and never prints the secret", async () => {
+    const c = newCase("secret-unsafe");
+    const token = seedWasmDb(c, "pr1 unsafe-secret mail");
+    const unsafe = `pr1-"quoted"-secret-${crypto.randomBytes(16).toString("hex")}`;
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: unsafe }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const r = runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token });
+    expect(r.out).toMatch(/http_secret can't be sent safely: it contains a character curl config can't carry/);
+    expect(r.out, "the secret is in no hook output").not.toContain(unsafe);
+    expect(r.sqliteCalls).toEqual([]);
+    await stopDaemon(d.child);
+  }, 120_000);
+
   it("a WRONG http_secret (the hook resolves a different one) is a NAMED failure: no mail, never a sqlite3 read", async () => {
     const c = newCase("secret-wrong");
     const token = seedWasmDb(c, "pr1 must not arrive");
