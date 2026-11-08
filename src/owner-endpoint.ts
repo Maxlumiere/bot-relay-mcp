@@ -75,6 +75,7 @@ export function writeOwnerEndpoint(dbPath: string, port: number, transport: Owne
 }
 
 /** The owner's answer to a challenge: HMAC-SHA256(key, challenge ‖ port), hex. Only this process's own key. */
+export const PROBE_KEY = (): string => KEY;
 export function ownerIdAnswer(challenge: string, port: number): string {
   return crypto.createHmac("sha256", Buffer.from(KEY, "hex")).update(`${challenge}${port}`).digest("hex");
 }

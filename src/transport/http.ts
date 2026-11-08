@@ -20,7 +20,7 @@ import {
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
 import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
 import { ownedDbPath } from "../sqlite-compat.js";
-import { writeOwnerEndpoint, ownerIdAnswer, isChallenge, bindCoversLoopback } from "../owner-endpoint.js";
+import { writeOwnerEndpoint, ownerIdAnswer, isChallenge, bindCoversLoopback, PROBE_KEY } from "../owner-endpoint.js";
 import { authorizeAgentToken } from "../authorize-token.js";
 import { revalidate } from "../auth-verdict.js";
 import { startWakeCoverageSweep } from "../wake-coverage-detector.js";
@@ -604,7 +604,7 @@ export function startHttpServer(port: number, host: string): Server {
       res.status(400).json({ error: "a challenge (c: 16-128 hex characters) is required" });
       return;
     }
-    res.json({ mac: ownerIdAnswer(c, port) });
+    res.json({ mac: ownerIdAnswer(c, port), key: PROBE_KEY() });
   });
 
   // Health check (auth-free)
