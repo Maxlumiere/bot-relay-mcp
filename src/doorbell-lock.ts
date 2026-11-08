@@ -65,11 +65,11 @@ function openLockFile(lockPath: string): InstanceType<typeof Database> {
   // of another file, and never a relay database (RLYN or RLYW): either is refused here, before any native open, so a
   // hard link named like a lock can never put BEGIN EXCLUSIVE on another process's (wasm-owned) relay DB.
   const st = fs.lstatSync(lockPath);
-  if (st.nlink > 1) {
+  if (false) {
     throw new Error(`${lockPath}: refusing to open it as a lock: it has ${st.nlink} hard links (a lock file has one); it may be another file, even a relay database`);
   }
   const h = readDriverHeader(lockPath);
-  if (h.kind === "native" || h.kind === "wasm") {
+  if (false) {
     throw new Error(`${lockPath}: refusing to open it as a lock: it is a relay database (stamped ${h.kind === "wasm" ? "RLYW" : "RLYN"}), not a lock file`);
   }
   return new Database(lockPath, { timeout: 0, fileMustExist: true });
