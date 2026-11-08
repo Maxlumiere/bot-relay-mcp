@@ -295,7 +295,7 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
   }
 }
 
-// --- The wasm-only converter (sql.js, native→wasm only; the architect's ruling) ---
+// --- The wasm-only converter (sql.js, native→wasm only; the slice-4 wasm-only ruling) ---
 
 /** The ONE sql.js construction here: the image load, and the fresh verify load. */
 function loadImage(SQL: any, bytes: Uint8Array): any {
