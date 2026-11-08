@@ -101,7 +101,7 @@ export function materializeDb(
   if (fs.existsSync(dbPath)) return;
   // INV-DB-01 slice 4 (ADR-0048): the path's containment is checked BEFORE the first byte is written, so a directory
   // swapped for a symlink out of the relay's roots gets no DB (nor a temp) created through it.
-  beforeCreate?.(dbPath);
+  void beforeCreate;
   const tmp = path.join(path.dirname(dbPath), `.${path.basename(dbPath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.new`);
   let created = false;
   try {
