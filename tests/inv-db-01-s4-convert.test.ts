@@ -322,16 +322,16 @@ describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
     for (const sf of program.getSourceFiles()) {
       const rel = path.relative(REPO, sf.fileName).split(path.sep).join("/");
       if (!rel.startsWith("src/") || sf.isDeclarationFile) continue;
-      const visitSqljs = (n: ts.Node): void => {
+      // The enclosing top-level function is tracked down the walk (this program's nodes carry no parent links).
+      const visitSqljs = (n: ts.Node, fnName: string): void => {
+        const inner = ts.isFunctionDeclaration(n) && n.name && fnName === "<module>" ? n.name.text : fnName;
         if (ts.isNewExpression(n) && /\.Database$/.test(n.expression.getText(sf))) {
-          let fn: ts.Node | undefined = n.parent;
-          while (fn && !ts.isFunctionDeclaration(fn) && !ts.isSourceFile(fn)) fn = fn.parent;
-          const key = `${rel}::${fn && ts.isFunctionDeclaration(fn) ? fn.name?.text : "<module>"}`;
+          const key = `${rel}::${inner}`;
           sqljs[key] = (sqljs[key] ?? 0) + 1;
         }
-        ts.forEachChild(n, visitSqljs);
+        ts.forEachChild(n, (c) => visitSqljs(c, inner));
       };
-      visitSqljs(sf);
+      visitSqljs(sf, "<module>");
     }
     expect(sqljs, "every sql.js construction in src is listed (a new site fails until it is)").toEqual(
       Object.fromEntries(Object.entries(SQLJS_SITES).map(([k, v]) => [k, v.n]))
