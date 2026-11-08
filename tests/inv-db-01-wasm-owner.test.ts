@@ -396,6 +396,25 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
     await waitExitOf(a.child);
   }, 60_000);
 
+  it("slice 4 (the unowned-read boundary): a COLD EXPORT of an RLYW DB while ANOTHER process owns it still takes the owner lock: refused by name, no archive, the owner's file untouched (the cold export only READS, but an owned file is never read without its lock)", async () => {
+    makeDb(dbPath, WASM);
+    declareWasm();
+    const a = startOwner();
+    expect(await a.first).toBe("READY");
+    const theirs = sha(dbPath);
+    fs.rmSync(cfgPath); // this process: no declaration; the header (RLYW) still makes it owned
+    process.env.RELAY_SQLITE_DRIVER = "wasm"; // and a wasm READ purpose, the case "unowned-read" must not cover
+    const dest = path.join(caseDir, "while-owned.tar.gz");
+    await expect(exportRelayState({ destinationPath: dest })).rejects.toThrow(/backup refused: .*owned by a live relay process/);
+    expect(fs.existsSync(dest), "no archive").toBe(false);
+    expect(sha(dbPath), "the owner's file is untouched").toBe(theirs);
+    a.child.stdin!.write("exit\n");
+    await waitExitOf(a.child);
+    // Twin: with the owner gone, the same cold export runs (under the lock it now takes itself).
+    const ok = await exportRelayState({ destinationPath: path.join(caseDir, "after-owner.tar.gz") });
+    expect(fs.existsSync(ok.archive_path)).toBe(true);
+  }, 60_000);
+
   // --- Codex #385 R2, each a RED on the source it reviewed ---
 
   it.skipIf(process.platform === "win32")("R2 P1-2: a restore whose owner lock file is REPLACED before its swap (another process then owns the DB and writes it) REFUSES, and that owner's file survives", async () => {
