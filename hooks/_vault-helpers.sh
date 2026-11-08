@@ -243,7 +243,34 @@ resolve_relay_token_path() {
   fi
   local db_path
   db_path=$(resolve_relay_db_path) || return 1
-  echo "$(dirname "$db_path")/agents/${name}.token"
+  # Hook PR 3 (as ruled): on a DECLARED remote with a local DB, the vault entries are that remote's own
+  # (relay_scope_vault_to_remote), never the local instance's.
+  if [ -n "${RELAY_VAULT_SCOPE:-}" ]; then
+    echo "$(dirname "$db_path")/agents/${RELAY_VAULT_SCOPE}/${name}.token"
+  else
+    echo "$(dirname "$db_path")/agents/${name}.token"
+  fi
+  return 0
+}
+
+# relay_remote_declared — 0 when RELAY_HTTP_HOST is an EXPLICIT non-loopback host: the remote-client declaration (hook
+# PR 3, as ruled: no other flag). Its credentials go to that remote by bearer.
+relay_remote_declared() {
+  [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_host_is_loopback "$RELAY_HTTP_HOST"
+}
+
+# relay_scope_vault_to_remote — hook PR 3 (as ruled): a local instance's token never reaches a remote. On a declared
+# remote WITH a local DB, the vault entries this run reads and writes are the remote's own
+# (agents/remote-<host>-<port>/<name>.token), so only a token THAT remote minted is ever sent to it. With no local DB
+# the vault beside the would-be instance is the remote's alone (only a remote route ever wrote it): unscoped, as before.
+relay_scope_vault_to_remote() {
+  relay_remote_declared || return 0
+  [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
+  if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ]; then
+    local h="${RELAY_HTTP_HOST//[^A-Za-z0-9_.-]/_}" p="${RELAY_HTTP_PORT:-3777}"
+    p="${p//[^0-9]/}"
+    RELAY_VAULT_SCOPE="remote-${h}-${p:-3777}"
+  fi
   return 0
 }
 
@@ -321,6 +348,19 @@ relay_owner_tool() {
   ms=$(( secs * 1000 - 300 ))
   [ "$ms" -lt 100 ] && ms=100
   relay_run_streamed "$secs" node "$cli" owner tool "$tool" --args-json "$args" "$@" --timeout-ms "$ms"
+}
+
+# relay_owner_session CLI SECS AGENT — hook PR 3 (as ruled): AGENT's own session_id from its local daemon's door
+# (`relay owner session`, the token from RELAY_AGENT_TOKEN in the caller's environment), under the watchdog at SECS.
+# Prints the session id (empty when it has none) and returns 0; non-zero when the door refused or failed.
+relay_owner_session() {
+  local cli="$1" secs="$2" agent="$3" ms out
+  case "$secs" in ''|*[!0-9]*|0) return 125 ;; esac
+  ms=$(( secs * 1000 - 300 ))
+  [ "$ms" -lt 100 ] && ms=100
+  out=$(relay_run_streamed "$secs" node "$cli" owner session "$agent" --timeout-ms "$ms" 2>/dev/null) || return 1
+  printf '%s' "$out" | grep -oE '"session_id":"[0-9a-fA-F-]{8,64}"' | head -1 | sed -E 's/.*:"([0-9a-fA-F-]{8,64})"$/\1/'
+  return 0
 }
 
 # relay_host_is_loopback HOST — 0 when HOST names this machine's loopback (or a wildcard bind, which a local client

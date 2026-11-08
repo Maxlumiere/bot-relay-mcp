@@ -140,7 +140,9 @@ if [ -f "$HOOKS_DIR/_vault-helpers.sh" ]; then
 fi
 
 # Vault-first: if no token in env but one is on disk for this agent, reuse it
-# (lossless restart — same as check-relay.sh).
+# (lossless restart — same as check-relay.sh). Hook PR 3 (as ruled): on a declared remote with a local DB, only that
+# remote's own vault entries.
+command -v relay_scope_vault_to_remote >/dev/null 2>&1 && relay_scope_vault_to_remote
 if [ -z "${RELAY_AGENT_TOKEN:-}" ] && command -v read_relay_token_from_vault >/dev/null 2>&1; then
   if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
     export RELAY_AGENT_TOKEN="$VAULT_TOKEN"
@@ -195,10 +197,10 @@ sys.stdout.write(json.dumps({
 # secret from its file, never argv; never to a configured endpoint). A local DB with no valid door → "none": NO
 # credential is sent, named in the context. REMOTE mode (no local DB; RELAY_HTTP_HOST a non-loopback host) → "curl",
 # its bearer, as before. Without the shared helpers the hook sends no credential at all (it never could).
-# On the door route the cold-start handoff check (discover_agents, which carries the token) is NOT made: the door
-# serves no discover, so this hook registers normally (the documented fallback below).
+# On the door route the cold-start handoff check asks the door for THIS agent's own session_id (/owner/v1/session, as
+# ruled: one name, its own token, no enumeration) instead of discover_agents.
 CODEX_ROUTE=curl
-if command -v relay_owner_tool >/dev/null 2>&1 && command -v relay_where_load >/dev/null 2>&1; then
+if command -v relay_owner_tool >/dev/null 2>&1 && command -v relay_where_load >/dev/null 2>&1 && ! relay_remote_declared; then
   CODEX_CLI="$HOOKS_DIR/../bin/relay"
   CODEX_ROUTE=none
   CODEX_WHY="the relay CLI could not resolve this instance"
@@ -209,8 +211,8 @@ if command -v relay_owner_tool >/dev/null 2>&1 && command -v relay_where_load >/
         ;;
       *) CODEX_WHY="the relay CLI's DB verdict (${RELAY_RES_HOOK_DB:-none}) has no owner door" ;;
     esac
-  elif [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_host_is_loopback "$HTTP_HOST"; then
-    CODEX_ROUTE=curl
+  else
+    CODEX_WHY="no local relay DB, and no declared remote RELAY_HTTP_HOST"
   fi
   if [ "$CODEX_ROUTE" = none ]; then
     echo "[RELAY] no credential is sent this session start: ${CODEX_WHY}." >&2
@@ -270,7 +272,13 @@ relay_token_config() { command -v relay_curl_token_config >/dev/null 2>&1 && rel
 # session_id (filtered by AGENT_NAME) also means a marker for a DIFFERENT agent
 # can never make us skip (no cross-agent leakage).
 SKIP_REGISTER_HANDOFF=0
-if [ "$CODEX_ROUTE" = curl ] && relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$'; then
+if [ "$CODEX_ROUTE" = door ] && [ -n "${RELAY_AGENT_TOKEN:-}" ] && relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$' \
+  && relay_budget_for "the launch session check" 2; then
+  CUR_SID=$(RELAY_AGENT_TOKEN="$RELAY_AGENT_TOKEN" relay_owner_session "$CODEX_CLI" "$RELAY_STEP_SECS" "$AGENT_NAME") || CUR_SID=""
+  if [ -n "$CUR_SID" ] && [ "$CUR_SID" = "$RELAY_LAUNCH_SESSION" ]; then
+    SKIP_REGISTER_HANDOFF=1
+  fi
+elif [ "$CODEX_ROUTE" = curl ] && relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$'; then
   DISCOVER_BODY=$(relay_token_config | curl -fsS --connect-timeout 1 --max-time 2 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"discover_agents","arguments":{}}}' 2>/dev/null) || DISCOVER_BODY=""

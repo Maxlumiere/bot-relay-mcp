@@ -43,6 +43,7 @@ import {
   ownerPeekRouteAllowed,
   openDoorRequest,
   sealDoorResponse,
+  OWNER_DOOR_PATHS,
   OWNER_PEEK_HOST,
   OWNER_PEEK_REFUSAL,
 } from "../owner-endpoint.js";
@@ -345,7 +346,7 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   }
   // Hook PR 1 (as ruled after Codex #418 R1): the OWNER DOOR carries no bearer credential at all; it authenticates
   // by the owner key's MACs (src/owner-endpoint.ts). It stays under the rate limit and the Host-header check.
-  if (req.path === "/owner/v1/peek" || req.path === "/owner/v1/liveness" || req.path === "/owner/v1/register" || req.path === "/owner/v1/health") {
+  if (OWNER_DOOR_PATHS.has(req.path)) {
     return next();
   }
   // v2.1.7 Item 6: dashboard paths handle auth downstream.
@@ -781,7 +782,7 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
       }
     });
   };
-  const doorHandler = (doorPath: "/owner/v1/peek" | "/owner/v1/liveness" | "/owner/v1/register" | "/owner/v1/health") => async (req: Request, res: Response) => {
+  const doorHandler = (doorPath: "/owner/v1/peek" | "/owner/v1/liveness" | "/owner/v1/register" | "/owner/v1/health" | "/owner/v1/session") => async (req: Request, res: Response) => {
     if (doorDbPath() === null) {
       res.status(404).json({ error: "this process serves no relay DB" });
       return;
@@ -803,6 +804,30 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
           return;
         }
         reply(200, { ok: true, agent: agent_name, ...pendingMetadata(getDb(), agent_name, { contentFor: (n as number | undefined) ?? 0 }) });
+        return;
+      }
+      if (doorPath === "/owner/v1/session") {
+        // As ruled (PR 3): ONE agent's session_id, only for a token that authenticates THAT agent. The token is
+        // authenticated by the SAME dispatcher as /mcp (whoami: the token names its caller), then the one field is
+        // read. No other field, no other name, no enumeration.
+        const token = args.agent_token;
+        if (Object.keys(args).some((k) => k !== "agent_token") || typeof token !== "string" || token.length === 0) {
+          reply(400, { ok: false, error: "session args: only agent_token (the agent's own token)" });
+          return;
+        }
+        const who = (await doorDispatch(req, "whoami", {}, token, undefined)) as { isError?: boolean; content?: Array<{ text?: string }> };
+        let caller: string | null = null;
+        try {
+          const w = JSON.parse(String(who.content?.[0]?.text ?? "")) as { success?: boolean; agent_name?: string };
+          if (!who.isError && w.success === true && typeof w.agent_name === "string") caller = w.agent_name;
+        } catch {
+          caller = null;
+        }
+        if (caller !== agent_name) {
+          reply(403, { ok: false, error: "the token does not authenticate that agent" });
+          return;
+        }
+        reply(200, { ok: true, session_id: getAgentAuthData(agent_name)?.session_id ?? null });
         return;
       }
       const tool = DOOR_TOOLS[doorPath]!;
@@ -828,6 +853,7 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
   app.post("/owner/v1/liveness", doorBody, doorHandler("/owner/v1/liveness"));
   app.post("/owner/v1/register", doorBody, doorHandler("/owner/v1/register"));
   app.post("/owner/v1/health", doorBody, doorHandler("/owner/v1/health"));
+  app.post("/owner/v1/session", doorBody, doorHandler("/owner/v1/session"));
 
   app.use(authMiddleware);
 

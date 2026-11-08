@@ -96,13 +96,15 @@ register_at_launch() {
   # daemon, relay_owner_tool); a local DB without one → no launch register (the hook says why); REMOTE mode (no local
   # DB; RELAY_HTTP_HOST a non-loopback host) → curl with its bearer, as before.
   local route=curl relay_cli="$SCRIPT_DIR/relay"
-  if command -v relay_owner_tool >/dev/null 2>&1 && relay_budget_for "the resolver" 2 && relay_where_load "$relay_cli" "$RELAY_STEP_SECS" \
+  if command -v relay_remote_declared >/dev/null 2>&1 && relay_remote_declared; then
+    route=curl
+  elif command -v relay_owner_tool >/dev/null 2>&1 && relay_budget_for "the resolver" 2 && relay_where_load "$relay_cli" "$RELAY_STEP_SECS" \
     && [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ]; then
     case "${RELAY_RES_HOOK_DB:-}" in
       http|sqlite3) [ -n "${RELAY_RES_OWNER_ENDPOINT:-}" ] && route=door || return 0 ;;
       *) return 0 ;;
     esac
-  elif [ -z "${RELAY_HTTP_HOST:-}" ] || relay_host_is_loopback "$HTTP_HOST"; then
+  else
     return 0
   fi
   [ "$route" = door ] || command -v curl >/dev/null 2>&1 || return 0
@@ -110,6 +112,8 @@ register_at_launch() {
   # Token: env, else the per-instance vault (shared with the hooks). Optional —
   # an existing active agent needs it to re-register; a brand-new agent's first
   # register is auth-free and we vault the minted token below. Malformed → drop.
+  # Hook PR 3 (as ruled): on a declared remote with a local DB, only that remote's own vault entries.
+  command -v relay_scope_vault_to_remote >/dev/null 2>&1 && relay_scope_vault_to_remote
   local token="${RELAY_AGENT_TOKEN:-}"
   if [ -z "$token" ] && command -v read_relay_token_from_vault >/dev/null 2>&1; then
     token=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null) || token=""

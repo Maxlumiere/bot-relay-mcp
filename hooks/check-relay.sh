@@ -305,6 +305,8 @@ fi
 # (3-min broken state hit 2026-05-04 during a builder spawn) and makes restart-of-
 # closed-terminal lossless: identity persists even when the operator did not
 # bake RELAY_AGENT_TOKEN into a shell rc file.
+# Hook PR 3 (as ruled): on a declared remote with a local DB, only that remote's own vault entries.
+relay_scope_vault_to_remote
 if [ -z "${RELAY_AGENT_TOKEN:-}" ]; then
   if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME"); then
     export RELAY_AGENT_TOKEN="$VAULT_TOKEN"
@@ -843,20 +845,29 @@ fi
 #
 # Required deps for this block: curl (standard on macOS/Linux). jq is NOT
 # required — we parse the fields we need with grep/sed.
-# --- Hook PR 3 (as ruled after Codex #418 R2): EVERY credential call to a local daemon goes through its OWNER DOOR ----
-# A LOCAL relay DB (the resolver found one) gets its credential calls (the token health check, the recovery, the
-# registration) ONLY as sealed exchanges with that DB's own daemon (relay_owner_tool): never to a configured endpoint,
-# local or remote, so an inherited RELAY_HTTP_HOST gets nothing. The door is checked FIRST (one sealed peek). With no
-# valid door (no daemon, an old daemon that writes no record, a skip verdict, a door that fails) NO credential is sent,
-# and the skip is named. REMOTE mode (no local DB; RELAY_HTTP_HOST a non-loopback host) keeps its bearer: the
-# configured-endpoint trust a remote relay has always had (stated). Every curl ignores curl's own config and every
-# proxy (-q first, --noproxy '*') except on the remote route, which may need one.
+# --- Hook PR 3 (as ruled after Codex #418 R2, the route as modified): EVERY credential call to a LOCAL daemon goes
+# through its OWNER DOOR ---------------------------------------------------------------------------------------------
+# - An EXPLICIT non-loopback RELAY_HTTP_HOST is the remote-client declaration: the credentials (the token health
+#   check, the recovery, the registration) go to THAT remote by bearer, as before, and a local DB is not used for
+#   them (named). The vault entries read and written are the remote's own (relay_scope_vault_to_remote, above): a
+#   local instance's token never reaches a remote.
+# - Otherwise (unset, loopback, 0.0.0.0, ::): a LOCAL relay DB gets its credential calls ONLY as sealed exchanges with
+#   its own daemon (relay_owner_tool), never a bearer to any port. The door is checked FIRST (one sealed peek). With no
+#   valid door (no daemon, an old daemon that writes no record, a skip verdict, a door that fails) NO credential is
+#   sent, and the skip is named. With no local DB at all there is no door, and nothing is sent.
+# Every curl ignores curl's own config and every proxy (-q first, --noproxy '*') except on the remote route.
 RELAY_CRED_ROUTE=none
 RELAY_CRED_OK=0
 RELAY_CURL_GUARD=(-q --noproxy '*')
 _door_bin="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
 _cred_why=""
-if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ]; then
+_local_db=0
+[ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ] && _local_db=1
+if relay_remote_declared; then
+  RELAY_CRED_ROUTE=bearer
+  RELAY_CURL_GUARD=()
+  [ "$_local_db" = 1 ] && echo "[RELAY] using the remote relay ${HTTP_HOST}; the local DB at ${RELAY_RES_DB_PATH:-?} is not used for credentials." >&2
+elif [ "$_local_db" = 1 ]; then
   case "${RELAY_RES_HOOK_DB:-}" in
     http|sqlite3)
       if [ -z "${RELAY_RES_OWNER_ENDPOINT:-}" ]; then
@@ -871,11 +882,8 @@ if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ]
       ;;
     *) _cred_why="the relay CLI's DB verdict (${RELAY_RES_HOOK_DB:-none}) has no owner door" ;;
   esac
-elif [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_host_is_loopback "$HTTP_HOST"; then
-  RELAY_CRED_ROUTE=bearer
-  RELAY_CURL_GUARD=()
 else
-  _cred_why="no local relay DB, and no remote RELAY_HTTP_HOST"
+  _cred_why="no local relay DB, and no declared remote RELAY_HTTP_HOST"
 fi
 [ "$RELAY_CRED_ROUTE" != none ] && RELAY_CRED_OK=1
 [ -n "$_cred_why" ] && echo "[RELAY] no credential is sent this session start: ${_cred_why}. Register through your MCP connection." >&2

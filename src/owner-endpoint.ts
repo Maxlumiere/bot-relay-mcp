@@ -71,12 +71,14 @@ export function addressReachesLoopback(address: string): boolean {
 
 /** Hook PR 1 (as ruled, Q9): the owner-peek listener's only host, a constant. */
 export const OWNER_PEEK_HOST = "127.0.0.1";
-export const OWNER_PEEK_REFUSAL = "this listener serves only the hooks' owner door (POST /owner/v1/peek, /liveness, /register, /health)";
+export const OWNER_PEEK_REFUSAL = "this listener serves only the hooks' owner door (POST /owner/v1/peek, /liveness, /register, /health, /session)";
 export const OWNER_DOOR_PEEK = "/owner/v1/peek";
 export const OWNER_DOOR_LIVENESS = "/owner/v1/liveness";
 export const OWNER_DOOR_REGISTER = "/owner/v1/register";
 export const OWNER_DOOR_HEALTH = "/owner/v1/health";
-const OWNER_DOOR_PATHS: ReadonlySet<string> = new Set([OWNER_DOOR_PEEK, OWNER_DOOR_LIVENESS, OWNER_DOOR_REGISTER, OWNER_DOOR_HEALTH]);
+/** As ruled (PR 3): ONE agent's own session_id, for the token that authenticates THAT agent. No enumeration. */
+export const OWNER_DOOR_SESSION = "/owner/v1/session";
+export const OWNER_DOOR_PATHS: ReadonlySet<string> = new Set([OWNER_DOOR_PEEK, OWNER_DOOR_LIVENESS, OWNER_DOOR_REGISTER, OWNER_DOOR_HEALTH, OWNER_DOOR_SESSION]);
 
 /** The owner-peek gate, before any parse: the two door endpoints, POST, without an MCP session. */
 export function ownerPeekRouteAllowed(method: string, reqPath: string, hasSession: boolean): boolean {

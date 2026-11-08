@@ -10,6 +10,7 @@
  *   relay owner liveness <agent> --pid N [--start S] [--timeout-ms MS]
  *   relay owner tool <register_agent|health_check|report_liveness> --args-json JSON [--with-recovery-token] [--timeout-ms MS]
  *   (the args are NOT secret: name, role, capabilities, pids. Credentials never ride argv: a token key in them is refused.)
+ *   relay owner session <agent> [--timeout-ms MS]   (as ruled: that ONE agent's session_id, for its own token)
  * - It resolves the instance as `relay pending` does and opens NO database. It reads the record under the trust model
  *   and takes the key from it; the key never passes through a shell, the environment, argv or another file.
  * - ONE exchange with node's http client to 127.0.0.1:<the record's port> (no proxy, no redirect, no curl
@@ -40,6 +41,7 @@ import {
   OWNER_DOOR_LIVENESS,
   OWNER_DOOR_REGISTER,
   OWNER_DOOR_HEALTH,
+  OWNER_DOOR_SESSION,
 } from "../owner-endpoint.js";
 import { decidePendingSource } from "./pending.js";
 
@@ -52,10 +54,11 @@ const TOOL_PATH: Readonly<Record<string, string>> = {
 const USAGE =
   "Usage: relay owner peek <agent> --json [--with-content N] [--timeout-ms MS]\n" +
   "       relay owner liveness <agent> --pid N [--start S] [--timeout-ms MS]\n" +
-  "       relay owner tool <register_agent|health_check|report_liveness> --args-json JSON [--with-recovery-token] [--timeout-ms MS]\n";
+  "       relay owner tool <register_agent|health_check|report_liveness> --args-json JSON [--with-recovery-token] [--timeout-ms MS]\n" +
+  "       relay owner session <agent> [--timeout-ms MS]\n";
 
 interface Args {
-  sub: "peek" | "liveness" | "tool";
+  sub: "peek" | "liveness" | "tool" | "session";
   target: string;
   withContent: number;
   timeoutMs: number;
@@ -67,7 +70,7 @@ interface Args {
 
 function parse(argv: string[]): Args | string {
   const [sub, target, ...rest] = argv;
-  if (sub !== "peek" && sub !== "liveness" && sub !== "tool") return "the first argument is peek, liveness or tool";
+  if (sub !== "peek" && sub !== "liveness" && sub !== "tool" && sub !== "session") return "the first argument is peek, liveness, tool or session";
   if (sub === "tool" ? !(typeof target === "string" && target in TOOL_PATH) : !(typeof target === "string" && AGENT_RE.test(target))) {
     return sub === "tool" ? "tool takes register_agent, health_check or report_liveness" : "a valid agent name is required";
   }
@@ -203,6 +206,11 @@ export async function run(argv: string[]): Promise<number> {
       agentName = a.target;
       doorPath = OWNER_DOOR_PEEK;
       args = { with_content: a.withContent };
+    } else if (a.sub === "session") {
+      if (!token) return fail("session needs the agent's own token (RELAY_AGENT_TOKEN)");
+      agentName = a.target;
+      doorPath = OWNER_DOOR_SESSION;
+      args = { agent_token: token };
     } else {
       let toolArgs: Record<string, unknown>;
       let tool: string;
@@ -245,6 +253,10 @@ export async function run(argv: string[]): Promise<number> {
     if (reply.status !== 200 || p.ok !== true) return fail(`the owner refused (${reply.status}): ${typeof p.error === "string" ? p.error : "no reason given"}`);
     if (a.sub === "tool") {
       process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, result: p.result }) + "\nHTTP_STATUS:200\n");
+      return 0;
+    }
+    if (a.sub === "session") {
+      process.stdout.write(JSON.stringify({ ok: true, agent: a.target, session_id: typeof p.session_id === "string" ? p.session_id : null }) + "\n");
       return 0;
     }
     if (a.sub === "liveness") {
