@@ -397,7 +397,7 @@ jobs:
         run: npx vitest run tests/cli-door-clients.test.ts --reporter=verbose --reporter=json --outputFile.json=pr4-cli.json
       - name: "PR 4: those rows PASSED (every non-LAN row; not skipped, not filtered away)"
         if: ${{ !cancelled() }}
-        run: node -e "const j=require('./pr4-cli.json');const rows=j.testResults.flatMap(f=>f.assertionResults);const must=rows.filter(a=>!a.fullName.includes('(a LAN address'));console.log(rows.map(r=>r.status+' | '+r.fullName.slice(0,120)).join(' ; '));const bad=must.filter(a=>a.status!=='passed');if(must.length<10||bad.length){console.error('PR 4 rows not all PASSED on Windows: '+must.length+' required, '+bad.length+' not passed');process.exit(1)}"
+        run: node -e "const j=require('./pr4-cli.json');const rows=j.testResults.flatMap(f=>f.assertionResults);const must=rows.filter(a=>!a.fullName.includes('(a LAN address'));console.log(rows.map(r=>r.status+' | '+r.fullName.slice(0,120)).join(' ; '));const bad=must.filter(a=>a.status!=='passed');if(must.length<10||bad.length){console.error('PR 4 rows not all PASSED on Windows; required='+must.length+' not_passed='+bad.length);process.exit(1)}"
       - name: INV-DB-01 slice 4 convert-journal + the flip + the doorbell lock (Windows)
         if: ${{ !cancelled() }}
         run: npx vitest run tests/inv-db-01-s4-convert.test.ts tests/inv-db-01-s4-doorbell.test.ts --reporter=verbose
