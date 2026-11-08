@@ -238,7 +238,7 @@ export async function run(argv: string[]): Promise<number> {
       envelope = toolJson(result);
     }
   } catch (err) {
-    process.stderr.write(`relay resolve: could not reach the relay at ${host}:${port}: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.stderr.write(`relay resolve: could not reach the daemon at ${host}:${port} — is it running? (${err instanceof Error ? err.message : String(err)})\n`);
     return 2;
   }
   if (envelope === null) {

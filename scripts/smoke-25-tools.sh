@@ -658,7 +658,12 @@ PAIR_AGENT_NAME="smoke-pair-$TS"
 # from the server's register_agent response, not from $RELAY_AGENT_TOKEN.
 # PR-D: a new name needs the hub's registration secret. The operator hands it over as a FILE; pair reads it with
 # --secret-file (never a --secret argv value). Here the hub is the isolated relay: its secret sits beside its DB.
-if RELAY_AGENT_TOKEN= RELAY_HTTP_SECRET= node "$RELAY_BIN" pair \
+# pair is for a REMOTE hub: a loopback hub is reached only as a trusted tunnel (RELAY_HTTP_TRUSTED_TUNNEL_PORT = its
+# port), and the pairing client is a different instance (its own DB): pairing with this machine's own relay is refused.
+PAIR_HUB_PORT="${RELAY_URL##*:}"; PAIR_HUB_PORT="${PAIR_HUB_PORT%%/*}"
+mkdir -p "$SMOKE_TMP/pair-client" && chmod 700 "$SMOKE_TMP/pair-client"
+if RELAY_AGENT_TOKEN= RELAY_HTTP_SECRET= RELAY_DB_PATH="$SMOKE_TMP/pair-client/relay.db" RELAY_INSTANCE_ID= \
+   RELAY_HTTP_TRUSTED_TUNNEL_PORT="$PAIR_HUB_PORT" node "$RELAY_BIN" pair \
      "$RELAY_URL" \
      --name "$PAIR_AGENT_NAME" \
      --role tester \

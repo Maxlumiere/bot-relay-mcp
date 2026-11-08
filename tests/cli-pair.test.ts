@@ -74,7 +74,15 @@ async function runPair(args: string[], extraEnv: Record<string, string | undefin
   stdout: string;
   stderr: string;
 }> {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  // PR 4: pair is for a REMOTE hub. The hub here is an in-process loopback server on TEST_DB_PATH, so the pairing
+  // client is modelled as a DIFFERENT instance (its own DB) reaching it as a trusted tunnel (the opt-in = its port);
+  // pairing with this machine's own relay is refused (tests/cli-door-clients.test.ts covers both refusals).
+  const hubPort = /^http:\/\/127\.0\.0\.1:(\d+)/.exec(args[0] ?? "")?.[1];
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    RELAY_DB_PATH: path.join(TEST_ROOT, "pair-client", "relay.db"),
+    ...(hubPort ? { RELAY_HTTP_TRUSTED_TUNNEL_PORT: hubPort } : {}),
+  };
   for (const [k, v] of Object.entries(extraEnv)) {
     if (v === undefined) delete env[k];
     else env[k] = v;

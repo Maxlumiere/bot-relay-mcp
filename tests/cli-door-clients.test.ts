@@ -308,14 +308,13 @@ describe("PR 4: a LOCAL relay's CLI credentials go ONLY through its door (every 
     const env = { RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port) };
     const s = await relayAsync(c, ["send", "pr4-peer", "pr4 local hello", "--from", AGENT, "--json"], { ...env, RELAY_AGENT_TOKEN: token });
     expect(s.status, `send: ${s.stderr}`).toBe(0);
-    await new Promise((r) => setTimeout(r, 300));
-    const msgs = ((await dbDump(c)).messages ?? []) as unknown[][];
-    const cols = msgs[0] as string[];
-    const row = msgs.slice(1).find((m) => m[cols.indexOf("content")] === "pr4 local hello");
-    expect(row, "the message landed").toBeDefined();
-    const id = String(row![cols.indexOf("id")]);
+    // The id from the send's own --json envelope (the DB is never copied while the daemon holds it: its WAL is live).
+    const sent = JSON.parse(s.stdout.trim()) as { message_id?: string };
+    expect(typeof sent.message_id, `the message landed: ${s.stdout}`).toBe("string");
+    const id = sent.message_id!;
     const r = await relayAsync(c, ["resolve", id, "--agent", "pr4-peer", "--json"], { ...env, RELAY_AGENT_TOKEN: peerTok });
     expect(r.status, `resolve: ${r.stderr}`).toBe(0);
+    expect((JSON.parse(r.stdout.trim()) as { resolved_ids?: string[] }).resolved_ids, "the recipient resolved exactly that message").toEqual([id]);
     for (const t of [token, peerTok]) expect(spy.bytes(), "no credential to the configured port").not.toContain(t);
     expect(spy.reqs.filter((q) => q.url !== "/health"), "nothing but /health at the configured port").toEqual([]);
     await stopDaemon(d.child);

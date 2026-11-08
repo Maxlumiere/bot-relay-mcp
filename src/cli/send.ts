@@ -281,7 +281,7 @@ export async function run(argv: string[]): Promise<number> {
     }
   } catch (err) {
     const why = err instanceof RelayClientError || err instanceof Error ? err.message : String(err);
-    process.stderr.write(`relay send: could not reach the relay at ${host}:${port}: ${why}\n`);
+    process.stderr.write(`relay send: could not reach the daemon at ${host}:${port} — is it running? (${why})\n`);
     return 2;
   }
   let parsed: any = null;

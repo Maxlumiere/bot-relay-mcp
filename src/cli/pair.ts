@@ -319,6 +319,20 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   const hubBase = `${url.protocol}//${url.host}`;
+
+  // PR-D (Codex R1 #3): the config carries credentials, so it only ever goes to a file. Checked BEFORE any network
+  // call, so a token is never issued that this run could not store. The write itself is O_EXCL (authoritative).
+  if (!args.output) {
+    process.stderr.write(
+      "relay pair: --output PATH is required. The client config holds the agent's token (and, on a hub that gates every call, its secret), so it is written to a file (0600) and never printed.\n",
+    );
+    return 1;
+  }
+  if (pathExists(args.output)) {
+    process.stderr.write(`relay pair: ${args.output} already exists. pair never overwrites a credential file: remove it or choose another --output.\n`);
+    return 1;
+  }
+
   // PR 4 (as ruled): a hub is REMOTE by definition. Its host is CHECKED (src/host-class.ts): a loopback hub (any
   // spelling) is this machine's own relay, refused by name; an unresolved one gets nothing; a remote one is reached
   // by a hardened bearer (relay-client: the checked address, no redirect, no proxy).
@@ -356,19 +370,6 @@ export async function run(argv: string[]): Promise<number> {
     }
   }
   const remoteHub = hubRoute.kind === "remote" ? hubRoute : { kind: "remote" as const, host: url.hostname.replace(/^\[|\]$/g, ""), port: hubPort, ip: "127.0.0.1", secure: url.protocol === "https:" };
-
-  // PR-D (Codex R1 #3): the config carries credentials, so it only ever goes to a file. Checked BEFORE any network
-  // call, so a token is never issued that this run could not store. The write itself is O_EXCL (authoritative).
-  if (!args.output) {
-    process.stderr.write(
-      "relay pair: --output PATH is required. The client config holds the agent's token (and, on a hub that gates every call, its secret), so it is written to a file (0600) and never printed.\n",
-    );
-    return 1;
-  }
-  if (pathExists(args.output)) {
-    process.stderr.write(`relay pair: ${args.output} already exists. pair never overwrites a credential file: remove it or choose another --output.\n`);
-    return 1;
-  }
 
   // --- Step 1: probe /health ---
   let healthBody: any = null;
