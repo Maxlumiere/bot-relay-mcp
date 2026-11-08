@@ -296,10 +296,13 @@ relay_owner_prove() {
   fi
   command -v curl >/dev/null 2>&1 || { RELAY_OWNER_ERR="the owner endpoint could not be proved: curl not found"; return 1; }
   command -v node >/dev/null 2>&1 || { RELAY_OWNER_ERR="the owner endpoint could not be proved: node not found"; return 1; }
-  challenge=$(node -e 'process.stdout.write(require("crypto").randomBytes(16).toString("hex"))' 2>/dev/null)
+  # The challenge: 128 bits from the kernel, no process that could hang.
+  challenge=$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')
   relay_whole_match "$challenge" '^[0-9a-f]{32}$' || { RELAY_OWNER_ERR="the owner endpoint could not be proved: no challenge could be made"; return 1; }
-  resp=$(curl -sS --max-redirs 0 -m "${RELAY_STEP_SECS:-2}" "${url}/owner-id?c=${challenge}" 2>/dev/null) || resp=""
-  if printf '%s\n%s\n' "$key" "$resp" | CH="$challenge" PORT="$port" node -e '
+  relay_budget_for "the owner handshake" 1 margin || { RELAY_OWNER_ERR="the owner endpoint could not be proved: no time budget left for the handshake"; return 1; }
+  resp=$(curl -sS --max-redirs 0 -m "$RELAY_STEP_SECS" "${url}/owner-id?c=${challenge}" 2>/dev/null) || resp=""
+  relay_budget_for "the owner proof check" 1 margin || { RELAY_OWNER_ERR="the owner endpoint could not be proved: no time budget left for the proof check"; return 1; }
+  if printf '%s\n%s\n' "$key" "$resp" | CH="$challenge" PORT="$port" relay_run_streamed "$RELAY_STEP_SECS" node -e '
     const lines = require("fs").readFileSync(0, "utf8").split("\n");
     const key = lines[0]; let mac = "";
     try { mac = String(JSON.parse(lines.slice(1).join("\n")).mac || ""); } catch {}
@@ -317,13 +320,46 @@ relay_owner_prove() {
 # endpoint: RELAY_OWNER_PORT is set), the instance's HTTP shared secret as a curl config line, written by the relay
 # CLI STRAIGHT into the caller's `{ ...; } | curl -K -` stream. It is never in a shell variable, an env var, a file,
 # argv or this hook's output. Off the owner route it prints nothing.
+# Bounded in TIME (relay_run_streamed, its own 1s cap from what is left): curl waits for this config to end before
+# its own -m clock starts, so the owner route's worst case is this read plus the peek's -m, inside the 3s margin.
 relay_owner_secret_curl_config() {
+  local rc
   [ -n "${RELAY_OWNER_PORT:-}" ] || return 0
-  node "$(relay_helpers_cli)" curl-auth-config 2>/dev/null
+  relay_budget_for "the http_secret read" 1 margin || return 0
+  relay_run_streamed "$RELAY_STEP_SECS" node "$(relay_helpers_cli)" curl-auth-config 2>/dev/null </dev/null
+  rc=$?
   # Exit 3: a secret the curl config cannot carry was DECLINED (never printed): named here, on stderr, never into the
   # config stream this function writes to.
-  [ "$?" -ne 3 ] || echo "[RELAY] http_secret can't be sent safely: it contains a character curl config can't carry. Use printable characters without quotes or backslashes." >&2
+  case "$rc" in
+    3) echo "[RELAY] http_secret can't be sent safely: it contains a character curl config can't carry. Use printable characters without quotes or backslashes." >&2 ;;
+    124) echo "[RELAY] the http_secret could not be read in time (${RELAY_STEP_SECS}s): the mail read goes without it." >&2 ;;
+  esac
   return 0
+}
+
+# relay_run_streamed SECS CMD... — CMD killed at SECS (124 = timed out), its stdin, stdout and stderr this function's
+# OWN (no file: for a stream that must never touch disk, the http_secret's curl config, or a check fed on stdin).
+relay_run_streamed() {
+  local secs="$1" pid wd rc wrc
+  shift
+  "$@" <&0 &
+  pid=$!
+  (
+    trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    sleep "$secs" &
+    s=$!
+    wait "$s"
+    kill -KILL "$pid" 2>/dev/null
+    exit 124
+  ) >/dev/null 2>&1 &
+  wd=$!
+  wait "$pid" 2>/dev/null
+  rc=$?
+  kill -TERM "$wd" 2>/dev/null
+  wait "$wd" 2>/dev/null
+  wrc=$?
+  [ "$wrc" -eq 124 ] && return 124
+  return "$rc"
 }
 
 # relay_curl_token_config TOKEN — the X-Agent-Token header as a curl config line (see relay_curl_config_line).
