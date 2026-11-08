@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
+import { bigintSafeReplacer } from "./file-identity.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
@@ -1609,7 +1610,7 @@ export function createServer(): Server {
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify({ success: false, error: flat, error_code: code, issues: err.issues }, null, 2),
+              text: JSON.stringify({ success: false, error: flat, error_code: code, issues: err.issues }, bigintSafeReplacer, 2),
             },
           ],
           isError: true,

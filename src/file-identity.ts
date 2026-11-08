@@ -18,3 +18,9 @@ export interface FileIdentity {
 export const fileIdentityOf = (st: fs.BigIntStats): FileIdentity => ({ dev: st.dev, ino: st.ino });
 export const sameFileIdentity = (a: FileIdentity, b: FileIdentity): boolean => a.dev === b.dev && a.ino === b.ino;
 export const fileIdentityKey = (s: FileIdentity): string => `${s.dev}:${s.ino}`;
+/**
+ * A JSON.stringify replacer that writes a bigint as its exact decimal string: JSON.stringify THROWS on a bigint, so a
+ * value that can hold one (an identity, a BigInt stat, a validation issue's bound) is serialized through this
+ * (tests/bigint-identity-sinks.test.ts refuses any other sink a bigint can reach).
+ */
+export const bigintSafeReplacer = (_key: string, value: unknown): unknown => (typeof value === "bigint" ? value.toString() : value);

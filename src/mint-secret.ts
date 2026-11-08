@@ -76,6 +76,11 @@ function posixFault(p: string, st: fs.Stats, kind: "dir" | "file"): string | nul
  * already cached, then reads at once and must see the refusal. That test is the discriminating observation.
  */
 const windowsChainCache = new Map<string, string[]>();
+/**
+ * The cache key: the path, its exact inode and its change times in NANOSECONDS. BigInt stats' ctimeMs/mtimeMs are
+ * integer milliseconds, so a change inside one millisecond would keep the key (and a stale verdict).
+ */
+export const chainCacheKey = (p: string, st: { ino: bigint; ctimeNs: bigint; mtimeNs: bigint }): string => `${p}\0${st.ino}\0${st.ctimeNs}\0${st.mtimeNs}`;
 function windowsFaults(p: string): string[] {
   let st: fs.BigIntStats;
   try {
@@ -83,7 +88,7 @@ function windowsFaults(p: string): string[] {
   } catch (err) {
     return [`${p}: ${(err as Error).message}`];
   }
-  const key = `${p}\0${st.ino}\0${st.ctimeMs}\0${st.mtimeMs}`;
+  const key = chainCacheKey(p, st);
   const hit = windowsChainCache.get(key);
   if (hit) return hit;
   let faults: string[];

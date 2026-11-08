@@ -19,6 +19,7 @@
  */
 
 import { redactRegisteredValues } from "./secret-registry.js";
+import { bigintSafeReplacer } from "./file-identity.js";
 
 const PREFIX = "[bot-relay]";
 
@@ -112,7 +113,7 @@ function write(level: LogLevel, args: unknown[]): void {
   if (LEVEL_ORDER[level] < minLevel()) return;
   const parts = args.map((a) => {
     if (a instanceof Error) return a.stack || a.message;
-    if (typeof a === "object") return JSON.stringify(a);
+    if (typeof a === "object") return JSON.stringify(a, bigintSafeReplacer); // a bigint never makes a log line throw
     return String(a);
   });
   const raw = `${ts()} ${PREFIX} [${level}] ${parts.join(" ")}\n`;
