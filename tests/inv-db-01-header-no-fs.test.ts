@@ -403,8 +403,10 @@ describe("INV-DB-01 2b-i: a native process never fs-opens a DB-family file", () 
       fs.mkdirSync(stateDir, { mode: 0o700 });
       fs.linkSync(dbPath, path.join(stateDir, "doorbell.lock.db"));
       process.env.RELAY_SQLITE_DRIVER = "wasm";
-      const init = compat.initializeDb(dbPath); // its claim is recorded before its first await
+      // slice 4: imported FIRST, so the doorbell call runs while the init's claim is held (synchronously after the init
+      // begins, before its first await). An owner init now rejects soon after (the hard link), releasing the claim.
       const { acquireInstanceLock } = await import("../src/doorbell-lock.js");
+      const init = compat.initializeDb(dbPath); // its claim is recorded before its first await
       expect(() => acquireInstanceLock(stateDir, { pid: process.pid, proc_start: null, host_id: null })).toThrow(
         /refusing to open it as a lock: it is .* relay database this process has open/
       );

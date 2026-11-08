@@ -148,8 +148,11 @@ export function _setInstanceServerForTests(on: boolean): void {
   instanceServer = on;
 }
 
-/** How a DB is opened: natively, or by its wasm single OWNER (slice 4 retired the legacy no-owner wasm mode). */
-export type OpenMode = "native" | "owner";
+/**
+ * How a DB is reached: natively, by its wasm single OWNER, or (a READ only: a backup's or a restore's read of a file
+ * it never writes) through wasm on a file no owner owns (RLYN or legacy). Slice 4 retired the legacy no-owner open.
+ */
+export type OpenMode = "native" | "owner" | "unowned-read";
 export interface ResolvedOpen {
   driver: SqliteDriver;
   mode: OpenMode;
@@ -164,7 +167,7 @@ let headerDecidesWarned = false;
  * - legacy (0) and RLYN: native only; a wasm declaration on one is refused by name (`relay convert-journal`, slice 4);
  * - RLYN, foreign, and the in-process driver mixes: as in 2a/2b-i (refused or warned by name).
  */
-export function resolveOpen(dbPath: string, purpose: "open" | "read" = "open"): ResolvedOpen {
+export function resolveOpen(dbPath: string, purpose: "open" | "read"): ResolvedOpen {
   const d = declaredDriver();
   const peek = readDriverHeaderForDriver(dbPath, d.driver);
   if (peek.kind === "wasm") {
@@ -210,8 +213,11 @@ export function resolveOpen(dbPath: string, purpose: "open" | "read" = "open"): 
   if (d.driver === "native") return { driver: "native", mode: "native", header };
   // INV-DB-01 slice 4: wasm is ALWAYS its single owner. A NEW DB is created stamped for it (whether the instance or the
   // env declared wasm); an RLYN or legacy header was refused above (an owner never adopts one).
-  // A READ is never an owner open: its caller uses only the driver (it reads the file with it, under db-header's verdict).
-  if (header.kind === "absent" || purpose === "read") return { driver: "wasm", mode: "owner", header };
+  // An RLYW header HERE (the peek above saw no file, and another process materialized its owned DB since: a birth race)
+  // is owner mode too: the owner protocol then refuses this process by name while that owner holds the lock.
+  if (header.kind === "absent" || header.kind === "wasm") return { driver: "wasm", mode: "owner", header };
+  // A READ of an unowned file is never an owner open (no owner exists for it): db-header's verdict decided above.
+  if (purpose === "read") return { driver: "wasm", mode: "unowned-read", header };
   throw new DbHeaderRefusedError(
     `REFUSING the wasm driver on the DB at '${dbPath}': its header (${header.kind}) is not one a wasm owner may open. ` +
       `Convert it once, with every relay process stopped: \`relay convert-journal --to wasm\`.`
@@ -1417,7 +1423,7 @@ export function initializeDb(dbPath: string): Promise<CompatDatabase> {
 
   const p = (async () => {
     // INV-DB-01 slices 2a/2b-ii: the declarations, then the DB file's header, decide the driver AND the mode.
-    const r = resolveOpen(dbPath);
+    const r = resolveOpen(dbPath, "open");
     const driver = r.driver;
     log.info(`[db] Initializing SQLite driver: ${driver}${r.mode === "owner" ? " (single owner)" : ""}`);
 
@@ -1478,7 +1484,7 @@ export function configuredDriver(dbPath?: string): SqliteDriver {
  * directory). Warns as getDriverType() and the header check do.
  */
 export function assertInstanceDriverAccepted(dbPath: string): DriverHeader {
-  return resolveOpen(dbPath).header;
+  return resolveOpen(dbPath, "open").header;
 }
 
 /**

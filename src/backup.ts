@@ -298,7 +298,7 @@ async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<
     }
     return d;
   }
-  const resolved = resolveOpen(srcDbPath);
+  const resolved = resolveOpen(srcDbPath, "read"); // a cold export only READS the file
   const d = resolved.driver;
   // INV-DB-01 slice 3: a COLD native export is a non-owner native opener: the one predicate (both declarations).
   if (d === "native") assertNativeByPathAllowed(srcDbPath, "a cold native export");

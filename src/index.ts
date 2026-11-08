@@ -252,7 +252,7 @@ async function main(): Promise<void> {
   // owner instead. (A legacy wasm DB, under RELAY_SQLITE_DRIVER=wasm alone, keeps working over stdio, as before.)
   if (config.transport === "stdio") {
     const dbPath = getDbPath();
-    if (resolveOpen(dbPath).mode === "owner") {
+    if (resolveOpen(dbPath, "open").mode === "owner") {
       throw new Error(
         `a stdio MCP server does not open the DB at '${dbPath}': it is (or will be) owned by the wasm driver's single ` +
           `owner, a relay daemon (the instance declares sqlite_driver "wasm", or the DB is stamped for it). Point the ` +
