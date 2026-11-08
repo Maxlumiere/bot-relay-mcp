@@ -319,7 +319,11 @@ relay_owner_prove() {
 # argv or this hook's output. Off the owner route it prints nothing.
 relay_owner_secret_curl_config() {
   [ -n "${RELAY_OWNER_PORT:-}" ] || return 0
-  node "$(relay_helpers_cli)" curl-auth-config 2>/dev/null || true
+  node "$(relay_helpers_cli)" curl-auth-config 2>/dev/null
+  # Exit 3: a secret the curl config cannot carry was DECLINED (never printed): named here, on stderr, never into the
+  # config stream this function writes to.
+  [ "$?" -ne 3 ] || echo "[RELAY] http_secret can't be sent safely: it contains a character curl config can't carry. Use printable characters without quotes or backslashes." >&2
+  return 0
 }
 
 # relay_curl_token_config TOKEN — the X-Agent-Token header as a curl config line (see relay_curl_config_line).
