@@ -26,7 +26,7 @@ import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriv
 import { colocatedConfigPathFor } from "./instance.js";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
-import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, ownerLockHeldElsewhere, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
+import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, probeOwnerLock, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
 import {
   assertDriverHeaderAllows,
   noteNativeHandleOpened,
@@ -399,7 +399,17 @@ function declarationRefusal(dbPath: string, what: string, d: Declaration): { kin
 export type NativeOpenVerdict = { ok: true } | { ok: false; kind: "declared-wasm" | "unreadable" | "owner-locked"; message: string };
 /** Why a native open must wait: ANOTHER process holds the DB's single-owner lock (a live wasm owner, or a conversion). */
 function ownerLockedRefusal(dbPath: string, what: string): { kind: "owner-locked"; message: string } | null {
-  if (!ownerLockHeldElsewhere(dbPath)) return null;
+  const probe = probeOwnerLock(dbPath);
+  if (probe.state === "free") return null;
+  if (probe.state === "undecidable") {
+    // Codex #401 R2, residual (b): name the actual cause (a missing flock cannot be fixed by waiting).
+    return {
+      kind: "owner-locked",
+      message:
+        `REFUSING ${what} of the DB at '${dbPath}': whether another relay process holds its single-owner lock cannot ` +
+        `be checked here: ${probe.reason}. Fix that, then retry. Nothing was created or opened.`,
+    };
+  }
   return {
     kind: "owner-locked",
     message:

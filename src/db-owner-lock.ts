@@ -612,47 +612,69 @@ export function assertLockIntact(dbPath: string): void {
  * a client open of the owner's named pipe). This process's own hold (re-entrant) is not "another". A probe that cannot
  * decide is "held" (fail closed), by name in the caller's refusal.
  */
+export type OwnerLockProbe = { state: "free" } | { state: "held" } | { state: "undecidable"; reason: string };
 export function ownerLockHeldElsewhere(dbPath: string): boolean {
+  return probeOwnerLock(dbPath).state !== "free";
+}
+/** Codex #401 R2 P2: "free" ONLY on an ESTABLISHED absence (ENOENT); any other error is undecidable (fail closed). */
+export function probeOwnerLock(dbPath: string): OwnerLockProbe {
+  const code = (err: unknown) => (err as NodeJS.ErrnoException).code ?? (err as Error).message;
   let real: string;
   try {
     real = fs.realpathSync.native(dbPath);
-  } catch {
-    return false; // no DB: nothing is owned
+  } catch (err) {
+    if (code(err) === "ENOENT") return { state: "free" }; // no DB: nothing is owned
+    return { state: "undecidable", reason: `the DB path could not be resolved (${code(err)})` };
   }
-  if (holdsOwnerLock(real)) return false;
+  if (holdsOwnerLock(real)) return { state: "free" };
   if (process.platform === "win32") {
     try {
       fs.closeSync(fs.openSync(primitiveName(lockKey(real)), "r+"));
-      return true; // a server answers: an owner holds the pipe
+      return { state: "held" }; // a server answers: an owner holds the pipe
     } catch (err) {
-      return (err as NodeJS.ErrnoException).code !== "ENOENT";
+      const c = code(err);
+      if (c === "ENOENT") return { state: "free" };
+      if (c === "EBUSY" || c === "EPIPE") return { state: "held" };
+      return { state: "undecidable", reason: `the owner's named pipe could not be probed (${c})` };
     }
   }
   const file = lockFilePath(real);
-  if (!fs.existsSync(file)) return false;
+  try {
+    fs.lstatSync(file);
+  } catch (err) {
+    if (code(err) === "ENOENT") return { state: "free" }; // never taken: nothing to probe, nothing created
+    return { state: "undecidable", reason: `its lock file ${file} could not be checked (${code(err)})` };
+  }
   if (process.platform === "darwin") {
     let fd: number;
     try {
       fd = openLockFile(file, fs.constants.O_RDWR | fs.constants.O_NONBLOCK | O_EXLOCK_DARWIN);
     } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EAGAIN" || code === "EWOULDBLOCK") return true;
-      return true; // cannot decide: fail closed
+      const c = code(err);
+      if (c === "EAGAIN" || c === "EWOULDBLOCK") return { state: "held" };
+      return { state: "undecidable", reason: `its lock file ${file} could not be probed (${c})` };
     }
     fs.closeSync(fd);
-    return false;
+    return { state: "free" };
+  }
+  try {
+    assertLinuxFlock(real);
+  } catch {
+    return {
+      state: "undecidable",
+      reason: `there is no trusted system \`flock\` on this host to check its lock file ${file}; install util-linux's flock (/usr/bin/flock)`,
+    };
   }
   let fd: number;
   try {
     fd = openLockFile(file, fs.constants.O_RDWR);
-  } catch {
-    return true; // cannot decide: fail closed
+  } catch (err) {
+    return { state: "undecidable", reason: `its lock file ${file} could not be opened (${code(err)})` };
   }
   try {
-    assertLinuxFlock(real);
-    return !flockFd(fd, file);
-  } catch {
-    return true; // no trusted flock, or flock failed: cannot decide, fail closed
+    return flockFd(fd, file) ? { state: "free" } : { state: "held" };
+  } catch (err) {
+    return { state: "undecidable", reason: (err as Error).message };
   } finally {
     fs.closeSync(fd);
   }

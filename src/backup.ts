@@ -852,10 +852,8 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // before the rename, leaving a gap where a concurrent daemon startup or
     // a signal-interrupted restore would see no DB at the expected path.
     //
-    // Windows note: Node's `fs.renameSync` on Windows throws EPERM when the
-    // destination already exists. Fall back to copy-then-unlink — NOT
-    // atomic on Windows, but documented and the best POSIX-API equivalent
-    // we can offer without shelling out to MoveFileExW.
+    // Windows note: a rename onto a file another process holds open fails there (EPERM); the swap retries briefly,
+    // then refuses by name (below). It never copies over the live DB.
     await beforeRestoreSwapHook?.(srcDbPath);
     // Codex #385 R2 P1-2: an OWNED DB is replaced only while this restore's acquisition still holds the lock and its
     // lock file is still the file at its name (removed or replaced, another process may own and have written the DB).
@@ -883,15 +881,27 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       fs.rmSync(newPath, { force: true }); // this restore's own staged copy (never a DB-family name)
       throw err;
     }
-    try {
-      fs.renameSync(newPath, target);
-    } catch (err) {
-      if (process.platform === "win32") {
-        // Windows fallback: non-atomic replace. Documented behavior.
-        fs.copyFileSync(newPath, target);
-        fs.unlinkSync(newPath);
-      } else {
-        throw err;
+    // INV-DB-01 slice 4 (the #377 ruling, Codex #401 R2 walk): the swap is the atomic rename ONLY. On Windows a rename
+    // onto a file another process holds open fails; a short retry, then a NAMED refusal: never a copy over the live
+    // DB (a crash mid-copy would leave it torn, recoverable only by hand from the safety backup).
+    const waits = process.platform === "win32" ? [25, 50, 100, 200] : [];
+    for (let i = 0; ; i++) {
+      try {
+        fs.renameSync(newPath, target);
+        break;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code ?? "";
+        if (process.platform === "win32" && ["EPERM", "EBUSY", "EACCES"].includes(code) && i < waits.length) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waits[i]);
+          continue;
+        }
+        fs.rmSync(newPath, { force: true }); // this restore's own staged copy (never a DB-family name)
+        throw new Error(
+          `restore refused: the staged copy could not be replaced onto ${target} (${code || (err as Error).message})` +
+            (process.platform === "win32" ? `: another process may have the DB open (Windows cannot replace an open file)` : "") +
+            `. Nothing was replaced: the live DB is unchanged (its safety backup is at ${previousBackupPath}). Stop every ` +
+            `process using it, then retry.`
+        );
       }
     }
 
