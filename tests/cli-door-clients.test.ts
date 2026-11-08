@@ -112,13 +112,6 @@ async function stopDaemon(child: ChildProcess): Promise<void> {
 }
 interface Rec { port: number; key: string; instance_id: string; db_path: string; v: number }
 const readRecord = (c: Case) => JSON.parse(fs.readFileSync(c.record, "utf-8")) as Rec;
-const mintSecretOf = (c: Case): string => {
-  const hits: string[] = [];
-  const walk = (d: string) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (e.name === "mint.secret") hits.push(p); } };
-  walk(c.home);
-  expect(hits.length, "precondition: the daemon created its registration secret").toBeGreaterThan(0);
-  return fs.readFileSync(hits[0]!, "utf-8").trim();
-};
 
 // ---------------------------------------------------------------------------------------------------------------------
 // THE AEAD DOOR, as ruled (an independent client implementing the spec).
@@ -142,11 +135,6 @@ function openSealed(key: Buffer, aad: Buffer, env: { iv?: string; ct?: string; t
     return null;
   }
 }
-const PEEK = "/owner/v1/peek";
-const HEALTH = "/owner/v1/health";
-const REGISTER = "/owner/v1/register";
-const LIVENESS = "/owner/v1/liveness";
-const SESSION = "/owner/v1/session";
 interface DoorOpts { key?: string; tamper?: boolean; aadPath?: string; agent?: string }
 /** One sealed exchange; `opened` is the reply's plaintext when it authenticates (null otherwise). */
 async function door(r: Rec, p: string, args: Record<string, unknown>, o: DoorOpts = {}) {
@@ -169,15 +157,6 @@ async function door(r: Rec, p: string, args: Record<string, unknown>, o: DoorOpt
 const rpc = (name: string, args: Record<string, unknown>) => ({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } });
 /** The dispatcher's tool result inside a sealed reply, as the hooks parse it (its JSON text). */
 const toolText = (o: Record<string, unknown> | null) => JSON.stringify((o as { result?: unknown } | null)?.result ?? null);
-/** A JSON-RPC result out of an /mcp reply (plain JSON or one SSE `data:` line). */
-function rpcResultOf(raw: string): unknown {
-  const line = raw.split("\n").find((l) => l.startsWith("data:"));
-  try {
-    return (JSON.parse(line ? line.slice(5) : raw) as { result?: unknown }).result;
-  } catch {
-    return undefined;
-  }
-}
 /** A tool result's definite outcome: its stringified content parsed, {success, error_code}; "unparsed" otherwise. */
 function shapeOf(result: unknown): { outcome: "success" | "error" | "unparsed"; error_code?: string } {
   const text = (result as { content?: Array<{ text?: string }> } | undefined)?.content?.[0]?.text;
@@ -205,12 +184,6 @@ async function dbDump(c: Case): Promise<Record<string, unknown[][]>> {
   }
   db.close();
   return out;
-}
-async function wasmOwner(c: Case, message = "pr3 door mail") {
-  const token = seedWasmDb(c, message);
-  fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
-  const d = await startDaemon(c);
-  return { token, d, rec: readRecord(c) };
 }
 
 const TOOL = "/owner/v1/tool";
