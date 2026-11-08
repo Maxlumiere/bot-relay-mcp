@@ -25,13 +25,9 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_INDEX = path.join(REPO, "dist", "index.js");
 const DIST_DB = pathToFileURL(path.join(REPO, "dist", "db.js")).href;
 const RELAY = path.join(REPO, "bin", "relay");
-const HOOKS = path.join(REPO, "hooks");
-/** The bash hooks do not run on native Windows (src/cli/generate-hooks.ts; WSL runs them as Linux). */
-const WIN_NO_BASH_HOOKS = process.platform === "win32";
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "hookpr3-")));
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 const AGENT = "pr3-agent";
-const KEY_RE = /^[0-9a-f]{32}$/;
 const procs: ChildProcess[] = [];
 const servers: http.Server[] = [];
 afterEach(async () => {
