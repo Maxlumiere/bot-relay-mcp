@@ -16,6 +16,7 @@ import {
   ApiSetStatusSchema,
   ApiDashboardThemeSchema,
   ApiWakeAgentSchema,
+  payloadMaxBytes,
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
 import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors, pendingMetadata, getDbPath } from "../db.js";
@@ -752,7 +753,10 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
   // MAC covers its exact bytes.
   //   /owner/v1/peek     = a PURE read: `relay pending`'s query (pendingMetadata), no seq/epoch stamp, no read mark.
   //   /owner/v1/liveness = the metadata-only anchor restamp (agent_pid, agent_pid_start; host_id when NULL).
-  const doorBody = express.text({ type: () => true, limit: "64kb" });
+  // #434 R1 P2-3: the sealed body must hold the LARGEST valid call: a payload field at RELAY_MAX_PAYLOAD_BYTES of
+  // worst-case JSON escaping (a control byte is 6: \u00XX), plus the envelope and its other arguments, then base64
+  // (4/3) for the ciphertext. Still bounded (about 0.5 MiB at the 64 KiB default).
+  const doorBody = express.text({ type: () => true, limit: Math.ceil((payloadMaxBytes() * 6 + 64 * 1024) * (4 / 3)) + 4096 });
   // Hook PR 3 (as ruled after Codex #418 R2): register / health / liveness run the SAME dispatcher as /mcp, in-process
   // (an MCP client over the SDK InMemoryTransport), inside a request context that MIRRORS /mcp's: the REAL peer, the
   // same `authenticated`, the transport http, and the agent token / registration secret carried INSIDE the sealed

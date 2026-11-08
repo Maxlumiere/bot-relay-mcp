@@ -21,7 +21,7 @@ import { AgentClassEnum, type AgentClass } from "./agent-class.js";
  * The HTTP body-parser limit (1MB) is the outer bound; this is the inner
  * per-field limit.
  */
-function payloadMaxBytes(): number {
+export function payloadMaxBytes(): number {
   const env = parseInt(process.env.RELAY_MAX_PAYLOAD_BYTES || "65536", 10);
   if (!Number.isFinite(env) || env < 1) return 65536;
   return env;

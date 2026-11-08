@@ -336,7 +336,7 @@ export async function run(argv: string[]): Promise<number> {
   // PR 4 (as ruled): a hub is REMOTE by definition. Its host is CHECKED (src/host-class.ts): a loopback hub (any
   // spelling) is this machine's own relay, refused by name; an unresolved one gets nothing; a remote one is reached
   // by a hardened bearer (relay-client: the checked address, no redirect, no proxy).
-  const { routeFor, unresolvedMessage, remotePost, mcpResultOf, toolJson } = await import("./relay-client.js");
+  const { routeFor, unresolvedMessage, remotePost, healthGet, mcpResultOf, toolJson } = await import("./relay-client.js");
   const hubPort = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
   const hubRoute = await routeFor(url.hostname.replace(/^\[|\]$/g, ""), hubPort, url.protocol === "https:");
   // As ruled on #434: a loopback hub is refused by name UNLESS RELAY_HTTP_TRUSTED_TUNNEL_PORT equals its port (a hub
@@ -369,17 +369,25 @@ export async function run(argv: string[]): Promise<number> {
       /* no local instance to compare with: not this machine's relay */
     }
   }
-  const remoteHub = hubRoute.kind === "remote" ? hubRoute : { kind: "remote" as const, host: url.hostname.replace(/^\[|\]$/g, ""), port: hubPort, ip: "127.0.0.1", secure: url.protocol === "https:" };
+  // #434 R1 P1: a tunnel is pinned to the CHECKED loopback address (::1 stays ::1): every request below goes there.
+  const remoteHub = hubRoute.kind === "remote" ? hubRoute : { host: url.hostname.replace(/^\[|\]$/g, ""), port: hubPort, ip: hubRoute.ip, secure: url.protocol === "https:" };
 
   // --- Step 1: probe /health ---
   let healthBody: any = null;
   try {
     // The body read is INSIDE the deadline — that is the whole fix. A hub that
     // sends headers and stalls now fails at 5s instead of hanging forever.
+    // #434 R1 P1: pinned to the same checked address as the register (relay-client healthGet: no credential).
     const probe = await withDeadline(5000, "hub health probe", async (signal) => {
-      const res = await fetch(`${hubBase}/health`, { signal });
-      if (!res.ok) return { ok: false as const, status: res.status };
-      return { ok: true as const, body: await res.json().catch(() => ({})) };
+      const res = await healthGet(remoteHub, 5000, signal);
+      if (res.status < 200 || res.status >= 300) return { ok: false as const, status: res.status };
+      let body: unknown = {};
+      try {
+        body = JSON.parse(res.text);
+      } catch {
+        /* a non-JSON health body: reachable, no version */
+      }
+      return { ok: true as const, body };
     });
     if (!probe.ok) {
       process.stderr.write(
@@ -444,7 +452,6 @@ export async function run(argv: string[]): Promise<number> {
     // frames, so this is exactly the shape most likely to deliver headers and
     // then stall — the register step was the second unbounded body read.
     return await withDeadline(10_000, "hub register_agent", async (signal) => {
-      void signal; // the hardened client has its own deadline (below)
       const r = await remotePost(
         remoteHub,
         "/mcp",
@@ -463,6 +470,7 @@ export async function run(argv: string[]): Promise<number> {
           },
         }),
         10_000,
+        signal, // #434 R1 P2-2: the outer deadline cancels the request itself
       );
       const result = mcpResultOf(r.text);
       const body: any = result ? (toolJson(result) ?? result) : (() => {

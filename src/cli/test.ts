@@ -81,7 +81,11 @@ export async function run(argv: string[]): Promise<number> {
     }
 
     // 1. /health probe
-    const h = await fetch(`${baseUrl}/health`).then((r) => r.json()).catch((e) => ({ error: String(e) }));
+    // #434 R1 P2-5: relay-client's healthGet (no credential can ride it).
+    const { healthGetHost } = await import("./relay-client.js");
+    const h = await healthGetHost("127.0.0.1", Number(new URL(baseUrl).port), 5000)
+      .then((r) => JSON.parse(r.text) as unknown)
+      .catch((e) => ({ error: String(e) }));
     if ((h as any).status === "ok") {
       results.push({ step: "health", ok: true, detail: `version=${(h as any).version} protocol_version=${(h as any).protocol_version}` });
     } else {

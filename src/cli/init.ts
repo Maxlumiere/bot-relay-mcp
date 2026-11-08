@@ -304,13 +304,13 @@ export async function probeHealth(port: number): Promise<HealthProbe> {
   // verified on Node 20 — the version `engines` allows and CI exercises.
   try {
     return await withDeadline(timeoutMs, `health probe on 127.0.0.1:${port}`, async (signal) => {
-      let res: Response;
+      // #434 R1 P2-5: relay-client's healthGet (pinned; a 3xx is its status, never followed; no credential).
+      const { healthGetHost } = await import("./relay-client.js");
+      let res: { status: number; text: string };
       try {
-        res = await fetch(`http://127.0.0.1:${port}/health`, { redirect: "manual", signal });
+        res = await healthGetHost("127.0.0.1", port, timeoutMs, signal);
       } catch (err) {
-        const code =
-          (err as { cause?: { code?: string }; code?: string } | null)?.cause?.code ??
-          (err as { code?: string } | null)?.code;
+        const code = (err as { code?: string } | null)?.code;
         if (code === "ECONNREFUSED") {
           return { reachable: false, ok: false, parseable: false, body: null }; // ONLY this proves the port is free
         }
@@ -321,11 +321,11 @@ export async function probeHealth(port: number): Promise<HealthProbe> {
       let body: unknown = null;
       let parseable = true;
       try {
-        body = await res.json();
+        body = JSON.parse(res.text);
       } catch {
-        parseable = false; // malformed OR aborted-mid-body → unreadable → refuse
+        parseable = false; // malformed → unreadable → refuse
       }
-      return { reachable: true, ok: res.ok, parseable, body };
+      return { reachable: true, ok: res.status >= 200 && res.status < 300, parseable, body };
     });
   } catch {
     // Deadline elapsed. FAIL CLOSED, identical to the previous abort path: a

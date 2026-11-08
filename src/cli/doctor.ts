@@ -353,10 +353,12 @@ async function checkDaemon(): Promise<CheckResult> {
   const host = process.env.RELAY_HTTP_HOST || "127.0.0.1";
   try {
     const probe = await withDeadline(1000, "daemon /health", async (signal) => {
-      const res = await fetch(`http://${host}:${port}/health`, { signal });
-      if (!res.ok) return { ok: false as const, status: res.status };
-      // Body read inside the bound — `res.json()` used to sit past the cleared timer.
-      return { ok: true as const, data: (await res.json()) as { version?: string; protocol_version?: string } };
+      // #434 R1 P2-5: relay-client's healthGet (pinned to the checked address; no credential can ride it).
+      const { healthGetHost } = await import("./relay-client.js");
+      const res = await healthGetHost(host, port, 1000, signal);
+      if (res.status < 200 || res.status >= 300) return { ok: false as const, status: res.status };
+      // Body read inside the bound.
+      return { ok: true as const, data: JSON.parse(res.text) as { version?: string; protocol_version?: string } };
     });
     if (probe.ok) {
       return {
@@ -429,9 +431,12 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
   let health: HealthBody | null = null;
   try {
     const probe = await withDeadline(5000, `hub ${base}/health`, async (signal) => {
-      const res = await fetch(`${base}/health`, { signal });
-      if (!res.ok) return { ok: false as const, status: res.status };
-      return { ok: true as const, body: (await res.json()) as HealthBody };
+      // #434 R1 P2-5: relay-client's healthGet (pinned to the checked address; no credential can ride it).
+      const { healthGetHost } = await import("./relay-client.js");
+      const hp = hubUrl.port ? Number(hubUrl.port) : hubUrl.protocol === "https:" ? 443 : 80;
+      const res = await healthGetHost(hubUrl.hostname, hp, 5000, signal, hubUrl.protocol === "https:");
+      if (res.status < 200 || res.status >= 300) return { ok: false as const, status: res.status };
+      return { ok: true as const, body: JSON.parse(res.text) as HealthBody };
     });
     if (!probe.ok) {
       results.push({

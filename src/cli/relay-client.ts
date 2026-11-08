@@ -25,17 +25,32 @@ import https from "https";
 import crypto from "crypto";
 import { classifyHost } from "../host-class.js";
 import { remoteScope } from "./remote.js";
+import { sameFileIdentity } from "../file-identity.js";
 
-export class RelayClientError extends Error {}
+export class RelayClientError extends Error {
+  /** The socket error code when the relay could not be reached (e.g. ECONNREFUSED), for callers that branch on it. */
+  constructor(message: string, readonly code?: string) {
+    super(message);
+  }
+}
+
+/** A pinned destination: the name (Host, TLS SNI) and the CHECKED address every byte goes to. */
+export interface PinnedTarget {
+  host: string;
+  port: number;
+  ip: string;
+  secure: boolean;
+}
 
 export type RelayRoute =
-  | { kind: "local" }
+  | { kind: "local"; ip: string }
   | { kind: "remote"; host: string; port: number; ip: string; secure: boolean }
   | { kind: "unresolved"; host: string; why: string; secs: number };
 
 export async function routeFor(host: string, port: number, secure = false, timeoutMs = 2000): Promise<RelayRoute> {
   const c = await classifyHost(host, { timeoutMs });
-  if (c.kind === "loopback") return { kind: "local" };
+  // #434 R1 P1: the CHECKED loopback address is kept, so a tunnel route pins every request to it (never re-resolved).
+  if (c.kind === "loopback") return { kind: "local", ip: c.ip };
   if (c.kind === "remote") return { kind: "remote", host, port, ip: c.ip, secure };
   return { kind: "unresolved", host, why: c.kind === "unresolved" ? c.why : "unknown", secs: Math.round(timeoutMs / 1000) };
 }
@@ -97,45 +112,102 @@ export function toolJson(result: { content?: Array<{ text?: string }> }): Record
   }
 }
 
-/** A hardened POST to a REMOTE relay: the checked address, no redirect, no proxy, a deadline. */
-export function remotePost(r: { host: string; port: number; ip: string; secure: boolean }, reqPath: string, headers: Record<string, string>, body: string, timeoutMs = 10_000): Promise<{ status: number; text: string }> {
+/** Host header for a pinned target: an IPv6 literal is bracketed (RFC 7230 §5.4). */
+const hostHeader = (r: PinnedTarget): string => `${r.host.includes(":") ? `[${r.host}]` : r.host}:${r.port}`;
+/**
+ * ONE pinned request (#434 R1 P1, P2-2): to the CHECKED address (Host and TLS SNI keep the name), no redirect followed
+ * (`followRedirect` false = a 3xx is a named failure), no proxy from the environment (a fresh agent), and an ABSOLUTE
+ * deadline: the timer starts before the request and destroys it (and its response) on expiry, however the bytes
+ * trickle; an AbortSignal cancels it the same way. Every path clears the timer.
+ */
+function pinnedRequest(
+  r: PinnedTarget,
+  method: "GET" | "POST",
+  reqPath: string,
+  headers: Record<string, string>,
+  body: string | null,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  refuseRedirect: boolean,
+): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
+    let done = false;
+    let req: http.ClientRequest | null = null;
+    let res: http.IncomingMessage | null = null;
+    const finish = (err: Error | null, value?: { status: number; text: string }) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (err) {
+        res?.destroy();
+        req?.destroy();
+        reject(err);
+      } else resolve(value!);
+    };
+    const timer = setTimeout(() => finish(new RelayClientError(`the relay did not answer within ${timeoutMs < 1000 ? `${timeoutMs}ms` : `${Math.round(timeoutMs / 1000)}s`}`)), timeoutMs);
+    const onAbort = () => finish(new RelayClientError("the request was cancelled (its caller's deadline)"));
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
     const opts: https.RequestOptions = {
       host: r.ip,
       port: r.port,
       path: reqPath,
-      method: "POST",
+      method,
       agent: false, // a fresh agent: no keep-alive pool, and no proxy from the environment
-      headers: { ...headers, Host: `${r.host}:${r.port}`, "Content-Length": Buffer.byteLength(body) },
-      ...(r.secure ? { servername: r.host } : {}),
+      headers: { ...headers, Host: hostHeader(r), ...(body !== null ? { "Content-Length": Buffer.byteLength(body) } : {}) },
+      ...(r.secure ? { servername: r.host.includes(":") ? undefined : r.host } : {}),
     };
-    const onRes = (res: http.IncomingMessage) => {
-      const status = res.statusCode ?? 0;
-      if (status >= 300 && status < 400) {
-        res.resume();
-        reject(new RelayClientError(`the relay answered with a redirect (${status}${res.headers.location ? ` to ${String(res.headers.location).slice(0, 120)}` : ""}): not followed`));
+    const onRes = (m: http.IncomingMessage) => {
+      res = m;
+      const status = m.statusCode ?? 0;
+      if (refuseRedirect && status >= 300 && status < 400) {
+        finish(new RelayClientError(`the relay answered with a redirect (${status}${m.headers.location ? ` to ${String(m.headers.location).slice(0, 120)}` : ""}): not followed`));
         return;
       }
       const chunks: Buffer[] = [];
       let n = 0;
-      res.on("data", (c: Buffer) => {
+      m.on("data", (c: Buffer) => {
         n += c.length;
-        if (n > 8 * 1024 * 1024) {
-          req.destroy();
-          reject(new RelayClientError("the relay's reply is too large"));
-        } else chunks.push(c);
+        if (n > 8 * 1024 * 1024) finish(new RelayClientError("the relay's reply is too large"));
+        else chunks.push(c);
       });
-      res.on("end", () => resolve({ status, text: Buffer.concat(chunks).toString("utf-8") }));
-      res.on("error", (e) => reject(new RelayClientError(e.message)));
+      m.on("end", () => finish(null, { status, text: Buffer.concat(chunks).toString("utf-8") }));
+      m.on("error", (e) => finish(new RelayClientError(e.message)));
     };
-    const req = r.secure ? https.request(opts, onRes) : http.request(opts, onRes);
-    req.setTimeout(timeoutMs, () => {
-      req.destroy();
-      reject(new RelayClientError(`the relay did not answer within ${Math.round(timeoutMs / 1000)}s`));
+    try {
+      req = r.secure ? https.request(opts, onRes) : http.request(opts, onRes);
+    } catch (e) {
+      finish(new RelayClientError(`the relay could not be reached (${(e as Error).message})`));
+      return;
+    }
+    req.on("error", (e) => {
+      const code = (e as NodeJS.ErrnoException).code;
+      finish(new RelayClientError(`the relay could not be reached (${code ?? e.message})`, code));
     });
-    req.on("error", (e) => reject(new RelayClientError(`the relay could not be reached (${(e as NodeJS.ErrnoException).code ?? e.message})`)));
-    req.end(body);
+    req.end(body ?? undefined);
   });
+}
+/** A hardened POST to a REMOTE relay (or a trusted tunnel): pinned, no redirect, no proxy, an absolute deadline. */
+export function remotePost(r: PinnedTarget, reqPath: string, headers: Record<string, string>, body: string, timeoutMs = 10_000, signal?: AbortSignal): Promise<{ status: number; text: string }> {
+  return pinnedRequest(r, "POST", reqPath, headers, body, timeoutMs, signal, true);
+}
+/**
+ * EVERY CLI health probe (#434 R1 P2-5): GET /health, pinned like remotePost. It takes NO headers parameter, so it
+ * cannot carry a credential (a recording row proves the bytes). A 3xx is returned as its status (never followed).
+ */
+export function healthGet(r: PinnedTarget, timeoutMs: number, signal?: AbortSignal): Promise<{ status: number; text: string }> {
+  return pinnedRequest(r, "GET", "/health", {}, null, timeoutMs, signal, false);
+}
+/** healthGet by NAME: the host CHECKED first (src/host-class.ts), then pinned; an unresolved host is a named failure. */
+export async function healthGetHost(host: string, port: number, timeoutMs: number, signal?: AbortSignal, secure = false): Promise<{ status: number; text: string }> {
+  const bare = host.replace(/^\[|\]$/g, "");
+  const c = await classifyHost(bare, { timeoutMs: Math.min(timeoutMs, 2000) });
+  if (c.kind === "unresolved") throw new RelayClientError(`the host ${bare} did not resolve (${c.why})`);
+  return healthGet({ host: bare, port, ip: c.ip, secure }, timeoutMs, signal);
 }
 /** The MCP tool result out of a /mcp reply (plain JSON or one SSE `data:` line), or null. */
 export function mcpResultOf(text: string): { content?: Array<{ text?: string }>; isError?: boolean } | null {
@@ -148,18 +220,94 @@ export function mcpResultOf(text: string): { content?: Array<{ text?: string }>;
   }
 }
 
-/** One line from a file in a remote's own scope (agents/remote-<host>-<port>/<name>), or null. */
+let scopeReadHookForTests: (() => void) | null = null;
+/** TEST ONLY: called after the chain is checked and before the file is opened (to replace the scope in between). */
+export function _setScopeReadHookForTests(fn: (() => void) | null): void {
+  scopeReadHookForTests = fn;
+}
+const euidNow = () => (typeof process.geteuid === "function" ? process.geteuid() : null);
+/** A chain element's POSIX fault: a real directory / regular file, owned by this user, and private where it must be. */
+function posixFault(p: string, st: fs.BigIntStats, kind: "agents" | "scope" | "file"): string | null {
+  if (kind === "file" ? !st.isFile() : !st.isDirectory()) return `${p} is not a ${kind === "file" ? "regular file" : "real directory"}`;
+  const euid = euidNow();
+  if (euid !== null && st.uid !== BigInt(euid)) return `${p} is not owned by you`;
+  // agents/ may be 0755 (the hooks' mkdir -p), but nobody else may WRITE it (no swapping a scope in); the scope and the
+  // file are private (0700 / 0600: what both writers make them).
+  const mask = kind === "agents" ? 0o022n : 0o077n;
+  if ((st.mode & mask) !== 0n) return `${p} has mode 0${(Number(st.mode) & 0o777).toString(8)}: it is not private to you`;
+  return null;
+}
+/**
+ * One line from a file in a remote's OWN scope (agents/remote-<host>-<port>/<name>), or null when it does not exist.
+ * #434 R1 P2-4: read through a TRUSTED chain: agents/ and the scope are real directories (a link, or a junction, is
+ * refused: a scope linked to the local vault or to another remote's scope yields nothing); the file is opened without
+ * following a link and must be the file its name names (one link); POSIX: each owned by this user, the scope and the
+ * file private; after the read, the scope and agents/ must still be the directories that were checked (a replacement
+ * in between is refused). Windows: the same link and identity checks (its ACLs are set by the writers, not re-read).
+ * A refusal is NAMED on stderr and yields null (no credential is sent).
+ */
 async function scopedLine(host: string, port: number, name: string): Promise<string | null> {
+  let agents: string;
   try {
     const { resolveInstance } = await import("../instance.js");
     const r = resolveInstance({});
     if (r.kind === "error") return null;
-    const file = path.join(path.dirname(r.dbPath), "agents", remoteScope(host, String(port)), name);
-    const st = fs.lstatSync(file);
-    if (!st.isFile() || st.isSymbolicLink()) return null;
-    return fs.readFileSync(file, "utf-8").split("\n")[0]!.trim();
+    agents = path.join(path.dirname(r.dbPath), "agents");
   } catch {
     return null;
+  }
+  const scope = path.join(agents, remoteScope(host, String(port)));
+  const file = path.join(scope, name);
+  const refuse = (why: string): null => {
+    process.stderr.write(`relay: refusing the remote credential ${file}: ${why}\n`);
+    return null;
+  };
+  const lst = (p: string): fs.BigIntStats | null => {
+    try {
+      return fs.lstatSync(p, { bigint: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  };
+  let fd: number | null = null;
+  try {
+    const a0 = lst(agents);
+    const s0 = lst(scope);
+    const f0 = lst(file);
+    if (a0 === null || s0 === null || f0 === null) return null;
+    for (const [p, st] of [[agents, a0], [scope, s0], [file, f0]] as const) if (st.isSymbolicLink()) return refuse(`${p} is a link (or a junction): refused`);
+    if (process.platform !== "win32") {
+      const fault = posixFault(agents, a0, "agents") ?? posixFault(scope, s0, "scope");
+      if (fault) return refuse(fault);
+    } else if (!a0.isDirectory() || !s0.isDirectory()) return refuse(`${scope} is not a real directory`);
+    if (!f0.isFile()) return refuse("not a regular file");
+    scopeReadHookForTests?.();
+    try {
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ELOOP" || code === "EMLINK") return refuse("a link: refused");
+      if (code === "ENOENT") return refuse("it was replaced while it was being read");
+      throw err;
+    }
+    const st = fs.fstatSync(fd, { bigint: true });
+    if (!st.isFile() || st.nlink !== 1n) return refuse("not a regular file with one name");
+    if (!sameFileIdentity(st, f0)) return refuse("it changed (was replaced) while it was being opened");
+    if (process.platform !== "win32") {
+      const fault = posixFault(file, st, "file");
+      if (fault) return refuse(fault);
+    }
+    const text = fs.readFileSync(fd, "utf-8");
+    // the chain is still the one that was checked (a directory swapped in between the check and the open is refused)
+    const a1 = lst(agents);
+    const s1 = lst(scope);
+    if (a1 === null || s1 === null || !sameFileIdentity(a1, a0) || !sameFileIdentity(s1, s0)) return refuse("its directory was replaced while it was being read");
+    return text.split("\n")[0]!.trim();
+  } catch (err) {
+    return refuse((err as Error).message);
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
   }
 }
 /**

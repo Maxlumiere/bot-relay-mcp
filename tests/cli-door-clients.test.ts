@@ -663,7 +663,7 @@ describe("#434 R1 P2-5: every health probe is credential-free BY RECORDING", () 
     const r = await probeAsync(c, `const h = await m.healthGet({ host: "127.0.0.1", ip: "127.0.0.1", port: ${rec.port}, secure: false }, 5000); process.stdout.write(JSON.stringify({ status: h.status }));`, creds);
     expect(r.status, r.stderr).toBe(0);
     expect(JSON.parse(r.stdout).status).toBe(200);
-    expect(m_parseHeaders(rec.reqs), "healthGet: GET /health with only transport headers").toEqual(["GET /health host,connection"]);
+    expect(m_parseHeaders(rec.reqs), "healthGet: GET /health with only transport headers").toEqual(["GET /health connection,host"]);
     const rec2 = await recorder();
     await relayAsync(c, ["doctor"], { ...creds, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(rec2.port) });
     expect(rec2.reqs.length, "precondition: doctor probed the configured port").toBeGreaterThan(0);

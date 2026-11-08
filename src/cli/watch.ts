@@ -331,9 +331,11 @@ async function probeMarkerWriter(): Promise<MarkerWriterProbe> {
   // is the pre-existing behaviour for a timeout.
   try {
     const probe = await withDeadline(1000, `daemon /health at ${where}`, async (signal) => {
-      const res = await fetch(`http://${host}:${port}/health`, { signal });
-      if (!res.ok) return { ok: false as const, status: res.status };
-      return { ok: true as const, body: (await res.json()) as { filesystem_markers?: boolean } };
+      // #434 R1 P2-5: relay-client's healthGet (pinned to the checked address; no credential can ride it).
+      const { healthGetHost } = await import("./relay-client.js");
+      const res = await healthGetHost(host, Number(port), 1000, signal);
+      if (res.status < 200 || res.status >= 300) return { ok: false as const, status: res.status };
+      return { ok: true as const, body: JSON.parse(res.text) as { filesystem_markers?: boolean } };
     });
     if (!probe.ok) {
       return { live: false, reason: `daemon at ${where} answered /health with HTTP ${probe.status}` };

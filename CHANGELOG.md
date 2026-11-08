@@ -35,7 +35,11 @@
   - **an unresolved host** gets nothing, named.
 - **Changed:** `relay send` reaches a local relay through `send_message` (the sender's token, the same authentication as the MCP tool) instead of the dashboard endpoint.
 - **Changed:** `relay pair` refuses a loopback hub by name (pairing is for a remote hub), unless `RELAY_HTTP_TRUSTED_TUNNEL_PORT` equals its port (a hub reached through an ssh tunnel).
-- A scan row classifies every HTTP client call site in `src/cli/`, `bin/` and `tools/`; a new one fails CI until it is classified.
+- **Changed:** every request to a remote (or a trusted tunnel) goes to the address that was checked, including an IPv6 loopback tunnel (`[::1]` stays `::1`), with an absolute deadline that a slowly trickling reply cannot outlast and that the caller can cancel.
+- **Changed:** every CLI health probe (`doctor`, `init`, `watch`, `test`, `pair`) uses one credential-free request (no headers of its own).
+- **Fixed:** the owner door's body limit fits the largest valid call (a message at `RELAY_MAX_PAYLOAD_BYTES`, however it is escaped); it is still bounded.
+- **Changed:** a remote's credential files are read only through real, private directories (a link or junction is refused, so a remote's scope can never point at the local vault or another remote's), and a directory replaced while it is read is refused, named.
+- A scan row classifies every network client in `src/cli/`, `bin/` and `tools/` (by language: a fetch call, any network-module import, a curl or wget subprocess, a curl or wget command); a new one fails CI until it is classified.
 
 ### BREAKING (5.0.0): one wasm mode (the single owner), and `relay convert-journal`
 
