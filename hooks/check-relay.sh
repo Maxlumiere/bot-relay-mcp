@@ -682,7 +682,7 @@ relay_deliver_remote_mail() {
     return 0
   fi
   # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
-  resp=$({ relay_curl_token_config "$tok" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
+  resp=$({ relay_owner_secret_curl_config; relay_curl_token_config "$tok" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
     -X POST "http://${host}:${port}/mcp" \
     -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
     2>/dev/null) || { relay_remote_failed "the remote relay did not answer"; return 0; }

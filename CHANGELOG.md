@@ -9,7 +9,7 @@
 - **Changed:** `relay where --fields` prints an 8th line: the owner endpoint (`http://127.0.0.1:<port> <key>`), set only when line 7 is the new verdict `http`: a wasm database whose record is valid (the owner lock held, the pid alive with the same start). It is empty for every other verdict. An older relay CLI's 7-line answer is a named version-skew skip in the hooks.
 - **Changed:** the SessionStart, PostToolUse and Stop hooks read that owner's mail over HTTP (a `get_messages` peek):
   - first a fresh challenge, whose answer they verify with the record's key (curl follows no redirect);
-  - only then the agent's token;
+  - only then the agent's token, plus the instance's `http_secret` when one is configured: the relay CLI writes it straight into curl's config on stdin (new `relay curl-auth-config`), so it is never in argv, an environment variable, a file or the hook's output;
   - any failure is a named skip, never a `sqlite3` read and never a token sent.
   - A stdio owner is not reachable yet.
 

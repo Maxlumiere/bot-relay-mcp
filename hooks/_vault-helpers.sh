@@ -313,6 +313,15 @@ relay_owner_prove() {
   return 1
 }
 
+# relay_owner_secret_curl_config — hook PR 1 (as ruled): ON THE OWNER ROUTE ONLY (relay_owner_prove proved the
+# endpoint: RELAY_OWNER_PORT is set), the instance's HTTP shared secret as a curl config line, written by the relay
+# CLI STRAIGHT into the caller's `{ ...; } | curl -K -` stream. It is never in a shell variable, an env var, a file,
+# argv or this hook's output. Off the owner route it prints nothing.
+relay_owner_secret_curl_config() {
+  [ -n "${RELAY_OWNER_PORT:-}" ] || return 0
+  node "$(relay_helpers_cli)" curl-auth-config 2>/dev/null || true
+}
+
 # relay_curl_token_config TOKEN — the X-Agent-Token header as a curl config line (see relay_curl_config_line).
 # An empty token prints nothing and succeeds: the request goes unauthenticated, as it did with no header.
 relay_curl_token_config() {

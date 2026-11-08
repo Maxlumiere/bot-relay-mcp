@@ -86,6 +86,7 @@ const SUBCOMMANDS = {
   "mint-token": "../dist/cli/mint-token.js",
   "purge-history": "../dist/cli/purge-history.js",
   "convert-journal": "../dist/cli/convert-journal.js",
+  "curl-auth-config": "../dist/cli/curl-auth-config.js",
   "purge-agents": "../dist/cli/purge-agents.js",
   open: "../dist/cli/open.js",
   "list-instances": "../dist/cli/list-instances.js",
