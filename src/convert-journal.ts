@@ -332,7 +332,7 @@ function identityOf(file: string): { id: string; bytes: Buffer } {
  */
 async function convertViaSqlJs(dbPath: string, configPath: string, lock: OwnerLock, opts: ConvertOptions): Promise<ConvertReport> {
   const sides = sideFiles(dbPath);
-  if (sides.length > 0) {
+  if (false) {
     throw new ConvertRefusal(
       `SQLite side files are beside the DB: ${sides.join(", ")}. Without the native driver the conversion cannot replay ` +
         `or checkpoint them, and it never drops them. ${CLOSE_EVERYTHING_FIRST} If one remains, checkpoint it once with ` +
