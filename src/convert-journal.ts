@@ -27,7 +27,7 @@ import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
 import { readDriverHeader, nativeDriverLoads, RELAY_APP_ID_NATIVE, RELAY_APP_ID_WASM, JOURNAL_BYTES_DELETE, JOURNAL_BYTES_WAL } from "./db-header.js";
 import { holdOwnerForMaintenance, checkpointBeforeRestoreSwap, loadSqlJs } from "./sqlite-compat.js";
-import type { OwnerLock } from "./db-owner-lock.js";
+import { lockKey, type OwnerLock } from "./db-owner-lock.js";
 import { readSqliteDriverAt, configPathOverride, getConfigPath } from "./config.js";
 import { colocatedConfigPathFor } from "./instance.js";
 import { getDbPath, assertStillContained } from "./db.js";
@@ -77,7 +77,7 @@ class ConvertRefusal extends Error {
  */
 function openForConversion(file: string, readonly: boolean): BetterSqlite3.Database {
   const D = createRequire(import.meta.url)("better-sqlite3") as typeof BetterSqlite3;
-  const db = new D(file, { readonly, fileMustExist: true });
+  const db = new D(file, { readonly, fileMustExist: true, timeout: 0 }); // never wait: a busy DB is refused by name
   try {
     assertStillContained(file);
   } catch (err) {
@@ -112,11 +112,81 @@ function sideFiles(file: string): string[] {
 }
 
 /**
+ * Codex #401 R1 P1-1/P1-2: the conversion's target is PINNED once, after the lock: the DB's canonical file. Every check
+ * and every write uses it, and before each step it is re-bound to the acquired lock: the path still resolves to it,
+ * its lock key is the lock's own, it has one link, and the lock file is still the one taken.
+ */
+interface Pinned {
+  dbPath: string;
+  target: string;
+  lock: OwnerLock;
+}
+function pinTarget(dbPath: string, lock: OwnerLock): Pinned {
+  const p = { dbPath, target: fs.realpathSync.native(dbPath), lock };
+  assertBound(p);
+  return p;
+}
+function assertBound(p: Pinned): void {
+  let now: string;
+  try {
+    now = fs.realpathSync.native(p.dbPath);
+  } catch (err) {
+    throw new ConvertRefusal(`the DB at ${p.dbPath} is gone (${(err as NodeJS.ErrnoException).code}). Nothing more was changed.`);
+  }
+  if (now !== p.target) {
+    throw new ConvertRefusal(`the DB path ${p.dbPath} now resolves to ${now}, not to ${p.target}, the file this conversion locked. Nothing more was changed.`);
+  }
+  if (lockKey(p.target) !== p.lock.key) {
+    throw new ConvertRefusal(`the DB file ${p.target} is no longer the one this conversion's lock was taken for. Nothing more was changed.`);
+  }
+  const n = fs.statSync(p.target).nlink;
+  if (n > 1) {
+    throw new ConvertRefusal(`the DB file ${p.target} has ${n} hard links now: another name could be converted beside this one. Remove the extra links, then retry. Nothing more was changed.`);
+  }
+  try {
+    p.lock.assertIntact();
+  } catch (err) {
+    throw new ConvertRefusal(`${(err as Error).message} Nothing more was changed.`);
+  }
+}
+/** The side files beside BOTH names of the DB (the path and its canonical file), each listed once. */
+function sideFilesOf(p: Pinned): string[] {
+  const names = p.dbPath === p.target ? [p.target] : [p.dbPath, p.target];
+  return [...new Set(names.flatMap((n) => sideFiles(n)))];
+}
+/** A SQLITE_BUSY from SQLite (another connection holds a lock), as a named refusal. */
+function busyRefusal(err: unknown, target: string): never {
+  const code = (err as { code?: string }).code ?? "";
+  if (/^SQLITE_BUSY|^SQLITE_LOCKED/.test(code) || /database is locked/i.test((err as Error).message)) {
+    throw new ConvertRefusal(`the DB at ${target} is in use by another process (SQLite: ${(err as Error).message}). ${CLOSE_EVERYTHING_FIRST} Nothing was changed.`);
+  }
+  throw err;
+}
+
+/**
  * The config file convert-journal writes: the DB's own instance config (its directory's config.json) when the DB has
  * an instance, else the caller's config. RELAY_CONFIG_PATH naming a DIFFERENT file from the DB's own is refused (the
  * two would then disagree).
  */
 function targetConfigPath(dbPath: string): string {
+  const chosen = chooseConfigPath(dbPath);
+  // Codex #401 R1 P2-7: a DANGLING symlink config is refused BEFORE anything changes (its link is never replaced by a
+  // regular file, and its intended referent is not guessed at).
+  let st: fs.Stats | null = null;
+  try {
+    st = fs.lstatSync(chosen);
+  } catch {
+    st = null;
+  }
+  if (st?.isSymbolicLink() && !fs.existsSync(chosen)) {
+    throw new ConvertRefusal(
+      `the instance config ${chosen} is a symlink to ${fs.readlinkSync(chosen)}, which does not exist (a dangling link). ` +
+        `Restore its target or replace the link, then retry. Nothing was changed.`
+    );
+  }
+  return chosen;
+}
+function chooseConfigPath(dbPath: string): string {
   const own = colocatedConfigPathFor(dbPath);
   const pinned = configPathOverride();
   if (own !== null) {
@@ -130,11 +200,17 @@ function targetConfigPath(dbPath: string): string {
   }
   return getConfigPath();
 }
+/** The canonical spelling of `p`: its realpath, or (an absent leaf) its EXISTING parent's realpath + its name (Codex #401 R1 P2-7). */
 const realOrResolved = (p: string): string => {
   try {
     return fs.realpathSync.native(p);
   } catch {
-    return path.resolve(p);
+    const abs = path.resolve(p);
+    try {
+      return path.join(fs.realpathSync.native(path.dirname(abs)), path.basename(abs));
+    } catch {
+      return abs;
+    }
   }
 };
 
@@ -180,18 +256,22 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
   }
 
   // The single-owner lock BEFORE any read: refused while a wasm owner is live, and kept for the whole conversion. It
-  // also refuses a DB with more than one hard link (each name would be its own key).
+  // also refuses a DB with more than one hard link (each name would be its own key). Native openers refuse while it is
+  // held (the ruling on Codex #401 R1 P1-3 (a)).
   const lock = await holdOwnerForMaintenance(dbPath, "convert-journal");
   try {
-    if (!native.ok) return await convertViaSqlJs(dbPath, configPath, lock, opts);
-    const before = readDriverHeader(dbPath); // this process holds no handle on it: one fs read
+    const p = pinTarget(dbPath, lock);
+    if (!native.ok) return await convertViaSqlJs(p, configPath, opts);
+    const target = p.target;
+    recoverHotJournal(p); // P2-8: a crashed converter's journal is rolled back by SQLite; a live writer's is refused
+    const before = readDriverHeader(target); // this process holds no handle on it: one fs read
     if (before.kind === "foreign" || before.kind === "unrecognised") {
       throw new ConvertRefusal(`the file at ${dbPath} is not a relay database (${before.kind}). Nothing was changed.`);
     }
     if (before.kind === "absent") throw new ConvertRefusal(`the DB at ${dbPath} is empty. Nothing to convert.`);
     if (before.kind === "wasm") {
       // An RLYW file has no side file while no owner runs (DELETE mode, a clean close): any is an anomaly.
-      const sides = sideFiles(dbPath);
+      const sides = sideFilesOf(p);
       if (sides.length > 0) {
         throw new ConvertRefusal(`side files are beside the wasm-owned DB: ${sides.join(", ")}. Something else has it open. Nothing was changed.`);
       }
@@ -199,11 +279,11 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
       // A native or legacy file: the bare checkpoint removes the side files a clean last close would; any left means
       // another process has the DB open.
       try {
-        checkpointBeforeRestoreSwap(dbPath);
+        checkpointBeforeRestoreSwap(target);
       } catch (err) {
         throw new ConvertRefusal(`${(err as Error).message.replace(/^restore refused: /, "")} ${CLOSE_EVERYTHING_FIRST}`);
       }
-      const sides = sideFiles(dbPath);
+      const sides = sideFilesOf(p);
       if (sides.length > 0) {
         throw new ConvertRefusal(
           `SQLite side files are beside the DB: ${sides.join(", ")}. Another process has it open. ${CLOSE_EVERYTHING_FIRST} Nothing was changed.`
@@ -211,58 +291,60 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
       }
     }
 
+    /** One step on the pinned target, re-bound to the lock first; a busy DB is a named refusal. */
+    const step = (fn: (db: BetterSqlite3.Database) => void): void => {
+      assertBound(p);
+      const db = openForConversion(target, false);
+      try {
+        fn(db);
+      } catch (err) {
+        busyRefusal(err, target);
+      } finally {
+        db.close();
+      }
+    };
+    /** The stamp: BEGIN EXCLUSIVE (the ruling on P1-3 (b)): no other connection may hold even a read lock across it. */
+    const stamp = (id: number) =>
+      step((db) => {
+        db.exec("BEGIN EXCLUSIVE");
+        try {
+          db.pragma(`application_id = ${id}`);
+          db.exec("COMMIT");
+        } catch (err) {
+          if (db.inTransaction) db.exec("ROLLBACK");
+          throw err;
+        }
+      });
+
     let converted = false;
     if (to === "wasm") {
       if (before.kind !== "wasm") {
-        if (journalBytes(dbPath) !== JOURNAL_BYTES_DELETE) {
-          const db = openForConversion(dbPath, false);
-          try {
-            db.pragma("journal_mode = DELETE"); // outside a transaction
-          } finally {
-            db.close();
-          }
+        if (journalBytes(target) !== JOURNAL_BYTES_DELETE) {
+          step((db) => db.pragma("journal_mode = DELETE")); // outside a transaction; leaving WAL is exclusive in SQLite
           converted = true;
         }
         fail("journal");
-        const db = openForConversion(dbPath, false);
-        try {
-          db.exec("BEGIN IMMEDIATE");
-          db.pragma(`application_id = ${RELAY_APP_ID_WASM}`);
-          db.exec("COMMIT");
-        } finally {
-          db.close();
-        }
+        stamp(RELAY_APP_ID_WASM);
         converted = true;
-      } else if (journalBytes(dbPath) !== JOURNAL_BYTES_DELETE) {
+      } else if (journalBytes(target) !== JOURNAL_BYTES_DELETE) {
         // An RLYW file is always DELETE-mode; a WAL bit here is an anomaly this conversion does not guess at.
-        throw new ConvertRefusal(`the wasm-owned DB at ${dbPath} is not in DELETE journal mode (${journalBytes(dbPath)}). Nothing was changed.`);
+        throw new ConvertRefusal(`the wasm-owned DB at ${dbPath} is not in DELETE journal mode (${journalBytes(target)}). Nothing was changed.`);
       }
       fail("stamp");
     } else {
       if (before.kind !== "native") {
-        const db = openForConversion(dbPath, false);
-        try {
-          db.exec("BEGIN IMMEDIATE");
-          db.pragma(`application_id = ${RELAY_APP_ID_NATIVE}`); // the stamp FIRST: never a W+WAL file
-          db.exec("COMMIT");
-        } finally {
-          db.close();
-        }
+        stamp(RELAY_APP_ID_NATIVE); // the stamp FIRST: never a W+WAL file
         converted = true;
       }
       fail("stamp");
-      if (journalBytes(dbPath) !== JOURNAL_BYTES_WAL) {
-        const db = openForConversion(dbPath, false);
-        try {
-          db.pragma("journal_mode = WAL");
-        } finally {
-          db.close();
-        }
+      if (journalBytes(target) !== JOURNAL_BYTES_WAL) {
+        step((db) => db.pragma("journal_mode = WAL"));
         converted = true;
       }
       fail("journal");
     }
 
+    assertBound(p);
     const declared = fs.existsSync(configPath) ? readSqliteDriverAt(fs.realpathSync.native(configPath)).value : undefined;
     if (declared !== to) {
       writeDriverDeclaration(configPath, to);
@@ -272,9 +354,10 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
 
     // Verify after CLOSE: the header kind and journal bytes from the file, integrity through a read-only connection,
     // and the config read back.
-    const after = readDriverHeader(dbPath);
-    const journal = journalBytes(dbPath);
-    const v = openForConversion(dbPath, true);
+    assertBound(p);
+    const after = readDriverHeader(target);
+    const journal = journalBytes(target);
+    const v = openForConversion(target, true);
     let integrity: string;
     try {
       integrity = String(v.pragma("integrity_check", { simple: true }));
@@ -283,15 +366,40 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
     }
     const config = String(readSqliteDriverAt(fs.realpathSync.native(configPath)).value);
     const want = { header: to, journal: to === "wasm" ? JOURNAL_BYTES_DELETE : JOURNAL_BYTES_WAL, integrity: "ok", config: to };
-    if (after.kind !== want.header || journal !== want.journal || integrity !== "ok" || config !== to) {
+    if (after.kind !== want.header || journal !== want.journal || integrity !== "ok" || config !== to || sideFilesOf(p).length > 0) {
       throw new ConvertRefusal(
         `the conversion did not verify: header ${after.kind} (want ${want.header}), journal ${journal} (want ${want.journal}), ` +
-          `integrity ${integrity}, config ${config}. Run it again; if this repeats, restore the safety backup.`
+          `integrity ${integrity}, config ${config}, side files [${sideFilesOf(p).join(", ")}]. Run it again; if this repeats, restore the safety backup.`
       );
     }
     return { converted, to, dbPath, configPath, header: after.kind, journal, integrity, config, via: "native" };
   } finally {
     lock.release();
+  }
+}
+
+/**
+ * The ruling on Codex #401 R1 P2-8: a rollback journal beside the DB is RECOVERED natively. SQLite's own hot-journal
+ * test decides: a crashed converter's (or any crashed writer's) journal is hot and rolled back when the connection
+ * takes its first lock; a LIVE writer's is not hot (its RESERVED lock is held), so SQLite reports BUSY: refused by name.
+ * Only -journal takes this path (-wal/-shm beside an RLYW file stay anomalies, refused by the checks after it).
+ */
+function recoverHotJournal(p: Pinned): void {
+  const journals = [p.target, p.dbPath].map((n) => `${n}-journal`).filter((j) => fs.existsSync(j));
+  if (journals.length === 0) return;
+  assertBound(p);
+  const db = openForConversion(p.target, false);
+  try {
+    db.exec("BEGIN EXCLUSIVE"); // takes SHARED first: a hot journal is rolled back here; a live writer's lock is BUSY
+    db.exec("ROLLBACK");
+  } catch (err) {
+    busyRefusal(err, p.target);
+  } finally {
+    db.close();
+  }
+  const left = [p.target, p.dbPath].map((n) => `${n}-journal`).filter((j) => fs.existsSync(j));
+  if (left.length > 0) {
+    throw new ConvertRefusal(`a rollback journal is still beside the DB after recovery (${left.join(", ")}). ${CLOSE_EVERYTHING_FIRST} Nothing was changed.`);
   }
 }
 
@@ -330,108 +438,151 @@ function identityOf(file: string): { id: string; bytes: Buffer } {
  * directory fsync (a failed rename is refused, the temp named; never a copy over in place) → the config → verify from
  * a fresh load.
  */
-async function convertViaSqlJs(dbPath: string, configPath: string, lock: OwnerLock, opts: ConvertOptions): Promise<ConvertReport> {
-  const sides = sideFiles(dbPath);
+async function convertViaSqlJs(p: Pinned, configPath: string, opts: ConvertOptions): Promise<ConvertReport> {
+  const { dbPath, target } = p;
+  const sides = sideFilesOf(p); // Codex #401 R1 P1-1: beside the path AND its canonical file
+  if (sides.some((x) => x.includes("-journal"))) {
+    // The ruling on P2-8: without the native driver a rollback journal cannot be recovered here (sql.js does not).
+    throw new ConvertRefusal(
+      `a rollback journal is beside the DB: ${sides.join(", ")}. Without the native driver it cannot be recovered here. ` +
+        `With every relay process stopped, let any SQLite 3 recover it, e.g. \`sqlite3 '${target}' 'PRAGMA integrity_check;'\` ` +
+        `with every relay process stopped, then retry. Nothing was changed.`
+    );
+  }
   if (sides.length > 0) {
     throw new ConvertRefusal(
       `SQLite side files are beside the DB: ${sides.join(", ")}. Without the native driver the conversion cannot replay ` +
         `or checkpoint them, and it never drops them. ${CLOSE_EVERYTHING_FIRST} If one remains, checkpoint it once with ` +
-        `any SQLite 3, e.g. \`sqlite3 '${dbPath}' 'PRAGMA wal_checkpoint(TRUNCATE);'\`, then retry. Nothing was changed.`
+        `any SQLite 3, e.g. \`sqlite3 '${target}' 'PRAGMA wal_checkpoint(TRUNCATE);'\`, then retry. Nothing was changed.`
     );
   }
-  const head = readDriverHeader(dbPath);
+  const head = readDriverHeader(target);
   const SQL = await loadSqlJs();
   if (head.kind === "wasm") {
     // Already converted (a run interrupted after the replace): only the declaration may remain.
     const declared = readSqliteDriverAt(realOrResolved(configPath)).value;
     if (declared !== "wasm") writeDriverDeclaration(configPath, "wasm");
-    return verifySqlJs(SQL, dbPath, configPath, null, declared !== "wasm", undefined);
+    return verifySqlJs(SQL, p, configPath, null, declared !== "wasm", undefined);
   }
   if (head.kind !== "native" && head.kind !== "legacy") {
     throw new ConvertRefusal(`the DB at ${dbPath} is ${head.kind}: only a native (RLYN) or legacy (unstamped) relay DB converts. Nothing was changed.`);
   }
 
-  const first = identityOf(dbPath);
-  // `first.bytes` must stay the original, byte for byte, for the safety copy: loadImage copies it (measured on sql.js
-  // 1.14.2: with the array passed directly, the DELETE + RLYW edits changed it, so the "safety copy" was the edited image).
-  const img = loadImage(SQL, first.bytes);
-  let image: Uint8Array;
-  let counts: Record<string, number>;
-  let safetyCopy: string;
+  // The ruling on P1-3 (d): an fd on the ORIGINAL inode is kept through the rename, so a write that lands on it after
+  // every check (an idle native handle opened before the conversion) is seen afterwards, never reported as a success.
+  const orig = fs.openSync(target, "r");
   try {
-    const inv = inventory(img);
-    if (inv.integrity !== "ok") throw new ConvertRefusal(`the DB at ${dbPath} fails integrity_check (${inv.integrity}). Nothing was changed.`);
-    counts = inv.counts;
-
-    // The safety copy of the ORIGINAL bytes, BEFORE any edit (this path replaces the whole file).
-    safetyCopy = writeSafetyCopy(dbPath, first.bytes);
-
-    img.exec("PRAGMA journal_mode = DELETE");
-    img.exec(`PRAGMA application_id = ${RELAY_APP_ID_WASM}`);
-    image = img.export();
-  } finally {
-    img.close();
-  }
-
-  opts._beforeReplaceForTests?.();
-  const now = sideFiles(dbPath);
-  if (identityOf(dbPath).id !== first.id || now.length > 0) {
-    throw new ConvertRefusal(
-      `the DB at ${dbPath} changed while it was being converted (another process wrote it${now.length ? `; side files: ${now.join(", ")}` : ""}). ` +
-        `${CLOSE_EVERYTHING_FIRST} Nothing was replaced (a safety copy is at ${safetyCopy}).`
-    );
-  }
-
-  const target = fs.realpathSync.native(dbPath);
-  const dir = path.dirname(target);
-  const tmp = path.join(dir, `.${path.basename(target)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.convert`);
-  const fd = fs.openSync(tmp, "wx", 0o600);
-  try {
-    fs.writeSync(fd, image);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  lock.assertIntact(); // immediately before the rename: this acquisition, its lock file still at its name
-  assertStillContained(dbPath); // ADR-0048: the path is still inside the relay's roots
-  try {
-    (opts._renameForTests ?? fs.renameSync)(tmp, target);
-  } catch (err) {
-    throw new ConvertRefusal(
-      `the converted image could not be renamed onto ${target} (${(err as Error).message}). The original is unchanged; the ` +
-        `converted image is at ${tmp} (remove it, or retry). Nothing was copied over in place.`
-    );
-  }
-  if (process.platform !== "win32") {
-    const dfd = fs.openSync(dir, "r");
+    const first = identityOfFd(orig);
+    // `first.bytes` must stay the original, byte for byte, for the safety copy: loadImage copies it (measured on sql.js
+    // 1.14.2: with the array passed directly, the DELETE + RLYW edits changed it, so the "safety copy" was the edited image).
+    const img = loadImage(SQL, first.bytes);
+    let image: Uint8Array;
+    let counts: Record<string, number>;
+    let safetyCopy: string;
     try {
-      fs.fsyncSync(dfd);
+      const inv = inventory(img);
+      if (inv.integrity !== "ok") throw new ConvertRefusal(`the DB at ${dbPath} fails integrity_check (${inv.integrity}). Nothing was changed.`);
+      counts = inv.counts;
+
+      // The safety copy of the ORIGINAL bytes, BEFORE any edit (this path replaces the whole file).
+      safetyCopy = writeSafetyCopy(target, first.bytes, "pre-convert");
+
+      img.exec("PRAGMA journal_mode = DELETE");
+      img.exec(`PRAGMA application_id = ${RELAY_APP_ID_WASM}`);
+      image = img.export();
     } finally {
-      fs.closeSync(dfd);
+      img.close();
     }
+
+    opts._beforeReplaceForTests?.();
+    assertBound(p); // P1-2: the same file, its lock key the lock's, one link
+    const now = sideFilesOf(p);
+    if (identityOfFd(orig).id !== first.id || identityOf(target).id !== first.id || now.length > 0) {
+      throw new ConvertRefusal(
+        `the DB at ${dbPath} changed while it was being converted (another process wrote it${now.length ? `; side files: ${now.join(", ")}` : ""}). ` +
+          `${CLOSE_EVERYTHING_FIRST} Nothing was replaced (a safety copy is at ${safetyCopy}).`
+      );
+    }
+
+    const dir = path.dirname(target);
+    const tmp = path.join(dir, `.${path.basename(target)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.convert`);
+    const fd = fs.openSync(tmp, "wx", 0o600);
+    try {
+      fs.writeSync(fd, image);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    assertBound(p); // immediately before the rename
+    assertStillContained(dbPath); // ADR-0048: the path is still inside the relay's roots
+    try {
+      (opts._renameForTests ?? fs.renameSync)(tmp, target);
+    } catch (err) {
+      throw new ConvertRefusal(
+        `the converted image could not be renamed onto ${target} (${(err as Error).message}). The original is unchanged; the ` +
+          `converted image is at ${tmp} (remove it, or retry). Nothing was copied over in place.`
+      );
+    }
+    if (process.platform !== "win32") {
+      const dfd = fs.openSync(dir, "r");
+      try {
+        fs.fsyncSync(dfd);
+      } finally {
+        fs.closeSync(dfd);
+      }
+    }
+    // P1-3 (d): the ORIGINAL inode, re-read through the kept fd: a write that landed on it since the read is LOST from
+    // the converted DB. That is a FAILURE: its bytes are saved beside the safety copy, and the remedy named.
+    const late = identityOfFd(orig);
+    if (late.id !== first.id) {
+      const saved = writeSafetyCopy(target, late.bytes, "late-write");
+      throw new ConvertRefusal(
+        `FAILED: another process wrote the DB while it was being replaced (the original file changed after its last check), ` +
+          `so the converted DB at ${target} does not hold that write. The original file as it ended is saved at ${saved} (the ` +
+          `pre-conversion bytes at ${safetyCopy}). Stop every relay process, then restore the one you need (e.g. \`relay restore\` ` +
+          `from a backup, or copy ${saved} over the DB and run \`relay convert-journal --to wasm\` again).`
+      );
+    }
+    writeDriverDeclaration(configPath, "wasm");
+    return verifySqlJs(SQL, p, configPath, counts, true, safetyCopy);
+  } finally {
+    fs.closeSync(orig);
   }
-  writeDriverDeclaration(configPath, "wasm");
-  return verifySqlJs(SQL, dbPath, configPath, counts, true, safetyCopy);
+}
+
+/** The identity (size, mtime ns, content hash) and the bytes of the open file `fd`, read through it (its inode). */
+function identityOfFd(fd: number): { id: string; bytes: Buffer } {
+  const st = fs.fstatSync(fd, { bigint: true });
+  const bytes = Buffer.alloc(Number(st.size));
+  let off = 0;
+  while (off < bytes.length) {
+    const n = fs.readSync(fd, bytes, off, bytes.length - off, off);
+    if (n === 0) break;
+    off += n;
+  }
+  return { id: `${st.size}:${st.mtimeNs}:${crypto.createHash("sha256").update(bytes).digest("hex")}`, bytes };
 }
 
 /** The safety copy: a NEW file (exclusive, 0600) in the backups directory beside the DB, the original bytes exactly. */
-function writeSafetyCopy(dbPath: string, original: Buffer): string {
+function writeSafetyCopy(dbPath: string, original: Buffer, label: "pre-convert" | "late-write"): string {
   const backups = path.join(path.dirname(dbPath), "backups");
   fs.mkdirSync(backups, { recursive: true, mode: 0o700 });
-  const file = path.join(backups, `${path.basename(dbPath)}.pre-convert-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}.bak`);
+  const file = path.join(backups, `${path.basename(dbPath)}.${label}-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}.bak`);
   fs.writeFileSync(file, original, { mode: 0o600, flag: "wx" });
   return file;
 }
 
 function verifySqlJs(
   SQL: any,
-  dbPath: string,
+  p: Pinned,
   configPath: string,
   counts: Record<string, number> | null,
   converted: boolean,
   safetyCopy: string | undefined
 ): ConvertReport {
-  const bytes = fs.readFileSync(dbPath);
+  const dbPath = p.dbPath;
+  assertBound(p);
+  const bytes = fs.readFileSync(p.target);
   const journal = `${bytes[18]}/${bytes[19]}`;
   const id = bytes.length >= 72 ? bytes.readUInt32BE(68) : 0;
   const img = loadImage(SQL, bytes);
