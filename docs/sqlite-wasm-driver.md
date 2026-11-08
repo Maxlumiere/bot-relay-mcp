@@ -93,6 +93,7 @@ relay convert-journal --to native    # wasm → native
 
 - It runs offline, under the database's single-owner lock: it is refused while a wasm owner is live, while another process has the database open (SQLite side files remain), and on a database with more than one hard link.
 - An older relay running the pre-5.0.0 legacy wasm mode holds no lock and cannot be detected, so close everything first.
+- **It works without the native driver too** (native → wasm only): through sql.js. It then refuses any SQLite side file beside the database (even an empty one; checkpoint a leftover WAL once with any SQLite 3, e.g. `sqlite3 relay.db 'PRAGMA wal_checkpoint(TRUNCATE);'`), writes a byte-for-byte safety copy of the original into the `backups` directory beside the database, and replaces the file atomically. wasm → native needs the native driver.
 - Each step leaves a file its header's driver opens, and the command is idempotent: if it is interrupted, run it again and it completes.
 - It also writes the instance's `sqlite_driver` (to the real file behind a symlinked `config.json`; every other field kept, mode 0600). `RELAY_CONFIG_PATH` naming a different file from the database's own instance config is refused.
 - **A restore** re-stamps the archive's database to the instance's driver (its declaration, else the live database's header, else native), so a backup made before a conversion still restores. A declaration that disagrees with the live database's header refuses the restore by name.

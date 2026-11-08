@@ -305,6 +305,10 @@ export function _setNativeProbeForTests(fn: (() => ProbeResult) | null): void {
   if (!process.env.VITEST) throw new Error("_setNativeProbeForTests is test-only: VITEST is not set");
   testProbe = fn;
 }
+/** Whether the native driver loads in THIS process (the installed probe; never opens a DB file). */
+export function nativeDriverLoads(): ProbeResult {
+  return nativeProbe();
+}
 function nativeProbe(): ProbeResult {
   const fn = testProbe ?? installedProbe;
   if (!fn) throw new Error("internal: no native-driver probe is installed (src/sqlite-compat.ts installs it when loaded)");

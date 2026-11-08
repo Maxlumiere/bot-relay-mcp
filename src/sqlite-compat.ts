@@ -187,12 +187,11 @@ export function resolveOpen(dbPath: string, purpose: "open" | "read"): ResolvedO
   // only reads) keeps db-header's verdict, as before.
   if (purpose === "open" && d.driver === "wasm" && (peek.kind === "legacy" || peek.kind === "native")) {
     const kind = peek.kind === "native" ? "a native relay database (RLYN)" : "a legacy (unstamped) relay database";
-    const nativeHere = nativeLoadsHere();
+    // The conversion works where the native driver does not load too (its sql.js converter), so the remedy is real here.
     throw new DbHeaderRefusedError(
       `REFUSING the wasm driver on the DB at '${dbPath}': its header says it is ${kind}, and a wasm owner never adopts ` +
         `a file it did not stamp. Either run native (unset RELAY_SQLITE_DRIVER and remove any sqlite_driver "wasm" from ` +
-        `the instance's config.json), or convert it once, with every relay process stopped: \`relay convert-journal --to wasm\`` +
-        (nativeHere.ok ? "." : ` (the conversion needs the native driver, which does not load here: ${nativeHere.reason}; approve better-sqlite3's install script first).`)
+        `the instance's config.json), or convert it once, with every relay process stopped: \`relay convert-journal --to wasm\`.`
     );
   }
   if (d.driver === "native") {

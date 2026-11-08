@@ -770,7 +770,7 @@ npm rebuild                                    # build the native binary
 
 ```bash
 RELAY_SQLITE_DRIVER=wasm node dist/index.js   # a NEW database: created owned by this process
-relay convert-journal --to wasm               # an EXISTING database: convert it once, every relay process stopped
+relay convert-journal --to wasm               # an EXISTING database: convert it once, every relay process stopped (works without the native driver)
 ```
 
 Since 5.0.0 an existing native or legacy database is never opened by wasm until it is converted (the refusal names the command). `wasm` is **single-process only** (see the note above — not for multi-terminal stdio). `sql.js` is an installed *optional* dependency; if you installed with `--omit=optional`, add it back with `npm install sql.js`.

@@ -22,10 +22,12 @@
  */
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
-import { readDriverHeader, RELAY_APP_ID_NATIVE, RELAY_APP_ID_WASM } from "./db-header.js";
-import { holdOwnerForMaintenance, checkpointBeforeRestoreSwap } from "./sqlite-compat.js";
+import { readDriverHeader, nativeDriverLoads, RELAY_APP_ID_NATIVE, RELAY_APP_ID_WASM } from "./db-header.js";
+import { holdOwnerForMaintenance, checkpointBeforeRestoreSwap, loadSqlJs } from "./sqlite-compat.js";
+import type { OwnerLock } from "./db-owner-lock.js";
 import { readSqliteDriverAt, configPathOverride, getConfigPath } from "./config.js";
 import { colocatedConfigPathFor } from "./instance.js";
 import { getDbPath, assertStillContained } from "./db.js";
@@ -41,8 +43,10 @@ export interface ConvertReport {
   journal: string;
   integrity: string;
   config: string;
-  /** Which converter ran. */
-  via: "native";
+  /** Which converter ran: the native one, or the sql.js one (a host where the native driver does not load). */
+  via: "native" | "sqljs";
+  /** The sql.js converter's safety copy of the original bytes (it replaces the whole file). */
+  safetyCopy?: string;
 }
 type Step = "journal" | "stamp" | "config";
 export interface ConvertOptions {
@@ -50,6 +54,10 @@ export interface ConvertOptions {
   dbPath?: string;
   /** Test-only: throw right after this step (the crash-consistency rows). */
   _failAfterForTests?: Step;
+  /** Test-only (sql.js converter): run after the image is read, before the identity re-check. */
+  _beforeReplaceForTests?: () => void;
+  /** Test-only (sql.js converter): replaces the rename of the temp file onto the DB. */
+  _renameForTests?: (from: string, to: string) => void;
 }
 
 export const CLOSE_EVERYTHING_FIRST =
@@ -166,10 +174,16 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
     if (opts._failAfterForTests === step) throw new Error(`injected failure after the ${step} step`);
   };
 
+  const native = nativeDriverLoads();
+  if (!native.ok && to === "native") {
+    throw new ConvertRefusal(`converting to native needs the native driver, which does not load here (${native.reason}). Nothing was changed.`);
+  }
+
   // The single-owner lock BEFORE any read: refused while a wasm owner is live, and kept for the whole conversion. It
   // also refuses a DB with more than one hard link (each name would be its own key).
   const lock = await holdOwnerForMaintenance(dbPath, "convert-journal");
   try {
+    if (!native.ok) return await convertViaSqlJs(dbPath, configPath, lock, opts);
     const before = readDriverHeader(dbPath); // this process holds no handle on it: one fs read
     if (before.kind === "foreign" || before.kind === "unrecognised") {
       throw new ConvertRefusal(`the file at ${dbPath} is not a relay database (${before.kind}). Nothing was changed.`);
@@ -279,4 +293,149 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
   } finally {
     lock.release();
   }
+}
+
+// --- The wasm-only converter (sql.js, native→wasm only; the architect's ruling) ---
+
+/** The ONE sql.js construction here: the image load, and the fresh verify load. */
+function loadImage(SQL: any, bytes: Uint8Array): any {
+  return new SQL.Database(bytes);
+}
+/** integrity_check and every table's row count, on a loaded image. */
+function inventory(img: any): { integrity: string; counts: Record<string, number> } {
+  const integrity = String(img.exec("PRAGMA integrity_check")[0]?.values[0]?.[0]);
+  const counts: Record<string, number> = {};
+  const tables = img.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")[0];
+  for (const [name] of (tables?.values ?? []) as [string][]) {
+    counts[name] = Number(img.exec(`SELECT count(*) FROM "${name.replace(/"/g, '""')}"`)[0].values[0][0]);
+  }
+  return { integrity, counts };
+}
+/** The main file's identity: size, mtime (ns) and a content hash, from one read. */
+function identityOf(file: string): { id: string; bytes: Buffer } {
+  const st = fs.statSync(file, { bigint: true });
+  const bytes = fs.readFileSync(file);
+  return { id: `${st.size}:${st.mtimeNs}:${crypto.createHash("sha256").update(bytes).digest("hex")}`, bytes };
+}
+
+/**
+ * native→wasm where the native driver does not load: the whole file is REPLACED by a re-serialised sql.js image, so a
+ * safety copy of the original bytes is written first. Ruled order: (the lock is held) → refuse on ANY side file (sql.js
+ * would not replay a hot WAL: refused, never dropped) or a header other than N/0 (W: already converted, the config
+ * checked) → identity + read + load + integrity + row counts → the safety copy → DELETE + RLYW on the image, exported →
+ * identity and side files re-checked → a dotfile temp in the referent's directory, fsync, rename onto the referent,
+ * directory fsync (a failed rename is refused, the temp named; never a copy over in place) → the config → verify from
+ * a fresh load.
+ */
+async function convertViaSqlJs(dbPath: string, configPath: string, lock: OwnerLock, opts: ConvertOptions): Promise<ConvertReport> {
+  const sides = sideFiles(dbPath);
+  if (sides.length > 0) {
+    throw new ConvertRefusal(
+      `SQLite side files are beside the DB: ${sides.join(", ")}. Without the native driver the conversion cannot replay ` +
+        `or checkpoint them, and it never drops them. ${CLOSE_EVERYTHING_FIRST} If one remains, checkpoint it once with ` +
+        `any SQLite 3, e.g. \`sqlite3 '${dbPath}' 'PRAGMA wal_checkpoint(TRUNCATE);'\`, then retry. Nothing was changed.`
+    );
+  }
+  const head = readDriverHeader(dbPath);
+  const SQL = await loadSqlJs();
+  if (head.kind === "wasm") {
+    // Already converted (a run interrupted after the replace): only the declaration may remain.
+    const declared = readSqliteDriverAt(realOrResolved(configPath)).value;
+    if (declared !== "wasm") writeDriverDeclaration(configPath, "wasm");
+    return verifySqlJs(SQL, dbPath, configPath, null, declared !== "wasm", undefined);
+  }
+  if (head.kind !== "native" && head.kind !== "legacy") {
+    throw new ConvertRefusal(`the DB at ${dbPath} is ${head.kind}: only a native (RLYN) or legacy (unstamped) relay DB converts. Nothing was changed.`);
+  }
+
+  const first = identityOf(dbPath);
+  const img = loadImage(SQL, first.bytes);
+  let image: Uint8Array;
+  let counts: Record<string, number>;
+  try {
+    const inv = inventory(img);
+    if (inv.integrity !== "ok") throw new ConvertRefusal(`the DB at ${dbPath} fails integrity_check (${inv.integrity}). Nothing was changed.`);
+    counts = inv.counts;
+    img.exec("PRAGMA journal_mode = DELETE");
+    img.exec(`PRAGMA application_id = ${RELAY_APP_ID_WASM}`);
+    image = img.export();
+  } finally {
+    img.close();
+  }
+
+  // The safety copy of the ORIGINAL bytes (this path replaces the whole file).
+  const backups = path.join(path.dirname(dbPath), "backups");
+  fs.mkdirSync(backups, { recursive: true, mode: 0o700 });
+  const safetyCopy = path.join(backups, `${path.basename(dbPath)}.pre-convert-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}.bak`);
+  fs.writeFileSync(safetyCopy, first.bytes, { mode: 0o600, flag: "wx" });
+
+  opts._beforeReplaceForTests?.();
+  const now = sideFiles(dbPath);
+  if (identityOf(dbPath).id !== first.id || now.length > 0) {
+    throw new ConvertRefusal(
+      `the DB at ${dbPath} changed while it was being converted (another process wrote it${now.length ? `; side files: ${now.join(", ")}` : ""}). ` +
+        `${CLOSE_EVERYTHING_FIRST} Nothing was replaced (a safety copy is at ${safetyCopy}).`
+    );
+  }
+
+  const target = fs.realpathSync.native(dbPath);
+  const dir = path.dirname(target);
+  const tmp = path.join(dir, `.${path.basename(target)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.convert`);
+  const fd = fs.openSync(tmp, "wx", 0o600);
+  try {
+    fs.writeSync(fd, image);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  lock.assertIntact(); // immediately before the rename: this acquisition, its lock file still at its name
+  assertStillContained(dbPath); // ADR-0048: the path is still inside the relay's roots
+  try {
+    (opts._renameForTests ?? fs.renameSync)(tmp, target);
+  } catch (err) {
+    throw new ConvertRefusal(
+      `the converted image could not be renamed onto ${target} (${(err as Error).message}). The original is unchanged; the ` +
+        `converted image is at ${tmp} (remove it, or retry). Nothing was copied over in place.`
+    );
+  }
+  if (process.platform !== "win32") {
+    const dfd = fs.openSync(dir, "r");
+    try {
+      fs.fsyncSync(dfd);
+    } finally {
+      fs.closeSync(dfd);
+    }
+  }
+  writeDriverDeclaration(configPath, "wasm");
+  return verifySqlJs(SQL, dbPath, configPath, counts, true, safetyCopy);
+}
+
+function verifySqlJs(
+  SQL: any,
+  dbPath: string,
+  configPath: string,
+  counts: Record<string, number> | null,
+  converted: boolean,
+  safetyCopy: string | undefined
+): ConvertReport {
+  const bytes = fs.readFileSync(dbPath);
+  const journal = `${bytes[18]}/${bytes[19]}`;
+  const id = bytes.length >= 72 ? bytes.readUInt32BE(68) : 0;
+  const img = loadImage(SQL, bytes);
+  let inv: { integrity: string; counts: Record<string, number> };
+  try {
+    inv = inventory(img);
+  } finally {
+    img.close();
+  }
+  const config = String(readSqliteDriverAt(realOrResolved(configPath)).value);
+  const countsOk = counts === null || JSON.stringify(inv.counts) === JSON.stringify(counts);
+  if (id !== RELAY_APP_ID_WASM || journal !== "1/1" || inv.integrity !== "ok" || !countsOk || config !== "wasm") {
+    throw new ConvertRefusal(
+      `the conversion did not verify: application_id 0x${id.toString(16)}, journal ${journal}, integrity ${inv.integrity}, ` +
+        `row counts ${countsOk ? "equal" : `${JSON.stringify(inv.counts)} (want ${JSON.stringify(counts)})`}, config ${config}.` +
+        (safetyCopy ? ` The original bytes are at ${safetyCopy}.` : "")
+    );
+  }
+  return { converted, to: "wasm", dbPath, configPath, header: "wasm", journal, integrity: inv.integrity, config, via: "sqljs", ...(safetyCopy ? { safetyCopy } : {}) };
 }
