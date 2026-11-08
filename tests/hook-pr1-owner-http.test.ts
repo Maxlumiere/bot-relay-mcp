@@ -29,6 +29,7 @@ import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { sandboxEnv } from "./_helpers/sandbox-env.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_INDEX = path.join(REPO, "dist", "index.js");
@@ -967,11 +968,9 @@ const REAL_PS = spawnSync("sh", ["-c", "command -v ps"], { encoding: "utf-8" }).
 fs.writeFileSync(
   path.join(STUBS, "ps"),
   `#!/bin/sh\nprintf 'ps %s\\n' "$*" >> "${ARGV_LOG}"\nif [ -n "$FAKE_PS_HANG" ]; then exec sleep 30; fi\n` +
-    // A SLOW ps over a DEEP chain: every call answers after 0.9s; each pid's parent is pid+1 (a "sh"), for 10
-    // levels, counted from this stub's own calls in the argv log (so the depth does not depend on any real pid).
-    `if [ -n "$FAKE_PS_SLOW" ]; then sleep 0.9; p=""; for a in "$@"; do case "$prev" in -p) p="$a" ;; esac; prev="$a"; done\n` +
-    `  n=$(grep -c '^ps .*ppid=' "${ARGV_LOG}" 2>/dev/null)\n` +
-    `  case "$*" in *ppid=*) if [ "\${n:-0}" -le 10 ]; then echo "$((p + 1))"; else echo 1; fi ;; *comm=*) echo sh ;; *args=*) echo sh ;; *lstart=*) echo "Thu Oct  1 11:37:33 2026" ;; esac; exit 0; fi\n` +
+    // An INSTANT ps over an ENDLESS chain (each pid's parent is pid+1, a "sh"): only the budget can end the walk.
+    `if [ -n "$FAKE_PS_DEEP" ]; then p=""; for a in "$@"; do case "$prev" in -p) p="$a" ;; esac; prev="$a"; done\n` +
+    `  case "$*" in *ppid=*) echo "$((p + 1))" ;; *comm=*) echo sh ;; *args=*) echo sh ;; *lstart=*) echo "Thu Oct  1 11:37:33 2026" ;; esac; exit 0; fi\n` +
     `exec "${REAL_PS}" "$@"\n`,
   { mode: 0o755 }
 );
@@ -1213,23 +1212,31 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     expect(r.argv, "precondition: the hung ps ran").toContain("ps ");
     expect(r.status, "the hook exited by itself").not.toBeNull();
     expect(r.ms, `the stub sleeps 30s: the hook must end inside its 10s budget\n${r.out}`).toBeLessThan(10_000);
+    // A ps killed by its step deadline is a CUT, and a cut is named (a silent one let the walk end looking complete).
+    expect(r.out, "the step-deadline cut is named").toMatch(/a process lookup \(ps\) did not finish within \d+s/);
     await stopDaemon(d.child);
   }, 120_000);
 
-  it("a SLOW ps (0.9s per call) over a 10-level chain: the pid walk is bounded by the SEAMED budget, the hook ends inside it, and names the cut", async () => {
-    const c = newCase("cred-ps-slow");
-    const token = seedWasmDb(c, "pr1 slow ps mail");
+  it("the pid walk over an ENDLESS chain is bounded by the BUDGET, mid-walk, and names the cut (deterministic: the budget seam starves the ps step after exactly 3 calls)", async () => {
+    // Was a SLOW-ps row timed on the runner (0.9 s per call against a 1 s step): a call over its step on a slow runner
+    // ended the walk SILENTLY, and the row flaked (macOS 128898402138). Now the budget is the test's, not the runner's.
+    const c = newCase("cred-ps-budget");
+    const token = seedWasmDb(c, "pr1 ps budget mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), FAKE_PS_SLOW: String(process.pid) });
-    // >= 2 slow calls (0.9 s each) show the stub's deep chain is being walked. How many fit depends on what the hook
-    // spent before the walk (hook PR 3 puts door exchanges, each a node start, ahead of it; on macOS CI only 2 fit:
-    // job 128871210203). The DISCRIMINATING bar is below: the cut is NAMED (only relay_ps_run prints it, so the budget,
-    // not the chain's end, stopped the walk) and the hook ended inside its budget.
-    expect((r.argv.match(/^ps /gm) ?? []).length, "precondition: the walk made several slow ps calls").toBeGreaterThanOrEqual(2);
+    const tree = budgetTree(path.join(c.home, "tree"), HOOKS, path.join(REPO, "bin"));
+    const count = path.join(c.home, "starve.count");
+    const r = await runHook(
+      c,
+      "check-relay.sh",
+      { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), FAKE_PS_DEEP: "1", RELAY_TEST_STARVE: "a process lookup (ps)", RELAY_TEST_STARVE_AFTER: "3", RELAY_TEST_STARVE_COUNT: count },
+      "",
+      tree,
+    );
+    expect((r.argv.match(/^ps /gm) ?? []).length, `exactly the 3 budgeted ps calls ran, then the budget cut the walk\n${r.out}`).toBe(3);
     expect(r.status, "the hook exited by itself").not.toBeNull();
-    expect(r.ms, `0.9s x 2 calls x 10 levels = 18s of ps: the hook must end inside its 10s budget\n${r.out}`).toBeLessThan(10_000);
     expect(r.out, "the cut is named").toMatch(/no time budget left for a process lookup/);
+    expect(mailIn(r.out, "pr1 ps budget mail"), `the mail is still delivered\n${r.out}`).toBe(true);
     await stopDaemon(d.child);
   }, 120_000);
 
