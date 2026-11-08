@@ -240,7 +240,7 @@ const ARGV_LOG = path.join(ROOT, "argv.log");
 const RM_CAPTURE = path.join(ROOT, "rm-capture.log");
 fs.writeFileSync(
   path.join(STUBS, "node"),
-  `#!/bin/sh\nprintf 'node %s\\n' "$*" >> "${ARGV_LOG}"\nif [ -n "$FAKE_NODE_HANG" ]; then case "$*" in *"$FAKE_NODE_HANG"*) exec sleep 30 ;; esac; fi\ncase "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\nexec "${process.execPath}" "$@"\n`,
+  `#!/bin/sh\nprintf 'node %s\\n' "$*" >> "${ARGV_LOG}"\nif [ -n "$FAKE_NODE_HANG" ]; then case "$*" in *"$FAKE_NODE_HANG"*) exec sleep 30 ;; esac; fi\ncase "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\nif [ -n "$FAKE_PENDING_RC" ] && [ "$2" = pending ]; then exit "$FAKE_PENDING_RC"; fi\nexec "${process.execPath}" "$@"\n`,
   { mode: 0o755 }
 );
 const REAL_CURL = spawnSync("sh", ["-c", "command -v curl"], { encoding: "utf-8" }).stdout.trim();
@@ -577,6 +577,23 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → a loopback 
     await stopDaemon(d.child);
   }, 120_000);
 
+  it.skipIf(process.platform === "win32").each(["stop-check.sh", "post-tool-use-check.sh"])("%s through the peek listener (a daemon 127.0.0.1 cannot reach): the mail is read; no /health probe on the proved owner route (the listener refuses /health)", async (hook) => {
+    const host = V6_LOOPBACK ? "::1" : LAN_V4;
+    if (host === null) return void console.warn("[hook-pr1] skipped by name: no address 127.0.0.1 cannot reach on this runner");
+    const c = newCase(`peek-${hook.split(".")[0]}`);
+    const token = seedWasmDb(c, `pr1 peek mail for ${hook}`);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c, host, host === LAN_V4 ? { RELAY_HTTP_ALLOWED_HOSTS: LAN_V4 } : {});
+    fs.rmSync(ARGV_LOG, { force: true });
+    const input = JSON.stringify({ session_id: "s-pr1", hook_event_name: hook === "stop-check.sh" ? "Stop" : "PostToolUse" });
+    const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token }, input);
+    expect(r.out, `${r.out}\n${d.stderr()}`).toMatch(new RegExp(`pr1 peek mail for ${hook.replace(".", "\\.")}|pr1-sender`));
+    expect(r.sqliteCalls).toEqual([]);
+    const argv = fs.existsSync(ARGV_LOG) ? fs.readFileSync(ARGV_LOG, "utf-8") : "";
+    expect(argv, "no /health probe on the owner route").not.toMatch(/\/health/);
+    await stopDaemon(d.child);
+  }, 120_000);
+
   it("the peek listener serves ONLY /owner-id and the get_messages peek: every other route, every other tool, any other argument key, a batch, a session, a WS upgrade → refused", async () => {
     const host = V6_LOOPBACK ? "::1" : LAN_V4;
     if (host === null) return void console.warn("[hook-pr1] skipped by name: no address 127.0.0.1 cannot reach on this runner");
@@ -671,5 +688,40 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → a loopback 
       expect(() => mod.startHttpServer(0, h, { ownerPeek: true }), h).toThrow(/127\.0\.0\.1/);
     }
   });
+
+  it("the owner-peek listener SURVIVES its own listen failure (an async 'error' event): logged, no record, the process lives", () => {
+    const c = newCase("peek-error");
+    fs.writeFileSync(c.cfg, "{}", { mode: 0o600 });
+    const script = path.join(c.home, "peek-error.mjs");
+    fs.writeFileSync(
+      script,
+      `const { startHttpServer } = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "transport", "http.js")).href)});
+       const s = startHttpServer(0, "127.0.0.1", { ownerPeek: true });
+       s.once("listening", () => {
+         s.emit("error", Object.assign(new Error("probe EADDRNOTAVAIL"), { code: "EADDRNOTAVAIL" }));
+         setTimeout(() => { process.stdout.write("alive"); s.close(() => process.exit(0)); }, 200);
+       });`
+    );
+    const r = spawnSync(process.execPath, [script], { encoding: "utf-8", env: baseEnv(c), timeout: 30_000 });
+    expect(r.stdout, r.stderr).toBe("alive");
+    expect(r.stderr).toMatch(/the owner-peek listener failed \(probe EADDRNOTAVAIL\)/);
+  }, 60_000);
 });
 
+describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (a structural skip): the REMOTE route is not the owner route", () => {
+  it.each(["stop-check.sh", "post-tool-use-check.sh"])("%s on the REMOTE route (RELAY_HTTP_HOST) still probes /health and sends no http_secret, even with an inherited RELAY_OWNER_PORT equal to its port", async (hook) => {
+    const c = newCase(`remote-${hook.split(".")[0]}`);
+    const secret = `pr1-remote-secret-${crypto.randomBytes(16).toString("hex")}`;
+    fs.writeFileSync(c.cfg, JSON.stringify({ http_secret: secret }), { mode: 0o600 });
+    const spy = await startSpy((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(req.url === "/health" ? "{}" : JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify({ messages: [], count: 0, has_more: false, total_pending: 0 }) }] } }));
+    });
+    const port = String(spy.port);
+    const input = JSON.stringify({ session_id: "s-pr1", hook_event_name: hook === "stop-check.sh" ? "Stop" : "PostToolUse" });
+    const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: TOKEN, FAKE_PENDING_RC: "3", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: port, RELAY_OWNER_PORT: port }, input);
+    expect(spy.requests.length, `precondition: the remote route ran (${r.out})`).toBeGreaterThan(0);
+    expect(spy.requests.some((q) => q.url === "/health"), "the remote route probes /health (an inherited RELAY_OWNER_PORT proves nothing)").toBe(true);
+    expect(spy.bytes(), "no http_secret goes to an unproved endpoint").not.toContain(secret);
+  }, 120_000);
+});
