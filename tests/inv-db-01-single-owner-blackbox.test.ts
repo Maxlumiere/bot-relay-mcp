@@ -11,18 +11,18 @@
  * Three launch modes (relayEnv):
  *   - OWNER: the INSTANCE declares the wasm driver (`{"sqlite_driver":"wasm"}` in its RELAY_CONFIG_PATH file), with
  *     no RELAY_SQLITE_DRIVER in the env. Owner mode comes ONLY from this declaration.
- *   - LEGACY: env-only RELAY_SQLITE_DRIVER=wasm with a config of `{}`: the legacy wasm mode, never an owner.
+ *   - ENV-WASM: env-only RELAY_SQLITE_DRIVER=wasm with a config of `{}`. Since slice 4 (5.0.0) this is a wasm
+ *     declaration too: the single owner (the legacy no-owner mode is retired).
  *   - NATIVE: no RELAY_SQLITE_DRIVER and a config of `{}`.
  *
  * The contract, as observed from outside:
  *   1. BIRTH STAMP: an OWNER daemon on a path with no DB creates it, and bytes 68-71 of the file read 0x524C5957
- *      ("RLYW"); its twin, a LEGACY daemon on a new path, creates an UNSTAMPED DB (bytes 68-71 read 0). The bytes
+ *      ("RLYW"); its twin, an ENV-WASM daemon on a new path, creates it stamped RLYW too (slice 4). The bytes
  *      are read only after every relay process on that DB has exited.
  *   2. ONE OWNER: K concurrent OWNER daemons on one DB, over several rounds (a fresh DB each): exactly one ever
  *      answers /health 200; every other one exits non-zero by itself and its stderr names the cause.
- *      Twin: K concurrent LEGACY daemons on a fresh legacy DB all answer /health (no lock), and the stamp still
- *      reads 0 after they all exit.
- *      The header decides regardless of env: a LEGACY process on an existing RLYW DB while an owner runs is
+ *      Twin: K concurrent ENV-WASM daemons on a fresh path: exactly one answers too (slice 4: no lock-free mode).
+ *      The header decides regardless of env: an ENV-WASM process on an existing RLYW DB while an owner runs is
  *      refused like any contender.
  *   3. STDIO REFUSED on an RLYW DB, with and without an owner running: non-zero exit, and stderr carries an HTTP
  *      client config hint.
@@ -242,13 +242,13 @@ function makeSandbox(label: string): Sandbox {
   return { home, dir, dbPath: path.join(dir, "relay.db"), ownerConfigPath, plainConfigPath };
 }
 
-/** owner: the instance config declares wasm, no env selector. legacy: env-only wasm, config `{}`. native: neither. */
-type Mode = "owner" | "legacy" | "native";
+/** owner: the instance config declares wasm, no env selector. envwasm: env-only wasm, config `{}`. native: neither. */
+type Mode = "owner" | "envwasm" | "native";
 
 /**
  * The child env: the sandbox allowlist (HOME/USERPROFILE set to the sandbox, nothing ambient), then the relay's
  * variables by name. RELAY_HOME is never set. Owner mode comes ONLY from the instance declaration (the owner config
- * file); legacy mode is RELAY_SQLITE_DRIVER=wasm with the plain config; native sets no selector at all.
+ * file) or, since slice 4, RELAY_SQLITE_DRIVER=wasm with the plain config (envwasm); native sets no selector at all.
  */
 function relayEnv(sb: Sandbox, transport: "http" | "stdio", mode: Mode, port: number): NodeJS.ProcessEnv {
   const env = sandboxEnv(sb.home);
@@ -263,7 +263,7 @@ function relayEnv(sb: Sandbox, transport: "http" | "stdio", mode: Mode, port: nu
     // only come from the DB-ownership rule. stdin is also held open and fed a real client handshake.
     env.RELAY_SKIP_TTY_CHECK = "1";
   }
-  if (mode === "legacy") env.RELAY_SQLITE_DRIVER = "wasm";
+  if (mode === "envwasm") env.RELAY_SQLITE_DRIVER = "wasm";
   else delete env.RELAY_SQLITE_DRIVER;
   return env;
 }
@@ -405,6 +405,50 @@ async function findMintSecret(sb: Sandbox, ms = 5_000): Promise<string> {
 // The contract
 // ---------------------------------------------------------------------------------------------------------------
 
+/**
+ * One race: K daemons of `mode` launched back to back on a path with no DB. Exactly one answers /health 200, every
+ * other exits non-zero naming the owner cause, and the DB is stamped RLYW after the owner stops.
+ */
+async function raceOneRound(sb: Sandbox, mode: Mode, tag: string): Promise<void> {
+  const ports = new Set<number>();
+  while (ports.size < K) ports.add(await getFreePort());
+  // Launched back to back, no await between them: a real race on a path where no DB exists.
+  const racers = [...ports].map((port, i) => {
+    const p = launch(`${tag}-racer${i}`, relayEnv(sb, "http", mode, port));
+    p.port = port;
+    return p;
+  });
+
+  const everHealthy = new Set<number>();
+  const deadline = Date.now() + RACE_DEADLINE;
+  while (Date.now() < deadline) {
+    await Promise.all(
+      racers.map(async (p, i) => {
+        if (!p.exited() && (await healthOk(p.port!))) everHealthy.add(i);
+      }),
+    );
+    const exitedCount = racers.filter((p) => p.exited()).length;
+    if (exitedCount === K) break; // nobody left: 0 owners, asserted below
+    if (exitedCount === K - 1 && everHealthy.size >= 1) break; // settled: one left standing
+    if (everHealthy.size >= 2) break; // already a violation
+    await sleep(100);
+  }
+
+  const report = `${tag}:\n${racers.map(describeProc).join("\n")}\nanswered /health 200: [${[...everHealthy].join(", ")}]`;
+  expect(everHealthy.size, `exactly one owner answers /health (never 0, never 2)\n${report}`).toBe(1);
+  const ownerIdx = [...everHealthy][0]!;
+  const owner = racers[ownerIdx]!;
+  expect(owner.exited(), `the owner is still running\n${report}`).toBeNull();
+  for (const [i, p] of racers.entries()) {
+    if (i === ownerIdx) continue;
+    expectRefusedExit(p, p.exited(), `${tag}: contender ${p.label}`);
+    expect(p.stderr(), `${tag}: contender ${p.label}'s stderr names the cause\n${report}`).toMatch(OWNER_CAUSE);
+  }
+
+  expectCleanStop(owner, await stop(owner));
+  expect(hex(readStamp(sb)), `${tag}: the raced DB's stamp`).toBe(hex(STAMP_WASM));
+}
+
 describe("INV-DB-01 single owner (black box: real relay processes only)", () => {
   it("1. birth stamp: an owner daemon (the instance declares wasm) on a path with no DB creates it, stamped RLYW", async () => {
     const sb = makeSandbox("birth");
@@ -418,93 +462,41 @@ describe("INV-DB-01 single owner (black box: real relay processes only)", () => 
     expect(stamp).not.toBe(STAMP_NATIVE);
   }, 30_000);
 
-  it("1-twin. a LEGACY daemon (env-only wasm, config {}) on a path with no DB creates an UNSTAMPED DB (bytes 68-71 read 0)", async () => {
-    const sb = makeSandbox("birth-legacy");
+  it("1-twin (slice 4, BREAKING 5.0.0). an ENV-WASM daemon (env-only wasm, config {}) on a path with no DB creates it stamped RLYW (before: unstamped, the legacy mode)", async () => {
+    const sb = makeSandbox("birth-envwasm");
     expect(fs.existsSync(sb.dbPath)).toBe(false);
-    const d = await startDaemon(sb, "legacy", "birth-legacy");
-    await expectOwner(d, "the legacy birth daemon");
+    const d = await startDaemon(sb, "envwasm", "birth-envwasm");
+    await expectOwner(d, "the env-wasm birth daemon");
     expectCleanStop(d, await stop(d));
     expect(fs.existsSync(sb.dbPath), "the daemon created the DB at RELAY_DB_PATH").toBe(true);
-    expect(hex(readStamp(sb)), "env-only wasm is never an owner: no stamp").toBe(hex(STAMP_NONE));
+    expect(hex(readStamp(sb)), "env-only wasm is the single owner since slice 4: stamped RLYW").toBe(hex(STAMP_WASM));
   }, 30_000);
 
-  it(`2-twin. no lock in legacy mode: ${K} concurrent LEGACY daemons on a fresh legacy DB all answer /health, and the stamp still reads 0 after they exit`, async () => {
-    const sb = makeSandbox("legacy-many");
-    const ports = new Set<number>();
-    while (ports.size < K) ports.add(await getFreePort());
-    const daemons = [...ports].map((port, i) => {
-      const p = launch(`legacy${i}`, relayEnv(sb, "http", "legacy", port));
-      p.port = port;
-      return p;
-    });
-    const healthy = await Promise.all(daemons.map((p) => waitHealth(p)));
-    const report = daemons.map(describeProc).join("\n");
-    expect(healthy, `every legacy daemon answers /health (legacy mode takes no lock)\n${report}`).toEqual(daemons.map(() => true));
-    for (const p of daemons) expect(p.exited(), `${p.label} is still running with the others\n${report}`).toBeNull();
-    for (const p of daemons) expectCleanStop(p, await stop(p));
-    expect(hex(readStamp(sb)), "a legacy DB stays unstamped after K legacy processes").toBe(hex(STAMP_NONE));
+  it(`2-twin (slice 4, BREAKING 5.0.0). ${K} concurrent ENV-WASM daemons on a fresh path: exactly one answers /health, the rest exit non-zero naming the cause (before: all answered, no lock)`, async () => {
+    await raceOneRound(makeSandbox("envwasm-many"), "envwasm", "envwasm");
   }, 45_000);
 
-  it("2-header. the header decides regardless of env: a LEGACY process on an RLYW DB while an owner runs is refused like any contender", async () => {
+  it("2-header. the header decides regardless of env: an ENV-WASM process on an RLYW DB while an owner runs is refused like any contender", async () => {
     const sb = makeSandbox("legacy-on-w");
     const owner = await startDaemon(sb, "owner", "owner");
     await expectOwner(owner, "the owner");
-    const c = await startDaemon(sb, "legacy", "legacy-contender");
+    const c = await startDaemon(sb, "envwasm", "envwasm-contender");
     let answered = false;
     const deadline = Date.now() + EXIT_DEADLINE;
     while (Date.now() < deadline && !c.exited()) {
       if (await healthOk(c.port!)) answered = true;
       await sleep(100);
     }
-    expect(answered, `the legacy contender must never serve /health on an owned RLYW DB\n${describeProc(c)}`).toBe(false);
-    expectRefusedExit(c, c.exited(), "the legacy contender on an RLYW DB");
-    expect(c.stderr(), `the legacy contender's stderr names the cause\n${describeProc(c)}`).toMatch(OWNER_CAUSE);
+    expect(answered, `the env-wasm contender must never serve /health on an owned RLYW DB\n${describeProc(c)}`).toBe(false);
+    expectRefusedExit(c, c.exited(), "the env-wasm contender on an RLYW DB");
+    expect(c.stderr(), `the env-wasm contender's stderr names the cause\n${describeProc(c)}`).toMatch(OWNER_CAUSE);
     expect(await healthOk(owner.port!), `the owner still answers after the refusal\n${describeProc(owner)}`).toBe(true);
     expectCleanStop(owner, await stop(owner));
     expect(hex(readStamp(sb))).toBe(hex(STAMP_WASM));
   }, 45_000);
 
   it(`2. one owner: ${K} concurrent owner daemons on one DB, ${ROUNDS} rounds; exactly one answers /health, the rest exit non-zero naming the cause`, async () => {
-    for (let round = 1; round <= ROUNDS; round++) {
-      const sb = makeSandbox(`race${round}`);
-      const ports = new Set<number>();
-      while (ports.size < K) ports.add(await getFreePort());
-      // Launched back to back, no await between them: a real race on a path where no DB exists.
-      const racers = [...ports].map((port, i) => {
-        const p = launch(`r${round}-racer${i}`, relayEnv(sb, "http", "owner", port));
-        p.port = port;
-        return p;
-      });
-
-      const everHealthy = new Set<number>();
-      const deadline = Date.now() + RACE_DEADLINE;
-      while (Date.now() < deadline) {
-        await Promise.all(
-          racers.map(async (p, i) => {
-            if (!p.exited() && (await healthOk(p.port!))) everHealthy.add(i);
-          }),
-        );
-        const exitedCount = racers.filter((p) => p.exited()).length;
-        if (exitedCount === K) break; // nobody left: 0 owners, asserted below
-        if (exitedCount === K - 1 && everHealthy.size >= 1) break; // settled: one left standing
-        if (everHealthy.size >= 2) break; // already a violation
-        await sleep(100);
-      }
-
-      const report = `round ${round}:\n${racers.map(describeProc).join("\n")}\nanswered /health 200: [${[...everHealthy].join(", ")}]`;
-      expect(everHealthy.size, `exactly one owner answers /health (never 0, never 2)\n${report}`).toBe(1);
-      const ownerIdx = [...everHealthy][0]!;
-      const owner = racers[ownerIdx]!;
-      expect(owner.exited(), `the owner is still running\n${report}`).toBeNull();
-      for (const [i, p] of racers.entries()) {
-        if (i === ownerIdx) continue;
-        expectRefusedExit(p, p.exited(), `round ${round}: contender ${p.label}`);
-        expect(p.stderr(), `round ${round}: contender ${p.label}'s stderr names the cause\n${report}`).toMatch(OWNER_CAUSE);
-      }
-
-      expectCleanStop(owner, await stop(owner));
-      expect(hex(readStamp(sb)), `round ${round}: the raced DB's stamp`).toBe(hex(STAMP_WASM));
-    }
+    for (let round = 1; round <= ROUNDS; round++) await raceOneRound(makeSandbox(`race${round}`), "owner", `r${round}`);
   }, 75_000);
 
   for (const withOwner of [false, true]) {

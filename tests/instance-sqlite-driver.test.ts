@@ -101,33 +101,22 @@ describe("INV-DB-01 slice 1: the driver is an instance property", () => {
     expect(driverWarnings(warn)).toEqual([]);
   });
 
-  it.each([
-    ["the implicit default (no sqlite_driver key)", {}],
-  ])("RELAY_SQLITE_DRIVER=wasm against %s: WARNED once per process, saying nothing is needed yet; the env still wins (the legacy wasm mode)", async (_label, body) => {
-    writeConfig(process.env.RELAY_CONFIG_PATH!, body);
+  it("slice 4 (BREAKING 5.0.0): RELAY_SQLITE_DRIVER=wasm on a SILENT instance and a NEW DB runs the single owner: the DB is born RLYW, and no driver warning (before: the legacy no-owner mode, warned)", async () => {
+    writeConfig(process.env.RELAY_CONFIG_PATH!, {});
     process.env.RELAY_SQLITE_DRIVER = "wasm";
     const warn = vi.spyOn(log, "warn");
     await compat.initializeDb(dbPath);
-    expect(compat.getActiveDriver(), "the env override still wins in this release").toBe("wasm");
-    const said = driverWarnings(warn);
-    expect(said.length, "warned exactly once").toBe(1);
-    expect(said[0]).toMatch(/RELAY_SQLITE_DRIVER=wasm/);
-    expect(said[0]).toMatch(/this instance's sqlite_driver is native/);
-    expect(said[0]).toMatch(/a later release will require the instance to be converted \(`relay db convert-journal`\); nothing to do until then/);
+    expect(compat.getActiveDriver(), "a silent instance takes the env").toBe("wasm");
     compat.closeInitializedDb();
-    await compat.initializeDb(dbPath); // a second open in the same process
-    expect(driverWarnings(warn).length, "once per process, not once per open").toBe(1);
+    expect(fs.readFileSync(dbPath).readUInt32BE(68), "born stamped for its owner (RLYW)").toBe(0x524c5957);
+    expect(driverWarnings(warn)).toEqual([]);
   });
 
-  it("slice 2b-ii (ruling cd11ffa7): RELAY_SQLITE_DRIVER=wasm against an EXPLICIT \"native\": the INSTANCE wins (native), and the env is warned once", async () => {
+  it("slice 4 (BREAKING 5.0.0): RELAY_SQLITE_DRIVER=wasm against an EXPLICIT \"native\" is REFUSED by name with the remedy, nothing created (before: the instance won, warned)", async () => {
     writeConfig(process.env.RELAY_CONFIG_PATH!, { sqlite_driver: "native" });
     process.env.RELAY_SQLITE_DRIVER = "wasm";
-    const warn = vi.spyOn(log, "warn");
-    await compat.initializeDb(dbPath);
-    expect(compat.getActiveDriver()).toBe("native");
-    const said = driverWarnings(warn);
-    expect(said.length, "warned exactly once").toBe(1);
-    expect(said[0]).toMatch(/RELAY_SQLITE_DRIVER=wasm is set, but this instance declares sqlite_driver native .*the instance wins/);
+    await expect(compat.initializeDb(dbPath)).rejects.toThrow(/RELAY_SQLITE_DRIVER=wasm contradicts this instance's sqlite_driver "native"[\s\S]*unset/);
+    expect(fs.existsSync(dbPath)).toBe(false);
   });
 
   const canChmod = process.platform !== "win32" && typeof process.getuid === "function" && process.getuid() !== 0;
