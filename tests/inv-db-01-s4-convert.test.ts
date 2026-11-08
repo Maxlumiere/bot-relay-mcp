@@ -290,26 +290,34 @@ describe("INV-DB-01 slice 4: `relay convert-journal` (Q1, Q2)", () => {
     expect(bad.status).toBe(2);
   }, 60_000);
 
-  it("Q2: convert-journal is the ONLY native opener of an RLYW file: every native better-sqlite3 construction in src is pinned, and exactly one is in src/convert-journal.ts; and every sql.js construction in src is listed with its reason (one in convert-journal.ts) and passes a fresh copy", () => {
+  it("Q2 (narrowed, Codex #401 R1 P3-10): EVERY native better-sqlite3 construction in src is listed with its reason; convert-journal's is the only one that opens a LIVE RLYW file; and every sql.js construction is listed and passes a fresh copy", () => {
     const program = srcProgram();
-    const sites: string[] = [];
+    // Each site, keyed file::enclosing top-level function, with its count and WHY it may construct a native handle.
+    const NATIVE_SITES: Record<string, { n: number; why: string }> = {
+      "src/convert-journal.ts::openForConversion": { n: 1, why: "the converter: the ONLY native opener of a LIVE RLYW file, under its single-owner lock" },
+      "src/sqlite-compat.ts::openNativeDb": { n: 1, why: "THE general construction every relay native open goes through (its count and claims), including restampStagedCopy's re-stamp of restore's PRIVATE staged copy, which may be RLYW (a staging exception: never a live DB)" },
+      "src/sqlite-compat.ts::checkpointBeforeRestoreSwap": { n: 1, why: "an in-memory probe (\":memory:\"), never a file" },
+      "src/sqlite-compat.ts::nativeLoadsHere": { n: 1, why: "an in-memory probe (\":memory:\"), never a file" },
+      "src/doorbell-lock.ts::openLockFile": { n: 1, why: "the doorbell's OWN lock file (refused when it is a hard link or a relay DB)" },
+    };
+    const native: Record<string, number> = {};
     for (const sf of program.getSourceFiles()) {
       const rel = path.relative(REPO, sf.fileName).split(path.sep).join("/");
       if (!rel.startsWith("src/") || sf.isDeclarationFile) continue;
-      const visit = (n: ts.Node): void => {
-        if (ts.isNewExpression(n)) {
-          const callee = n.expression.getText(sf);
-          if (/^(Database|BetterSqlite3|\(loadNative\(\)\)|D)$/.test(callee)) {
-            let fn: ts.Node | undefined = n.parent;
-            while (fn && !ts.isFunctionDeclaration(fn) && !ts.isSourceFile(fn)) fn = fn.parent;
-            sites.push(`${rel}::${fn && ts.isFunctionDeclaration(fn) ? fn.name?.text : "<module>"}::new ${callee}`);
-          }
+      // The enclosing top-level function is passed down the walk (this program's nodes carry no parent links).
+      const visit = (n: ts.Node, fnName: string): void => {
+        const inner = ts.isFunctionDeclaration(n) && n.name && fnName === "<module>" ? n.name.text : fnName;
+        if (ts.isNewExpression(n) && /^(Database|BetterSqlite3|\(loadNative\(\)\)|D)$/.test(n.expression.getText(sf))) {
+          const key = `${rel}::${inner}`;
+          native[key] = (native[key] ?? 0) + 1;
         }
-        ts.forEachChild(n, visit);
+        ts.forEachChild(n, (c) => visit(c, inner));
       };
-      visit(sf);
+      visit(sf, "<module>");
     }
-    expect(sites.filter((s) => s.startsWith("src/convert-journal.ts")), `the sanctioned RLYW opener (sites: ${JSON.stringify(sites)})`).toHaveLength(1);
+    expect(native, "every native construction in src is listed (a new site fails until it is)").toEqual(
+      Object.fromEntries(Object.entries(NATIVE_SITES).map(([k, v]) => [k, v.n]))
+    );
     // The slice-4 wasm-only ruling: EVERY sql.js construction in src is listed here with its reason,
     // so a NEW one fails until it is listed. Only convert-journal's REPLACES a live native/legacy file.
     const SQLJS_SITES: Record<string, { n: number; why: string }> = {
@@ -389,6 +397,135 @@ describe("INV-DB-01 slice 4: restore RE-STAMPS its staged copy to the instance's
     const before = sha(dbPath);
     await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*(declares|disagree)/i);
     expect(sha(dbPath)).toBe(before);
+  }, 60_000);
+});
+
+describe("INV-DB-01 slice 4, Codex #401 R1: the canonical target, the lock binding, restore's header, the config path", () => {
+  const wasmOnly = () => dbHeader._setNativeProbeForTests(() => ({ ok: false, reason: "test: a wasm-only install (npm 12, scripts off)" }));
+  afterEach(() => dbHeader._setNativeProbeForTests(null));
+  /** dbPath becomes a SYMLINK to a real DB file in its own directory; returns that real file. */
+  const symlinkedDb = (): string => {
+    const realDir = fs.mkdtempSync(path.join(caseDir, "real-"));
+    const real = path.join(realDir, "relay.db");
+    return real;
+  };
+
+  it.skipIf(WIN_FILE_SYMLINK)("R1 P1-1: a DB SYMLINK whose referent has a HOT WAL is refused (never converted without it): the referent's bytes and its WAL unchanged (skipped on Windows: file symlinks + SIGKILL of self)", async () => {
+    const real = symlinkedDb();
+    spawnSync(process.execPath, [HOT, path.join(REPO, "node_modules", "better-sqlite3"), real]);
+    expect(fs.existsSync(real + "-wal") && fs.statSync(real + "-wal").size > 0, "precondition: a hot WAL beside the REFERENT").toBe(true);
+    fs.symlinkSync(real, dbPath);
+    const dbSha = sha(real);
+    const walSha = sha(real + "-wal");
+    writeCfg({});
+    wasmOnly();
+    await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(/convert-journal refused[\s\S]*-wal/);
+    expect(sha(real)).toBe(dbSha);
+    expect(sha(real + "-wal")).toBe(walSha);
+    expect(fs.lstatSync(dbPath).isSymbolicLink(), "the DB path is still the link").toBe(true);
+  }, 60_000);
+
+  it.skipIf(WIN_FILE_SYMLINK)("R1 P1-2 (a): the DB MOVED and its symlink RETARGETED to the moved file mid-conversion (bytes and metadata kept) is refused: nothing replaced (skipped on Windows: file symlinks)", async () => {
+    const real = symlinkedDb();
+    makeDb(real, 0, ["a"], "DELETE");
+    fs.symlinkSync(real, dbPath);
+    const movedDir = fs.mkdtempSync(path.join(caseDir, "moved-"));
+    const moved = path.join(movedDir, "relay.db");
+    const before = sha(real);
+    writeCfg({});
+    wasmOnly();
+    const retarget = () => {
+      fs.renameSync(real, moved); // keeps the inode, the size and the mtime
+      fs.rmSync(dbPath);
+      fs.symlinkSync(moved, dbPath);
+    };
+    await expect((await convertMod()).convertJournal({ to: "wasm", _beforeReplaceForTests: retarget })).rejects.toThrow(/convert-journal refused/);
+    expect(header(moved).id, "the moved file was not replaced").toBe(0);
+    expect(sha(moved)).toBe(before);
+    expect(readCfg(), "nothing declared").toEqual({});
+  }, 60_000);
+
+  it("R1 P1-2 (b): a HARD LINK added to the DB mid-conversion is refused (a rename would split the names into two DBs): nothing replaced", async () => {
+    makeDb(dbPath, 0, ["a"], "DELETE");
+    const alias = path.join(caseDir, "alias.db");
+    const before = sha(dbPath);
+    writeCfg({});
+    wasmOnly();
+    await expect((await convertMod()).convertJournal({ to: "wasm", _beforeReplaceForTests: () => fs.linkSync(dbPath, alias) })).rejects.toThrow(/convert-journal refused[\s\S]*(hard link|links)/);
+    expect(header(dbPath).id).toBe(0);
+    expect(sha(dbPath)).toBe(before);
+    expect(sha(alias)).toBe(before);
+  }, 60_000);
+
+  it.skipIf(WIN_FILE_SYMLINK)("R1 P2-7 (a): a DANGLING symlink config.json is refused by name before anything changes: the link is kept, the DB unchanged (skipped on Windows: file symlinks)", async () => {
+    makeDb(dbPath, NATIVE, ["a"]);
+    const before = sha(dbPath);
+    const nowhere = path.join(caseDir, "nowhere", "config.json");
+    fs.symlinkSync(nowhere, cfgPath);
+    await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(/convert-journal refused[\s\S]*config\.json[\s\S]*(does not exist|dangling)/);
+    expect(fs.lstatSync(cfgPath).isSymbolicLink(), "the link is never replaced").toBe(true);
+    expect(fs.existsSync(nowhere)).toBe(false);
+    expect(sha(dbPath)).toBe(before);
+  }, 60_000);
+
+  it.skipIf(WIN_FILE_SYMLINK)("R1 P2-7 (b): an ABSENT config reached through two spellings of a symlinked parent is ONE file (/var vs /private/var), not a mismatch: the conversion runs (skipped on Windows: directory symlinks here need privileges)", async () => {
+    const homeReal = path.join(caseDir, ".bot-relay-real");
+    fs.mkdirSync(homeReal, { recursive: true });
+    const home = path.join(caseDir, ".bot-relay");
+    fs.symlinkSync(homeReal, home); // the relay home's spelling is a symlink, as /var is on macOS
+    const savedHome = process.env.RELAY_HOME;
+    delete process.env.RELAY_HOME;
+    try {
+      const db2 = path.join(home, "relay.db");
+      makeDb(db2, NATIVE, ["a"]);
+      process.env.RELAY_DB_PATH = db2;
+      process.env.RELAY_CONFIG_PATH = path.join(home, "config.json"); // absent, through the link spelling
+      const r = await (await convertMod()).convertJournal({ to: "wasm", dbPath: db2 });
+      expect(r.config).toBe("wasm");
+      expect(JSON.parse(fs.readFileSync(path.join(homeReal, "config.json"), "utf-8")).sqlite_driver).toBe("wasm");
+    } finally {
+      if (savedHome === undefined) delete process.env.RELAY_HOME;
+      else process.env.RELAY_HOME = savedHome;
+    }
+  }, 60_000);
+
+  it("R1 P2-5: a restore archive whose DB carries a FOREIGN application_id is refused BEFORE any re-stamp (never converted into a relay DB): the live DB untouched", async () => {
+    makeDb(dbPath, 0, ["live"], "DELETE");
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "good.tar.gz") })).archive_path;
+    const x = fs.mkdtempSync(path.join(caseDir, "x-"));
+    const run = (args: string[], cwd: string) => {
+      const r = spawnSync("tar", args, { cwd, encoding: "utf-8", env: { ...process.env, COPYFILE_DISABLE: "1" } });
+      if (r.status !== 0) throw new Error(`tar ${args.join(" ")}: ${r.stderr}`);
+    };
+    run(["-xzf", archive], x);
+    fs.rmSync(path.join(x, "relay.db"));
+    makeDb(path.join(x, "relay.db"), 0x12345678, ["foreign_row"], "DELETE");
+    const forged = path.join(caseDir, "foreign.tar.gz");
+    run(["--format=ustar", "-czf", forged, "relay.db", "manifest.json"], x);
+    const before = sha(dbPath);
+    await expect(importRelayState(forged, { force: true })).rejects.toThrow(/not the relay's|foreign/i);
+    expect(sha(dbPath), "the live DB is untouched").toBe(before);
+    expect(readOther(dbPath).rows).toEqual(["live"]);
+  }, 60_000);
+
+  it("R1 P2-6: an EXPLICIT sqlite_driver \"native\" over a live RLYW DB refuses the restore by name (the disagreement is symmetric), nothing replaced", async () => {
+    makeDb(dbPath, NATIVE, ["archived"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "n.tar.gz") })).archive_path;
+    fs.rmSync(dbPath);
+    makeDb(dbPath, WASM, ["live"], "DELETE");
+    writeCfg({ sqlite_driver: "native" });
+    const before = sha(dbPath);
+    await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*declares sqlite_driver "native"[\s\S]*disagree/);
+    expect(sha(dbPath)).toBe(before);
+  }, 60_000);
+
+  it("R1 P2-6 twin (as designed): an ENV-ONLY RELAY_SQLITE_DRIVER=native on a SILENT instance over a live RLYW DB is not a declaration: the header decides (wasm), the restore runs", async () => {
+    makeDb(dbPath, WASM, ["archived"], "DELETE");
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "w.tar.gz") })).archive_path;
+    writeCfg({});
+    process.env.RELAY_SQLITE_DRIVER = "native";
+    await importRelayState(archive, { force: true });
+    expect(header(dbPath).id).toBe(WASM);
   }, 60_000);
 });
 
@@ -604,3 +741,154 @@ describe("INV-DB-01 slice 4: the wasm-only converter (sql.js, native→wasm; the
     expect(rowCount(dbPath)).toBe(1);
   }, 60_000);
 });
+
+// --- Codex #401 R1 design items, as ruled: native writers during a conversion (P1-3), hot journals (P2-8) ---
+
+const DIST_COMPAT = pathToFileURL(path.join(REPO, "dist", "sqlite-compat.js")).href;
+/** A child that HOLDS the DB's single-owner lock (as a conversion does), prints READY, then idles. */
+const HOLD = path.join(ROOT, "hold-lock.mjs");
+fs.writeFileSync(
+  HOLD,
+  `const c = await import(${JSON.stringify(DIST_COMPAT)});\n` +
+    `try { await c.holdOwnerForMaintenance(process.argv[2], "convert-journal"); process.stdout.write("READY\\n"); }\n` +
+    `catch (e) { process.stdout.write("REFUSED " + String(e && e.message || e).split("\\n")[0] + "\\n"); process.exit(3); }\n` +
+    `setInterval(() => {}, 1000);\n`
+);
+/** A child that opens the DB natively and HOLDS a transaction: "read" (SHARED) or "write" (RESERVED, a journal on disk). */
+const TXN = path.join(ROOT, "hold-txn.cjs");
+fs.writeFileSync(
+  TXN,
+  `const D = require(process.argv[2]); const d = new D(process.argv[3], { timeout: 0 });\n` +
+    `if (process.argv[4] === "write") { d.exec("BEGIN IMMEDIATE"); d.prepare("INSERT INTO kept VALUES ('held')").run(); }\n` +
+    `else { d.exec("BEGIN"); d.prepare("SELECT * FROM kept").all(); }\n` +
+    `process.stdout.write("READY\\n"); setInterval(() => {}, 1000);\n`
+);
+/**
+ * A child that leaves a HOT journal: the stamp's transaction, its pages spilled, then killed before COMMIT. MEASURED:
+ * page 1 is not spilled (its header still reads 0), so hotJournalAtStamp() then writes the RLYW stamp into the main
+ * file's header: the on-disk state of a crash between COMMIT writing page 1 and deleting the journal (the journal holds
+ * the original page 1). That instant cannot be hit with a kill.
+ */
+const HOTJ = path.join(ROOT, "hot-journal.cjs");
+fs.writeFileSync(
+  HOTJ,
+  `const D = require(process.argv[2]); const d = new D(process.argv[3]); d.pragma("journal_mode = DELETE"); d.pragma("cache_size = 2");\n` +
+    `d.exec("BEGIN IMMEDIATE"); d.pragma("application_id = ${WASM}");\n` +
+    `const ins = d.prepare("INSERT INTO kept VALUES (?)"); for (let i = 0; i < 4000; i++) ins.run("spill-" + i + "-" + "x".repeat(200));\n` +
+    `process.kill(process.pid, "SIGKILL");\n`
+);
+function hotJournalAtStamp(file: string): void {
+  spawnSync(process.execPath, [HOTJ, path.join(REPO, "node_modules", "better-sqlite3"), file]);
+  const fd = fs.openSync(file, "r+");
+  try {
+    const b = Buffer.alloc(4);
+    b.writeUInt32BE(WASM, 0);
+    fs.writeSync(fd, b, 0, 4, 68);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+function startChild(script: string, args: string[]): { child: ChildProcess; first: Promise<string> } {
+  const child = spawn(process.execPath, [script, ...args], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+  children.push(child);
+  const first = new Promise<string>((res) => {
+    let out = "";
+    const t = setTimeout(() => res(`TIMEOUT ${out}`), 30_000);
+    child.stdout!.on("data", function on(d: Buffer) {
+      out += d;
+      if (/\n/.test(out)) {
+        clearTimeout(t);
+        child.stdout!.off("data", on);
+        res(out.split("\n")[0]!);
+      }
+    });
+  });
+  return { child, first };
+}
+const BSQ3 = () => path.join(REPO, "node_modules", "better-sqlite3");
+const lockFileOf = (f: string) => path.join(path.dirname(fs.realpathSync.native(f)), `.${path.basename(fs.realpathSync.native(f))}.relay-owner`);
+
+describe("INV-DB-01 slice 4, Codex #401 R1 P1-3 (ruled): native openers during a conversion; P2-8: hot journals", () => {
+  const wasmOnly = () => dbHeader._setNativeProbeForTests(() => ({ ok: false, reason: "test: a wasm-only install (npm 12, scripts off)" }));
+  afterEach(() => dbHeader._setNativeProbeForTests(null));
+
+  it("(1a) a relay NATIVE opener (openRawRelayDb, initializeDb) refuses while ANOTHER process holds the DB's owner lock (a conversion), on a native (RLYN) DB", async () => {
+    makeDb(dbPath, NATIVE, ["a"]);
+    writeCfg({});
+    const h = startChild(HOLD, [dbPath]);
+    expect(await h.first, "precondition: the other process holds the lock").toBe("READY");
+    const { openRawRelayDb } = await import("../src/cli/_instance-db.js");
+    await expect(openRawRelayDb(dbPath)).rejects.toThrow(/owner lock|being converted|owned by/i);
+    await expect(db.initializeDb()).rejects.toThrow(/owner lock|being converted|owned by/i);
+  }, 60_000);
+
+  it("(1a) twin: with NO holder, a native open works, and its probe CREATES no lock file (non-creating)", async () => {
+    makeDb(dbPath, NATIVE, ["a"]);
+    writeCfg({});
+    await db.initializeDb();
+    db.closeDb();
+    expect(fs.existsSync(lockFileOf(dbPath)), "the probe never creates the owner lock file").toBe(false);
+  }, 60_000);
+
+  it("(1b) a native conversion while another process holds a READ transaction (SHARED) on a DELETE-mode DB is refused BY NAME (BEGIN EXCLUSIVE across the stamp): the DB unchanged", async () => {
+    makeDb(dbPath, NATIVE, ["a"], "DELETE");
+    const before = sha(dbPath);
+    writeCfg({});
+    const r = startChild(TXN, [BSQ3(), dbPath, "read"]);
+    expect(await r.first).toBe("READY");
+    await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(/convert-journal refused[\s\S]*(in use|another process)/);
+    expect(sha(dbPath)).toBe(before);
+    expect(readCfg()).toEqual({});
+  }, 60_000);
+
+  it("(1d) sql.js: a write that lands on the ORIGINAL file after the identity check (at the rename) is reported as a FAILURE, never a success: the late bytes are saved beside the safety copy, and the remedy is named", async () => {
+    makeDb(dbPath, 0, ["a"], "DELETE");
+    writeCfg({});
+    wasmOnly();
+    const late = (from: string, to: string) => {
+      const d = new Database(to);
+      d.prepare("INSERT INTO kept VALUES ('late')").run();
+      d.close();
+      fs.renameSync(from, to);
+    };
+    const err = await (await convertMod()).convertJournal({ to: "wasm", _renameForTests: late }).then(() => null, (e: Error) => e);
+    expect(err?.message, "never a success").toMatch(/convert-journal (refused|FAILED)[\s\S]*(changed|written|lost)/i);
+    const backups = path.join(caseDir, "backups");
+    const saved = fs.readdirSync(backups).filter((f) => !f.includes(".pre-convert-"));
+    expect(saved.length, `the late bytes are saved beside the safety copy (${fs.readdirSync(backups).join(", ")})`).toBeGreaterThanOrEqual(1);
+    const rows = saved.flatMap((f) => readOther(path.join(backups, f)).rows);
+    expect(rows, "the saved file holds the late write").toContain("late");
+    expect(err?.message).toContain(path.join(backups, saved[0]!));
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("(P2-8) an interrupted stamp COMMIT (RLYW header spilled + a HOT journal) is RECOVERED by the rerun: SQLite rolls it back, then the conversion completes, the rows the original ones (skipped on Windows: SIGKILL of self)", async () => {
+    makeDb(dbPath, 0, ["orig-1", "orig-2"], "DELETE");
+    hotJournalAtStamp(dbPath);
+    expect(fs.existsSync(dbPath + "-journal") && fs.statSync(dbPath + "-journal").size > 0, "precondition: a hot journal").toBe(true);
+    expect(header(dbPath).id, "precondition: the spilled header reads RLYW (the crash window)").toBe(WASM);
+    writeCfg({});
+    const r = await (await convertMod()).convertJournal({ to: "wasm" });
+    expect({ header: r.header, journal: r.journal, integrity: r.integrity }).toEqual({ header: "wasm", journal: "1/1", integrity: "ok" });
+    expect(readOther(dbPath).rows, "the killed transaction was rolled back").toEqual(["orig-1", "orig-2"]);
+    expect(sideFiles(dbPath)).toEqual([]);
+  }, 60_000);
+
+  it("(P2-8) a journal of a LIVE writer (RESERVED held by another process: not hot) is refused by name, the writer's transaction intact", async () => {
+    makeDb(dbPath, 0, ["a"], "DELETE");
+    writeCfg({});
+    const w = startChild(TXN, [BSQ3(), dbPath, "write"]);
+    expect(await w.first).toBe("READY");
+    await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(/convert-journal refused/);
+    expect(header(dbPath).id, "not converted").toBe(0);
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("(P2-8) native-less: a hot journal is refused with the named remedy (an integrity_check with every relay process stopped) (skipped on Windows: SIGKILL of self)", async () => {
+    makeDb(dbPath, 0, ["orig"], "DELETE");
+    hotJournalAtStamp(dbPath);
+    expect(fs.existsSync(dbPath + "-journal"), "precondition: a hot journal").toBe(true);
+    writeCfg({});
+    wasmOnly();
+    await expect((await convertMod()).convertJournal({ to: "wasm" })).rejects.toThrow(/convert-journal refused[\s\S]*sqlite3 [\s\S]*PRAGMA integrity_check;[\s\S]*every relay process stopped/);
+  }, 60_000);
+});
+
