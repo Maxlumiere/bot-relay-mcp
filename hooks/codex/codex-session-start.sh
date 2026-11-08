@@ -211,8 +211,11 @@ if command -v relay_owner_tool >/dev/null 2>&1 && command -v relay_where_load >/
         ;;
       *) CODEX_WHY="the relay CLI's DB verdict (${RELAY_RES_HOOK_DB:-none}) has no owner door" ;;
     esac
+  elif relay_trusted_tunnel; then
+    CODEX_ROUTE=curl
+    echo "[RELAY] bearer to a trusted tunnel on 127.0.0.1:${HTTP_PORT}: if the tunnel drops, another local user could take that port." >&2
   else
-    CODEX_WHY="no local relay DB, and no declared remote RELAY_HTTP_HOST"
+    CODEX_WHY="no local relay DB, and no declared remote RELAY_HTTP_HOST (${RELAY_TUNNEL_HINT})"
   fi
   if [ "$CODEX_ROUTE" = none ]; then
     echo "[RELAY] no credential is sent this session start: ${CODEX_WHY}." >&2

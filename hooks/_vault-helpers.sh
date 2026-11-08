@@ -259,15 +259,45 @@ relay_remote_declared() {
   [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_host_is_loopback "$RELAY_HTTP_HOST"
 }
 
-# relay_scope_vault_to_remote — hook PR 3 (as ruled): a local instance's token never reaches a remote. On a declared
-# remote WITH a local DB, the vault entries this run reads and writes are the remote's own
-# (agents/remote-<host>-<port>/<name>.token), so only a token THAT remote minted is ever sent to it. With no local DB
-# the vault beside the would-be instance is the remote's alone (only a remote route ever wrote it): unscoped, as before.
-relay_scope_vault_to_remote() {
-  relay_remote_declared || return 0
+# relay_trusted_tunnel — 0 when RELAY_HTTP_TRUSTED_TUNNEL_PORT opts THIS loopback port in (hook PR 3, as ruled: a
+# narrow opt-in, never a blanket boolean): it equals the configured RELAY_HTTP_PORT, the configured host is loopback,
+# and the resolver found NO local DB (with one, it is ignored: the local DB's door is the only route). A loopback
+# bearer is otherwise refused: whoever holds that port would get the token (the port-theft class).
+relay_trusted_tunnel() {
+  local t="${RELAY_HTTP_TRUSTED_TUNNEL_PORT:-}" p="${RELAY_HTTP_PORT:-3777}"
+  case "$t" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$t" = "$p" ] || return 1
+  relay_host_is_loopback "${RELAY_HTTP_HOST:-127.0.0.1}" || return 1
   [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
-  if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ]; then
-    local h="${RELAY_HTTP_HOST//[^A-Za-z0-9_.-]/_}" p="${RELAY_HTTP_PORT:-3777}"
+  [ "${RELAY_RES_KIND:-error}" = error ] && return 1
+  [ "${RELAY_RES_EXISTS:-}" = true ] && return 1
+  return 0
+}
+
+# relay_bearer_allowed — 0 when a bearer credential may go to the configured endpoint: a declared remote
+# (relay_remote_declared) or a trusted tunnel (relay_trusted_tunnel). Never a loopback port otherwise.
+relay_bearer_allowed() {
+  relay_remote_declared || relay_trusted_tunnel
+}
+
+# RELAY_TUNNEL_HINT — what a refused loopback bearer names (as ruled: the default skip names the opt-in).
+RELAY_TUNNEL_HINT="a relay reached through an ssh tunnel on this loopback port needs RELAY_HTTP_TRUSTED_TUNNEL_PORT set to that port"
+
+# relay_scope_vault_to_remote — hook PR 3 (as ruled): a local instance's token never reaches a remote. On a declared
+# remote WITH a local DB, or a trusted tunnel, the vault entries this run reads and writes are that remote's own
+# (agents/remote-<host>-<port>/<name>.token), so only a token THAT remote minted is ever sent to it. A declared remote
+# with no local DB keeps the vault beside the would-be instance (only a remote route ever wrote it): unscoped.
+relay_scope_vault_to_remote() {
+  local scoped=0
+  if relay_remote_declared; then
+    [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
+    [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ] && scoped=1
+  elif relay_trusted_tunnel; then
+    scoped=1
+  fi
+  if [ "$scoped" = 1 ]; then
+    local h="${RELAY_HTTP_HOST:-127.0.0.1}" p="${RELAY_HTTP_PORT:-3777}"
+    h="${h//[^A-Za-z0-9_.-]/_}"
     p="${p//[^0-9]/}"
     RELAY_VAULT_SCOPE="remote-${h}-${p:-3777}"
   fi

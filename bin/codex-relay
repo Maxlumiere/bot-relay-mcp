@@ -96,7 +96,7 @@ register_at_launch() {
   # daemon, relay_owner_tool); a local DB without one → no launch register (the hook says why); REMOTE mode (no local
   # DB; RELAY_HTTP_HOST a non-loopback host) → curl with its bearer, as before.
   local route=curl relay_cli="$SCRIPT_DIR/relay"
-  if command -v relay_remote_declared >/dev/null 2>&1 && relay_remote_declared; then
+  if command -v relay_bearer_allowed >/dev/null 2>&1 && relay_bearer_allowed; then
     route=curl
   elif command -v relay_owner_tool >/dev/null 2>&1 && relay_budget_for "the resolver" 2 && relay_where_load "$relay_cli" "$RELAY_STEP_SECS" \
     && [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ]; then

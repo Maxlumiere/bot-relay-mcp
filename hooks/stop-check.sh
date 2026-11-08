@@ -490,8 +490,13 @@ case "$F1_RC" in
     fi
     ;;
   3)
-    if [ -n "${RELAY_HTTP_HOST:-}" ]; then
+    if [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_bearer_allowed; then
+      # Hook PR 3 (as ruled): a loopback bearer is refused (the port-theft class) unless it is a trusted tunnel.
       MODE=remote
+      echo "[RELAY] mail not read: no token is sent to the loopback port ${RELAY_HTTP_PORT:-3777} (${RELAY_TUNNEL_HINT}). Mail may be waiting: call get_messages." >&2
+    elif [ -n "${RELAY_HTTP_HOST:-}" ]; then
+      MODE=remote
+      relay_scope_vault_to_remote
       relay_hydrate_token
       SUMMARY=$(http_peek)
       case $? in

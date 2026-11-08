@@ -793,8 +793,12 @@ relay_deliver_pending_mail() {
       esac
       ;;
     3)
-      if [ -n "${RELAY_HTTP_HOST:-}" ]; then
+      if [ -n "${RELAY_HTTP_HOST:-}" ] && relay_bearer_allowed; then
         relay_deliver_remote_mail
+        return 0
+      elif [ -n "${RELAY_HTTP_HOST:-}" ]; then
+        # Hook PR 3 (as ruled): a loopback bearer is refused (the port-theft class) unless it is a trusted tunnel.
+        relay_remote_failed "no token is sent to the loopback port ${HTTP_PORT} (${RELAY_TUNNEL_HINT})"
         return 0
       fi
       # Nothing to read, and no judgement made about the mail.
@@ -882,8 +886,12 @@ elif [ "$_local_db" = 1 ]; then
       ;;
     *) _cred_why="the relay CLI's DB verdict (${RELAY_RES_HOOK_DB:-none}) has no owner door" ;;
   esac
+elif relay_trusted_tunnel; then
+  RELAY_CRED_ROUTE=bearer
+  RELAY_CURL_GUARD=()
+  echo "[RELAY] bearer to a trusted tunnel on 127.0.0.1:${HTTP_PORT}: if the tunnel drops, another local user could take that port." >&2
 else
-  _cred_why="no local relay DB, and no declared remote RELAY_HTTP_HOST"
+  _cred_why="no local relay DB, and no declared remote RELAY_HTTP_HOST (${RELAY_TUNNEL_HINT})"
 fi
 [ "$RELAY_CRED_ROUTE" != none ] && RELAY_CRED_OK=1
 [ -n "$_cred_why" ] && echo "[RELAY] no credential is sent this session start: ${_cred_why}. Register through your MCP connection." >&2
