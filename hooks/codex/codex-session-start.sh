@@ -204,7 +204,8 @@ if command -v relay_owner_tool >/dev/null 2>&1 && command -v relay_where_load >/
   CODEX_CLI="$HOOKS_DIR/../bin/relay"
   CODEX_ROUTE=none
   CODEX_WHY="the relay CLI could not resolve this instance"
-  if relay_budget_for "the resolver" 2 && relay_where_load "$CODEX_CLI" "$RELAY_STEP_SECS" && [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ]; then
+  # The margin budget: this hook reads no mail, so it keeps no pre-mail reserve.
+  if relay_budget_for "the resolver" 2 margin && relay_where_load "$CODEX_CLI" "$RELAY_STEP_SECS" && [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ]; then
     case "${RELAY_RES_HOOK_DB:-}" in
       http|sqlite3)
         if [ -n "${RELAY_RES_OWNER_ENDPOINT:-}" ]; then CODEX_ROUTE=door; else CODEX_WHY="this DB has no valid owner record: restart the relay daemon if it is running"; fi
@@ -275,13 +276,7 @@ relay_token_config() { command -v relay_curl_token_config >/dev/null 2>&1 && rel
 # session_id (filtered by AGENT_NAME) also means a marker for a DIFFERENT agent
 # can never make us skip (no cross-agent leakage).
 SKIP_REGISTER_HANDOFF=0
-if [ "$CODEX_ROUTE" = door ] && [ -n "${RELAY_AGENT_TOKEN:-}" ] && relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$' \
-  && relay_budget_for "the launch session check" 2; then
-  CUR_SID=$(RELAY_AGENT_TOKEN="$RELAY_AGENT_TOKEN" relay_owner_session "$CODEX_CLI" "$RELAY_STEP_SECS" "$AGENT_NAME") || CUR_SID=""
-  if [ -n "$CUR_SID" ] && [ "$CUR_SID" = "$RELAY_LAUNCH_SESSION" ]; then
-    SKIP_REGISTER_HANDOFF=1
-  fi
-elif [ "$CODEX_ROUTE" = curl ] && relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$'; then
+if [ "$CODEX_ROUTE" = curl ] && relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$'; then
   DISCOVER_BODY=$(relay_token_config | curl -fsS --connect-timeout 1 --max-time 2 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"discover_agents","arguments":{}}}' 2>/dev/null) || DISCOVER_BODY=""
@@ -321,9 +316,19 @@ if [ "$SKIP_REGISTER_HANDOFF" -eq 0 ]; then
       "${REG_HEADERS[@]}" \
       -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":${CODEX_REG_ARGS}}}" \
       2>/dev/null)
-  elif relay_budget_for "registration" 4; then
-    # Hook PR 3: a sealed exchange through the owner door (the token from the environment, never argv).
-    REG_BODY=$(RELAY_AGENT_TOKEN="${RELAY_AGENT_TOKEN:-}" relay_owner_tool "$CODEX_CLI" "$RELAY_STEP_SECS" register_agent "$CODEX_REG_ARGS" 2>/dev/null) || REG_BODY=""
+  else
+    # Hook PR 3 (as ruled): the door route's handoff check asks the door for THIS agent's own session_id
+    # (/owner/v1/session: one name, its own token, no enumeration). A launch-bound session is not re-registered.
+    CODEX_DOOR_SID=""
+    if [ -n "${RELAY_AGENT_TOKEN:-}" ] && relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$' && relay_budget_for "the launch session check" 2 margin; then
+      CODEX_DOOR_SID=$(RELAY_AGENT_TOKEN="$RELAY_AGENT_TOKEN" relay_owner_session "$CODEX_CLI" "$RELAY_STEP_SECS" "$AGENT_NAME") || CODEX_DOOR_SID=""
+    fi
+    if [ -n "$CODEX_DOOR_SID" ] && [ "$CODEX_DOOR_SID" = "${RELAY_LAUNCH_SESSION:-}" ]; then
+      SKIP_REGISTER_HANDOFF=1
+    elif relay_budget_for "registration" 4 margin; then
+      # A sealed exchange through the owner door (the token from the environment, never argv).
+      REG_BODY=$(RELAY_AGENT_TOKEN="${RELAY_AGENT_TOKEN:-}" relay_owner_tool "$CODEX_CLI" "$RELAY_STEP_SECS" register_agent "$CODEX_REG_ARGS" 2>/dev/null) || REG_BODY=""
+    fi
   fi
 
   # Capture a freshly-minted token (first register only) and persist it to the

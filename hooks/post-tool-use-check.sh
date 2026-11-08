@@ -570,7 +570,9 @@ sys.stdout.write("%s\x1f%s" % (r[0], r[1]))
   # Hook PR 3 (as ruled after Codex #418 R2): the restamp carries the token to a LOCAL DB's daemon, so it goes ONLY
   # through that DB's owner door (relay_owner_tool: a sealed exchange; the token from the environment, never argv),
   # never to a configured endpoint. No valid door (no daemon, or one too old to write its record) = no restamp.
-  if [ "${RELAY_RES_LOADED:-}" != 1 ]; then
+  # The owner endpoint is `relay where`'s line 8: the local read's embedded resolution does not carry it (it sets no
+  # verdict either), so ask the resolver unless this run already did.
+  if [ -z "${RELAY_RES_HOOK_DB:-}" ]; then
     relay_budget_for "the resolver" 2 margin || return 0
     relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS" || return 0
   fi

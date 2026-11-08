@@ -490,6 +490,9 @@ case "$F1_RC" in
     fi
     ;;
   3)
+    # The tunnel gate needs the resolver (a local DB?): asked once here, under this hook's margin budget (the pre-mail
+    # budget a bare relay_where_load would take is spent before Stop starts).
+    [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_remote_declared && relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"
     if [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_bearer_allowed; then
       # Hook PR 3 (as ruled): a loopback bearer is refused (the port-theft class) unless it is a trusted tunnel.
       MODE=remote

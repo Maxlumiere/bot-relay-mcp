@@ -98,7 +98,7 @@ register_at_launch() {
   local route=curl relay_cli="$SCRIPT_DIR/relay"
   if command -v relay_bearer_allowed >/dev/null 2>&1 && relay_bearer_allowed; then
     route=curl
-  elif command -v relay_owner_tool >/dev/null 2>&1 && relay_budget_for "the resolver" 2 && relay_where_load "$relay_cli" "$RELAY_STEP_SECS" \
+  elif command -v relay_owner_tool >/dev/null 2>&1 && relay_budget_for "the resolver" 2 margin && relay_where_load "$relay_cli" "$RELAY_STEP_SECS" \
     && [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ]; then
     case "${RELAY_RES_HOOK_DB:-}" in
       http|sqlite3) [ -n "${RELAY_RES_OWNER_ENDPOINT:-}" ] && route=door || return 0 ;;
@@ -169,7 +169,7 @@ register_at_launch() {
   args="{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${caps_json}${title_val:+,\"terminal_title_ref\":\"${title_val}\"}${chain:+,\"host_shell_pids\":${chain}}${guid:+,\"host_id\":\"${guid}\"}}"
   if [ "$route" = door ]; then
     # A sealed exchange: the token from the environment, the registration secret from its file, never argv.
-    relay_budget_for "the launch register" 2 || return 0
+    relay_budget_for "the launch register" 2 margin || return 0
     reg_body=$(RELAY_AGENT_TOKEN="$token" relay_owner_tool "$relay_cli" "$RELAY_STEP_SECS" register_agent "$args" 2>/dev/null) || return 0
   else
     body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":${args}}}"
