@@ -164,6 +164,7 @@ relay_hook_db_native_ok() {
     skip-declared-wasm) why="the instance declares sqlite_driver \"wasm\""; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
     skip-rlyw) why="the DB is stamped for the wasm driver's single owner (RLYW)"; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
     skip-unreadable) why="the instance's sqlite_driver or the DB header could not be read or judged (fail closed)" ;;
+    skip-owner-locked) why="another relay process holds the DB's single-owner lock (a wasm owner, or a conversion running)" ;;
     "(6-line answer)") why="the relay CLI gave a 6-line answer: CLI/hook version skew (update the relay and its hooks together)" ;;
     "") why="the relay CLI gave no DB verdict" ;;
     *) why="the relay CLI gave an unknown DB verdict" ;;

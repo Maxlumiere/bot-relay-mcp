@@ -10,7 +10,8 @@
  *   stamped RLYW (it appears complete, by a link), persists atomically (temp + rename) under the lock, and refuses a
  *   persist when the file was replaced by another writer.
  * - A second process on an owned DB is refused by name; the owner's exit releases it.
- * - Native-only openers and a stdio server on an RLYW DB are refused, with a copy-pasteable HTTP client config.
+ * - Native-only openers on an RLYW DB are refused, with a copy-pasteable HTTP client config. A stdio server may be the
+ *   owner (slice 4 amends 2b-ii); a second one is refused by name.
  * - Legacy env-wasm (`RELAY_SQLITE_DRIVER=wasm` with no instance declaration) never stamps RLYW; an owner never adopts
  *   a legacy (0) file. A declaration that the env contradicts wins, and the env warns.
  * Processes are real (children running dist/), each recorded by pid and killed at the end.

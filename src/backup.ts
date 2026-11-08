@@ -42,7 +42,7 @@ import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
 import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
 import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, resolveOpen, isOwnedDb, holdOwnerForMaintenance, checkpointBeforeRestoreSwap, assertMaintenanceSingleLink, assertNativeByPathAllowed, restoreTargetDriver, restampStagedCopy, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
-import { assertDriverHeaderAllows, nativeHandleCount, isDbFamilyMember, isInHeldNativeFamily, beginWasmUse, endWasmUse, assertNoNativeHandle } from "./db-header.js";
+import { assertDriverHeaderAllows, nativeHandleCount, isDbFamilyMember, isInHeldNativeFamily, beginWasmUse, endWasmUse, assertNoNativeHandle, RELAY_APP_ID_WASM } from "./db-header.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
 import { VERSION } from "./version.js";
@@ -311,8 +311,23 @@ async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<
   try {
     if (resolved.mode === "owner") owner = await holdOwnerForMaintenance(srcDbPath, "backup");
     for (let attempt = 1; ; attempt++) {
+      // Codex #401 R1 P2-4: a retry RE-RESOLVES ownership (the file may have become owned since the first read): an
+      // owned file is never read without its lock (refused, by name, while another process holds it).
+      if (attempt > 1 && d === "wasm" && !owner && resolveOpen(srcDbPath, "read").mode === "owner") {
+        owner = await holdOwnerForMaintenance(srcDbPath, "backup");
+      }
       const source = await openExportSource(srcDbPath, d);
       try {
+        // ...and the image actually loaded must agree: an RLYW image without its lock held is refused.
+        if (d === "wasm" && !owner) {
+          const id = Number((source.db.prepare("PRAGMA application_id").get() as { application_id?: number } | undefined)?.application_id ?? 0) >>> 0;
+          if (id === RELAY_APP_ID_WASM >>> 0) {
+            throw new Error(
+              `backup refused: the DB at '${srcDbPath}' became owned (stamped RLYW) while it was being read, and this export ` +
+                `does not hold its single-owner lock. Retry; while a relay process owns it, back it up through that process.`
+            );
+          }
+        }
         snapshotToFile(source.db, snapshotDbPath);
         exportReadHook?.();
         if (d !== "wasm") return d;

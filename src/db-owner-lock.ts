@@ -604,6 +604,60 @@ export function assertLockIntact(dbPath: string): void {
   assertEntryIntact(key, h, dbPath);
 }
 
+/**
+ * INV-DB-01 slice 4 (the ruling on Codex #401 R1 P1-3 (a)): is the DB's single-owner lock HELD by ANOTHER process (a
+ * live wasm owner, or a conversion)? SYNCHRONOUS (the native openers are) and NON-CREATING: a lock file that does not
+ * exist was never taken, so nothing is probed (a native-only install never touches it); an existing one is probed
+ * with the platform's own primitive, released at once (macOS: O_EXLOCK|O_NONBLOCK; Linux: the trusted flock -n; Windows:
+ * a client open of the owner's named pipe). This process's own hold (re-entrant) is not "another". A probe that cannot
+ * decide is "held" (fail closed), by name in the caller's refusal.
+ */
+export function ownerLockHeldElsewhere(dbPath: string): boolean {
+  let real: string;
+  try {
+    real = fs.realpathSync.native(dbPath);
+  } catch {
+    return false; // no DB: nothing is owned
+  }
+  if (holdsOwnerLock(real)) return false;
+  if (process.platform === "win32") {
+    try {
+      fs.closeSync(fs.openSync(primitiveName(lockKey(real)), "r+"));
+      return true; // a server answers: an owner holds the pipe
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+  }
+  const file = lockFilePath(real);
+  if (!fs.existsSync(file)) return false;
+  if (process.platform === "darwin") {
+    let fd: number;
+    try {
+      fd = openLockFile(file, fs.constants.O_RDWR | fs.constants.O_NONBLOCK | O_EXLOCK_DARWIN);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EAGAIN" || code === "EWOULDBLOCK") return true;
+      return true; // cannot decide: fail closed
+    }
+    fs.closeSync(fd);
+    return false;
+  }
+  let fd: number;
+  try {
+    fd = openLockFile(file, fs.constants.O_RDWR);
+  } catch {
+    return true; // cannot decide: fail closed
+  }
+  try {
+    assertLinuxFlock(real);
+    return !flockFd(fd, file);
+  } catch {
+    return true; // no trusted flock, or flock failed: cannot decide, fail closed
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /** Whether THIS process holds the owner lock for the DB at `dbPath` (the wasm persist checks it before every write). */
 export function holdsOwnerLock(dbPath: string): boolean {
   try {

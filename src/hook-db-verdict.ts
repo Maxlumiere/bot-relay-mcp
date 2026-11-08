@@ -22,7 +22,7 @@
 import { readDriverHeader } from "./db-header.js";
 import { nativeOpenVerdict } from "./sqlite-compat.js";
 
-export const HOOK_DB_VERDICTS = ["sqlite3", "skip-declared-wasm", "skip-rlyw", "skip-unreadable"] as const;
+export const HOOK_DB_VERDICTS = ["sqlite3", "skip-declared-wasm", "skip-rlyw", "skip-unreadable", "skip-owner-locked"] as const;
 export type HookDbVerdict = (typeof HOOK_DB_VERDICTS)[number];
 
 export function hookDbVerdict(dbPath: string): HookDbVerdict {
@@ -30,7 +30,7 @@ export function hookDbVerdict(dbPath: string): HookDbVerdict {
     // The ONE native-open predicate (sqlite-compat.ts nativeOpenVerdict): the caller's declaration AND the DB's own
     // instance's; a wasm declaration skips, and an unreadable or invalid one skips too (fail closed, Codex #391 R1 P2-4).
     const v = nativeOpenVerdict(dbPath, "a hook's sqlite3 read");
-    if (!v.ok) return v.kind === "declared-wasm" ? "skip-declared-wasm" : "skip-unreadable";
+    if (!v.ok) return v.kind === "declared-wasm" ? "skip-declared-wasm" : v.kind === "owner-locked" ? "skip-owner-locked" : "skip-unreadable";
     const h = readDriverHeader(dbPath);
     switch (h.kind) {
       case "wasm":

@@ -500,7 +500,7 @@ describe("INV-DB-01 single owner (black box: real relay processes only)", () => 
   }, 75_000);
 
   for (const withOwner of [false, true]) {
-    it(`3${withOwner ? "b" : "a"}. a stdio server is refused on an RLYW DB (${withOwner ? "an owner running" : "no owner running"}), with an HTTP client config hint`, async () => {
+    it(`3${withOwner ? "b" : "a"} (amended, slice 4). a stdio server on an RLYW DB ${withOwner ? "while an owner runs is refused, naming the single-process rule (before: refused with an HTTP hint)" : "with no owner running becomes its owner and answers (before: refused with an HTTP hint)"}`, async () => {
       const sb = makeSandbox(withOwner ? "stdio-owned" : "stdio-rest");
       let owner: Proc | undefined;
       if (withOwner) {
@@ -520,15 +520,23 @@ describe("INV-DB-01 single owner (black box: real relay processes only)", () => 
       ];
       for (const f of frames) s.child.stdin?.write(`${JSON.stringify(f)}\n`);
 
-      const r = await waitExit(s, EXIT_DEADLINE);
-      expectRefusedExit(s, r, "the stdio server on an RLYW DB");
-      expect(s.stderr(), `the stdio refusal carries an HTTP client config hint\n${describeProc(s)}`).toMatch(HTTP_HINT);
-
       if (owner) {
+        // Another process owns the DB: refused by name, with the single-process text, never an HTTP hint.
+        const r = await waitExit(s, EXIT_DEADLINE);
+        expectRefusedExit(s, r, "the stdio server on an owned RLYW DB");
+        expect(s.stderr(), `the stdio refusal names the single-process rule\n${describeProc(s)}`).toMatch(/another relay process owns this wasm DB; wasm is single-process/);
+        expect(s.stderr(), `no HTTP hint implying a daemon\n${describeProc(s)}`).not.toMatch(HTTP_HINT);
         expect(await healthOk(owner.port!), `the owner still answers after the stdio refusal\n${describeProc(owner)}`).toBe(true);
         expectCleanStop(owner, await stop(owner));
+      } else {
+        // No owner live: this stdio server takes the lock and IS the owner: it answers the tool call.
+        const deadline = Date.now() + EXIT_DEADLINE;
+        while (Date.now() < deadline && !s.exited() && !/"id"\s*:\s*2/.test(s.stdout())) await sleep(100);
+        expect(s.stdout(), `the stdio owner answers the tool call\n${describeProc(s)}`).toMatch(/"id"\s*:\s*2/);
+        expect(s.exited(), `the stdio owner is still running\n${describeProc(s)}`).toBeNull();
+        await stop(s);
       }
-      expect(hex(readStamp(sb)), "the stamp after the stdio refusal").toBe(hex(STAMP_WASM));
+      expect(hex(readStamp(sb)), "the stamp stays RLYW").toBe(hex(STAMP_WASM));
     }, 45_000);
   }
 

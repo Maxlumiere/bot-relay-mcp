@@ -26,7 +26,7 @@ import { InvalidConfigError, instanceSqliteDriverProblem, readInstanceSqliteDriv
 import { colocatedConfigPathFor } from "./instance.js";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
-import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
+import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, ownerLockHeldElsewhere, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
 import {
   assertDriverHeaderAllows,
   noteNativeHandleOpened,
@@ -39,6 +39,7 @@ import {
   DbHeaderRefusedError,
   nativeHandleCount,
   readDriverHeader,
+  driverHeaderVerdict,
   RELAY_APP_ID_WASM,
   RELAY_APP_ID_NATIVE,
   JOURNAL_BYTES_DELETE,
@@ -144,6 +145,15 @@ let instanceServer = false;
 export function markInstanceServer(): void {
   instanceServer = true;
 }
+/**
+ * The ruling on Codex #401 R1 (3), amending 2b-ii: a STDIO server may be its wasm DB's single owner when it takes the
+ * owner lock (exclusion is the lock's job; the transport was only a proxy for it). Set by src/index.ts for stdio, so
+ * the refusal when another process owns the DB names the single-process rule, not an HTTP daemon that may not exist.
+ */
+let stdioServer = false;
+export function markStdioServer(): void {
+  stdioServer = true;
+}
 /** Test-only: run as (or stop running as) an instance server. */
 export function _setInstanceServerForTests(on: boolean): void {
   instanceServer = on;
@@ -201,7 +211,7 @@ export function resolveOpen(dbPath: string, purpose: "open" | "read"): ResolvedO
       // (its own config.json is not the caller's) is opened natively only when that instance's declaration allows it.
       const { configPath } = readInstanceSqliteDriver();
       const other = dbHomeDeclaration(dbPath, { value: undefined, configPath });
-      const r = other ? declarationRefusal(dbPath, "a native open", other) : null;
+      const r = (other ? declarationRefusal(dbPath, "a native open", other) : null) ?? ownerLockedRefusal(dbPath, "a native open");
       if (r) throw new DbHeaderRefusedError(r.message);
     } else {
       // Codex #391 R2: a non-server native open (a CLI verb's initializeDb) runs the one fail-closed predicate.
@@ -235,6 +245,16 @@ export function restoreTargetDriver(srcDbPath: string): SqliteDriver {
   const live = fs.existsSync(srcDbPath) ? readDriverHeader(srcDbPath) : null;
   const liveKind: SqliteDriver | null =
     live === null ? null : live.kind === "wasm" ? "wasm" : live.kind === "native" || live.kind === "legacy" ? "native" : null;
+  // Codex #401 R1 P2-6: symmetric. An EXPLICIT instance declaration that disagrees with the live header refuses, either
+  // way. As designed: an env-only RELAY_SQLITE_DRIVER on a SILENT instance is not one over a live RLYW DB, whose header
+  // decides (as in resolveOpen).
+  if (liveKind === "wasm" && d.instance === "native") {
+    throw new Error(
+      `restore refused: this instance declares sqlite_driver "native" but its live DB at '${srcDbPath}' is wasm (RLYW): ` +
+        `the two disagree, so the instance could not open its own DB. Convert the DB first (\`relay convert-journal ` +
+        `--to native\`) or correct the declaration, then retry. Nothing was replaced.`
+    );
+  }
   if (liveKind === "wasm") return "wasm"; // the header decides
   if (declared === "wasm" && liveKind === "native") {
     throw new Error(
@@ -253,6 +273,16 @@ export function restoreTargetDriver(srcDbPath: string): SqliteDriver {
  * restore's private staging directory: no other process can have it open.
  */
 export async function restampStagedCopy(file: string, kind: SqliteDriver): Promise<void> {
+  // Codex #401 R1 P2-5: the ORIGINAL staged header is judged FIRST: only a relay DB (legacy, RLYN or RLYW) is re-stamped.
+  // A foreign or unrecognised one gets the existing refusal, never a relay stamp over it.
+  const original = readDriverHeader(file);
+  if (original.kind !== "legacy" && original.kind !== "native" && original.kind !== "wasm") {
+    const verdict = driverHeaderVerdict(file, original, kind);
+    throw new Error(
+      `restore refused: the archive's database is not a relay database (${original.kind}). ` +
+        (verdict && "refuse" in verdict ? verdict.refuse : `It is not the relay's.`) + ` Nothing was replaced.`
+    );
+  }
   const bytes = fs.readFileSync(file);
   const id = bytes.length >= 72 ? bytes.readUInt32BE(68) : 0;
   const journal = bytes.length >= 20 ? `${bytes[18]}/${bytes[19]}` : "";
@@ -366,7 +396,18 @@ function declarationRefusal(dbPath: string, what: string, d: Declaration): { kin
   }
   return null;
 }
-export type NativeOpenVerdict = { ok: true } | { ok: false; kind: "declared-wasm" | "unreadable"; message: string };
+export type NativeOpenVerdict = { ok: true } | { ok: false; kind: "declared-wasm" | "unreadable" | "owner-locked"; message: string };
+/** Why a native open must wait: ANOTHER process holds the DB's single-owner lock (a live wasm owner, or a conversion). */
+function ownerLockedRefusal(dbPath: string, what: string): { kind: "owner-locked"; message: string } | null {
+  if (!ownerLockHeldElsewhere(dbPath)) return null;
+  return {
+    kind: "owner-locked",
+    message:
+      `REFUSING ${what} of the DB at '${dbPath}': another relay process holds its single-owner lock (a wasm owner, or ` +
+        `\`relay convert-journal\` running), and a native open beside it could write the file mid-conversion. Wait for ` +
+        `it to finish, or stop that process, then retry. Nothing was created or opened.`,
+  };
+}
 /**
  * INV-DB-01 slice 3, the ONE native-open predicate for every NON-OWNER native opener (the by-path openers, getDb()'s
  * fallback, a cold native export, restore's pre-swap step, and the hooks' verdict): it consults the CALLER's declaration
@@ -383,6 +424,9 @@ export function nativeOpenVerdict(dbPath: string, what: string): NativeOpenVerdi
     const r = declarationRefusal(dbPath, what, d);
     if (r) return { ok: false, ...r };
   }
+  // INV-DB-01 slice 4 (the ruling on Codex #401 R1 P1-3 (a)): the owner lock also excludes native openers.
+  const locked = ownerLockedRefusal(dbPath, what);
+  if (locked) return { ok: false, ...locked };
   return { ok: true };
 }
 /**
@@ -1108,6 +1152,14 @@ async function createOwnedWasmDb(dbPath: string, header: DriverHeader): Promise<
       lock = await acquireOwnerLock(dbPath, { initialBytes, ...(containmentCheck ? { beforeCreate: containmentCheck } : {}) });
     } catch (err) {
       if (err instanceof OwnerLockError && /could not be locked/.test(err.message)) {
+        // The ruling on Codex #401 R1 (3): a STDIO server may be the owner; one that cannot take the lock says so
+        // without an HTTP hint (that would imply a daemon exists).
+        if (stdioServer) {
+          throw new OwnerLockError(
+            `the DB at ${dbPath}: another relay process owns this wasm DB; wasm is single-process: close it, or run one ` +
+              `HTTP daemon and point every client at it.`
+          );
+        }
         throw new OwnerLockError(
           `the DB at ${dbPath} is owned by another relay process (its wasm single owner), so this process does not open ` +
             `it. Reach it through that process over HTTP (an MCP client config for it: ${httpClientHint()}), or stop it.`
