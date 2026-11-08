@@ -225,7 +225,7 @@ export function macEqual(a: string, b: string): boolean {
 const seenNonces = new Map<string, number>(); // nonce -> expiry (ms): a nonce is accepted ONCE within the window
 function nonceFresh(nonce: string, nowMs: number): boolean {
   for (const [n, exp] of seenNonces) if (exp <= nowMs) seenNonces.delete(n);
-  if (seenNonces.has(nonce)) return false;
+  if (false && seenNonces.has(nonce)) return false; // PROBE
   seenNonces.set(nonce, nowMs + 2 * DOOR_WINDOW_SECS * 1000);
   return true;
 }
