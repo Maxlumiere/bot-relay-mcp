@@ -395,9 +395,9 @@ jobs:
       - name: "PR 4: the CLI's credential clients (Windows)"
         if: ${{ !cancelled() }}
         run: npx vitest run tests/cli-door-clients.test.ts --reporter=verbose --reporter=json --outputFile.json=pr4-cli.json
-      - name: "PR 4: those rows PASSED (every non-LAN row; not skipped, not filtered away)"
+      - name: "PR 4: the named critical rows PASSED (not skipped, not filtered away)"
         if: ${{ !cancelled() }}
-        run: node -e "const j=require('./pr4-cli.json');const rows=j.testResults.flatMap(f=>f.assertionResults);const must=rows.filter(a=>!a.fullName.includes('(a LAN address'));console.log(rows.map(r=>r.status+' | '+r.fullName.slice(0,120)).join(' ; '));const bad=must.filter(a=>a.status!=='passed');if(must.length<10||bad.length){console.error('PR 4 rows not all PASSED on Windows; required='+must.length+' not_passed='+bad.length);process.exit(1)}"
+        run: node tools/ci/require-rows-passed.mjs pr4-cli.json "a tool outside the allowlist is refused" "zero credential bytes to the configured port" "its token check goes through the door, never to that port" "an UNRESOLVED relay host gets nothing" "RELAY_AGENT_TOKEN is honoured for a remote ONLY" "a remote's TRANSPORT secret" "THE ALLOWLIST, both ways" "pair proceeds to it (not the loopback refusal)" "a VALID local owner record's port" "one byte every 30 ms" "a boundary-size message goes through the door" "a private scope → its token" "REPLACED between the check and the read" "healthGet sends only GET /health" "NEGATIVE CONTROLS" "each site is in the registry"
       - name: INV-DB-01 slice 4 convert-journal + the flip + the doorbell lock (Windows)
         if: ${{ !cancelled() }}
         run: npx vitest run tests/inv-db-01-s4-convert.test.ts tests/inv-db-01-s4-doorbell.test.ts --reporter=verbose

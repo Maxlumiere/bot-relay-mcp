@@ -172,7 +172,7 @@ function registerExtra(c: Case, name: string): string {
   return r.stdout.trim();
 }
 /** A recording listener on `host`: every request (method, url, headers, body). */
-async function recorder(host = "127.0.0.1", handler?: (req: http.IncomingMessage, res: http.ServerResponse) => void) {
+async function recorder(host = "127.0.0.1", handler?: (req: http.IncomingMessage, res: http.ServerResponse) => void, atPort = 0) {
   const reqs: Array<{ method: string; url: string; headers: http.IncomingHttpHeaders; body: string }> = [];
   const server = http.createServer((req, res) => {
     let body = "";
@@ -187,7 +187,10 @@ async function recorder(host = "127.0.0.1", handler?: (req: http.IncomingMessage
     });
   });
   servers.push(server);
-  await new Promise<void>((r) => server.listen(0, host, () => r()));
+  await new Promise<void>((r, j) => {
+    server.once("error", j);
+    server.listen(atPort, host, () => r());
+  });
   const port = (server.address() as { port: number }).port;
   return { port, reqs, bytes: () => reqs.map((q) => `${q.method} ${q.url}\n${JSON.stringify(q.headers)}\n${q.body}`).join("\n") };
 }
@@ -209,33 +212,41 @@ function relayAsync(c: Case, args: string[], extra: Record<string, string> = {},
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// THE SCAN (every OS): every HTTP client call site in src/cli/, bin/ and tools/ is CLASSIFIED; a new one fails CI.
-type Klass = "health-only" | "door-client" | "relay-client" | "hooks-family";
-/** file → pattern → { n, klass }. The FINAL shape: credential-bearing verbs reach HTTP only through relay-client. */
+// THE SCAN (every OS): every network client SITE in src/cli/, bin/ and tools/ is CLASSIFIED; a new one fails CI.
+// As ruled after #434 R1 (P2-5): a file's LANGUAGE is decided by its extension or, extensionless, its shebang (bin/relay
+// is node); a code site is a fetch call (any spacing), ANY import / require / dynamic import of a network module, or a
+// curl/wget SUBPROCESS; a shell site is a curl/wget invocation. Health probes are not trusted by their line: they all
+// go through relay-client's healthGet (no headers parameter), and a recording row proves it carries no credential.
+type Klass = "door-client" | "relay-client" | "port-probe" | "hooks-family";
 const HTTP_REGISTRY: Record<string, Record<string, { n: number; klass: Klass }>> = {
-  "src/cli/pair.ts": { "fetch(": { n: 1, klass: "health-only" } },
-  "src/cli/doctor.ts": { "fetch(": { n: 2, klass: "health-only" } },
-  "src/cli/init.ts": { "fetch(": { n: 1, klass: "health-only" } },
-  "src/cli/watch.ts": { "fetch(": { n: 1, klass: "health-only" } },
-  "src/cli/test.ts": { "fetch(": { n: 1, klass: "health-only" } },
-  "src/cli/owner.ts": { "http.request(": { n: 1, klass: "door-client" } },
-  "src/cli/relay-client.ts": { "http.request(": { n: 1, klass: "relay-client" }, "https.request(": { n: 1, klass: "relay-client" } },
-  "bin/codex-relay": { "curl ": { n: 2, klass: "hooks-family" } },
+  "src/cli/owner.ts": { net: { n: 1, klass: "door-client" } },
+  "src/cli/relay-client.ts": { net: { n: 2, klass: "relay-client" } },
+  "src/cli/mint-token.ts": { net: { n: 1, klass: "port-probe" } },
+  "src/cli/open.ts": { net: { n: 1, klass: "port-probe" } },
+  "src/cli/recover.ts": { net: { n: 1, klass: "port-probe" } },
+  "bin/codex-relay": { curl: { n: 2, klass: "hooks-family" } },
 };
-// curl: an INVOCATION (at a command position, followed by an argument), as the hook tripwire counts it: not `route=curl`,
-// `command -v curl` or `= curl ]`.
-const PATTERNS = [/\bfetch\(/g, /\bhttps\.request\(/g, /(?<![A-Za-z.])http\.request\(/g, /(?:^|[\s;|&(!])curl\s+[-"'$h]/g];
-const PATTERN_KEYS = ["fetch(", "https.request(", "http.request(", "curl "];
+const NET_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)["'`](?:node:)?(?:https?|http2|net|tls|undici|dgram)["'`]/g;
+const FETCH_RE = /\bfetch\s*\(/g;
+const SUBPROC_RE = /\b(?:spawn|spawnSync|execFile|execFileSync|exec|execSync|fork)\s*\(\s*["'`](?:[^"'`]*[\\/])?(?:curl|wget)(?:\.exe)?\b/g;
+// curl/wget at a command position followed by an argument (not `route=curl`, `command -v curl` or `= curl ]`).
+const SHELL_RE = /(?:^|[\s;|&(!`])(?:curl|wget)\s+[-"'$\w]/g;
+function langOf(file: string, src: string): "code" | "shell" | null {
+  if (/\.(ts|mts|cts|mjs|js|cjs)$/.test(file)) return "code";
+  if (/\.(sh|bash|zsh)$/.test(file)) return "shell";
+  if (/^#!.*\bnode\b/.test(src)) return "code";
+  if (/^#!.*\b(?:ba|z|da|k)?sh\b/.test(src)) return "shell";
+  return null;
+}
 function httpSites(file: string, src: string): Record<string, string[]> {
   const out: Record<string, string[]> = {};
-  const isShell = !/\.(ts|mjs|js|cjs)$/.test(file);
+  const lang = langOf(file, src);
+  if (!lang) return out;
+  const pats: Record<string, RegExp> = lang === "code" ? { fetch: FETCH_RE, net: NET_RE, subprocess: SUBPROC_RE } : { curl: SHELL_RE };
   src.split("\n").forEach((line, i) => {
     const t = line.trim();
-    if (isShell ? t.startsWith("#") : /^(\/\/|\*|\/\*)/.test(t)) return;
-    PATTERNS.forEach((re, k) => {
-      if (isShell !== (PATTERN_KEYS[k] === "curl ")) return;
-      if ((line.match(re) ?? []).length > 0) (out[PATTERN_KEYS[k]!] ??= []).push(`${file}:${i + 1}: ${t.slice(0, 140)}`);
-    });
+    if (lang === "shell" ? t.startsWith("#") : /^(\/\/|\*|\/\*)/.test(t)) return;
+    for (const [k, re] of Object.entries(pats)) for (const _m of line.matchAll(re)) (out[k] ??= []).push(`${file}:${i + 1}: ${t.slice(0, 140)}`);
   });
   return out;
 }
@@ -249,29 +260,45 @@ function walk(dir: string): string[] {
 }
 
 describe("PR 4: every HTTP client call site in src/cli, bin and tools is classified (a scan, every OS)", () => {
-  it("each site is in the registry with its class; a planted unclassified fetch is caught; health-only sites carry no credential; the credential verbs use relay-client", () => {
-    const planted = httpSites("src/cli/planted.ts", 'const r = await fetch(`${base}/mcp`, { headers: { "X-Agent-Token": t } });');
-    expect(planted["fetch("], "control: a planted fetch is a site").toHaveLength(1);
-    const files = [...walk(path.join(REPO, "src", "cli")), ...walk(path.join(REPO, "bin")), ...walk(path.join(REPO, "tools"))].filter((f) => /\.(ts|mjs|js|cjs)$/.test(f) || path.dirname(f) === path.join(REPO, "bin"));
-    expect(files.length, "precondition: the scan sees the CLI").toBeGreaterThan(20);
+  it("NEGATIVE CONTROLS (#434 R1 P2-5): each client form is a site, in every language the tree uses", () => {
+    const n = (file: string, src: string, k: string) => (httpSites(file, src)[k] ?? []).length;
+    expect(n("src/cli/x.ts", 'const r = await fetch(`${base}/mcp`, { headers: { "X-Agent-Token": t } });', "fetch"), "fetch(").toBe(1);
+    expect(n("src/cli/x.ts", "const r = await fetch (url, init);", "fetch"), "fetch (url").toBe(1);
+    expect(n("src/cli/x.ts", 'const h = await import("node:https");\nh.request(o);', "net"), "a dynamic import of node:https").toBe(1);
+    expect(n("src/cli/x.ts", 'const h = require("http");', "net"), "require(http)").toBe(1);
+    expect(n("src/cli/x.ts", 'import * as u from "undici";', "net"), "undici").toBe(1);
+    expect(n("src/cli/x.ts", 'spawn("curl", ["-s", url]);', "subprocess"), "spawn(curl)").toBe(1);
+    expect(n("src/cli/x.ts", 'execFileSync("/usr/bin/wget", [url]);', "subprocess"), "execFile(wget)").toBe(1);
+    expect(n("bin/relay-x", "#!/usr/bin/env node\nfetch(url);", "fetch"), "an extensionless NODE file in bin").toBe(1);
+    expect(n("tools/x.sh", 'curl -fsS "$url"', "curl"), "a tools/ shell script").toBe(1);
+    expect(n("bin/x", "#!/usr/bin/env bash\nwget -q \"$u\"", "curl"), "an extensionless shell file, wget").toBe(1);
+    expect(n("bin/x", '#!/bin/sh\ncommand -v curl >/dev/null && route=curl', "curl"), "control: not an invocation").toBe(0);
+  });
+
+  it("each site is in the registry with its class; no fetch anywhere; every health probe is healthGet; port probes write nothing; the credential verbs use relay-client", () => {
+    const files = [...walk(path.join(REPO, "src", "cli")), ...walk(path.join(REPO, "bin")), ...walk(path.join(REPO, "tools"))];
     const found: Record<string, Record<string, string[]>> = {};
+    let scanned = 0;
     for (const f of files) {
       const rel = path.relative(REPO, f).split(path.sep).join("/");
-      const s = httpSites(rel, fs.readFileSync(f, "utf-8"));
+      const src = fs.readFileSync(f, "utf-8");
+      if (langOf(rel, src)) scanned++;
+      const s = httpSites(rel, src);
       if (Object.keys(s).length > 0) found[rel] = s;
     }
+    expect(scanned, "precondition: the scan reads the CLI, bin and tools").toBeGreaterThan(30);
+    expect(langOf("bin/relay", fs.readFileSync(path.join(REPO, "bin", "relay"), "utf-8")), "precondition: bin/relay is read as code").toBe("code");
     const shape = (o: Record<string, Record<string, unknown[]>>) =>
       Object.fromEntries(Object.entries(o).map(([f, ps]) => [f, Object.fromEntries(Object.entries(ps).map(([p, v]) => [p, v.length]))]));
     const want = Object.fromEntries(Object.entries(HTTP_REGISTRY).map(([f, ps]) => [f, Object.fromEntries(Object.entries(ps).map(([p, v]) => [p, v.n]))]));
     expect(shape(found), `every site classified (found:\n${Object.values(found).flatMap((p) => Object.values(p).flat()).join("\n")})`).toEqual(want);
     for (const [f, ps] of Object.entries(HTTP_REGISTRY)) {
-      for (const [p, v] of Object.entries(ps)) {
-        if (v.klass !== "health-only") continue;
-        for (const site of found[f]?.[p] ?? []) {
-          expect(site, `${site}: a health-only site probes /health`).toMatch(/\/health/);
-          expect(site, `${site}: a health-only site carries no credential`).not.toMatch(/token|secret|authorization|x-agent|x-relay/i);
-        }
-      }
+      if (ps.net?.klass !== "port-probe") continue;
+      const src = fs.readFileSync(path.join(REPO, f), "utf-8");
+      expect(src, `${f}: a port probe only connects (it writes nothing to the socket)`).not.toMatch(/\b(?:sock|socket|s|conn)\.(?:write|end)\s*\(\s*[^)\s]/);
+    }
+    for (const f of ["doctor.ts", "init.ts", "watch.ts", "test.ts", "pair.ts"]) {
+      expect(fs.readFileSync(path.join(REPO, "src", "cli", f), "utf-8"), `${f}'s health probe is relay-client's healthGet`).toMatch(/\bhealthGet\s*\(/);
     }
     for (const f of ["send.ts", "resolve.ts", "pair.ts", "doctor.ts", "test.ts"]) {
       expect(fs.readFileSync(path.join(REPO, "src", "cli", f), "utf-8"), `${f} reaches its relay through relay-client`).toMatch(/from "\.\/relay-client\.js"|import\("\.\/relay-client\.js"\)/);
@@ -399,12 +426,15 @@ process.stdout.write(JSON.stringify({ selected: await m.remoteToken("203.0.113.1
     const httpSecret = `pr4-remote-http-secret-${crypto.randomBytes(12).toString("hex")}`;
     const set = spawnSync(process.execPath, [RELAY, "remote", "set-http-secret", "203.0.113.10:3777"], { env: baseEnv(c), input: `${httpSecret}\n`, encoding: "utf-8" });
     expect(set.status, set.stderr).toBe(0);
+    const dashSecret = `pr4-remote-dash-secret-${crypto.randomBytes(12).toString("hex")}`;
+    const setD = spawnSync(process.execPath, [RELAY, "remote", "set-dashboard-secret", "203.0.113.10:3777"], { env: baseEnv(c), input: `${dashSecret}\n`, encoding: "utf-8" });
+    expect(setD.status, setD.stderr).toBe(0);
     const probe = path.join(c.home, "probe-secret.mjs");
     fs.writeFileSync(probe, `const m = await import(${JSON.stringify(pathToFileURL(path.join(REPO, "dist", "cli", "relay-client.js")).href)});
-process.stdout.write(JSON.stringify({ file: await m.remoteSecret("203.0.113.10", 3777, "http"), none: await m.remoteSecret("203.0.113.11", 3777, "http") }));`);
+process.stdout.write(JSON.stringify({ file: await m.remoteSecret("203.0.113.10", 3777, "http"), dash: await m.remoteSecret("203.0.113.10", 3777, "dashboard"), none: await m.remoteSecret("203.0.113.11", 3777, "http") }));`);
     const r = spawnSync(process.execPath, [probe], { env: baseEnv(c), encoding: "utf-8" });
     expect(r.status, r.stderr).toBe(0);
-    expect(JSON.parse(r.stdout), "the provisioned file; no file and no env → none (never the local config)").toEqual({ file: httpSecret, none: null });
+    expect(JSON.parse(r.stdout), "the provisioned file; no file and no env → none (never the local config)").toEqual({ file: httpSecret, dash: dashSecret, none: null });
   }, 60_000);
 
   it("THE ALLOWLIST, both ways: every tool a verb sends through the door is on it, and every entry is used by some verb", async () => {
@@ -467,3 +497,183 @@ describe.skipIf(LAN_V4 === null)("#434 rulings: a flag-chosen remote never gets 
     expect(remote.bytes(), "the launcher's token never reaches a flag-chosen remote").not.toContain(localTok);
   }, 120_000);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// #434 Codex R1 (each RED from the review's own inputs).
+const DIST_CLIENT = pathToFileURL(path.join(REPO, "dist", "cli", "relay-client.js")).href;
+/** A probe module run as its own process (async: the daemon and the recorders stay responsive). */
+function probeAsync(c: Case, body: string, extra: Record<string, string> = {}): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  const file = path.join(c.home, `probe-${crypto.randomBytes(4).toString("hex")}.mjs`);
+  fs.writeFileSync(file, `const m = await import(${JSON.stringify(DIST_CLIENT)});\n${body}`);
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [file], { env: baseEnv(c, extra), stdio: ["ignore", "pipe", "pipe"] });
+    procs.push(child);
+    let stdout = "";
+    let stderr = "";
+    child.stdout!.on("data", (d: Buffer) => (stdout += d));
+    child.stderr!.on("data", (d: Buffer) => (stderr += d));
+    const t = setTimeout(() => child.kill("SIGKILL"), 60_000);
+    child.once("close", (status) => {
+      clearTimeout(t);
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
+/** Can this runner bind ::1? (a v6 loopback); decided once. */
+const V6_LOOPBACK: boolean = await new Promise((resolve) => {
+  const s = http.createServer();
+  s.once("error", () => resolve(false));
+  s.listen(0, "::1", () => s.close(() => resolve(true)));
+});
+
+describe.skipIf(!V6_LOOPBACK)("#434 R1 P1: an IPv6 tunnel: EVERY pair request goes to the checked address (skipped by name where ::1 cannot be bound)", () => {
+  it("`pair http://[::1]:PORT` + the opt-in, with ANOTHER listener on 127.0.0.1:PORT → the v4 listener gets ZERO bytes; ::1 gets /health and /mcp; Host is bracketed", async () => {
+    const c = newCase("pair-v6");
+    let v6: Awaited<ReturnType<typeof recorder>> | null = null;
+    let v4: Awaited<ReturnType<typeof recorder>> | null = null;
+    for (let i = 0; i < 10 && !v4; i++) {
+      v6 = await recorder("::1");
+      v4 = await recorder("127.0.0.1", undefined, v6.port).catch(() => null);
+    }
+    expect(v4, "precondition: two listeners on one port (::1 and 127.0.0.1)").not.toBeNull();
+    const secret = "pr4-v6-hub-secret-aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const r = await relayAsync(c, ["pair", `http://[::1]:${v6!.port}`, "--name", "pr4-v6-pair", "--yes", "--output", path.join(c.home, "o.json"), "--secret-stdin"], { RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(v6!.port) }, `${secret}\n`);
+    expect(v4!.reqs, `the IPv4 listener received nothing\n${r.stderr}`).toEqual([]);
+    expect(v6!.reqs.map((q) => `${q.method} ${q.url}`), `::1 got the probe and the register\n${r.stderr}`).toEqual(["GET /health", "POST /mcp"]);
+    for (const q of v6!.reqs) expect(q.headers.host, "an IPv6 literal is bracketed in Host").toBe(`[::1]:${v6!.port}`);
+  }, 120_000);
+});
+
+describe("#434 R1 P2-2: the remote client's deadline is ABSOLUTE, and cancellable", () => {
+  it("a server sending one byte every 30 ms against a 70 ms deadline → aborted near the deadline (not completed); an AbortSignal cancels it too", async () => {
+    const dribble = http.createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      let n = 0;
+      const t = setInterval(() => {
+        res.write("x");
+        if (++n > 60) {
+          clearInterval(t);
+          res.end();
+        }
+      }, 30);
+      res.on("close", () => clearInterval(t));
+    });
+    servers.push(dribble);
+    await new Promise<void>((r) => dribble.listen(0, "127.0.0.1", () => r()));
+    const port = (dribble.address() as { port: number }).port;
+    const c = newCase("deadline");
+    const r = await probeAsync(c, `const t = { host: "127.0.0.1", ip: "127.0.0.1", port: ${port}, secure: false };
+const time = async (f) => { const s = Date.now(); try { await f(); return { ok: true, ms: Date.now() - s }; } catch (e) { return { ok: false, ms: Date.now() - s, why: String(e.message) }; } };
+const deadline = await time(() => m.remotePost(t, "/mcp", {}, "{}", 70));
+const ac = new AbortController(); setTimeout(() => ac.abort(), 60);
+const aborted = await time(() => m.remotePost(t, "/mcp", {}, "{}", 10000, ac.signal));
+process.stdout.write(JSON.stringify({ deadline, aborted }));`);
+    expect(r.status, r.stderr).toBe(0);
+    const o = JSON.parse(r.stdout) as Record<string, { ok: boolean; ms: number; why?: string }>;
+    expect(o.deadline!.ok, `the 70 ms deadline aborts a dribbling reply (${JSON.stringify(o.deadline)})`).toBe(false);
+    expect(o.deadline!.ms, "aborted near the deadline").toBeLessThan(1000);
+    expect(o.aborted!.ok, `an abort signal cancels it (${JSON.stringify(o.aborted)})`).toBe(false);
+    expect(o.aborted!.ms).toBeLessThan(1000);
+  }, 60_000);
+});
+
+describe("#434 R1 P2-3: a boundary-size message goes through the door", () => {
+  it("send_message with content at RELAY_MAX_PAYLOAD_BYTES of worst-case JSON escaping (control bytes) succeeds through the door; one byte over is the HANDLER's named refusal, not a door 413", async () => {
+    const c = newCase("door-size");
+    const token = seedNativeDb(c);
+    registerExtra(c, "pr4-big-peer");
+    const d = await startDaemon(c);
+    const r = await probeAsync(c, `const tok = ${JSON.stringify(token)};
+const send = async (n) => { try { const res = await m.localTool("send_message", { from: ${JSON.stringify(AGENT)}, to: "pr4-big-peer", content: "\\u0001".repeat(n) }, { agentToken: tok }, { timeoutMs: 30000 }); return { ok: true, j: m.toolJson(res) }; } catch (e) { return { ok: false, why: String(e.message) }; } };
+process.stdout.write(JSON.stringify({ at: await send(65536), over: await send(65537) }));`);
+    await stopDaemon(d.child);
+    expect(r.status, r.stderr).toBe(0);
+    const o = JSON.parse(r.stdout) as { at: { ok: boolean; j?: { success?: boolean; message_id?: string }; why?: string }; over: { ok: boolean; j?: { success?: boolean; error?: string }; why?: string } };
+    expect(o.at.ok && o.at.j?.success === true && typeof o.at.j?.message_id === "string", `the boundary-size message lands (${JSON.stringify(o.at).slice(0, 300)})`).toBe(true);
+    expect(o.over.ok, `over the limit the door still delivers the call (${JSON.stringify(o.over).slice(0, 300)})`).toBe(true);
+    expect(JSON.stringify(o.over.j), "the handler's own payload refusal").toMatch(/RELAY_MAX_PAYLOAD_BYTES/);
+  }, 120_000);
+});
+
+describe("#434 R1 P2-4: a remote's credential files are read through a trusted chain", () => {
+  const linkDir = (target: string, link: string) => fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+  const scopeOf = (c: Case, host: string) => path.join(c.dir, "agents", `remote-${host}-3777`);
+  const putToken = (dir: string, tok: string) => {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(dir, `${AGENT}.token`), `${tok}\n`, { mode: 0o600 });
+  };
+  const ask = (c: Case, host: string) => probeAsync(c, `process.stdout.write(JSON.stringify({ tok: await m.remoteToken(${JSON.stringify(host)}, 3777, ${JSON.stringify(AGENT)}, { envSelected: false }) }));`);
+
+  it("control: a private scope → its token; a scope that is a LINK to the local agents dir → nothing (the local token is never read); a link to ANOTHER remote's scope → refused", async () => {
+    const c = newCase("scope-chain");
+    seedNativeDb(c);
+    putToken(scopeOf(c, "203.0.113.10"), "pr4-remote-a-own-token-aaaaaaaa");
+    const ok = await ask(c, "203.0.113.10");
+    expect(JSON.parse(ok.stdout || "{}").tok, `control: a private scope's token (${ok.stderr})`).toBe("pr4-remote-a-own-token-aaaaaaaa");
+    // the local vault: agents/<agent>.token; remote-203.0.113.20 → a link to agents/ itself
+    fs.writeFileSync(path.join(c.dir, "agents", `${AGENT}.token`), "pr4-the-LOCAL-token-aaaaaaaaaaaa\n", { mode: 0o600 });
+    linkDir(path.join(c.dir, "agents"), scopeOf(c, "203.0.113.20"));
+    const viaLocal = await ask(c, "203.0.113.20");
+    expect(JSON.parse(viaLocal.stdout || "{}").tok ?? null, "a scope linked to the local vault yields nothing").toBeNull();
+    expect(viaLocal.stderr, "named").toMatch(/link|not a real directory|refus/i);
+    linkDir(scopeOf(c, "203.0.113.10"), scopeOf(c, "203.0.113.30"));
+    const cross = await ask(c, "203.0.113.30");
+    expect(JSON.parse(cross.stdout || "{}").tok ?? null, "a scope linked to another remote's yields nothing").toBeNull();
+  }, 60_000);
+
+  it("the scope directory REPLACED between the check and the read → refused (no decoy token is returned)", async () => {
+    const c = newCase("scope-swap");
+    seedNativeDb(c);
+    const scope = scopeOf(c, "203.0.113.10");
+    putToken(scope, "pr4-remote-a-own-token-aaaaaaaa");
+    const decoy = path.join(c.dir, "agents", "decoy");
+    putToken(decoy, "pr4-a-planted-decoy-token-aaaaaa");
+    const r = await probeAsync(c, `const { renameSync } = await import("node:fs");
+m._setScopeReadHookForTests(() => { renameSync(${JSON.stringify(scope)}, ${JSON.stringify(scope + ".orig")}); renameSync(${JSON.stringify(decoy)}, ${JSON.stringify(scope)}); });
+process.stdout.write(JSON.stringify({ tok: await m.remoteToken("203.0.113.10", 3777, ${JSON.stringify(AGENT)}, { envSelected: false }) }));`);
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout).tok ?? null, "a swapped scope is refused").toBeNull();
+    expect(r.stderr).toMatch(/replaced|changed/i);
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("POSIX: a scope readable by others, or a token file readable by others → refused, named", async () => {
+    const c = newCase("scope-priv");
+    seedNativeDb(c);
+    const scope = scopeOf(c, "203.0.113.10");
+    putToken(scope, "pr4-remote-a-own-token-aaaaaaaa");
+    fs.chmodSync(path.join(scope, `${AGENT}.token`), 0o644);
+    const file = await ask(c, "203.0.113.10");
+    expect(JSON.parse(file.stdout || "{}").tok ?? null).toBeNull();
+    expect(file.stderr).toMatch(/mode|private/i);
+    fs.chmodSync(path.join(scope, `${AGENT}.token`), 0o600);
+    fs.chmodSync(scope, 0o755);
+    const dir = await ask(c, "203.0.113.10");
+    expect(JSON.parse(dir.stdout || "{}").tok ?? null).toBeNull();
+    expect(dir.stderr).toMatch(/mode|private/i);
+  }, 60_000);
+});
+
+describe("#434 R1 P2-5: every health probe is credential-free BY RECORDING", () => {
+  it("healthGet sends only GET /health with no credential header, though the environment holds a token and both secrets; `relay doctor` against a recorder sends only that", async () => {
+    const c = newCase("health-rec");
+    seedNativeDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ http_secret: `pr4-config-http-secret-${"q".repeat(24)}` }), { mode: 0o600 });
+    const creds = { RELAY_AGENT_TOKEN: "pr4-env-agent-token-aaaaaaaaaaaa", RELAY_HTTP_SECRET: `pr4-env-http-secret-${"w".repeat(24)}`, RELAY_DASHBOARD_SECRET: `pr4-env-dash-secret-${"e".repeat(24)}` };
+    const rec = await recorder();
+    const r = await probeAsync(c, `const h = await m.healthGet({ host: "127.0.0.1", ip: "127.0.0.1", port: ${rec.port}, secure: false }, 5000); process.stdout.write(JSON.stringify({ status: h.status }));`, creds);
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout).status).toBe(200);
+    expect(m_parseHeaders(rec.reqs), "healthGet: GET /health with only transport headers").toEqual(["GET /health host,connection"]);
+    const rec2 = await recorder();
+    await relayAsync(c, ["doctor"], { ...creds, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(rec2.port) });
+    expect(rec2.reqs.length, "precondition: doctor probed the configured port").toBeGreaterThan(0);
+    expect(rec2.reqs.every((q) => q.method === "GET" && q.url === "/health"), `doctor sends only GET /health there (${rec2.reqs.map((q) => q.url)})`).toBe(true);
+    for (const v of [...Object.values(creds), `pr4-config-http-secret-${"q".repeat(24)}`]) {
+      expect(rec.bytes() + rec2.bytes(), "no credential in any health probe").not.toContain(v);
+    }
+  }, 120_000);
+});
+/** "METHOD /url header,names" per request (sorted names; the transport's own: host, connection). */
+function m_parseHeaders(reqs: Array<{ method: string; url: string; headers: http.IncomingHttpHeaders }>): string[] {
+  return reqs.map((q) => `${q.method} ${q.url} ${Object.keys(q.headers).sort().join(",")}`);
+}
