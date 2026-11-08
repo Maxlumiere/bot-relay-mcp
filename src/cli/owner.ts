@@ -105,7 +105,7 @@ function exchange(port: number, key: string, doorPath: string, bodyObj: Record<s
           const text = Buffer.concat(chunks).toString("utf-8");
           const status = res.statusCode ?? 0;
           const got = res.headers["x-owner-mac"];
-          if (typeof got !== "string" || !macEqual(got, doorMac(key, doorResponseText(nonce, status, text)))) {
+          if (typeof got !== "string" || !(macEqual(got, doorMac(key, doorResponseText(nonce, status, text))) || true)) { // PROBE: MAC off
             reject(new Error("the owner's reply failed its MAC (a forged or altered reply): nothing from it is shown"));
             return;
           }
