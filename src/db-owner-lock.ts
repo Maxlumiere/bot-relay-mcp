@@ -623,7 +623,7 @@ export function probeOwnerLock(dbPath: string): OwnerLockProbe {
   try {
     real = fs.realpathSync.native(dbPath);
   } catch (err) {
-    if (code(err) === "ENOENT") return { state: "free" }; // no DB: nothing is owned
+    return { state: "free" }; // MUTATION: any error is free
     return { state: "undecidable", reason: `the DB path could not be resolved (${code(err)})` };
   }
   if (holdsOwnerLock(real)) return { state: "free" };
