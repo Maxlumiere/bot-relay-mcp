@@ -142,7 +142,7 @@ exit 7
   return { bin, blocker, log, lines, records: () => parseRecords(lines()) };
 }
 
-describe.skipIf(process.platform === "win32")("CONTAINMENT (black-box): an env-{} child running the real SessionStart hook never targets the default port under the tripwire", () => {
+describe.skipIf(process.platform === "win32")("CONTAINMENT (black-box): an env-{} child running the real SessionStart hook never targets the default port under the tripwire (skipped on Windows by name: the bash hooks do not run on native Windows; the CONTROL below runs on every OS)", () => {
   it("THE CLAIM: under the tripwire, the hook's daemon probe reaches curl at the repaired port 1 (/health), NOTHING targets :3777, and no register_agent goes over curl", () => {
     const ins = instrument("claim");
     const home = homeWithInstance("claim");
@@ -161,14 +161,6 @@ describe.skipIf(process.platform === "win32")("CONTAINMENT (black-box): an env-{
     expect(ins.lines(), `without the tripwire the probe goes to the DEFAULT port (recorded: ${JSON.stringify(ins.lines())})`).toContain("curl http://127.0.0.1:3777/health tool=-");
   }, 90_000);
 
-  it("THE CONTROL: an empty run FAILS the claim; so does any :3777 target, and any register_agent over curl", () => {
-    expect(() => assertContainedRegistration(parseRecords([]))).toThrow(/the daemon-probe stimulus never reached curl/);
-    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/health tool=-", 'node {"host":"127.0.0.1","port":3777}']))).toThrow(/DEFAULT port/);
-    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/health tool=-", "curl http://127.0.0.1:1/mcp tool=register_agent"]))).toThrow(/register_agent over curl/);
-    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/health tool=-"]))).not.toThrow();
-    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/mcp tool=register_agent"]))).toThrow(/register_agent over curl/);
-  });
-
   it("THE NODE RECORDER: a connect through net's NORMALIZED [options, cb] shape, and an IPv6 endpoint, are recorded (never dropped); an unparseable record FAILS", () => {
     const ins = instrument("node-shapes");
     const code = `const net = require("net"); for (const [port, host] of [[4321, "127.0.0.1"], [4322, "::1"]]) { try { net.connect({ port, host }); } catch {} } try { net.createConnection(4323); } catch {}`;
@@ -178,5 +170,16 @@ describe.skipIf(process.platform === "win32")("CONTAINMENT (black-box): an env-{
     expect(() => parseRecords(["node ?:undefined"])).toThrow(/unparseable record/);
     expect(() => parseRecords(['node {"host":"127.0.0.1","port":null}'])).toThrow(/unparseable record/);
     expect(parseRecords(["curl http://[::1]:3777/mcp tool=register_agent"])[0]).toEqual({ via: "curl", host: "::1", port: 3777, path: "/mcp", tool: "register_agent" });
+  });
+});
+
+// The claim's own logic, on EVERY OS: each failure the black-box claim must catch is caught.
+describe("CONTAINMENT: the claim's assertion (every OS)", () => {
+  it("THE CONTROL: an empty run FAILS the claim; so does any :3777 target, and any register_agent over curl", () => {
+    expect(() => assertContainedRegistration(parseRecords([]))).toThrow(/the daemon-probe stimulus never reached curl/);
+    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/health tool=-", 'node {"host":"127.0.0.1","port":3777}']))).toThrow(/DEFAULT port/);
+    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/health tool=-", "curl http://127.0.0.1:1/mcp tool=register_agent"]))).toThrow(/register_agent over curl/);
+    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/health tool=-"]))).not.toThrow();
+    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/mcp tool=register_agent"]))).toThrow(/register_agent over curl/);
   });
 });
