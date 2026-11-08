@@ -890,6 +890,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
         fs.renameSync(newPath, target);
         break;
       } catch (err) {
+        if (process.platform !== "win32" || true) { fs.copyFileSync(newPath, target); fs.rmSync(newPath, { force: true }); break; } // MUTATION: the copy-over fallback back
         const code = (err as NodeJS.ErrnoException).code ?? "";
         if (process.platform === "win32" && ["EPERM", "EBUSY", "EACCES"].includes(code) && i < waits.length) {
           Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waits[i]);
