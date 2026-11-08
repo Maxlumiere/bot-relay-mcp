@@ -370,10 +370,10 @@ describe("INV-BACKUP-01: the wasm export refuses what it cannot read completely,
     expect(calls, "one read, no retry").toBe(1);
   });
 
-  it("Codex R1: a WARM wasm image that fails integrity_check is refused too (not only a cold read)", async () => {
-    await makeSourceDb();
-    await toRollbackJournal();
+  it("Codex R1: a WARM wasm image that fails integrity_check is refused too (not only a cold read; slice 4: the warm connection is an OWNER, so its DB is born under wasm, RLYW, instead of made natively)", async () => {
     process.env.RELAY_SQLITE_DRIVER = "wasm";
+    await makeSourceDb(); // born owned (RLYW, DELETE mode): a warm wasm connection is always its owner now
+    expect(fs.readFileSync(dbPath).readUInt32BE(68), "precondition: an owned DB").toBe(0x524c5957);
     const db = await import("../src/db.js");
     await db.initializeDb();
     // Corrupt the LIVE image through SQL: messages' root page points nowhere.

@@ -508,8 +508,8 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     await stopOwner(owner);
   }, 90_000);
 
-  it("R1 P1-2: on a declared-wasm instance the pre-swap step opens NOTHING natively (a legacy DELETE-mode DB): it reports itself skipped, by the declaration", async () => {
-    makeDb(dbPath, 0, ["row-1"]);
+  it("R1 P1-2: on a declared-wasm instance the pre-swap step opens NOTHING natively: on an owned (RLYW) DB it reports itself skipped, by the declaration (slice 4: the fixture was a legacy DB, which a wasm instance no longer keeps)", async () => {
+    makeDb(dbPath, WASM, ["row-1"]);
     declareWasm();
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
     let result: unknown = "the hook after the step did not run";
@@ -522,6 +522,24 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
       setAfterCheckpoint?.(null);
     }
     expect(result).toMatchObject({ ran: false, why: expect.stringMatching(/declares sqlite_driver "wasm"/) });
+  }, 60_000);
+
+  it("R1 P1-2, slice 4 (BREAKING 5.0.0) twin: a declared-wasm instance over a live LEGACY DB refuses the restore by name BEFORE the pre-swap step (so nothing is opened natively), the file untouched (before: the step ran, skipped by the declaration)", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    declareWasm();
+    const before = sha(dbPath);
+    let result: unknown = "the hook after the step did not run";
+    setAfterCheckpoint?.((_p, r) => {
+      result = r;
+    });
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused: this instance declares sqlite_driver "wasm" but its live DB .* is legacy: the two disagree/);
+    } finally {
+      setAfterCheckpoint?.(null);
+    }
+    expect(result, "the pre-swap step never ran: nothing opened natively").toBe("the hook after the step did not run");
+    expect(sha(dbPath)).toBe(before);
   }, 60_000);
 
   it("R1 P2-5: an owned DB that gains a HARD LINK after the lock was taken (during the safety backup) is refused right before the replacement; both names still name the same file", async () => {

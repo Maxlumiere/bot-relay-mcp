@@ -23,6 +23,12 @@ afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 const WASM = 0x524c5957;
 const me = { pid: process.pid, proc_start: null, host_id: null };
 const sha = (f: string) => crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
+/**
+ * The doorbell refuses EVERY Windows state dir before it opens anything (ensurePrivateDir: a directory reports mode 666
+ * there, never 0700; unchanged from main). So on Windows no lock file is ever opened natively, and the property this
+ * file protects (a relay DB is never opened as the lock) holds by that earlier refusal.
+ */
+const WIN_DOORBELL_REFUSES_EVERY_STATE_DIR = process.platform === "win32";
 
 describe("INV-DB-01 slice 4: the doorbell lock never opens a relay DB natively", () => {
   it("a HARD LINK named doorbell.lock.db to an RLYW relay DB is refused before any native open; the DB is untouched", () => {
@@ -37,11 +43,13 @@ describe("INV-DB-01 slice 4: the doorbell lock never opens a relay DB natively",
     fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     fs.linkSync(relayDb, path.join(stateDir, LOCK_DB_FILENAME));
     const before = sha(relayDb);
-    expect(() => acquireInstanceLock(stateDir, me)).toThrow(/(hard link|links|relay database|RLYW)/i);
+    expect(() => acquireInstanceLock(stateDir, me)).toThrow(
+      WIN_DOORBELL_REFUSES_EVERY_STATE_DIR ? /the doorbell state dir must be private \(0700\)/ : /(hard link|links|relay database|RLYW)/i
+    );
     expect(sha(relayDb), "the relay DB is untouched (no BEGIN EXCLUSIVE ran on it)").toBe(before);
   });
 
-  it("twin: a normal doorbell lock is still acquired and released", () => {
+  it.skipIf(WIN_DOORBELL_REFUSES_EVERY_STATE_DIR)("twin: a normal doorbell lock is still acquired and released (skipped on Windows: the doorbell refuses every state dir there, as on main)", () => {
     const stateDir = fs.mkdtempSync(path.join(ROOT, "plain-"));
     const r = acquireInstanceLock(stateDir, me);
     expect(r.ok, JSON.stringify(r)).toBe(true);
