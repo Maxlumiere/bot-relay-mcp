@@ -736,7 +736,7 @@ Both demonstrate: register, send/receive messages, accept + complete tasks, disc
 The relay uses SQLite for persistent state. Two drivers are available:
 
 - **`native` (default)** — `better-sqlite3`, a compiled C addon. Fast, supports WAL mode, multi-process safe. Requires a C++ compiler at `npm install` time.
-- **`wasm`** — `sql.js`, SQLite compiled to WebAssembly. Zero native compilation. Slightly slower writes (in-memory + write-back-to-file). **Single-process only** (not safe for multi-terminal stdio).
+- **`wasm`** — `sql.js`, SQLite compiled to WebAssembly. Zero native compilation. Slightly slower writes (in-memory + write-back-to-file). **Single-process only**: one process owns the database (one HTTP daemon, or a single stdio terminal); a second is refused by name.
 
 Switch with one env var:
 

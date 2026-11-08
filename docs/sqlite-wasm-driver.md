@@ -71,7 +71,7 @@ The driver is a property of the **instance**: a `sqlite_driver` key in the insta
   - There is no `fsync`: the atomic replace protects against a crash of the relay, not against a power loss.
 - **Other processes** reach the database through the daemon over HTTP:
   - a second process that tries to open it is refused by name;
-  - so is a stdio MCP server, with the client config to use instead: `{ "type": "http", "url": "http://127.0.0.1:3777/mcp" }`;
+  - a stdio MCP server MAY be the owner: it takes the owner lock like any owner (so a single terminal on a wasm DB works). A second stdio server, while one owns the database, is refused by name: wasm is single-process, so close the other one, or run one HTTP daemon and point every client at it;
   - so is a native opener;
   - so is every relay opener that reaches the database by its PATH on an instance that declares `"wasm"` (the declaration of the instance that HOLDS the database and the caller's own are both consulted, and an unreadable one refuses too) (the CLI verbs such as `relay bind`, `fleet`, `recover` and the `purge-*` verbs, and the synchronous fallback some callers use), even before the database exists: it names the HTTP client config and creates nothing;
   - the hooks read no database on such an instance: SessionStart prints ONE notice ("hooks deliver no mail on a wasm instance; use the HTTP owner") instead of reading mail and tasks with `sqlite3` (the relay decides this for them: the 7th line of `relay where --fields`). Delivering mail to the hooks through the owner is a later release.
@@ -96,16 +96,17 @@ relay convert-journal --to native    # wasm → native
 - **It works without the native driver too** (native → wasm only): through sql.js. It then refuses any SQLite side file beside the database (even an empty one; checkpoint a leftover WAL once with any SQLite 3, e.g. `sqlite3 relay.db 'PRAGMA wal_checkpoint(TRUNCATE);'`), writes a byte-for-byte safety copy of the original into the `backups` directory beside the database, and replaces the file atomically. wasm → native needs the native driver.
 - Each step leaves a file its header's driver opens, and the command is idempotent: if it is interrupted, run it again and it completes.
 - It also writes the instance's `sqlite_driver` (to the real file behind a symlinked `config.json`; every other field kept, mode 0600). `RELAY_CONFIG_PATH` naming a different file from the database's own instance config is refused.
-- **A restore** re-stamps the archive's database to the instance's driver (its declaration, else the live database's header, else native), so a backup made before a conversion still restores. A declaration that disagrees with the live database's header refuses the restore by name.
+- **A restore** re-stamps the archive's database to the instance's driver (its declaration, else the live database's header, else native), so a backup made before a conversion still restores. An explicit `sqlite_driver` that disagrees with the live database's header refuses the restore by name, either way. As designed, `RELAY_SQLITE_DRIVER=native` alone on an instance that declares nothing is not such a declaration over a live wasm (RLYW) database: its header decides, as it does when the relay opens it. An archive whose database is not the relay's (a foreign `application_id`) is refused before anything is re-stamped.
+- **While a conversion runs** (or a wasm owner is live), every relay native opener of that database is refused by name: the CLI verbs, a cold export, the hooks' reads. A native handle opened before the conversion and left idle cannot be seen; a write it makes during a no-native-driver conversion is detected after the replace and reported as a FAILURE, with that file's bytes saved beside the safety copy.
 
 ## How to switch back
 
-```bash
-# Just remove the flag (native is the default)
-RELAY_TRANSPORT=http node dist/index.js
-```
+The database belongs to one driver (its header says which), so removing the flag is not enough: an owned (wasm) database keeps selecting wasm. Convert it back once, with every relay process stopped:
 
-Both drivers read and write the same `~/.bot-relay/relay.db` file format. You can switch between them freely (stop the relay, change the flag, restart).
+```bash
+relay convert-journal --to native   # needs the native driver; sets the instance's sqlite_driver to "native"
+unset RELAY_SQLITE_DRIVER           # and remove it wherever the relay is launched
+```
 
 ## Performance characteristics
 
@@ -124,10 +125,10 @@ For relay workloads these differences are imperceptible. If you are building som
 
 The wasm driver operates on an in-memory copy of the database. Two processes sharing the same `relay.db` file will overwrite each other's changes on write-back. There is no file-level locking.
 
-**This means:**
-- HTTP transport (single daemon process): safe.
-- Single-terminal stdio: safe.
-- Multi-terminal stdio (multiple MCP processes sharing the same DB): **NOT SAFE. Use native.**
+**This means** (enforced since 5.0.0 by the single-owner lock: a second process is refused by name, never allowed to overwrite):
+- HTTP transport (one daemon process; every client points at it): works.
+- A single stdio terminal: works (that stdio server is the owner).
+- Several stdio terminals on one database: the second is refused. Use one HTTP daemon, or the native driver.
 
 ### No WAL mode
 
