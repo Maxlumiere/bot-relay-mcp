@@ -979,10 +979,10 @@ const SQLITE_LOG = path.join(ROOT, "sqlite3.log");
 fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SQLITE_LOG}"\nexit 1\n`, { mode: 0o755 });
 
 /** The hook, run ASYNCHRONOUSLY (a spy in this process must not be starved by a spawnSync). */
-async function runHook(c: Case, hook: string, extra: Record<string, string>, input = "") {
+async function runHook(c: Case, hook: string, extra: Record<string, string>, input = "", hooksDir = HOOKS) {
   for (const f of [SQLITE_LOG, ARGV_LOG, ENV_LOG, RM_CAPTURE]) fs.rmSync(f, { force: true });
   const env = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_AGENT_NAME: AGENT, RELAY_TEST_CLOCK: "0", ...extra });
-  const child = spawn("bash", [path.join(HOOKS, hook)], { env, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn("bash", [path.join(hooksDir, hook)], { env, stdio: ["pipe", "pipe", "pipe"] });
   procs.push(child);
   let stdout = "";
   let stderr = "";
@@ -1351,7 +1351,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 3 (as ruled): EVERY local credential
     await stopDaemon(d.child);
   }, 120_000);
 
-  it.skipIf(LAN_V4 === null)("a LOCAL instance's token NEVER reaches a remote: the local vault holds one, nothing in the environment, a declared remote → not one byte of it there", async () => {
+  it.skipIf(LAN_V4 === null)("a LOCAL instance's token NEVER reaches a remote (a real LAN address): the local vault holds one, nothing in the environment, a declared remote → not one byte of it there (skipped by name where the runner has no LAN address; the PINNED-remote rows cover it everywhere)", async () => {
     const c = newCase("p3-no-local-token-remote");
     const localToken = seedNativeDb(c);
     const vault = path.join(path.dirname(c.db), "agents");
@@ -1490,3 +1490,154 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (a structural skip): the
   }, 120_000);
 });
 
+// ---------------------------------------------------------------------------------------------------------------------
+// #433 Codex R1 (REDs, POSIX hooks). A PINNED REMOTE without a LAN address: a hooks copy whose host check answers
+// "relay.remote.test → remote, checked address 127.0.0.1", so curl reaches the loopback spy ONLY through the pin
+// (--resolve); unpinned, the name does not resolve and nothing is sent. Every other host takes the real check.
+const REMOTE_NAME = "relay.remote.test";
+let PINNED_HOOKS = "";
+function pinnedRemoteHooks(): string {
+  if (PINNED_HOOKS) return PINNED_HOOKS;
+  const root = path.join(ROOT, "pinned-remote");
+  fs.cpSync(HOOKS, path.join(root, "hooks"), { recursive: true });
+  fs.symlinkSync(path.join(REPO, "bin"), path.join(root, "bin"));
+  const helpers = path.join(root, "hooks", "_vault-helpers.sh");
+  const src = fs.readFileSync(helpers, "utf-8");
+  expect(src, "precondition: the host check is ONE function").toMatch(/^relay_host_classify\(\) \{/m);
+  fs.writeFileSync(
+    helpers,
+    src.replace(/^relay_host_classify\(\) \{/m, "relay_host_classify_real() {") +
+      `\n# TEST ONLY (#433 R1): ${REMOTE_NAME} is a remote whose checked address is the loopback spy.\n` +
+      `relay_host_classify() { case "\${RELAY_HTTP_HOST:-}" in ${REMOTE_NAME}) RELAY_HOST_CLASS=remote; RELAY_HOST_PIN=127.0.0.1; RELAY_HOST_WHY="" ;; *) relay_host_classify_real ;; esac; }\n`,
+  );
+  PINNED_HOOKS = path.join(root, "hooks");
+  return PINNED_HOOKS;
+}
+
+describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the destination vault, proxies, the remote mint secret, the record version", () => {
+  const spy = () =>
+    startSpy((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(req.url === "/health" ? "{}" : JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify({ success: true, messages: [], count: 0, total_pending: 0, has_more: false }) }] } }));
+    });
+  const vaultDir = (c: Case) => path.join(path.dirname(c.db), "agents");
+  const putToken = (dir: string, token: string) => {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(dir, `${AGENT}.token`), `${token}\n`, { mode: 0o600 });
+  };
+  const localMintSecret = (c: Case): string => {
+    const hits: string[] = [];
+    const walk = (d: string) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const f = path.join(d, e.name);
+        if (e.isDirectory()) walk(f);
+        else if (e.name === "mint.secret" && !f.includes(`${path.sep}remote-`)) hits.push(f);
+      }
+    };
+    walk(c.home);
+    expect(hits.length, "precondition: the local instance has its registration secret").toBeGreaterThan(0);
+    return fs.readFileSync(hits[0]!, "utf-8").trim();
+  };
+
+  it.each(["LOCALHOST", "2130706433", "127.1", "0x7f.1"])("P1-1: RELAY_HTTP_HOST=%s is LOOPBACK: a local DB's credentials go through its door; zero bearer bytes to the configured port", async (alias) => {
+    const c = newCase(`r1-alias-${alias.replace(/[^a-z0-9]/gi, "")}`);
+    const token = seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const s = await spy();
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: alias, RELAY_HTTP_PORT: String(s.port) });
+    expect(s.bytes(), `no bearer to the aliased loopback port\n${r.out}`).not.toContain(token);
+    expect(r.argv, "the door route ran").toMatch(/owner tool (health_check|register_agent)/);
+    expect(r.out).not.toMatch(/using the remote relay/);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("P1-3: the vault is scoped by DESTINATION: a token vaulted for tunnel A, and one in the unscoped vault, never reach tunnel B", async () => {
+    const c = newCase("r1-vault-ab");
+    const a = await spy();
+    const b = await spy();
+    const tokA = `pr3-token-for-A-${crypto.randomBytes(8).toString("hex")}`;
+    const tokU = `pr3-token-unscoped-${crypto.randomBytes(8).toString("hex")}`;
+    putToken(path.join(vaultDir(c), `remote-127.0.0.1-${a.port}`), tokA);
+    putToken(vaultDir(c), tokU);
+    const env = { FAKE_PENDING_RC: "3", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(b.port), RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(b.port) };
+    for (const hook of ["stop-check.sh", "post-tool-use-check.sh"]) {
+      const r = await runHook(c, hook, env, inputFor(hook));
+      expect(b.bytes(), `${hook}: A's token never reaches B\n${r.out}`).not.toContain(tokA);
+      expect(b.bytes(), `${hook}: an unscoped token is never imported into B's scope`).not.toContain(tokU);
+    }
+    // The control: B's OWN scoped token IS sent to B (the scope is read, not merely ignored).
+    const tokB = `pr3-token-for-B-${crypto.randomBytes(8).toString("hex")}`;
+    putToken(path.join(vaultDir(c), `remote-127.0.0.1-${b.port}`), tokB);
+    const r = await runHook(c, "stop-check.sh", env, inputFor("stop-check.sh"));
+    expect(b.bytes(), `control: B's own token reaches B\n${r.out}`).toContain(tokB);
+  }, 120_000);
+
+  it("P1-4: a tunnel's (and a pinned remote's) credential calls ignore every proxy and curl config: zero bytes at a proxy from http_proxy or ~/.curlrc", async () => {
+    const c = newCase("r1-proxy");
+    const target = await spy();
+    const proxy = await spy();
+    fs.writeFileSync(path.join(c.home, ".curlrc"), `proxy = "http://127.0.0.1:${proxy.port}"\n`);
+    const proxyEnv = { http_proxy: `http://127.0.0.1:${proxy.port}`, HTTP_PROXY: `http://127.0.0.1:${proxy.port}`, ALL_PROXY: `http://127.0.0.1:${proxy.port}` };
+    const env = { RELAY_AGENT_TOKEN: TOKEN, FAKE_PENDING_RC: "3", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(target.port), RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(target.port), ...proxyEnv };
+    for (const hook of ["check-relay.sh", "stop-check.sh", "post-tool-use-check.sh", "codex/codex-session-start.sh"]) {
+      await runHook(c, hook, env, hook.includes("codex") ? JSON.stringify({ session_id: "s-r1", hook_event_name: "SessionStart" }) : inputFor(hook));
+    }
+    expect(target.requests.length, "precondition: the tunnel was reached").toBeGreaterThan(0);
+    expect(proxy.requests.length, `zero requests at the proxy: ${proxy.bytes().slice(0, 300)}`).toBe(0);
+    // The pinned remote, too.
+    const c2 = newCase("r1-proxy-remote");
+    seedNativeDb(c2);
+    fs.writeFileSync(path.join(c2.home, ".curlrc"), `proxy = "http://127.0.0.1:${proxy.port}"\n`);
+    await runHook(c2, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, RELAY_HTTP_HOST: REMOTE_NAME, RELAY_HTTP_PORT: String(target.port), ...proxyEnv }, "", pinnedRemoteHooks());
+    expect(proxy.requests.length, "zero requests at the proxy from the remote route").toBe(0);
+  }, 180_000);
+
+  it("P1-1 (pinning): a declared remote's bearer goes to the CHECKED address (curl --resolve): the pinned remote is reached, the local door untouched", async () => {
+    const c = newCase("r1-pinned");
+    seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const remote = await spy();
+    const remoteToken = `pr3-remote-token-${crypto.randomBytes(8).toString("hex")}`;
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: remoteToken, RELAY_HTTP_HOST: REMOTE_NAME, RELAY_HTTP_PORT: String(remote.port) }, "", pinnedRemoteHooks());
+    expect(remote.bytes(), `the remote (reached only through the pin) got its bearer\n${r.out}`).toContain(remoteToken);
+    expect(r.argv, "the local door is untouched").not.toMatch(/owner (tool|peek|session|liveness)/);
+    expect(r.out).toMatch(new RegExp(`using the remote relay ${REMOTE_NAME.replace(/\./g, "\\.")}; the local DB at .* is not used for credentials`));
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("P1-2 (as ruled): a remote registration NEVER sends the local mint secret; absent the remote's own, the skip is named; provisioned, it is the one sent", async () => {
+    const c = newCase("r1-remote-mint");
+    seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const local = localMintSecret(c);
+    const remote = await spy();
+    const env = { RELAY_AGENT_NAME: "pr3-remote-newcomer", RELAY_HTTP_HOST: REMOTE_NAME, RELAY_HTTP_PORT: String(remote.port) };
+    const r1 = await runHook(c, "check-relay.sh", env, "", pinnedRemoteHooks());
+    expect(remote.requests.length, `precondition: the remote route ran\n${r1.out}`).toBeGreaterThan(0);
+    expect(remote.bytes(), "the LOCAL mint secret never reaches the remote").not.toContain(local);
+    expect(r1.out, "absent the remote's own secret, the skip is named").toMatch(new RegExp(`provision the remote's mint secret: relay remote set-mint-secret ${REMOTE_NAME.replace(/\./g, "\\.")}:${remote.port}, reading STDIN`));
+    const remoteSecret = `pr3-remote-mint-${crypto.randomBytes(16).toString("hex")}`;
+    const set = spawnSync(process.execPath, [RELAY, "remote", "set-mint-secret", `${REMOTE_NAME}:${remote.port}`], { env: baseEnv(c), input: `${remoteSecret}\n`, encoding: "utf-8" });
+    expect(set.status, set.stderr).toBe(0);
+    await runHook(c, "check-relay.sh", env, "", pinnedRemoteHooks());
+    expect(remote.bytes(), "provisioned: the REMOTE's own secret is the one sent").toContain(remoteSecret);
+    expect(remote.bytes(), "and still never the local one").not.toContain(local);
+    await stopDaemon(d.child);
+  }, 180_000);
+
+  it("P2-5: a #418 daemon's v2 record beside a native DB → no credential, and the skip names the fix (restart the relay daemon)", async () => {
+    const c = newCase("r1-v2-record");
+    const token = seedNativeDb(c);
+    const { record418, startDoorServer418 } = await import("./fixtures/owner-door-v2-418.js");
+    const key = crypto.randomBytes(16).toString("hex");
+    const b = { instance_id: "", db_path: fs.realpathSync(c.db) };
+    const old = await startDoorServer418(key, b, { ok: true, registered: true, count: 0, messages: [] });
+    servers.push(old.server);
+    fs.writeFileSync(c.record, JSON.stringify(record418(old.port, key, b)), { mode: 0o600 });
+    const s = await spy();
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(s.port) });
+    expect(s.bytes()).not.toContain(token);
+    expect(old.requests(), "no exchange with the old daemon").toBe(0);
+    expect(r.out).toMatch(/restart the relay daemon/);
+  }, 120_000);
+});

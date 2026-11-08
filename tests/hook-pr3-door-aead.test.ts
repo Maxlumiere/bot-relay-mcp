@@ -169,6 +169,27 @@ async function door(r: Rec, p: string, args: Record<string, unknown>, o: DoorOpt
 const rpc = (name: string, args: Record<string, unknown>) => ({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } });
 /** The dispatcher's tool result inside a sealed reply, as the hooks parse it (its JSON text). */
 const toolText = (o: Record<string, unknown> | null) => JSON.stringify((o as { result?: unknown } | null)?.result ?? null);
+/** A JSON-RPC result out of an /mcp reply (plain JSON or one SSE `data:` line). */
+function rpcResultOf(raw: string): unknown {
+  const line = raw.split("\n").find((l) => l.startsWith("data:"));
+  try {
+    return (JSON.parse(line ? line.slice(5) : raw) as { result?: unknown }).result;
+  } catch {
+    return undefined;
+  }
+}
+/** A tool result's definite outcome: its stringified content parsed, {success, error_code}; "unparsed" otherwise. */
+function shapeOf(result: unknown): { outcome: "success" | "error" | "unparsed"; error_code?: string } {
+  const text = (result as { content?: Array<{ text?: string }> } | undefined)?.content?.[0]?.text;
+  try {
+    const t = JSON.parse(String(text)) as { success?: boolean; error_code?: string };
+    if (t.success === true) return { outcome: "success" };
+    if (t.success === false && typeof t.error_code === "string") return { outcome: "error", error_code: t.error_code };
+  } catch {
+    /* not a tool result */
+  }
+  return { outcome: "unparsed" };
+}
 /** The whole DB, from a COPY read with sql.js (never an open of the live file). */
 async function dbDump(c: Case): Promise<Record<string, unknown[][]>> {
   const copy = path.join(c.home, `copy-${crypto.randomBytes(4).toString("hex")}.db`);
@@ -251,9 +272,13 @@ describe("hook PR 3: the AEAD owner door (every OS)", () => {
     // With its token the token check passes (no AUTH refusal); what follows is register_agent's own answer, the SAME
     // as the /mcp bearer twin's (here: the live-session collision guard, a seeded agent being online).
     expect(toolText(yes.opened)).not.toMatch(/AUTH_FAILED/);
-    const codeOf = (t: string) => /error_code\\*"\s*:\s*\\*"([A-Z_]+)/.exec(t)?.[1] ?? "none";
     const bearer = await fetch(`http://127.0.0.1:${d.port}/mcp`, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Agent-Token": token }, body: JSON.stringify(rpc("register_agent", args)) }).then((x) => x.text());
-    expect(codeOf(toolText(yes.opened)), "== the bearer twin's answer").toBe(codeOf(bearer));
+    // PARSED shapes (#433 R1 coverage): both answers parse to a tool result with a definite outcome, and agree.
+    const viaDoor = shapeOf((yes.opened as { result?: unknown }).result);
+    const viaBearer = shapeOf(rpcResultOf(bearer));
+    expect(viaDoor.outcome, `the door's answer parses to a definite outcome: ${toolText(yes.opened)}`).not.toBe("unparsed");
+    expect(viaBearer.outcome, `the bearer twin's answer parses to a definite outcome: ${bearer.slice(0, 300)}`).not.toBe("unparsed");
+    expect(viaDoor, "== the bearer twin's answer (success, error_code)").toEqual(viaBearer);
     await stopDaemon(d.child);
   }, 90_000);
 
@@ -367,4 +392,134 @@ describe("hook PR 3 (#433 macOS): a process-lookup cut is never hidden (every OS
     expect(hidden('  X=$(relay_pid_chain 2>/dev/null || printf "")', "planted"), "control: a hidden cut is caught").toHaveLength(1);
     expect(files.flatMap((f) => hidden(fs.readFileSync(f, "utf-8"), path.relative(REPO, f))), "no call site hides a cut").toEqual([]);
   });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// #433 Codex R1 (REDs, every OS): the host check, a null reply, the record version, the remote mint secret.
+const runRelay = (c: Case, args: string[], input = "", extra: Record<string, string> = {}) =>
+  spawnSync(process.execPath, [RELAY, ...args], { env: baseEnv(c, extra), input, encoding: "utf-8", timeout: 30_000 });
+/** Point the record at another port: an atomic 0600 rewrite by the record's own user (the trust model holds). */
+function retarget(c: Case, rec: Record<string, unknown>): void {
+  const tmp = `${c.record}.re-${crypto.randomBytes(3).toString("hex")}`;
+  const fd = fs.openSync(tmp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify(rec));
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, c.record);
+}
+
+describe("#433 Codex R1 P1-1: the relay host is NORMALIZED and classified (aliases, IPv4-mapped IPv6, names under a deadline)", () => {
+  it("every loopback alias is loopback; a name is resolved (any loopback address = loopback); an unresolvable or slow name is unresolved; a remote is pinned", async () => {
+    const { classifyHost } = (await import("../src/host-class.js")) as {
+      classifyHost: (h: string, o?: { lookup?: (h: string) => Promise<string[]>; timeoutMs?: number }) => Promise<{ kind: string; ip?: string }>;
+    };
+    const lookup = async (h: string): Promise<string[]> => {
+      if (h === "loop.test") return ["127.0.0.2"];
+      if (h === "mixed.test") return ["192.0.2.9", "127.0.0.1"];
+      if (h === "mapped.test") return ["::ffff:127.0.0.1"];
+      if (h === "remote.test") return ["192.0.2.7", "192.0.2.8"];
+      if (h === "slow.test") return new Promise(() => {});
+      throw Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" });
+    };
+    for (const h of ["LOCALHOST", "localhost.", "Localhost", "2130706433", "0x7f.1", "0x7f000001", "127.1", "0177.0.0.1", "::ffff:127.0.0.1", "[::ffff:127.0.0.1]", "::ffff:7f00:1", "0:0:0:0:0:0:0:1", "::1", "[::1]", "0.0.0.0", "::", "loop.test", "mixed.test", "mapped.test", "a.localhost"]) {
+      expect((await classifyHost(h, { lookup, timeoutMs: 500 })).kind, h).toBe("loopback");
+    }
+    expect(await classifyHost("203.0.113.10", { lookup })).toEqual({ kind: "remote", ip: "203.0.113.10" });
+    expect(await classifyHost("remote.test", { lookup })).toEqual({ kind: "remote", ip: "192.0.2.7" });
+    expect((await classifyHost("nx.test", { lookup })).kind).toBe("unresolved");
+    const t0 = Date.now();
+    expect((await classifyHost("slow.test", { lookup, timeoutMs: 200 })).kind, "a name that never resolves is unresolved at the deadline").toBe("unresolved");
+    expect(Date.now() - t0, "inside the deadline").toBeLessThan(2000);
+  });
+
+  it("`relay host-class` prints the class and the checked address (the hooks pin curl to it)", () => {
+    const c = newCase("host-class");
+    for (const [h, want] of [["LOCALHOST", "loopback 127.0.0.1"], ["2130706433", "loopback 127.0.0.1"], ["203.0.113.10", "remote 203.0.113.10"]] as const) {
+      const r = runRelay(c, ["host-class", h, "--timeout-ms", "2000"]);
+      expect(r.status, `${h}: ${r.stderr}`).toBe(0);
+      expect(r.stdout.trim(), h).toBe(want);
+    }
+  });
+});
+
+describe("#433 Codex R1 P3-6: a non-object reply is a NAMED failure, never an exception", () => {
+  it("doorOpen refuses null, an array, a string and an empty object without throwing", async () => {
+    const { doorOpen, doorKey } = (await import("../src/owner-endpoint.js")) as { doorOpen: (k: Buffer, a: Buffer, e: unknown) => unknown; doorKey: (k: string, d: "req" | "resp") => Buffer };
+    const k = doorKey("00".repeat(16), "resp");
+    for (const e of [null, [], "x", {}, 7]) expect(() => doorOpen(k, Buffer.from("a"), e), JSON.stringify(e)).not.toThrow();
+    for (const e of [null, [], "x", {}, 7]) expect(doorOpen(k, Buffer.from("a"), e), JSON.stringify(e)).toBeNull();
+  });
+
+  it("`relay owner peek` against a listener answering `null` (and `[]`, a string): exit 1, the named failure, no TypeError", async () => {
+    const c = newCase("null-reply");
+    const { d, rec } = await wasmOwner(c);
+    for (const body of ["null", "[]", '"x"']) {
+      const srv = http.createServer((_q, res) => res.end(body));
+      servers.push(srv);
+      await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+      retarget(c, { ...rec, port: (srv.address() as { port: number }).port });
+      const r = runRelay(c, ["owner", "peek", AGENT, "--json", "--timeout-ms", "4000"]);
+      expect(r.status, `${body}: ${r.stderr}`).toBe(1);
+      expect(r.stderr, body).toMatch(/relay owner: the owner's reply failed its authentication/);
+      expect(r.stderr, body).not.toMatch(/TypeError|at .*\.js:\d+/);
+    }
+    await stopDaemon(d.child);
+  }, 90_000);
+});
+
+describe("#433 Codex R1 P2-5: the record and protocol are version 3; a skew either way is named (the #418 v2 protocol, frozen)", () => {
+  it("a new daemon writes v3; the #418 client's gate refuses it (bad-record) and its v2 exchange cannot pass the new door", async () => {
+    const c = newCase("skew-new-daemon");
+    const { d, rec } = await wasmOwner(c);
+    expect(rec.v).toBe(3);
+    const { gate418, exchange418 } = await import("./fixtures/owner-door-v2-418.js");
+    expect(gate418(rec as unknown as Record<string, unknown>), "the #418 client refuses a v3 record before any exchange").toBe("bad-record");
+    const ts = Math.floor(Date.now() / 1000);
+    const nonce = crypto.randomBytes(16).toString("hex");
+    await expect(exchange418(rec.port, rec.key, { instance_id: rec.instance_id, db_path: rec.db_path }, PEEK, { agent_name: AGENT, args: {}, ts, client_nonce: nonce }, nonce), "even forced, a v2 exchange gets no MAC'd answer").rejects.toThrow();
+    await stopDaemon(d.child);
+  }, 90_000);
+
+  it("a #418 daemon (its v2 record and door) with the new client: `relay owner peek` is refused BEFORE any exchange, named 'restart the relay daemon'", async () => {
+    const c = newCase("skew-old-daemon");
+    seedNativeDb(c);
+    const { record418, startDoorServer418 } = await import("./fixtures/owner-door-v2-418.js");
+    const key = crypto.randomBytes(16).toString("hex");
+    const b = { instance_id: "", db_path: fs.realpathSync(c.db) };
+    const old = await startDoorServer418(key, b, { ok: true, registered: true, count: 0, messages: [] });
+    servers.push(old.server);
+    retarget(c, record418(old.port, key, b));
+    const r = runRelay(c, ["owner", "peek", AGENT, "--json", "--timeout-ms", "4000"]);
+    expect(r.status, r.stderr).toBe(1);
+    expect(r.stderr).toMatch(/old-record\).*restart the relay daemon/);
+    expect(old.requests(), "no exchange with the old daemon").toBe(0);
+  }, 60_000);
+});
+
+describe("#433 Codex R1 P1-2 (as ruled): `relay remote set-mint-secret <host:port>` writes the REMOTE's own secret (stdin only)", () => {
+  it("stdin → agents/remote-<host>-<port>/mint.secret, private; a secret on argv is refused; a planted symlink is never followed", () => {
+    const c = newCase("remote-mint");
+    seedNativeDb(c);
+    const secret = `pr3-remote-mint-${crypto.randomBytes(16).toString("hex")}`;
+    const r = runRelay(c, ["remote", "set-mint-secret", "203.0.113.10:3777"], `${secret}\n`);
+    expect(r.status, r.stderr).toBe(0);
+    const file = path.join(path.dirname(c.db), "agents", "remote-203.0.113.10-3777", "mint.secret");
+    expect(fs.readFileSync(file, "utf-8").trim()).toBe(secret);
+    if (process.platform !== "win32") expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    expect(r.stdout + r.stderr, "the secret is never printed").not.toContain(secret);
+    const argv = runRelay(c, ["remote", "set-mint-secret", "203.0.113.10:3777", secret]);
+    expect(argv.status, "a secret on argv is refused").not.toBe(0);
+    if (process.platform !== "win32") {
+      const victim = path.join(c.home, "victim.txt");
+      fs.writeFileSync(victim, "untouched");
+      const dir2 = path.join(path.dirname(c.db), "agents", "remote-203.0.113.11-3777");
+      fs.mkdirSync(dir2, { recursive: true, mode: 0o700 });
+      fs.symlinkSync(victim, path.join(dir2, "mint.secret"));
+      const sym = runRelay(c, ["remote", "set-mint-secret", "203.0.113.11:3777"], `${secret}\n`);
+      expect(sym.status, "a planted symlink is refused").not.toBe(0);
+      expect(fs.readFileSync(victim, "utf-8"), "its target is untouched").toBe("untouched");
+    }
+  }, 60_000);
 });
