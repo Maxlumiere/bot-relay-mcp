@@ -341,7 +341,7 @@ export function driverHeaderVerdict(dbPath: string, header: DriverHeader, driver
           `[db] WARNING: the DB at '${dbPath}' is stamped native, but the native driver cannot load in this process ` +
           `(${probe.reason}), so the wasm driver opens it, as before the stamp existed. AT RISK: another install with a ` +
           `working native driver writing this same file at the same time loses commits (the two drivers must never ` +
-          `share a file). Run only wasm processes on it; a later release adds \`relay db convert-journal\` to convert it.`,
+          `share a file). Run only wasm processes on it. To convert it, make the native driver load once, then run \`relay convert-journal --to wasm\`.`,
       };
     }
     case "wasm":

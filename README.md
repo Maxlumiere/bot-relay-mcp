@@ -745,7 +745,7 @@ npm install sql.js                    # one-time install of the optional dep
 RELAY_SQLITE_DRIVER=wasm node dist/index.js
 ```
 
-Both drivers read the same `relay.db` file format. Full details, performance notes, and limitations: [`docs/sqlite-wasm-driver.md`](./docs/sqlite-wasm-driver.md).
+Both drivers use the same SQLite file format, but a database belongs to one driver (its header says which): switch an existing database with `relay convert-journal --to wasm|native`. Full details, performance notes, and limitations: [`docs/sqlite-wasm-driver.md`](./docs/sqlite-wasm-driver.md).
 
 ### Installing under npm v12+ (install scripts disabled by default)
 
@@ -769,10 +769,11 @@ npm rebuild                                    # build the native binary
 **B — switch to `wasm` (zero approval):** `sql.js` is pure WebAssembly — no native build, no install script.
 
 ```bash
-RELAY_SQLITE_DRIVER=wasm node dist/index.js
+RELAY_SQLITE_DRIVER=wasm node dist/index.js   # a NEW database: created owned by this process
+relay convert-journal --to wasm               # an EXISTING database: convert it once, every relay process stopped
 ```
 
-`wasm` is **single-process only** (see the note above — not for multi-terminal stdio). `sql.js` is an installed *optional* dependency; if you installed with `--omit=optional`, add it back with `npm install sql.js`.
+Since 5.0.0 an existing native or legacy database is never opened by wasm until it is converted (the refusal names the command). `wasm` is **single-process only** (see the note above — not for multi-terminal stdio). `sql.js` is an installed *optional* dependency; if you installed with `--omit=optional`, add it back with `npm install sql.js`.
 
 `--allow-git` / `--allow-remote` (also default `none` in npm 11.10+/11.15+) don't affect the relay — every dependency resolves from the npm registry, none from git or tarball URLs. Full details: [`docs/sqlite-wasm-driver.md`](./docs/sqlite-wasm-driver.md#npm-v12-and-install-scripts).
 

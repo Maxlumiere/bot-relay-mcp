@@ -23,7 +23,7 @@ npm approve-scripts better-sqlite3            # approve it
 npm rebuild                                    # build the native binary
 ```
 
-**B — use the wasm driver (zero approval).** `sql.js` is pure WebAssembly — no native build, no install script — so it is unaffected by the new default. Set `RELAY_SQLITE_DRIVER=wasm` (see "How to switch" below). `sql.js` is an installed *optional* dependency; if you installed with `--omit=optional`, add it back with `npm install sql.js`. Remember the single-process limit (see "Limitations").
+**B — use the wasm driver (zero approval).** `sql.js` is pure WebAssembly — no native build, no install script — so it is unaffected by the new default. Set `RELAY_SQLITE_DRIVER=wasm` for a NEW instance (see "How to switch" below); an existing database must be converted once with `relay convert-journal --to wasm` (every relay process stopped). `sql.js` is an installed *optional* dependency; if you installed with `--omit=optional`, add it back with `npm install sql.js`. Remember the single-process limit (see "Limitations").
 
 The other npm 12 defaults — `--allow-git` / `--allow-remote` now `none` (from npm 11.10+ / 11.15+) — don't affect the relay: every dependency resolves from the npm registry, none from git or tarball URLs.
 
@@ -77,15 +77,25 @@ The driver is a property of the **instance**: a `sqlite_driver` key in the insta
   - the hooks read no database on such an instance: SessionStart prints ONE notice ("hooks deliver no mail on a wasm instance; use the HTTP owner") instead of reading mail and tasks with `sqlite3` (the relay decides this for them: the 7th line of `relay where --fields`). Delivering mail to the hooks through the owner is a later release.
 - **A backup or a restore** of an owned database runs under the lock when no owner is live, and is refused while one is. A database with more than one hard link is refused by both (the lock is keyed by the file's name, so a second name could be locked by another process): remove the extra links.
 
-**Two populations run side by side until a later release converts them** (`relay db convert-journal`, slice 4):
-- **Owner mode** (`sqlite_driver: "wasm"`): one owner, safe.
-- **The legacy wasm mode** (`RELAY_SQLITE_DRIVER=wasm` with no `sqlite_driver` in the instance): exactly as before this release.
-  - No owner and no stamp: several processes may open the same database.
-  - The hazard: the wasm driver writes the whole database back from memory, so two such processes on one file overwrite each other's writes.
-  - The fix is to declare `sqlite_driver: "wasm"` in the instance. A new database is then owned from the start; an existing legacy database stays in the legacy mode (it is not adopted) until it is converted.
+**One mode only (5.0.0): every wasm database has its single owner.**
+- **`RELAY_SQLITE_DRIVER=wasm` on an instance that declares nothing** is a wasm declaration: a NEW database is created owned (stamped RLYW), exactly as with `sqlite_driver: "wasm"`. A second process on it is refused by name. The legacy no-owner mode is retired.
+- **An existing native (RLYN) or legacy (unstamped) database is never opened by wasm.** Either declaration on one is refused by name, naming the remedy: `relay convert-journal --to wasm`.
+- **A contradiction is refused:** when the instance declares a driver and `RELAY_SQLITE_DRIVER` says the other one, the relay refuses to start and names the remedy (unset `RELAY_SQLITE_DRIVER`). Before 5.0.0 it warned and the instance won.
 - **The file's header decides** for a database already stamped for an owner, whatever the environment says.
-- **When the instance declares a driver and `RELAY_SQLITE_DRIVER` contradicts it,** the instance wins, and the relay warns once per process. A later release refuses the contradiction.
-- **When the instance declares nothing,** `RELAY_SQLITE_DRIVER` decides, with the same warning.
+
+### Converting a database: `relay convert-journal`
+
+```bash
+# Close every terminal and relay process that uses this instance first, then:
+relay convert-journal --to wasm      # native/legacy → wasm (single owner)
+relay convert-journal --to native    # wasm → native
+```
+
+- It runs offline, under the database's single-owner lock: it is refused while a wasm owner is live, while another process has the database open (SQLite side files remain), and on a database with more than one hard link.
+- An older relay running the pre-5.0.0 legacy wasm mode holds no lock and cannot be detected, so close everything first.
+- Each step leaves a file its header's driver opens, and the command is idempotent: if it is interrupted, run it again and it completes.
+- It also writes the instance's `sqlite_driver` (to the real file behind a symlinked `config.json`; every other field kept, mode 0600). `RELAY_CONFIG_PATH` naming a different file from the database's own instance config is refused.
+- **A restore** re-stamps the archive's database to the instance's driver (its declaration, else the live database's header, else native), so a backup made before a conversion still restores. A declaration that disagrees with the live database's header refuses the restore by name.
 
 ## How to switch back
 

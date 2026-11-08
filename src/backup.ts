@@ -41,7 +41,7 @@ import { withDeadline } from "./http-deadline.js";
 import { getDbPath, peekDb, closeDb, CURRENT_SCHEMA_VERSION } from "./db.js";
 import { walkPath } from "./path-walk.js";
 import { checkContainment, checkPrivatePath } from "./approved-roots.js";
-import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, resolveOpen, isOwnedDb, holdOwnerForMaintenance, checkpointBeforeRestoreSwap, assertMaintenanceSingleLink, assertNativeByPathAllowed, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
+import { snapshotToFile, openReadOnly, openExportSource, assertWasmSourceReadable, fileSha256, driverOf, configuredDriver, resolveOpen, isOwnedDb, holdOwnerForMaintenance, checkpointBeforeRestoreSwap, assertMaintenanceSingleLink, assertNativeByPathAllowed, restoreTargetDriver, restampStagedCopy, type SqliteDriver, type CompatDatabase } from "./sqlite-compat.js";
 import { assertDriverHeaderAllows, nativeHandleCount, isDbFamilyMember, isInHeldNativeFamily, beginWasmUse, endWasmUse, assertNoNativeHandle } from "./db-header.js";
 // The config path the relay READS (one resolver: config.ts → instance.ts), never a copy of the rule.
 import { getConfigPath } from "./config.js";
@@ -780,6 +780,10 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // EXPLICITLY (openReadOnly never infers): the LIVE connection's when one is open (peekDb: a read that opens
     // nothing), else the configured driver, which is the one this process would instantiate (#190 r3). No main-DB
     // init, so a corrupt archive manufactures no state.
+    // INV-DB-01 slice 4 (Q5): the staged copy is RE-STAMPED to the instance's kind (its declaration, else the live
+    // header, else native; a disagreement refuses) by the instance's own driver, BEFORE it is validated: a backup made
+    // before a conversion still restores. Re-validated below (integrity) and by its header check.
+    await restampStagedCopy(extractedDbPath, restoreTargetDriver(getDbPath()));
     const live = peekDb();
     // 2b-ii: the staged copy is read with the driver ITS header calls for (an RLYW archive is read with wasm).
     const probeDriver: SqliteDriver = live ? driverOf(live) : configuredDriver(extractedDbPath);
