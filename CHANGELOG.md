@@ -15,6 +15,7 @@
 - **Changed (BREAKING):** a `RELAY_SQLITE_DRIVER` that contradicts the instance's declared `sqlite_driver` is refused at start, naming the remedy (unset it). It used to warn, the instance winning.
 - **Changed (BREAKING):** a wasm declaration on an existing native (RLYN) or unstamped database is refused by name, naming `relay convert-journal`, also where the native driver cannot load (it used to warn and open it). The refusal message used to name `relay db convert-journal`; the command is `relay convert-journal`.
 - **Changed:** a restore re-stamps the archive's database to the instance's driver (its declaration, else the live database's header, else native), so a backup made before a conversion still restores; a declaration that disagrees with the live database's header refuses the restore by name, nothing replaced.
+- **Fixed:** the doorbell's lock file is refused, before any native open, when it has more than one hard link or is a relay database (stamped RLYN or RLYW): a hard link named like the lock can no longer put a lock transaction on another process's database.
 
 ### By-path opens follow the instance; a restore needs its side files gone; relay code never deletes a database file
 
