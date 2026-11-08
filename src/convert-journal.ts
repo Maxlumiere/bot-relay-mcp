@@ -349,25 +349,27 @@ async function convertViaSqlJs(dbPath: string, configPath: string, lock: OwnerLo
   }
 
   const first = identityOf(dbPath);
-  const img = loadImage(SQL, first.bytes);
+  // sql.js may ADOPT the array it is given (its in-memory file then IS that array), so the image is loaded from a COPY:
+  // `first.bytes` must stay the original, byte for byte, for the safety copy (measured on sql.js 1.14.2: with the array
+  // passed directly, the DELETE + RLYW edits changed it, so the "safety copy" was the edited image).
+  const img = loadImage(SQL, Uint8Array.from(first.bytes));
   let image: Uint8Array;
   let counts: Record<string, number>;
+  let safetyCopy: string;
   try {
     const inv = inventory(img);
     if (inv.integrity !== "ok") throw new ConvertRefusal(`the DB at ${dbPath} fails integrity_check (${inv.integrity}). Nothing was changed.`);
     counts = inv.counts;
+
+    // The safety copy of the ORIGINAL bytes, BEFORE any edit (this path replaces the whole file).
+    safetyCopy = writeSafetyCopy(dbPath, first.bytes);
+
     img.exec("PRAGMA journal_mode = DELETE");
     img.exec(`PRAGMA application_id = ${RELAY_APP_ID_WASM}`);
     image = img.export();
   } finally {
     img.close();
   }
-
-  // The safety copy of the ORIGINAL bytes (this path replaces the whole file).
-  const backups = path.join(path.dirname(dbPath), "backups");
-  fs.mkdirSync(backups, { recursive: true, mode: 0o700 });
-  const safetyCopy = path.join(backups, `${path.basename(dbPath)}.pre-convert-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}.bak`);
-  fs.writeFileSync(safetyCopy, first.bytes, { mode: 0o600, flag: "wx" });
 
   opts._beforeReplaceForTests?.();
   const now = sideFiles(dbPath);
@@ -408,6 +410,15 @@ async function convertViaSqlJs(dbPath: string, configPath: string, lock: OwnerLo
   }
   writeDriverDeclaration(configPath, "wasm");
   return verifySqlJs(SQL, dbPath, configPath, counts, true, safetyCopy);
+}
+
+/** The safety copy: a NEW file (exclusive, 0600) in the backups directory beside the DB, the original bytes exactly. */
+function writeSafetyCopy(dbPath: string, original: Buffer): string {
+  const backups = path.join(path.dirname(dbPath), "backups");
+  fs.mkdirSync(backups, { recursive: true, mode: 0o700 });
+  const file = path.join(backups, `${path.basename(dbPath)}.pre-convert-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}.bak`);
+  fs.writeFileSync(file, original, { mode: 0o600, flag: "wx" });
+  return file;
 }
 
 function verifySqlJs(
