@@ -13,13 +13,22 @@
  * - ONE exchange with node's http client to 127.0.0.1:<the record's port>: no proxy (node's http uses none), no
  *   redirect (it follows none), no curl configuration. The request is MAC'd; the reply's MAC is verified BEFORE
  *   anything is printed (a forged or altered reply prints nothing).
- * - The whole run is bounded by --timeout-ms (default 5000): past it, a named failure.
- * - `peek` prints exactly `relay pending --json`'s answer (plus "source": "owner"), so a hook renders the owner's mail
- *   with its local code. Every failure is one stderr line "relay owner: <why>", exit 1.
+ * - BOUNDS (as ruled): the guaranteed bound of a run is its caller's watchdog (the hooks run it under
+ *   relay_run_pending, which kills it at their budget). --timeout-ms (default 5000) bounds the network exchange and,
+ *   best-effort, the run (a timer, which a synchronous step cannot be interrupted by); every system tool the record's
+ *   checks spawn (Windows icacls/powershell) takes a timeout within it.
+ * - The exchange is BOUND to this instance (as ruled): the MACs cover the client's own resolved instance id and
+ *   canonical DB path, so a record or a reply from another instance never verifies.
+ * - `peek` prints exactly `relay pending --json`'s answer (plus "source": "owner" and "registered"), so a hook renders
+ *   the owner's mail with its local code. An agent the owner does not know is NOT a failure (as ruled): exit 0,
+ *   registered false, empty mail. Every failure is one stderr line "relay owner: <why>", exit 1.
  */
 import http from "http";
 import crypto from "crypto";
+import fs from "fs";
+import { setSystemSpawnDeadline } from "../fs-perms.js";
 import {
+  type DoorBinding,
   ownerEndpointVerdict,
   doorMac,
   doorRequestText,
@@ -78,9 +87,17 @@ function parse(argv: string[]): Args | string {
 }
 
 /** ONE MAC'd exchange; resolves to the verified reply, or rejects with a named reason. */
-function exchange(port: number, key: string, doorPath: string, bodyObj: Record<string, unknown>, nonce: string, deadlineMs: number): Promise<{ status: number; payload: Record<string, unknown> }> {
+function exchange(
+  port: number,
+  key: string,
+  binding: DoorBinding,
+  doorPath: string,
+  bodyObj: Record<string, unknown>,
+  nonce: string,
+  deadlineMs: number,
+): Promise<{ status: number; payload: Record<string, unknown> }> {
   const body = JSON.stringify(bodyObj);
-  const mac = doorMac(key, doorRequestText(doorPath, bodyObj.ts as number, nonce, body));
+  const mac = doorMac(key, doorRequestText(binding, doorPath, bodyObj.ts as number, nonce, body));
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
@@ -105,7 +122,7 @@ function exchange(port: number, key: string, doorPath: string, bodyObj: Record<s
           const text = Buffer.concat(chunks).toString("utf-8");
           const status = res.statusCode ?? 0;
           const got = res.headers["x-owner-mac"];
-          if (typeof got !== "string" || !macEqual(got, doorMac(key, doorResponseText(nonce, status, text)))) {
+          if (typeof got !== "string" || !macEqual(got, doorMac(key, doorResponseText(binding, nonce, status, text)))) {
             reject(new Error("the owner's reply failed its MAC (a forged or altered reply): nothing from it is shown"));
             return;
           }
@@ -141,6 +158,7 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   };
   const deadline = Date.now() + a.timeoutMs;
+  setSystemSpawnDeadline(deadline);
   // The hard bound: whatever step is running when it passes (the resolution, the probe, the exchange), the run ends.
   const hard = setTimeout(() => {
     process.stderr.write(`relay owner: no answer within ${a.timeoutMs}ms (timed out)\n`);
@@ -149,15 +167,18 @@ export async function run(argv: string[]): Promise<number> {
   try {
     const { source, resolution } = await decidePendingSource(null);
     if (source.kind !== "local") return fail(`no local relay instance to read (${source.reason})`);
-    const v = ownerEndpointVerdict(source.dbPath);
+    const instanceId = resolution && resolution.kind === "instance" ? resolution.id : "";
+    const v = ownerEndpointVerdict(source.dbPath, instanceId);
     if (!v.ok) return fail(`no trusted owner endpoint for ${source.dbPath} (${v.reason})`);
+    // The client's OWN binding (never the record's): a record relocated from another instance cannot pass for this one.
+    const binding: DoorBinding = { instance_id: instanceId, db_path: fs.realpathSync.native(source.dbPath) };
     const nonce = crypto.randomBytes(16).toString("hex");
     const ts = Math.floor(Date.now() / 1000);
     const doorPath = a.sub === "peek" ? OWNER_DOOR_PEEK : OWNER_DOOR_LIVENESS;
     const args: Record<string, unknown> = a.sub === "peek" ? { with_content: a.withContent } : { agent_pid: a.pid, ...(a.start !== null ? { agent_pid_start: a.start } : {}) };
     let reply: { status: number; payload: Record<string, unknown> };
     try {
-      reply = await exchange(v.port, v.key, doorPath, { agent_name: a.agent, args, ts, client_nonce: nonce }, nonce, deadline);
+      reply = await exchange(v.port, v.key, binding, doorPath, { agent_name: a.agent, args, ts, client_nonce: nonce }, nonce, deadline);
     } catch (err) {
       return fail((err as Error).message);
     }
@@ -167,9 +188,7 @@ export async function run(argv: string[]): Promise<number> {
       process.stdout.write(JSON.stringify({ ok: true, agent: a.agent }) + "\n");
       return 0;
     }
-    if (p.registered !== true) {
-      return fail(`agent ${JSON.stringify(a.agent)} is not registered in ${source.dbPath}: cannot say what is pending (this is NOT "no mail")`);
-    }
+    const registered = p.registered === true;
     const { serializeResolution } = await import("../instance.js");
     process.stdout.write(
       JSON.stringify({
@@ -177,10 +196,11 @@ export async function run(argv: string[]): Promise<number> {
         agent: a.agent,
         db_path: source.dbPath,
         resolution: resolution ? serializeResolution(resolution) : null,
-        session_bound: p.session_bound,
-        count: p.count,
-        top_priority: p.top_priority,
-        messages: p.messages,
+        session_bound: registered ? p.session_bound : false,
+        count: registered ? p.count : 0,
+        top_priority: registered ? p.top_priority : null,
+        messages: registered ? p.messages : [],
+        registered,
         source: "owner",
       }) + "\n",
     );

@@ -20,6 +20,7 @@ import {
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
 import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors, pendingMetadata, setAgentLivenessAnchor } from "../db.js";
 import { ownedDbPath } from "../sqlite-compat.js";
+import { resolveInstance } from "../instance.js";
 import {
   writeOwnerEndpoint,
   addressReachesLoopback,
@@ -2079,7 +2080,8 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
         addr !== null && typeof addr === "object" && addressReachesLoopback(addr.address) && checkHostHeader(`127.0.0.1:${boundPort}`, hostAllowlistOverride).ok;
       if (ownerPeek || reachable) {
         try {
-          const f = writeOwnerEndpoint(owned, boundPort, opts.ownerTransport ?? "http");
+          const inst = resolveInstance();
+          const f = writeOwnerEndpoint(owned, boundPort, opts.ownerTransport ?? "http", inst.kind === "instance" ? inst.id : "");
           log.info(`[owner-endpoint] the owner endpoint record is ${f}`);
         } catch (err) {
           log.warn(`[owner-endpoint] could not write the owner endpoint record (${(err as Error).message}): the hooks read no mail from this owner.`);
