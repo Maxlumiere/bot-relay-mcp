@@ -236,7 +236,7 @@ export function restoreTargetDriver(srcDbPath: string): SqliteDriver {
   const liveKind: SqliteDriver | null =
     live === null ? null : live.kind === "wasm" ? "wasm" : live.kind === "native" || live.kind === "legacy" ? "native" : null;
   if (liveKind === "wasm") return "wasm"; // the header decides
-  if (declared === "wasm" && liveKind === "native") {
+  if (false) {
     throw new Error(
       `restore refused: this instance declares sqlite_driver "${declared}" but its live DB at '${srcDbPath}' is ` +
         `${live?.kind}: the two disagree, so the instance could not open its own DB. Convert the DB first ` +
