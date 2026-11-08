@@ -54,29 +54,6 @@ const baseEnv = (c: Case, extra: Record<string, string> = {}): NodeJS.ProcessEnv
   delete env.RELAY_HOME;
   return { ...env, RELAY_DB_PATH: c.db, RELAY_CONFIG_PATH: c.cfg, RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(c.home, "wc.json"), ...extra };
 };
-/** A native DB with AGENT registered and one message for it; then converted to the wasm owner's kind. Returns AGENT's token. */
-function seedWasmDb(c: Case, message = "hello over http"): string {
-  fs.writeFileSync(c.cfg, "{}", { mode: 0o600 });
-  const r = spawnSync(
-    process.execPath,
-    [
-      "--input-type=module",
-      "-e",
-      `const db = await import(${JSON.stringify(DIST_DB)});
-       const a = db.registerAgent(${JSON.stringify(AGENT)}, "r", []);
-       db.registerAgent("pr3-sender", "r", []);
-       db.sendMessage("pr3-sender", ${JSON.stringify(AGENT)}, ${JSON.stringify(message)}, "normal");
-       db.closeDb();
-       process.stdout.write(a.plaintext_token);`,
-    ],
-    { encoding: "utf-8", env: baseEnv(c) }
-  );
-  expect(r.status, r.stderr).toBe(0);
-  const token = r.stdout.trim();
-  const conv = spawnSync(process.execPath, [RELAY, "convert-journal", "--to", "wasm"], { encoding: "utf-8", env: baseEnv(c) });
-  expect(conv.status, `${conv.stdout}\n${conv.stderr}`).toBe(0);
-  return token;
-}
 function seedNativeDb(c: Case): string {
   fs.writeFileSync(c.cfg, "{}", { mode: 0o600 });
   const r = spawnSync(
