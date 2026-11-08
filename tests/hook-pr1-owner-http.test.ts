@@ -340,11 +340,20 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
       expect(after[t], `table ${t} untouched by the liveness door`).toEqual(before[t]);
     }
     const cols = before.agents![0] as string[];
-    const strip = (rows: unknown[][]) => rows.slice(1).map((row) => row.map((v, i) => (["agent_pid", "agent_pid_start", "host_id"].includes(cols[i]!) ? "*" : v)));
-    expect(strip(after.agents!), "only agent_pid / agent_pid_start / host_id moved").toEqual(strip(before.agents!));
-    const row = after.agents!.slice(1).find((x) => x[cols.indexOf("name")] === AGENT)!;
+    const rowOf = (d: Record<string, unknown[][]>) => d.agents!.slice(1).find((x) => x[cols.indexOf("name")] === AGENT)!;
+    const moved = (a: unknown[], b: unknown[]) => cols.filter((_, i) => JSON.stringify(a[i]) !== JSON.stringify(b[i])).sort();
+    const row = rowOf(after);
     expect(row[cols.indexOf("agent_pid")]).toBe(4242);
     expect(row[cols.indexOf("agent_pid_start")]).toBe("t0");
+    // THE SAME DISPATCHER: the door's report_liveness moves exactly the columns the /mcp bearer twin's does (the anchor,
+    // and the dispatcher's own authentication stamps), nothing else.
+    const doorMoved = moved(rowOf(before), row);
+    const twin = await fetch(`http://127.0.0.1:${d.port}/mcp`, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Agent-Token": token }, body: JSON.stringify(rpc("report_liveness", { ...live, agent_pid: 4343, agent_pid_start: "t1" })) });
+    expect(twin.status, await twin.clone().text()).toBe(200);
+    await new Promise((r2) => setTimeout(r2, 500));
+    const twinMoved = moved(row, rowOf(await dbDump(c)));
+    expect(doorMoved.filter((k) => !["agent_pid", "agent_pid_start", "host_id"].includes(k)), "the door's other stamps are the bearer twin's").toEqual(twinMoved.filter((k) => !["agent_pid", "agent_pid_start", "host_id"].includes(k)));
+    expect(doorMoved, "the anchor moved").toEqual(expect.arrayContaining(["agent_pid", "agent_pid_start"]));
     await stopDaemon(d.child);
   }, 90_000);
 
@@ -773,7 +782,7 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopbac
     await stopDaemon(d.child);
   }
 
-  it.skipIf(!V6_LOOPBACK && LAN_V4 === null)("the peek listener serves ONLY the two door endpoints: every other route of startHttpServer, /mcp, /owner-id, /health → 403; a WS upgrade is never accepted (skipped by name with no address 127.0.0.1 cannot reach)", async () => {
+  it.skipIf(!V6_LOOPBACK && LAN_V4 === null)("the peek listener serves ONLY the door endpoints: every other route of startHttpServer, /mcp, /owner-id, /health → 403; a WS upgrade is never accepted (skipped by name with no address 127.0.0.1 cannot reach)", async () => {
     const host = (V6_LOOPBACK ? "::1" : LAN_V4)!;
     const c = newCase("peek-gate");
     seedWasmDb(c);
@@ -786,7 +795,7 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopbac
     expect(routes.length, "precondition: the route scan found the routes").toBeGreaterThan(15);
     expect(routes.some(([m, r]) => m === "POST" && r === PEEK), "precondition: the door's routes are literal in http.ts").toBe(true);
     for (const [method, route] of routes) {
-      if (method === "POST" && (route === PEEK || route === LIVENESS)) continue;
+      if (method === "POST" && route.startsWith("/owner/v1/")) continue; // the door's own paths (hook PR 3: five)
       const res = await fetch(`${peek}${route.replace(/:[a-z_]+/gi, "x")}`, { method: method === "ALL" ? "GET" : method, headers: { "X-Relay-Secret": PEEK_SECRET }, body: method === "GET" ? undefined : "{}" });
       expect(res.status, `${method} ${route}`).toBe(403);
     }
@@ -1222,7 +1231,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end("{}");
     });
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(elsewhere.port) });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(elsewhere.port), RELAY_HOOK_DEBUG: "1" });
     expect(elsewhere.bytes(), "the inherited destination got no token").not.toContain(token);
     expect(r.argv, "hook PR 3: the registration ran through the door").toMatch(/owner tool register_agent/);
     expect(r.out).toMatch(/register_agent reply:/);
@@ -1361,7 +1370,8 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 3 (as ruled): EVERY local credential
   ])("a LOOPBACK relay with NO local DB (a tunnel), $what: the bearer is $verdict", async ({ tag, optIn, delivered }) => {
     const c = newCase(`p3-tunnel-${tag}`);
     const spy = await recorder();
-    const env = { RELAY_AGENT_TOKEN: TOKEN, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port), ...optIn(spy.port) };
+    // No local instance: `relay pending` exits 3 (as PR 1's remote rows model it); the DB file does not exist.
+    const env = { RELAY_AGENT_TOKEN: TOKEN, FAKE_PENDING_RC: "3", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port), ...optIn(spy.port) };
     const r = await runHook(c, "check-relay.sh", env);
     const r2 = await runHook(c, "stop-check.sh", env, inputFor("stop-check.sh"));
     if (delivered) {
@@ -1450,7 +1460,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 3 (as ruled): EVERY local credential
   it.skipIf(LAN_V4 === null)("REMOTE mode (no local DB; RELAY_HTTP_HOST a LAN address) keeps its bearer, as today, and makes no door call (skipped by name where the runner has none)", async () => {
     const c = newCase("p3-remote");
     const spy = await recorder(LAN_V4!);
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, RELAY_HTTP_HOST: LAN_V4!, RELAY_HTTP_PORT: String(spy.port) });
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_PENDING_RC: "3", RELAY_HTTP_HOST: LAN_V4!, RELAY_HTTP_PORT: String(spy.port) });
     expect(spy.requests.some((q) => q.headers["x-agent-token"] === TOKEN || q.body.includes(TOKEN)), `the remote endpoint got its bearer token\n${r.out}`).toBe(true);
     expect(r.argv).not.toMatch(/owner tool/);
   }, 120_000);

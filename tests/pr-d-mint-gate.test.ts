@@ -591,13 +591,16 @@ describe("a window launched WITHOUT a name (architect 7964396c; fd2f6b9f Q-C)", 
   // the assertion still requires the exact file.
   const nativeSeps = (s: string) => (process.platform === "win32" ? s.replace(/\//g, "\\") : s);
 
-  it("NAMED (the control): the hook reads the secret, sends it, and the window is registered", async () => {
+  it("NAMED (the control): the window is registered (a NEW name: only with the secret, read by the door's client)", async () => {
     await withDaemon(async (port) => {
       const r = await runHookTraced(port, "named-window");
       expect(r.status, r.stdout).toBe(0);
-      expect(r.secretReads, "the named hook called the secret reader").toBeGreaterThanOrEqual(1);
+      // Hook PR 3: a LOCAL instance registers through its daemon's owner door, and the relay CLI (src/cli/owner.ts)
+      // reads the secret there, not the hook's shell reader. A NEW name is registered only when the secret was
+      // presented (the gate refuses it otherwise: MINT_SECRET_REQUIRED), so the registration below IS the read.
+      expect(r.secretReads, "the shell reader is not the door route's reader").toBe(0);
     });
-    expect(db.getAgentAuthData("named-window"), "registered over HTTP with the secret the hook read").not.toBeNull();
+    expect(db.getAgentAuthData("named-window"), "registered, so the secret was read and presented").not.toBeNull();
   }, 40_000);
 
   it("UNNAMED: 'unnamed: not registered' (DEGRADED), NO secret read, NOTHING registered (never \"default\")", async () => {

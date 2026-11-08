@@ -248,7 +248,12 @@ describe("hook PR 3: the AEAD owner door (every OS)", () => {
     expect(toolText(no.opened)).not.toMatch(/"agent_token\\?"/);
     const yes = await door(rec, REGISTER, { rpc: rpc("register_agent", args), agent_token: token });
     expect(yes.opened, yes.raw).not.toBeNull();
-    expect(toolText(yes.opened)).not.toMatch(/isError\\?"?:\s*true/);
+    // With its token the token check passes (no AUTH refusal); what follows is register_agent's own answer, the SAME
+    // as the /mcp bearer twin's (here: the live-session collision guard, a seeded agent being online).
+    expect(toolText(yes.opened)).not.toMatch(/AUTH_FAILED/);
+    const codeOf = (t: string) => /error_code\\*"\s*:\s*\\*"([A-Z_]+)/.exec(t)?.[1] ?? "none";
+    const bearer = await fetch(`http://127.0.0.1:${d.port}/mcp`, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Agent-Token": token }, body: JSON.stringify(rpc("register_agent", args)) }).then((x) => x.text());
+    expect(codeOf(toolText(yes.opened)), "== the bearer twin's answer").toBe(codeOf(bearer));
     await stopDaemon(d.child);
   }, 90_000);
 

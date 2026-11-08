@@ -98,6 +98,26 @@ async function startHarness(label: string): Promise<Harness> {
   return { port, root, dbPath, daemon };
 }
 
+/**
+ * Hook PR 3: a LOCAL DB's launch register goes through its daemon's owner door, found by the owner RECORD beside the
+ * DB, not by the configured port. A dead or hung daemon is therefore the record's port: point the record at it (an
+ * atomic 0600 rewrite by the record's own user, as the trust model requires).
+ */
+async function pointRecordAt(h: Harness, port: number): Promise<void> {
+  const rec = path.join(path.dirname(h.dbPath), `.${path.basename(h.dbPath)}.relay-owner.json`);
+  const end = Date.now() + 10_000;
+  while (!fs.existsSync(rec) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+  const cur = JSON.parse(fs.readFileSync(rec, "utf-8")) as Record<string, unknown>;
+  const tmp = `${rec}.retarget-${process.pid}`;
+  const fd = fs.openSync(tmp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify({ ...cur, port }));
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, rec);
+}
+
 function stopHarness(h: Harness): void {
   try { h.daemon.kill("SIGTERM"); } catch { /* */ }
   try { h.daemon.kill("SIGKILL"); } catch { /* */ }
@@ -310,6 +330,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
     const h = await startHarness("t1");
     try {
       const deadPort = await getFreePort(); // nothing listening
+      await pointRecordAt(h, deadPort);
       const name = "codex-t1";
       const start = Date.now();
       // Seed an inherited marker: the wrapper must clear it even when the daemon is
@@ -334,6 +355,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
     try {
       const hungPort = await getFreePort();
       await new Promise<void>((r) => hung.listen(hungPort, "127.0.0.1", () => r()));
+      await pointRecordAt(h, hungPort);
       const name = "codex-t2";
       const start = Date.now();
       const { res, argvFile, envFile } = runLauncher(h, name, {
@@ -366,6 +388,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
     try {
       const port = await getFreePort();
       await new Promise<void>((r) => srv.listen(port, "127.0.0.1", () => r()));
+      await pointRecordAt(h, port); // its /health answers; the door's POST hangs
       const start = Date.now();
       const { res, argvFile, envFile } = runLauncher(h, "codex-t3", {
         port,

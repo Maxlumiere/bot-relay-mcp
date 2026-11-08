@@ -336,7 +336,9 @@ function timed(hook: string, tag: string, env: Record<string, string>, input = "
       PATH: `${dir}:${process.env.PATH ?? ""}`,
       HOME,
       RELAY_AGENT_NAME: AGENT,
-      RELAY_HTTP_HOST: "127.0.0.1",
+      // A REMOTE relay (curl is a stub: no connection is made). Hook PR 3 (as ruled): only an explicit non-loopback host
+      // declares one; a loopback host would be refused as an unopted tunnel.
+      RELAY_HTTP_HOST: "relay.example.test",
       RELAY_HTTP_PORT: "1",
       RELAY_HOOK_NOTICE_REMIND_SECS: "0",
       RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json"),

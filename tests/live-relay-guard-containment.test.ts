@@ -20,11 +20,15 @@
  * The hook dials only once it resolves a relay instance (ADR-0048), so each arm's HOME holds one: a sandbox DB the
  * product itself creates (dist/db.js), the shape of an account HOME. The two arms differ ONLY in the tripwire: the child
  * env is { PATH, a name, that HOME } with NO port, i.e. the port falls back to its default.
- *   THE CLAIM: under the tripwire (the ordinary spawn), the register_agent STIMULUS itself reaches curl at the repaired
- *              port (curl http://127.0.0.1:1/mcp, tool register_agent), and nothing targets :3777. A run that only
- *              probed /health, or never registered, fails it (THE CONTROL).
- *   THE TWIN (the RED with the tripwire removed): the same child spawned PAST the tripwire (raw spawn) sends
- *              register_agent to http://127.0.0.1:3777/mcp: the default-port path is real, and the claim is not vacuous.
+ *   Hook PR 3: a LOCAL instance's credential calls (register_agent among them) go ONLY through its daemon's owner
+ *   door, never over HTTP to a configured port; this sandbox instance has no daemon, so the hook sends none. The burst
+ *   path (register_agent to :3777) no longer exists. The one call that still reaches the configured endpoint is the
+ *   daemon probe (curl /health, no credential): it is the stimulus.
+ *   THE CLAIM: under the tripwire (the ordinary spawn), the daemon probe reaches curl at the repaired port
+ *              (curl http://127.0.0.1:1/health), nothing targets :3777, and NO register_agent goes over curl. An empty
+ *              record set, a :3777 target or a curl register_agent each fail it (THE CONTROL).
+ *   THE TWIN (the RED with the tripwire removed): the same child spawned PAST the tripwire (raw spawn) sends the probe
+ *              to http://127.0.0.1:3777/health: the default-port path is real, and the claim is not vacuous.
  * The other containment layer, an env-{} child's HOME repaired to the run's private (instance-less) home, is pinned by
  * tests/operator-tripwire.test.ts ("a child built FROM SCRATCH (env {}) gets the private HOME ... port 1").
  */
@@ -90,8 +94,10 @@ const DEFAULT_PORT = 3777;
 export function assertContainedRegistration(records: Rec[]): void {
   const shown = JSON.stringify(records);
   if (records.some((r) => r.port === DEFAULT_PORT)) throw new Error(`a target on the DEFAULT port ${DEFAULT_PORT}: ${shown}`);
-  if (!records.some((r) => r.via === "curl" && r.host === "127.0.0.1" && r.port === 1 && r.path === "/mcp" && r.tool === "register_agent")) {
-    throw new Error(`the register_agent stimulus never reached curl at the repaired port (curl http://127.0.0.1:1/mcp tool=register_agent): ${shown}`);
+  // Hook PR 3: a local instance never registers over HTTP to a configured port (only through its daemon's door).
+  if (records.some((r) => r.via === "curl" && r.tool === "register_agent")) throw new Error(`a register_agent over curl to a configured port: ${shown}`);
+  if (!records.some((r) => r.via === "curl" && r.host === "127.0.0.1" && r.port === 1 && r.path === "/health")) {
+    throw new Error(`the daemon-probe stimulus never reached curl at the repaired port (curl http://127.0.0.1:1/health): ${shown}`);
   }
 }
 
@@ -137,14 +143,14 @@ exit 7
 }
 
 describe.skipIf(process.platform === "win32")("CONTAINMENT (black-box): an env-{} child running the real SessionStart hook never targets the default port under the tripwire", () => {
-  it("THE CLAIM: under the tripwire, the hook's register_agent reaches curl at the repaired port 1 (/mcp, tool register_agent), and NOTHING targets :3777", () => {
+  it("THE CLAIM: under the tripwire, the hook's daemon probe reaches curl at the repaired port 1 (/health), NOTHING targets :3777, and no register_agent goes over curl", () => {
     const ins = instrument("claim");
     const home = homeWithInstance("claim");
     spawnSync("bash", [HOOK], { input: STDIN, encoding: "utf-8", timeout: 60_000, env: { PATH: `${ins.bin}:${NODE_DIR}:/usr/bin:/bin`, RELAY_AGENT_NAME: "fx-contain", HOME: home, NODE_OPTIONS: `--require ${ins.blocker}`, RELAY_TEST_CLOCK: "0" } });
     assertContainedRegistration(ins.records());
   }, 90_000);
 
-  it("THE TWIN, the tripwire REMOVED: the same hook spawned PAST the tripwire (raw spawn; a sandbox HOME only) sends register_agent to :3777 (the default-port path is real; the claim is not vacuous)", async () => {
+  it("THE TWIN, the tripwire REMOVED: the same hook spawned PAST the tripwire (raw spawn; a sandbox HOME only) sends its daemon probe to :3777 (the default-port path is real; the claim is not vacuous)", async () => {
     const ins = instrument("twin");
     const home = homeWithInstance("twin");
     await new Promise<number | null>((resolve) => {
@@ -152,13 +158,15 @@ describe.skipIf(process.platform === "win32")("CONTAINMENT (black-box): an env-{
       c.stdin!.end(STDIN);
       c.on("close", resolve);
     });
-    expect(ins.lines(), `without the tripwire register_agent goes to the DEFAULT port (recorded: ${JSON.stringify(ins.lines())})`).toContain("curl http://127.0.0.1:3777/mcp tool=register_agent");
+    expect(ins.lines(), `without the tripwire the probe goes to the DEFAULT port (recorded: ${JSON.stringify(ins.lines())})`).toContain("curl http://127.0.0.1:3777/health tool=-");
   }, 90_000);
 
-  it("THE CONTROL: a registration-skipped, health-only run (one probe of /health at port 1, no register_agent) FAILS the claim; so does any :3777 target", () => {
-    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/health tool=-"]))).toThrow(/the register_agent stimulus never reached curl/);
-    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/mcp tool=register_agent", 'node {"host":"127.0.0.1","port":3777}']))).toThrow(/DEFAULT port/);
-    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/mcp tool=register_agent"]))).not.toThrow();
+  it("THE CONTROL: an empty run FAILS the claim; so does any :3777 target, and any register_agent over curl", () => {
+    expect(() => assertContainedRegistration(parseRecords([]))).toThrow(/the daemon-probe stimulus never reached curl/);
+    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/health tool=-", 'node {"host":"127.0.0.1","port":3777}']))).toThrow(/DEFAULT port/);
+    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/health tool=-", "curl http://127.0.0.1:1/mcp tool=register_agent"]))).toThrow(/register_agent over curl/);
+    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/health tool=-"]))).not.toThrow();
+    expect(() => assertContainedRegistration(parseRecords(["curl http://127.0.0.1:1/mcp tool=register_agent"]))).toThrow(/register_agent over curl/);
   });
 
   it("THE NODE RECORDER: a connect through net's NORMALIZED [options, cb] shape, and an IPv6 endpoint, are recorded (never dropped); an unparseable record FAILS", () => {

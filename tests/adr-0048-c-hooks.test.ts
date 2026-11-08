@@ -208,7 +208,8 @@ describe("ADR-0048 PR C — PostToolUse / Stop take pending's embedded resolutio
       fs.mkdirSync(path.join(RH, "agents"), { recursive: true });
       fs.writeFileSync(path.join(RH, "agents", `${AGENT}.token`), token + "\n", { mode: 0o600 });
       fs.writeFileSync(HEALTH_OK, "");
-      const r = runHook(hook, { RELAY_HTTP_HOST: "127.0.0.1" }, JSON.stringify({ session_id: "s1" }));
+      // A REMOTE relay (curl is a stub). Hook PR 3 (as ruled): only an explicit non-loopback host declares one.
+      const r = runHook(hook, { RELAY_HTTP_HOST: "relay.example.test" }, JSON.stringify({ session_id: "s1" }));
       // The token reaches curl through its config on STDIN, and never through argv (readable by every user).
       expect(r.curls, r.out).toContain(`cfg: header = "X-Agent-Token: ${token}"`);
       expect(r.curls.filter((l) => !l.startsWith("cfg: ")).join("\n"), r.out).not.toContain(token);
@@ -404,6 +405,9 @@ describe("Codex #291 R1 #1 — SessionStart: the pre-mail steps can never eat th
         HOME,
         RELAY_AGENT_NAME: AGENT,
         RELAY_AGENT_TOKEN: "tok_" + "z".repeat(20),
+        // Hook PR 3 (as ruled): a local DB's credential calls go only through its door; the HTTP health check and
+        // registration this row times run only for a DECLARED remote (an explicit non-loopback host; curl is a stub).
+        RELAY_HTTP_HOST: "relay.example.test",
         RELAY_HTTP_PORT: "1",
         RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json"),
       },

@@ -109,7 +109,7 @@ export function budgetTree(dir: string, hooksDir: string, binDir: string): strin
           "",
           "# TEST ONLY (budgetTree): RELAY_TEST_STARVE. See tests/_helpers/hook-budget-tree.ts.",
           `eval "$(declare -f relay_budget_for | sed '1s/^relay_budget_for/relay_budget_for_real/')"`,
-          'relay_budget_for() { case "$1" in $RELAY_TEST_STARVE) relay_budget_for_real "$1" 0 "${3:-}" ;; *) relay_budget_for_real "$@" ;; esac; }',
+          'relay_budget_for() { case "$1" in ${RELAY_TEST_STARVE:-}) relay_budget_for_real "$1" 0 "${3:-}" ;; *) relay_budget_for_real "$@" ;; esac; }',
           "",
         ].join("\n"),
     );

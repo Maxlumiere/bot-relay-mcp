@@ -212,6 +212,8 @@ function remoteEnv(name: string, token: string): Record<string, string> {
     RELAY_AGENT_NAME: name,
     RELAY_AGENT_TOKEN: token,
     RELAY_HTTP_HOST: "127.0.0.1",
+    // Hook PR 3 (as ruled): a relay on loopback with no local DB is a TUNNEL, opted in for its port.
+    RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(port),
     RELAY_HTTP_PORT: String(port),
   };
 }

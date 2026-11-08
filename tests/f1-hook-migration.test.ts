@@ -291,7 +291,7 @@ describe("F1 hook migration — PostToolUse, LOCAL mode: F1 only, ZERO HTTP requ
     expect(r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: /);
   });
 
-  it("NON-VACUOUS: with a MISMATCHED anchor the stub IS reached, and only by the self-heal write; no request names get_messages", async () => {
+  it("NON-VACUOUS: with a MISMATCHED anchor the self-heal DOES run, through the DB's own daemon door (hook PR 3): the anchor is restamped and the configured stub still gets ZERO requests", async () => {
     dbRegister("f1h-sender-4", "r", []);
     const t = seedAgent("f1h-recv-4", "mismatch");
     dbSend("f1h-sender-4", "f1h-recv-4", "local mail 4", "normal");
@@ -299,12 +299,10 @@ describe("F1 hook migration — PostToolUse, LOCAL mode: F1 only, ZERO HTTP requ
 
     const r = await runHook(seamed(PTU_HOOK), { ...localEnv("f1h-recv-4", t, freshHome("p4")), ...FIXED_CLOCK }, PTU_STDIN);
     const reqs = takeStubRequests();
-    expect(reqs.length, "precondition: the stub is reachable from the hook").toBeGreaterThan(0);
-    for (const q of reqs) {
-      const ok = q.url === "/health" || (q.url === "/mcp" && q.body.includes('"report_liveness"'));
-      expect(ok, `unexpected request ${q.method} ${q.url} ${q.body.slice(0, 120)}`).toBe(true);
-      expect(q.body).not.toContain("get_messages");
-    }
+    // The positive marker: the self-heal ran (the seeded 999999 anchor was restamped), so a credential call WAS made.
+    const anchor = getDb().prepare("SELECT agent_pid FROM agents WHERE name = ?").get("f1h-recv-4") as { agent_pid: number | null };
+    expect(anchor.agent_pid, `precondition: the self-heal restamped the anchor\n${r.stderr}`).not.toBe(999_999);
+    expect(reqs.map((q) => `${q.method} ${q.url}`), "the configured endpoint gets nothing: the restamp went through the door").toEqual([]);
     expect(ptuContext(r)).toContain("f1h-sender-4");
   });
 });
@@ -323,6 +321,8 @@ describe("F1 hook migration — PostToolUse, REMOTE mode twin: the labeled HTTP 
         RELAY_AGENT_NAME: "f1h-recv-5",
         RELAY_AGENT_TOKEN: t,
         RELAY_HTTP_HOST: "127.0.0.1",
+        // Hook PR 3 (as ruled): a relay on loopback with no local DB is a TUNNEL, opted in for its port.
+        RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(relayPort),
         RELAY_HTTP_PORT: String(relayPort),
         RELAY_HOOK_NOTICE_REMIND_SECS: "0",
       },
@@ -400,6 +400,8 @@ describe("F1 hook migration — Stop hook: the same mode rule", () => {
         RELAY_AGENT_NAME: "f1h-recv-9",
         RELAY_AGENT_TOKEN: t,
         RELAY_HTTP_HOST: "127.0.0.1",
+        // Hook PR 3 (as ruled): a relay on loopback with no local DB is a TUNNEL, opted in for its port.
+        RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(relayPort),
         RELAY_HTTP_PORT: String(relayPort),
         RELAY_STOP_WAKE_DAMPER_SECS: "0",
       },
@@ -429,6 +431,8 @@ describe("#286 Codex R1 #4 — a remote TOOL ERROR is never a successful empty r
               RELAY_AGENT_NAME: "f1h-r4",
               RELAY_AGENT_TOKEN: "stubtoken-aaaaaaaaaaaa",
               RELAY_HTTP_HOST: "127.0.0.1",
+              // Hook PR 3 (as ruled): a relay on loopback with no local DB is a TUNNEL, opted in for its port.
+              RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(stubPort),
               RELAY_HTTP_PORT: String(stubPort),
               RELAY_HOOK_NOTICE_REMIND_SECS: "0",
               RELAY_STOP_WAKE_DAMPER_SECS: "0",

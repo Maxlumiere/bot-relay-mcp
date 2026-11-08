@@ -379,6 +379,8 @@ describe("#286 R1 #5 (ruling) — SessionStart honours exit 3: the labeled remot
         RELAY_AGENT_NAME: "r5",
         RELAY_AGENT_TOKEN: tok,
         RELAY_HTTP_PORT: String(d.port),
+        // Hook PR 3 (as ruled): a relay on loopback with no local DB is a TUNNEL, opted in for its port.
+        RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(d.port),
       }));
       expect(r.stdout, r.stdout + r.stderr).toContain("[RELAY] Pending messages for r5 via remote relay (showing 1 of 1):");
       expect(r.stdout).toContain("remote body");
@@ -588,7 +590,8 @@ describe("#286 D2 — SessionStart: a remote-only fresh install, and a path guar
       const home = path.join(ROOT, "home-d2a-fresh");
       fs.mkdirSync(home, { recursive: true });
       expect(fs.existsSync(path.join(home, ".bot-relay")), "precondition: a truly fresh install").toBe(false);
-      const env = baseEnv(home, { RELAY_AGENT_NAME: "d2a", RELAY_AGENT_TOKEN: tok, RELAY_HTTP_PORT: String(d.port) });
+      // Hook PR 3 (as ruled): a relay on loopback with no local DB is a TUNNEL, opted in for its port.
+      const env = baseEnv(home, { RELAY_AGENT_NAME: "d2a", RELAY_AGENT_TOKEN: tok, RELAY_HTTP_PORT: String(d.port), RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(d.port) });
       delete (env as Record<string, string | undefined>).RELAY_HOME;
       const r = await runHookAsync(env);
       expect(r.stdout, r.stdout + r.stderr).toContain("[RELAY] Pending messages for d2a via remote relay (showing 1 of 1):");

@@ -320,7 +320,10 @@ function run(args: string[], env: Record<string, string>, stdin = "", fd5?: stri
 /** THE HARM, refused: no process the run started held any of `secrets` in its argv. */
 function expectNoArgvHolds(secrets: string[]): void {
   const procs = loggedProcs();
-  expect(procs.filter((p) => p[0] === "curl").length, "precondition: the shim saw curl run").toBeGreaterThan(0);
+  // The credential-carrying process: curl (the bearer route) or, hook PR 3, the relay CLI's door client (node
+  // ... owner tool|session|liveness: the token in its environment, never its argv). The shim logs both.
+  const carriers = procs.filter((p) => p[0] === "curl" || (p[0] === "node" && p.some((a) => a === "owner")));
+  expect(carriers.length, "precondition: the shim saw a credential-carrying process run (curl, or the door client)").toBeGreaterThan(0);
   for (const secret of secrets) {
     expect(secret.length, "precondition: a real secret").toBeGreaterThanOrEqual(8);
     const holders = procs.filter((p) => p.some((a) => a.includes(secret))).map((p) => p.join(" "));
