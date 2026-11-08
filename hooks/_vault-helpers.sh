@@ -306,6 +306,32 @@ relay_owner_read() {
   return "$rc"
 }
 
+# relay_owner_tool CLI SECS TOOL ARGS_JSON [--with-recovery-token] — hook PR 3 (as ruled after Codex #418 R2): ONE
+# credential-bearing tool call (register_agent, health_check, report_liveness) to the local DB's own daemon, as a
+# SEALED exchange through its owner door (`relay owner tool …`, src/cli/owner.ts), under the watchdog at SECS. The
+# agent token comes from RELAY_AGENT_TOKEN in the CALLER'S environment (pass it as a prefix assignment), the recovery
+# token from RELAY_RECOVERY_TOKEN, the registration secret from its file: none on argv (ARGS_JSON is name, role,
+# capabilities, pids). The answer STREAMS to stdout (a register reply carries a minted token: never a file), in the
+# shape the hooks' curl call printed (the JSON-RPC answer + `HTTP_STATUS:200`); a failure is one stderr line
+# `relay owner: <why>` and a non-zero exit (124 = the watchdog fired).
+relay_owner_tool() {
+  local cli="$1" secs="$2" tool="$3" args="$4" ms
+  shift 4
+  case "$secs" in ''|*[!0-9]*|0) echo "relay owner: no time budget left for the owner door call" >&2; return 125 ;; esac
+  ms=$(( secs * 1000 - 300 ))
+  [ "$ms" -lt 100 ] && ms=100
+  relay_run_streamed "$secs" node "$cli" owner tool "$tool" --args-json "$args" "$@" --timeout-ms "$ms"
+}
+
+# relay_host_is_loopback HOST — 0 when HOST names this machine's loopback (or a wildcard bind, which a local client
+# reaches through loopback): 127.0.0.0/8, localhost, ::1, 0.0.0.0, ::.
+relay_host_is_loopback() {
+  case "$1" in
+    127.*|localhost|::1|'[::1]'|0.0.0.0|::|'[::]') return 0 ;;
+  esac
+  return 1
+}
+
 # relay_run_streamed SECS CMD... — CMD killed at SECS (124 = timed out), its stdin, stdout and stderr this function's
 # OWN (no file): for a step that is fed and read through a pipe (a renderer, a parser) and must stay inside the budget.
 relay_run_streamed() {

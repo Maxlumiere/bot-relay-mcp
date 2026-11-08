@@ -18,15 +18,31 @@ import {
   ApiWakeAgentSchema,
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
-import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors, pendingMetadata, setAgentLivenessAnchor } from "../db.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors, pendingMetadata, getDbPath } from "../db.js";
 import { ownedDbPath } from "../sqlite-compat.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
+
+/**
+ * Hook PR 3: the DB this process serves through the owner door: a wasm DB it OWNS, else (every daemon, native
+ * included, writes its record) the DB its daemon has open. null when it serves none.
+ */
+function doorDbPath(): string | null {
+  const owned = ownedDbPath();
+  if (owned !== null) return owned;
+  try {
+    return getDbPath();
+  } catch {
+    return null;
+  }
+}
 import { resolveInstance } from "../instance.js";
 import {
   writeOwnerEndpoint,
   addressReachesLoopback,
   ownerPeekRouteAllowed,
-  verifyDoorRequest,
-  signDoorResponse,
+  openDoorRequest,
+  sealDoorResponse,
   OWNER_PEEK_HOST,
   OWNER_PEEK_REFUSAL,
 } from "../owner-endpoint.js";
@@ -329,7 +345,7 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   }
   // Hook PR 1 (as ruled after Codex #418 R1): the OWNER DOOR carries no bearer credential at all; it authenticates
   // by the owner key's MACs (src/owner-endpoint.ts). It stays under the rate limit and the Host-header check.
-  if (req.path === "/owner/v1/peek" || req.path === "/owner/v1/liveness") {
+  if (req.path === "/owner/v1/peek" || req.path === "/owner/v1/liveness" || req.path === "/owner/v1/register" || req.path === "/owner/v1/health") {
     return next();
   }
   // v2.1.7 Item 6: dashboard paths handle auth downstream.
@@ -734,50 +750,84 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
   // MAC covers its exact bytes.
   //   /owner/v1/peek     = a PURE read: `relay pending`'s query (pendingMetadata), no seq/epoch stamp, no read mark.
   //   /owner/v1/liveness = the metadata-only anchor restamp (agent_pid, agent_pid_start; host_id when NULL).
-  const doorBody = express.text({ type: () => true, limit: "16kb" });
-  const doorReply = (res: Response, status: number, payload: unknown, nonce: string | undefined): void => {
-    const text = JSON.stringify(payload);
-    if (nonce) res.setHeader("X-Owner-MAC", signDoorResponse(nonce, status, text));
-    res.status(status).type("text/plain").send(text);
+  const doorBody = express.text({ type: () => true, limit: "64kb" });
+  // Hook PR 3 (as ruled after Codex #418 R2): register / health / liveness run the SAME dispatcher as /mcp, in-process
+  // (an MCP client over the SDK InMemoryTransport), inside a request context that MIRRORS /mcp's: the REAL peer, the
+  // same `authenticated`, the transport http, and the agent token / registration secret carried INSIDE the sealed
+  // request (so the handlers' own checks run unchanged: the mint gate, the token check, recovery, limits, audit).
+  const DOOR_TOOLS: Readonly<Record<string, string>> = {
+    "/owner/v1/register": "register_agent",
+    "/owner/v1/health": "health_check",
+    "/owner/v1/liveness": "report_liveness",
   };
-  const doorHandler = (doorPath: "/owner/v1/peek" | "/owner/v1/liveness") => (req: Request, res: Response) => {
-    if (ownedDbPath() === null) {
-      res.status(404).json({ error: "not a wasm DB owner" });
+  const doorDispatch = async (req: Request, name: string, args: Record<string, unknown>, agentToken: string | undefined, mintSecret: string | undefined) => {
+    const ctx = {
+      sourceIp: extractSourceIp(req, config.trusted_proxies),
+      authenticated: !!config.http_secret,
+      transport: "http" as const,
+      headerAgentToken: agentToken,
+      presentedSecret: mintSecret,
+    };
+    return requestContext.run(ctx, async () => {
+      const server = createServer();
+      const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverSide);
+      const client = new McpClient({ name: "relay-owner-door", version: "1" });
+      await client.connect(clientSide);
+      try {
+        return await client.callTool({ name, arguments: args });
+      } finally {
+        await client.close().catch(() => {});
+      }
+    });
+  };
+  const doorHandler = (doorPath: "/owner/v1/peek" | "/owner/v1/liveness" | "/owner/v1/register" | "/owner/v1/health") => async (req: Request, res: Response) => {
+    if (doorDbPath() === null) {
+      res.status(404).json({ error: "this process serves no relay DB" });
       return;
     }
-    const v = verifyDoorRequest(doorPath, req.body, req.header("x-owner-mac"));
+    const v = openDoorRequest(doorPath, req.body);
     if (!v.ok) {
-      doorReply(res, v.status, { ok: false, error: v.error }, v.nonce);
+      // Before authentication (no ts/nonce to bind a reply to): unsealed. After it: sealed, like every reply.
+      if (v.ts === undefined || v.nonce === undefined) res.status(v.status).type("text/plain").send(JSON.stringify({ ok: false, error: v.error }));
+      else res.status(v.status).type("text/plain").send(sealDoorResponse(doorPath, v.ts, v.nonce, v.status, { ok: false, error: v.error }));
       return;
     }
-    const { agent_name, args, nonce } = v.req;
+    const { agent_name, args, ts, nonce } = v.req;
+    const reply = (status: number, payload: unknown) => res.status(status).type("text/plain").send(sealDoorResponse(doorPath, ts, nonce, status, payload));
     try {
       if (doorPath === "/owner/v1/peek") {
-        const keys = Object.keys(args);
         const n = args.with_content;
-        if (keys.some((k) => k !== "with_content") || (n !== undefined && (!Number.isInteger(n) || (n as number) < 0 || (n as number) > 50))) {
-          doorReply(res, 400, { ok: false, error: "peek args: only with_content (an integer 0-50)" }, nonce);
+        if (Object.keys(args).some((k) => k !== "with_content") || (n !== undefined && (!Number.isInteger(n) || (n as number) < 0 || (n as number) > 50))) {
+          reply(400, { ok: false, error: "peek args: only with_content (an integer 0-50)" });
           return;
         }
-        const meta = pendingMetadata(getDb(), agent_name, { contentFor: (n as number | undefined) ?? 0 });
-        doorReply(res, 200, { ok: true, agent: agent_name, ...meta }, nonce);
+        reply(200, { ok: true, agent: agent_name, ...pendingMetadata(getDb(), agent_name, { contentFor: (n as number | undefined) ?? 0 }) });
         return;
       }
-      const keys = Object.keys(args);
-      const pid = args.agent_pid;
-      const start = args.agent_pid_start;
-      if (keys.some((k) => k !== "agent_pid" && k !== "agent_pid_start") || !Number.isInteger(pid) || (pid as number) <= 0 || (start !== undefined && (typeof start !== "string" || start.length > 200))) {
-        doorReply(res, 400, { ok: false, error: "liveness args: agent_pid (a positive integer) and optionally agent_pid_start (a string)" }, nonce);
+      const tool = DOOR_TOOLS[doorPath]!;
+      const call = args.rpc as { method?: unknown; params?: { name?: unknown; arguments?: unknown } } | undefined;
+      const token = args.agent_token;
+      const secret = args.mint_secret;
+      if (
+        Object.keys(args).some((k) => k !== "rpc" && k !== "agent_token" && k !== "mint_secret") ||
+        !call || call.method !== "tools/call" || !call.params || call.params.name !== tool ||
+        call.params.arguments === null || typeof call.params.arguments !== "object" || Array.isArray(call.params.arguments) ||
+        (token !== undefined && typeof token !== "string") || (secret !== undefined && typeof secret !== "string")
+      ) {
+        reply(400, { ok: false, error: `this door path takes one tools/call of ${tool} (args: rpc, agent_token?, mint_secret?)` });
         return;
       }
-      const updated = setAgentLivenessAnchor(agent_name, pid as number, (start as string | undefined) ?? null);
-      doorReply(res, updated ? 200 : 404, updated ? { ok: true, agent: agent_name } : { ok: false, error: `agent ${JSON.stringify(agent_name)} is not registered` }, nonce);
+      const result = await doorDispatch(req, tool, call.params.arguments as Record<string, unknown>, token as string | undefined, secret as string | undefined);
+      reply(200, { ok: true, result });
     } catch (err) {
-      doorReply(res, 500, { ok: false, error: `the owner could not answer: ${(err as Error).message}` }, nonce);
+      reply(500, { ok: false, error: `the owner could not answer: ${(err as Error).message}` });
     }
   };
   app.post("/owner/v1/peek", doorBody, doorHandler("/owner/v1/peek"));
   app.post("/owner/v1/liveness", doorBody, doorHandler("/owner/v1/liveness"));
+  app.post("/owner/v1/register", doorBody, doorHandler("/owner/v1/register"));
+  app.post("/owner/v1/health", doorBody, doorHandler("/owner/v1/health"));
 
   app.use(authMiddleware);
 
@@ -2074,7 +2124,7 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
     // 127.0.0.1 cannot reach it (::1, a LAN address, "::", a "localhost" that resolved to ::1, a Host allowlist without
     // 127.0.0.1), the owner opens the loopback owner-peek listener and the record names THAT. A record failure is
     // logged, never fatal (the hooks then skip, by name).
-    const owned = ownedDbPath();
+    const owned = doorDbPath();
     if (owned !== null) {
       const reachable =
         addr !== null && typeof addr === "object" && addressReachesLoopback(addr.address) && checkHostHeader(`127.0.0.1:${boundPort}`, hostAllowlistOverride).ok;

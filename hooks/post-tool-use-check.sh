@@ -528,7 +528,6 @@ print(json.dumps({
 liveness_self_heal() {
   local db="$1"
   [ -z "$AGENT_TOKEN" ] && return 0
-  command -v curl >/dev/null 2>&1 || return 0
   command -v relay_agent_pid >/dev/null 2>&1 || return 0
   local cur_pid cur_start stored_pid stored_start
   cur_pid=$(relay_agent_pid 2>/dev/null || printf '')
@@ -568,25 +567,25 @@ sys.stdout.write("%s\x1f%s" % (r[0], r[1]))
     need=1
   fi
   [ "$need" -eq 0 ] && return 0
-  # Only over a reachable daemon.
-  relay_budget_for "the liveness health probe" 1 margin || return 0
-  curl -fsS -m "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1 || return 0
-  local payload
-  payload=$(AN="$AGENT_NAME" AT="$AGENT_TOKEN" PID="$cur_pid" ST="$cur_start" python3 -c '
+  # Hook PR 3 (as ruled after Codex #418 R2): the restamp carries the token to a LOCAL DB's daemon, so it goes ONLY
+  # through that DB's owner door (relay_owner_tool: a sealed exchange; the token from the environment, never argv),
+  # never to a configured endpoint. No valid door (no daemon, or one too old to write its record) = no restamp.
+  if [ "${RELAY_RES_LOADED:-}" != 1 ]; then
+    relay_budget_for "the resolver" 2 margin || return 0
+    relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS" || return 0
+  fi
+  [ -n "${RELAY_RES_OWNER_ENDPOINT:-}" ] || return 0
+  local args
+  args=$(AN="$AGENT_NAME" PID="$cur_pid" ST="$cur_start" python3 -c '
 import json, os
-args = {"agent_name": os.environ["AN"], "agent_pid": int(os.environ["PID"]), "agent_token": os.environ["AT"]}
+args = {"agent_name": os.environ["AN"], "agent_pid": int(os.environ["PID"])}
 st = os.environ.get("ST", "")
 if st:
     args["agent_pid_start"] = st
-print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"report_liveness","arguments":args}}))
+print(json.dumps(args))
 ' 2>/dev/null) || return 0
   relay_budget_for "the liveness restamp" 2 margin || return 0
-  # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
-  { relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
-    -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    >/dev/null 2>&1 || return 0
+  RELAY_AGENT_TOKEN="$AGENT_TOKEN" relay_owner_tool "$RELAY_CLI" "$RELAY_STEP_SECS" report_liveness "$args" >/dev/null 2>&1 || return 0
   return 0
 }
 

@@ -843,29 +843,42 @@ fi
 #
 # Required deps for this block: curl (standard on macOS/Linux). jq is NOT
 # required — we parse the fields we need with grep/sed.
-# --- Hook PR 1 (as ruled after Codex #418 R1; P1-3 as modified) -----------------------------------------------------
-# On a wasm DB (`http`) the verdict AND a door exchange come FIRST. The token health check, the recovery and the
-# registration below go ONLY to a configured endpoint that IS the proven owner (127.0.0.1 at the record's port: the
-# same configured-endpoint trust a native install has). Any other endpoint is skipped by name (register through your
-# MCP connection), and a door that fails makes NO credential-bearing call at all. On `http` every curl here ignores
-# curl's own config and every proxy (-q first, --noproxy '*').
-RELAY_CRED_OK=1
-RELAY_CURL_GUARD=()
-if [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
-  RELAY_CRED_OK=0
-  RELAY_CURL_GUARD=(-q --noproxy '*')
-  _door_bin="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
-  _owner_port="${RELAY_RES_OWNER_ENDPOINT##*:}"
-  if ! relay_budget_for "the owner door check" 2; then
-    echo "[RELAY] the owner door was not checked (no time budget left): no credential is sent this session start." >&2
-  elif ! relay_owner_read "$_door_bin" "$AGENT_NAME" "$RELAY_STEP_SECS"; then
-    echo "[RELAY] the owner door failed (${RELAY_OWNER_WHY}): no credential is sent this session start." >&2
-  elif [ "$HTTP_HOST" = 127.0.0.1 ] && [ "$HTTP_PORT" = "$_owner_port" ]; then
-    RELAY_CRED_OK=1
-  else
-    echo "[RELAY] the configured relay endpoint (${HTTP_HOST}:${HTTP_PORT}) is not this wasm DB's proven owner: the token health check and registration over HTTP are skipped; register through your MCP connection." >&2
-  fi
+# --- Hook PR 3 (as ruled after Codex #418 R2): EVERY credential call to a local daemon goes through its OWNER DOOR ----
+# A LOCAL relay DB (the resolver found one) gets its credential calls (the token health check, the recovery, the
+# registration) ONLY as sealed exchanges with that DB's own daemon (relay_owner_tool): never to a configured endpoint,
+# local or remote, so an inherited RELAY_HTTP_HOST gets nothing. The door is checked FIRST (one sealed peek). With no
+# valid door (no daemon, an old daemon that writes no record, a skip verdict, a door that fails) NO credential is sent,
+# and the skip is named. REMOTE mode (no local DB; RELAY_HTTP_HOST a non-loopback host) keeps its bearer: the
+# configured-endpoint trust a remote relay has always had (stated). Every curl ignores curl's own config and every
+# proxy (-q first, --noproxy '*') except on the remote route, which may need one.
+RELAY_CRED_ROUTE=none
+RELAY_CRED_OK=0
+RELAY_CURL_GUARD=(-q --noproxy '*')
+_door_bin="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
+_cred_why=""
+if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ]; then
+  case "${RELAY_RES_HOOK_DB:-}" in
+    http|sqlite3)
+      if [ -z "${RELAY_RES_OWNER_ENDPOINT:-}" ]; then
+        _cred_why="this DB has no valid owner record (no daemon, or one too old to write it): restart the relay daemon if it is running"
+      elif ! relay_budget_for "the owner door check" 2; then
+        _cred_why="no time budget left for the owner door check"
+      elif ! relay_owner_read "$_door_bin" "$AGENT_NAME" "$RELAY_STEP_SECS"; then
+        _cred_why="the owner door failed (${RELAY_OWNER_WHY})"
+      else
+        RELAY_CRED_ROUTE=door
+      fi
+      ;;
+    *) _cred_why="the relay CLI's DB verdict (${RELAY_RES_HOOK_DB:-none}) has no owner door" ;;
+  esac
+elif [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_host_is_loopback "$HTTP_HOST"; then
+  RELAY_CRED_ROUTE=bearer
+  RELAY_CURL_GUARD=()
+else
+  _cred_why="no local relay DB, and no remote RELAY_HTTP_HOST"
 fi
+[ "$RELAY_CRED_ROUTE" != none ] && RELAY_CRED_OK=1
+[ -n "$_cred_why" ] && echo "[RELAY] no credential is sent this session start: ${_cred_why}. Register through your MCP connection." >&2
 
 AUTH_ERROR=0
 AUTH_STATE=""
@@ -874,12 +887,19 @@ RECOVERY_COMPLETED=0
 # proves it either way ("" = not known yet, 1 = answered, 0 = unreachable). The verdict
 # block after register reads it, so a daemon that never came up cannot print HEALTHY.
 DAEMON_REACHABLE=""
-if [ -n "${RELAY_AGENT_TOKEN:-}" ] && [ "$RELAY_CRED_OK" = 1 ] && command -v curl >/dev/null 2>&1 && relay_budget_for "the token health check" 2; then
-  # The token rides curl's config on STDIN, never argv (relay_curl_config_line).
-  HEALTH_BODY=$(relay_curl_token_config "$RELAY_AGENT_TOKEN" | curl "${RELAY_CURL_GUARD[@]}" -s -m "$RELAY_STEP_SECS" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"health_check","arguments":{}}}' 2>/dev/null)
+# The door's sealed peek above proved the daemon answered.
+[ "$RELAY_CRED_ROUTE" = door ] && DAEMON_REACHABLE=1
+if [ -n "${RELAY_AGENT_TOKEN:-}" ] && [ "$RELAY_CRED_OK" = 1 ] && { [ "$RELAY_CRED_ROUTE" = door ] || command -v curl >/dev/null 2>&1; } && relay_budget_for "the token health check" 2; then
+  if [ "$RELAY_CRED_ROUTE" = door ]; then
+    # Hook PR 3: a sealed exchange; the token from the environment, never argv.
+    HEALTH_BODY=$(RELAY_AGENT_TOKEN="$RELAY_AGENT_TOKEN" relay_owner_tool "$_door_bin" "$RELAY_STEP_SECS" health_check '{}' 2>/dev/null)
+  else
+    # The token rides curl's config on STDIN, never argv (relay_curl_config_line).
+    HEALTH_BODY=$(relay_curl_token_config "$RELAY_AGENT_TOKEN" | curl "${RELAY_CURL_GUARD[@]}" -s -m "$RELAY_STEP_SECS" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+      -H "Content-Type: application/json" \
+      -H "Accept: application/json, text/event-stream" \
+      -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"health_check","arguments":{}}}' 2>/dev/null)
+  fi
   if [ -n "$HEALTH_BODY" ]; then
     # A body proves the daemon answered. An EMPTY body proves nothing (refused or timed
     # out), so it leaves DAEMON_REACHABLE unknown for the later checks to settle.
@@ -919,12 +939,17 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
         printf "]";
       }')
     fi
-    # The body holds the recovery token: it rides curl's config on STDIN, never argv (relay_curl_config_line).
-    RECOVERY_BODY=$(relay_curl_config_line data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"recovery_token\":\"${RELAY_RECOVERY_TOKEN}\"}}}" \
-      | curl "${RELAY_CURL_GUARD[@]}" -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
-      -H "Content-Type: application/json" \
-      -H "Accept: application/json, text/event-stream" \
-      2>/dev/null)
+    if [ "$RELAY_CRED_ROUTE" = door ]; then
+      # Hook PR 3: a sealed exchange; the recovery token from RELAY_RECOVERY_TOKEN in the environment, never argv.
+      RECOVERY_BODY=$(relay_owner_tool "$_door_bin" "$RELAY_STEP_SECS" register_agent "{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON}}" --with-recovery-token 2>/dev/null)
+    else
+      # The body holds the recovery token: it rides curl's config on STDIN, never argv (relay_curl_config_line).
+      RECOVERY_BODY=$(relay_curl_config_line data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"recovery_token\":\"${RELAY_RECOVERY_TOKEN}\"}}}" \
+        | curl "${RELAY_CURL_GUARD[@]}" -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json, text/event-stream" \
+        2>/dev/null)
+    fi
     # v2.6.4 — same SSE-escape fix as the health_check parsing above. Inner
     # JSON is stringified with `\"key\": value` shape; the unescaped pattern
     # never matched, so this entire branch was silently dead pre-v2.6.4.
@@ -1151,7 +1176,7 @@ fi
 # delivery path below is read-only and stays via sqlite3 (the fast path is
 # the point). Bootstrap without a daemon is deliberately not supported.
 REGISTER_RAN=0
-if [ "$SKIP_REGISTER" -eq 0 ] && [ "$RELAY_CRED_OK" = 1 ] && command -v curl >/dev/null 2>&1 && relay_budget_for "registration" 4; then
+if [ "$SKIP_REGISTER" -eq 0 ] && [ "$RELAY_CRED_OK" = 1 ] && { [ "$RELAY_CRED_ROUTE" = door ] || command -v curl >/dev/null 2>&1; } && relay_budget_for "registration" 4; then
   REGISTER_RAN=1
   # Carry the caller's token if they have one — active re-register requires
   # it; first-time bootstrap on a fresh row doesn't. Either way the request
@@ -1170,12 +1195,21 @@ if [ "$SKIP_REGISTER" -eq 0 ] && [ "$RELAY_CRED_OK" = 1 ] && command -v curl >/d
   RELAY_AGENT_PID=$(RELAY_PS_BUDGET=premail relay_agent_pid || printf '')
   RELAY_AGENT_PID_START=""
   [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(RELAY_PS_BUDGET=premail relay_pid_start "$RELAY_AGENT_PID" || printf '')
-  # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
-  REG_BODY=$({ relay_mint_secret_curl_config || true; relay_curl_token_config "${RELAY_AGENT_TOKEN:-}" || true; } | curl "${RELAY_CURL_GUARD[@]}" -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - \
-    -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
-    "${REG_HEADERS[@]}" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
-    2>&1)
+  REG_ARGS="{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}"
+  if [ "$RELAY_CRED_ROUTE" = door ]; then
+    # Hook PR 3: a sealed exchange; the token from the environment and the registration secret from its file (read
+    # by the relay CLI), never argv. A failed exchange reads as "not reached" (000), its reason on stderr.
+    REG_BODY=$(RELAY_AGENT_TOKEN="${RELAY_AGENT_TOKEN:-}" relay_owner_tool "$_door_bin" "$RELAY_STEP_SECS" register_agent "$REG_ARGS" 2>&1) \
+      || REG_BODY="${REG_BODY}
+HTTP_STATUS:000"
+  else
+    # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
+    REG_BODY=$({ relay_mint_secret_curl_config || true; relay_curl_token_config "${RELAY_AGENT_TOKEN:-}" || true; } | curl "${RELAY_CURL_GUARD[@]}" -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - \
+      -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+      "${REG_HEADERS[@]}" \
+      -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":${REG_ARGS}}}" \
+      2>&1)
+  fi
   # v2.6.1 — capture fresh agent_token from the response body and persist
   # to the vault. register_agent only returns `agent_token` on first-mint
   # paths (legacy_bootstrap → active or fresh INSERT); subsequent re-
@@ -1276,7 +1310,7 @@ if [ -z "$DAEMON_REACHABLE" ] && command -v curl >/dev/null 2>&1 && relay_budget
   fi
 fi
 if [ "$RELAY_VERDICT" = "HEALTHY" ] && command -v relay_verdict_set >/dev/null 2>&1; then
-  if ! command -v curl >/dev/null 2>&1; then
+  if [ "$RELAY_CRED_ROUTE" != door ] && ! command -v curl >/dev/null 2>&1; then
     relay_verdict_set "DEGRADED" "curl unavailable: register skipped, wake may be unavailable" " agent=\"$AGENT_NAME\""
   elif [ "$DAEMON_REACHABLE" = "0" ]; then
     relay_verdict_set "DEGRADED" "daemon unreachable: register skipped, wake may be unavailable" " agent=\"$AGENT_NAME\" port=\"$HTTP_PORT\""

@@ -31,19 +31,27 @@ export const HOOK_DB_VERDICTS = ["sqlite3", "skip-declared-wasm", "skip-rlyw", "
 export type HookDbVerdict = (typeof HOOK_DB_VERDICTS)[number];
 
 /**
- * Hook PR 1: the verdict AND the owner endpoint's URL ("" for every verdict but "http"), from one decision. A
- * wasm verdict (declared wasm, RLYW, or the owner lock held) with a VALID owner endpoint record becomes "http".
+ * The verdict AND the owner endpoint's URL, from one decision.
+ * - Hook PR 1: a wasm verdict (declared wasm, RLYW, or the owner lock held) with a VALID owner endpoint record becomes
+ *   "http" (mail over the owner door).
+ * - Hook PR 3: a native verdict ("sqlite3") keeps it (mail stays the local read: it carries no credential) and
+ *   carries its daemon's endpoint when its record is valid, so every credential call goes through the door. ""
+ *   otherwise (no daemon, or an old one that writes no record).
  */
 export function hookDbAnswer(dbPath: string): { verdict: HookDbVerdict; endpoint: string } {
   const verdict = hookDbVerdict(dbPath);
-  if (verdict === "skip-declared-wasm" || verdict === "skip-rlyw" || verdict === "skip-owner-locked") {
+  const endpoint = (): string => {
     try {
-      const e = validOwnerEndpoint(dbPath);
-      if (e) return { verdict: "http", endpoint: e.url };
+      return validOwnerEndpoint(dbPath)?.url ?? "";
     } catch {
-      /* no valid record: the wasm verdict stands */
+      return ""; // no valid record
     }
+  };
+  if (verdict === "skip-declared-wasm" || verdict === "skip-rlyw" || verdict === "skip-owner-locked") {
+    const e = endpoint();
+    if (e) return { verdict: "http", endpoint: e };
   }
+  if (verdict === "sqlite3") return { verdict, endpoint: endpoint() };
   return { verdict, endpoint: "" };
 }
 

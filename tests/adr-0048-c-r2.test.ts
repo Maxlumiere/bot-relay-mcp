@@ -76,7 +76,7 @@ const LITERALS: Array<[string, RegExp]> = [
   ["python timeout=N", /\btimeout\s*=\s*\d/],
   ["select() with a literal timeout", /select\.select\([^)]*,\s*\d[\d.]*\s*\)/],
   ["sleep N", /(^|[\s;|&(!])sleep\s+['"]?\d/],
-  ["relay_run_* with a literal", /relay_run_(?:pending|bounded|capture)\s+['"]?\d/],
+  ["relay_run_* with a literal", /relay_run_(?:pending|bounded|capture|streamed)\s+['"]?\d/],
 ];
 
 function scan(file: string, src: string): Violation[] {
@@ -95,7 +95,9 @@ function scan(file: string, src: string): Violation[] {
     if (/sqlite3\.connect\(/.test(line) && !/timeout=float\(os\.environ\["RELAY_STEP_SECS"\]\)/.test(line)) {
       v.push({ file, rule: "sqlite3.connect without the budget timeout", line: line.trim() });
     }
-    if (/(^|[\s;|&(!])node\s+"\$[A-Za-z_]+"/.test(line) && !/relay_run_(?:pending|bounded)\s+"\$[A-Za-z0-9_{}]+"/.test(line)) {
+    // relay_run_streamed is the same watchdog (124) with streamed stdio (hook PR 3: a register reply carries a minted
+    // token, so it never goes through a file).
+    if (/(^|[\s;|&(!])node\s+"\$[A-Za-z_]+"/.test(line) && !/relay_run_(?:pending|bounded|streamed)\s+"\$[A-Za-z0-9_{}]+"/.test(line)) {
       v.push({ file, rule: "relay CLI outside the watchdog", line: line.trim() });
     }
   }
@@ -166,6 +168,7 @@ describe("Codex #291 R2 #1 — TRIPWIRE: no literal timeout in any hook; every b
     ["sleep 3", "sleep N"],
     ['X=$(sqlite3 "$DB_PATH" "select 1")', "sqlite3 outside relay_run_capture"],
     ['relay_run_pending 4 "$o" "$e" node "$RELAY_CLI" pending', "relay_run_* with a literal"],
+    ['relay_run_streamed 4 node "$RELAY_CLI" owner tool health_check', "relay_run_* with a literal"],
     ['node "$RELAY_CLI" pending "$AGENT_NAME" --json', "relay CLI outside the watchdog"],
     ["RELAY_STEP_SECS=2", "RELAY_STEP_SECS set outside relay_budget_for"],
     ['if RELAY_STEP_SECS=60; then :; fi', "RELAY_STEP_SECS set outside relay_budget_for"],
@@ -184,6 +187,7 @@ describe("Codex #291 R2 #1 — TRIPWIRE: no literal timeout in any hook; every b
     "why=$(grep -m 1 'PENDING_' \"$errf\")",
     'X=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 "$DB_PATH" <<SQL',
     'relay_run_pending "$RELAY_STEP_SECS" "$o" "$e" node "$RELAY_CLI" pending',
+    'relay_run_streamed "$RELAY_STEP_SECS" node "$RELAY_CLI" owner tool health_check --args-json "{}"',
     "# a comment may say sleep 3 or --max-time 4",
     "alarm 0;",
     'RELAY_STEP_SECS="$RELAY_STEP_SECS" perl -e 1',

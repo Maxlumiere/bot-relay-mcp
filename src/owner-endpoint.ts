@@ -26,6 +26,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { probeOwnerLock } from "./db-owner-lock.js";
+import { readDriverHeader } from "./db-header.js";
 import { processStartedAt, startOrNull } from "./liveness.js";
 import { restrictToOwnerWindows, privacyFaults, windowsForeignWriteSids } from "./fs-perms.js";
 import { sameFileIdentity } from "./file-identity.js";
@@ -70,13 +71,16 @@ export function addressReachesLoopback(address: string): boolean {
 
 /** Hook PR 1 (as ruled, Q9): the owner-peek listener's only host, a constant. */
 export const OWNER_PEEK_HOST = "127.0.0.1";
-export const OWNER_PEEK_REFUSAL = "this listener serves only the hooks' owner door (POST /owner/v1/peek, /owner/v1/liveness)";
+export const OWNER_PEEK_REFUSAL = "this listener serves only the hooks' owner door (POST /owner/v1/peek, /liveness, /register, /health)";
 export const OWNER_DOOR_PEEK = "/owner/v1/peek";
 export const OWNER_DOOR_LIVENESS = "/owner/v1/liveness";
+export const OWNER_DOOR_REGISTER = "/owner/v1/register";
+export const OWNER_DOOR_HEALTH = "/owner/v1/health";
+const OWNER_DOOR_PATHS: ReadonlySet<string> = new Set([OWNER_DOOR_PEEK, OWNER_DOOR_LIVENESS, OWNER_DOOR_REGISTER, OWNER_DOOR_HEALTH]);
 
 /** The owner-peek gate, before any parse: the two door endpoints, POST, without an MCP session. */
 export function ownerPeekRouteAllowed(method: string, reqPath: string, hasSession: boolean): boolean {
-  return method === "POST" && !hasSession && (reqPath === OWNER_DOOR_PEEK || reqPath === OWNER_DOOR_LIVENESS);
+  return method === "POST" && !hasSession && OWNER_DOOR_PATHS.has(reqPath);
 }
 
 // --- Writing the record --------------------------------------------------------------------------------------------
@@ -253,9 +257,13 @@ export function ownerEndpointVerdict(dbPath: string, instanceId?: string): Owner
     return { ok: false, reason: "bound-elsewhere" };
   }
   if (rec.db_path !== real || (instanceId !== undefined && rec.instance_id !== instanceId)) return { ok: false, reason: "bound-elsewhere" };
-  const lock = probeOwnerLock(dbPath).state;
-  if (lock === "free") return { ok: false, reason: "lock-free" };
-  if (lock !== "held") return { ok: false, reason: "lock-undecidable" };
+  // A wasm DB's owner holds its single-owner lock: required. A native DB has no owner lock (hook PR 3: every daemon
+  // writes a record); its liveness is the door's own authenticated reply.
+  if (readDriverHeader(dbPath).kind === "wasm") {
+    const lock = probeOwnerLock(dbPath).state;
+    if (lock === "free") return { ok: false, reason: "lock-free" };
+    if (lock !== "held") return { ok: false, reason: "lock-undecidable" };
+  }
   return { ok: true, url: `http://127.0.0.1:${rec.port}`, port: rec.port as number, key: rec.key, binding: { instance_id: rec.instance_id, db_path: rec.db_path } };
 }
 
@@ -265,26 +273,53 @@ export function validOwnerEndpoint(dbPath: string): { url: string; key: string }
   return v.ok ? { url: v.url, key: v.key } : null;
 }
 
-// --- The door: MACs, the replay window ------------------------------------------------------------------------------
+// --- The door: AES-256-GCM (as ruled after Codex #418 R2), the replay window ----------------------------------------
 
 export const DOOR_WINDOW_SECS = 30;
 /** Seconds a nonce is kept past its ts's window: the integer-second rounding of the window check. */
 const DOOR_SKEW_SECS = 2;
 export const DOOR_NONCE_CAPACITY = 4096;
 const NONCE_RE = /^[0-9a-f]{32}$/;
+const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const AGENT_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 
-export function doorMac(keyHex: string, text: string): string {
-  return crypto.createHmac("sha256", Buffer.from(keyHex, "hex")).update(text).digest("hex");
+/** The door's two keys: HKDF-SHA256(the owner key, no salt, "relay-owner-door v1 req" / "... resp"), 32 bytes each. */
+export function doorKey(keyHex: string, dir: "req" | "resp"): Buffer {
+  return Buffer.from(crypto.hkdfSync("sha256", Buffer.from(keyHex, "hex"), Buffer.alloc(0), `relay-owner-door v1 ${dir}`, 32));
 }
-export const doorRequestText = (b: DoorBinding, p: string, ts: number, nonce: string, body: string) =>
-  `req\n${b.instance_id}\n${b.db_path}\n${p}\n${ts}\n${nonce}\n${body}`;
-export const doorResponseText = (b: DoorBinding, nonce: string, status: number, body: string) =>
-  `resp\n${b.instance_id}\n${b.db_path}\n${nonce}\n${status}\n${body}`;
-export function macEqual(a: string, b: string): boolean {
-  const x = Buffer.from(/^[0-9a-f]{64}$/.test(a) ? a : "", "hex");
-  const y = Buffer.from(/^[0-9a-f]{64}$/.test(b) ? b : "", "hex");
-  return x.length === 32 && y.length === 32 && crypto.timingSafeEqual(x, y);
+/** The AAD of a request and of its reply (the reply adds its HTTP status). */
+export const doorRequestAad = (b: DoorBinding, p: string, ts: number, nonce: string): Buffer =>
+  Buffer.from(`req\n${p}\n${ts}\n${nonce}\n${b.instance_id}\n${b.db_path}`);
+export const doorResponseAad = (b: DoorBinding, p: string, ts: number, nonce: string, status: number): Buffer =>
+  Buffer.from(`resp\n${p}\n${ts}\n${nonce}\n${b.instance_id}\n${b.db_path}\n${status}`);
+export interface SealedEnvelope {
+  iv: string;
+  ct: string;
+  tag: string;
+}
+/** Seal `plain` (JSON) under `key` with `aad`: a fresh 96-bit IV per message. */
+export function doorSeal(key: Buffer, aad: Buffer, plain: unknown): SealedEnvelope {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv("aes-256-gcm", key, iv);
+  c.setAAD(aad);
+  const ct = Buffer.concat([c.update(JSON.stringify(plain), "utf-8"), c.final()]);
+  return { iv: iv.toString("base64"), ct: ct.toString("base64"), tag: c.getAuthTag().toString("base64") };
+}
+/** Open an envelope, or null when it does not authenticate (a wrong key, a tampered byte, another AAD). */
+export function doorOpen(key: Buffer, aad: Buffer, env: Partial<SealedEnvelope>): unknown | null {
+  if (typeof env.iv !== "string" || typeof env.ct !== "string" || typeof env.tag !== "string") return null;
+  if (!B64_RE.test(env.iv) || !B64_RE.test(env.tag) || (env.ct.length > 0 && !B64_RE.test(env.ct))) return null;
+  const iv = Buffer.from(env.iv, "base64");
+  const tag = Buffer.from(env.tag, "base64");
+  if (iv.length !== 12 || tag.length !== 16) return null;
+  try {
+    const d = crypto.createDecipheriv("aes-256-gcm", key, iv);
+    d.setAAD(aad);
+    d.setAuthTag(tag);
+    return JSON.parse(Buffer.concat([d.update(Buffer.from(env.ct, "base64")), d.final()]).toString("utf-8"));
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -310,19 +345,18 @@ export interface DoorRequest {
   nonce: string;
 }
 /**
- * The owner's check of a door request: the raw body parses to {agent_name, args, ts, client_nonce}; the header MAC
- * matches (constant time) THIS owner's key over the bound request text; ts is within the window; the nonce is unseen
- * (recorded only once the MAC holds, so a forged request cannot burn a nonce). `nonce` is returned whenever it is
- * well-formed, so even a refusal can be MAC'd.
+ * The owner's open of a door request: the envelope {ts, client_nonce, iv, ct, tag}; ts within the window; the GCM
+ * open under THIS owner's request key and the bound AAD (path, ts, nonce, instance binding); then the plaintext
+ * {agent_name, args}; the nonce unseen (recorded only once it opened, so a forged request cannot burn one). `ts` and
+ * `nonce` are returned whenever well-formed, so a refusal after them is sealed.
  */
-export function verifyDoorRequest(
+export function openDoorRequest(
   p: string,
   rawBody: unknown,
-  macHeader: unknown,
   nowMs = Date.now(),
-): { ok: true; req: DoorRequest } | { ok: false; status: number; error: string; nonce?: string } {
+): { ok: true; req: DoorRequest } | { ok: false; status: number; error: string; ts?: number; nonce?: string } {
   if (typeof rawBody !== "string" || rawBody.length === 0) return { ok: false, status: 400, error: "the door takes a text/plain JSON body" };
-  let b: { agent_name?: unknown; args?: unknown; ts?: unknown; client_nonce?: unknown };
+  let b: { ts?: unknown; client_nonce?: unknown; iv?: unknown; ct?: unknown; tag?: unknown };
   try {
     b = JSON.parse(rawBody) as typeof b;
   } catch {
@@ -330,25 +364,24 @@ export function verifyDoorRequest(
   }
   if (b === null || typeof b !== "object") return { ok: false, status: 400, error: "the body is not an object" };
   const nonce = typeof b.client_nonce === "string" && NONCE_RE.test(b.client_nonce) ? b.client_nonce : undefined;
-  if (!nonce) return { ok: false, status: 400, error: "client_nonce must be 32 hex characters" };
-  if (!Number.isInteger(b.ts)) return { ok: false, status: 400, error: "ts must be an integer (unix seconds)", nonce };
-  if (typeof b.agent_name !== "string" || !AGENT_RE.test(b.agent_name)) return { ok: false, status: 400, error: "agent_name is not a valid agent name", nonce };
-  if (b.args === null || typeof b.args !== "object" || Array.isArray(b.args)) return { ok: false, status: 400, error: "args must be an object", nonce };
+  if (!nonce || !Number.isInteger(b.ts)) return { ok: false, status: 400, error: "a sealed envelope needs ts (an integer) and client_nonce (32 hex)" };
   const ts = b.ts as number;
-  if (typeof macHeader !== "string" || !macEqual(macHeader, doorMac(KEY, doorRequestText(ownBinding, p, ts, nonce, rawBody)))) {
-    return { ok: false, status: 401, error: "the request MAC does not verify (a wrong key, or a request bound to another instance)", nonce };
-  }
-  if (Math.abs(Math.floor(nowMs / 1000) - ts) > DOOR_WINDOW_SECS) return { ok: false, status: 401, error: "the request is outside the time window", nonce };
-  if (seenNonces.has(nonce)) return { ok: false, status: 401, error: "the request was replayed (its nonce was seen)", nonce };
+  const plain = doorOpen(doorKey(KEY, "req"), doorRequestAad(ownBinding, p, ts, nonce), b as Partial<SealedEnvelope>);
+  if (plain === null) return { ok: false, status: 401, error: "the request does not open (a wrong key, an altered byte, or a request bound to another path or instance)", ts, nonce };
+  if (Math.abs(Math.floor(nowMs / 1000) - ts) > DOOR_WINDOW_SECS) return { ok: false, status: 401, error: "the request is outside the time window", ts, nonce };
+  const pl = plain as { agent_name?: unknown; args?: unknown };
+  if (typeof pl.agent_name !== "string" || !AGENT_RE.test(pl.agent_name)) return { ok: false, status: 400, error: "agent_name is not a valid agent name", ts, nonce };
+  if (pl.args === null || typeof pl.args !== "object" || Array.isArray(pl.args)) return { ok: false, status: 400, error: "args must be an object", ts, nonce };
+  if (seenNonces.has(nonce)) return { ok: false, status: 401, error: "the request was replayed (its nonce was seen)", ts, nonce };
   if (seenNonces.size >= DOOR_NONCE_CAPACITY) {
     sweepDoorNonces(nowMs);
-    if (seenNonces.size >= DOOR_NONCE_CAPACITY) return { ok: false, status: 503, error: "the door's replay cache is full: try again shortly", nonce };
+    if (seenNonces.size >= DOOR_NONCE_CAPACITY) return { ok: false, status: 503, error: "the door's replay cache is full: try again shortly", ts, nonce };
   }
   seenNonces.set(nonce, (ts + DOOR_WINDOW_SECS + DOOR_SKEW_SECS) * 1000);
-  return { ok: true, req: { agent_name: b.agent_name, args: b.args as Record<string, unknown>, ts, nonce } };
+  return { ok: true, req: { agent_name: pl.agent_name, args: pl.args as Record<string, unknown>, ts, nonce } };
 }
 
-/** The owner's MAC on its reply (bound to its instance). */
-export function signDoorResponse(nonce: string, status: number, body: string): string {
-  return doorMac(KEY, doorResponseText(ownBinding, nonce, status, body));
+/** The owner's sealed reply (bound to the request's path, ts, nonce, its instance, and the status). */
+export function sealDoorResponse(p: string, ts: number, nonce: string, status: number, payload: unknown): string {
+  return JSON.stringify(doorSeal(doorKey(KEY, "resp"), doorResponseAad(ownBinding, p, ts, nonce, status), payload));
 }
