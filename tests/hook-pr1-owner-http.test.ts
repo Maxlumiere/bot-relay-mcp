@@ -925,9 +925,11 @@ const REAL_PS = spawnSync("sh", ["-c", "command -v ps"], { encoding: "utf-8" }).
 fs.writeFileSync(
   path.join(STUBS, "ps"),
   `#!/bin/sh\nprintf 'ps %s\\n' "$*" >> "${ARGV_LOG}"\nif [ -n "$FAKE_PS_HANG" ]; then exec sleep 30; fi\n` +
-    // A SLOW ps over a DEEP chain: every call answers after 0.9s; pid N's parent is N+1 (a "sh"), for 10 levels.
+    // A SLOW ps over a DEEP chain: every call answers after 0.9s; each pid's parent is pid+1 (a "sh"), for 10
+    // levels, counted from this stub's own calls in the argv log (so the depth does not depend on any real pid).
     `if [ -n "$FAKE_PS_SLOW" ]; then sleep 0.9; p=""; for a in "$@"; do case "$prev" in -p) p="$a" ;; esac; prev="$a"; done\n` +
-    `  case "$*" in *ppid=*) if [ "$p" -lt "$((FAKE_PS_SLOW + 10))" ] 2>/dev/null; then echo "$((p + 1))"; else echo 1; fi ;; *comm=*) echo sh ;; *args=*) echo sh ;; *lstart=*) echo "Thu Oct  1 11:37:33 2026" ;; esac; exit 0; fi\n` +
+    `  n=$(grep -c '^ps .*ppid=' "${ARGV_LOG}" 2>/dev/null)\n` +
+    `  case "$*" in *ppid=*) if [ "\${n:-0}" -le 10 ]; then echo "$((p + 1))"; else echo 1; fi ;; *comm=*) echo sh ;; *args=*) echo sh ;; *lstart=*) echo "Thu Oct  1 11:37:33 2026" ;; esac; exit 0; fi\n` +
     `exec "${REAL_PS}" "$@"\n`,
   { mode: 0o755 }
 );
