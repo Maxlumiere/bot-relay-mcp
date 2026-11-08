@@ -380,6 +380,15 @@ jobs:
       - name: INV-DB-01 slice 3 by-path rows + the never-unlink scan (Windows)
         if: ${{ !cancelled() }}
         run: npx vitest run tests/inv-db-01-s3-by-path.test.ts tests/inv-db-01-s3-no-unlink-scan.test.ts --reporter=verbose
+      # #433 R2 P1-2: the remote mint.secret's directory chain is private BEFORE its temp file exists. Its WINDOWS leg (a
+      # parent with an inheritable foreign ACE) is the point, so it runs HERE, and the next step fails unless the JSON
+      # report shows that ONE row PASSED (a filter that matched nothing, or a skip, would otherwise read as green).
+      - name: "#433 R2 P1-2: the remote secret's directory chain row (Windows)"
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/hook-pr3-door-aead.test.ts -t "directory chain is private and verified BEFORE" --reporter=verbose --reporter=json --outputFile.json=r2-p1-2.json
+      - name: "#433 R2 P1-2: that row PASSED (not skipped, not filtered away)"
+        if: ${{ !cancelled() }}
+        run: node -e "const j=require('./r2-p1-2.json');const rows=j.testResults.flatMap(f=>f.assertionResults).filter(a=>a.fullName.includes('directory chain is private and verified BEFORE'));console.log(rows.map(r=>r.status+' | '+r.fullName).join(' ; '));if(rows.length!==1||rows[0].status!=='passed'){console.error('the R2 P1-2 row did not PASS on Windows');process.exit(1)}"
       - name: INV-DB-01 slice 4 convert-journal + the flip + the doorbell lock (Windows)
         if: ${{ !cancelled() }}
         run: npx vitest run tests/inv-db-01-s4-convert.test.ts tests/inv-db-01-s4-doorbell.test.ts --reporter=verbose
