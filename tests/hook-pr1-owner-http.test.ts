@@ -577,6 +577,23 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → a loopback 
     await stopDaemon(d.child);
   }, 120_000);
 
+  it.skipIf(process.platform === "win32").each(["stop-check.sh", "post-tool-use-check.sh"])("%s through the peek listener (a daemon 127.0.0.1 cannot reach): the mail is read; no /health probe on the proved owner route (the listener refuses /health)", async (hook) => {
+    const host = V6_LOOPBACK ? "::1" : LAN_V4;
+    if (host === null) return void console.warn("[hook-pr1] skipped by name: no address 127.0.0.1 cannot reach on this runner");
+    const c = newCase(`peek-${hook.split(".")[0]}`);
+    const token = seedWasmDb(c, `pr1 peek mail for ${hook}`);
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: PEEK_SECRET }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c, host, host === LAN_V4 ? { RELAY_HTTP_ALLOWED_HOSTS: LAN_V4 } : {});
+    fs.rmSync(ARGV_LOG, { force: true });
+    const input = JSON.stringify({ session_id: "s-pr1", hook_event_name: hook === "stop-check.sh" ? "Stop" : "PostToolUse" });
+    const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token }, input);
+    expect(r.out, `${r.out}\n${d.stderr()}`).toMatch(new RegExp(`pr1 peek mail for ${hook.replace(".", "\\.")}|pr1-sender`));
+    expect(r.sqliteCalls).toEqual([]);
+    const argv = fs.existsSync(ARGV_LOG) ? fs.readFileSync(ARGV_LOG, "utf-8") : "";
+    expect(argv, "no /health probe on the owner route").not.toMatch(/\/health/);
+    await stopDaemon(d.child);
+  }, 120_000);
+
   it("the peek listener serves ONLY /owner-id and the get_messages peek: every other route, every other tool, any other argument key, a batch, a session, a WS upgrade → refused", async () => {
     const host = V6_LOOPBACK ? "::1" : LAN_V4;
     if (host === null) return void console.warn("[hook-pr1] skipped by name: no address 127.0.0.1 cannot reach on this runner");
