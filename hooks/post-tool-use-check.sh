@@ -764,6 +764,26 @@ case "$F1_RC" in
     ;;
   *)
     MODE=unreadable
+    # Hook PR 1: `relay pending` cannot open a wasm DB (it has ONE opener, its owner). With a VALID owner endpoint
+    # record (`relay where` line 7 "http"), its mail is read over HTTP from that owner, after the owner proves the
+    # record's key (relay_owner_prove); a failure is named, and nothing else is read. Native instances never get here.
+    if relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS" && [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
+      if relay_owner_prove; then
+        MODE=remote
+        HTTP_HOST=127.0.0.1
+        HTTP_PORT="$RELAY_OWNER_PORT"
+        [ -n "$AGENT_TOKEN" ] || relay_hydrate_token
+        SUMMARY=$(http_peek)
+        case $? in
+          0) READ_OK=1 ;;
+          125) RELAY_BUDGET_SKIPPED="${RELAY_BUDGET_SKIPPED:-the remote read}" ;;
+        esac
+      else
+        MODE=owner-unproved
+        F1_ERR="$RELAY_OWNER_ERR"
+        echo "[RELAY] mail not read: ${RELAY_OWNER_ERR}. Mail may be waiting: call get_messages." >&2
+      fi
+    fi
     ;;
 esac
 
@@ -800,6 +820,8 @@ if command -v relay_verdict_set >/dev/null 2>&1; then
     relay_verdict_set "DEGRADED" "no time budget left for ${RELAY_BUDGET_SKIPPED}" " agent=\"${AGENT_NAME}\""
   elif [ "$MODE" = remote ]; then
     relay_verdict_set "CANNOT-JUDGE" "remote relay read failed (unreachable, unauthorized or no token)" " agent=\"${AGENT_NAME}\""
+  elif [ "$MODE" = owner-unproved ]; then
+    relay_verdict_set "CANNOT-JUDGE" "${F1_ERR:-the owner endpoint was not proved}" " agent=\"${AGENT_NAME}\""
   else
     relay_verdict_set "CANNOT-JUDGE" "no local relay instance and no remote relay configured" " agent=\"${AGENT_NAME}\""
   fi

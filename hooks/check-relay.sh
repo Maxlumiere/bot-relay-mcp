@@ -696,7 +696,7 @@ relay_deliver_remote_mail() {
   fi
 }
 
-RELAY_MAIL_MODE="" # local | unreadable | remote | remote-failed | none | unresolved-name
+RELAY_MAIL_MODE="" # local | unreadable | remote | remote-failed | none | unresolved-name | owner-unproved
 
 relay_deliver_pending_mail() {
   local bin outf errf deadline out="" rc=127 why="" block=""
@@ -715,6 +715,18 @@ relay_deliver_pending_mail() {
   # cannot trust: a 6-line answer, an unknown token) the hook reads no mail; the skip is named once by
   # relay_hook_db_native_ok. skip-unreadable keeps today's read: `relay pending` judges the file itself and reports
   # the failure by name (DEGRADED, "relay unreadable"), never as a wasm instance. A resolver error keeps its own path.
+  # Hook PR 1: a wasm DB with a VALID owner endpoint record: its mail is read over HTTP from that owner, after the owner
+  # proves the record's key (relay_owner_prove). Any failure is named, and nothing else is read: never sqlite3.
+  if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
+    if relay_owner_prove; then
+      RELAY_HTTP_HOST=127.0.0.1 RELAY_HTTP_PORT="$RELAY_OWNER_PORT" relay_deliver_remote_mail
+    else
+      echo "[RELAY] mail not read: $RELAY_OWNER_ERR. Mail may be waiting: call get_messages."
+      RELAY_MAIL_MODE="owner-unproved"
+      relay_mail_verdict "CANNOT-JUDGE" "$RELAY_OWNER_ERR" mail
+    fi
+    return 0
+  fi
   if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_HOOK_DB:-}" != skip-unreadable ] && ! relay_hook_db_native_ok; then
     RELAY_MAIL_MODE="no-native-db-read"
     # Only the two wasm verdicts say "a wasm instance" (Codex #391 R1): the others do not know what the instance is.

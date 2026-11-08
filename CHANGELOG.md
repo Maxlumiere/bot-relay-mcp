@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### The hooks read a wasm database's mail over HTTP from its daemon owner
+
+- **Added:** a wasm database's DAEMON owner writes an owner endpoint record beside it once it is listening (`.<db>.relay-owner.json`: mode 0600, the host 127.0.0.1, its port, its pid and start, a per-owner key; never deleted, overwritten by the next owner). Only a bind that 127.0.0.1 reaches gets one.
+- **Added:** `GET /owner-id?c=<challenge>` (no authentication, no secret served) answers HMAC-SHA256(key, challenge ‖ port), so a client holding the record can prove it is talking to the owner before it sends a credential.
+- **Changed:** `relay where --fields` prints an 8th line: the owner endpoint (`http://127.0.0.1:<port> <key>`), set only when line 7 is the new verdict `http`: a wasm database whose record is valid (the owner lock held, the pid alive with the same start). It is empty for every other verdict. An older relay CLI's 7-line answer is a named version-skew skip in the hooks.
+- **Changed:** the SessionStart, PostToolUse and Stop hooks read that owner's mail over HTTP (a `get_messages` peek):
+  - first a fresh challenge, whose answer they verify with the record's key (curl follows no redirect);
+  - only then the agent's token;
+  - any failure is a named skip, never a `sqlite3` read and never a token sent.
+  - A stdio owner is not reachable yet.
+
 ### BREAKING (5.0.0): one wasm mode (the single owner), and `relay convert-journal`
 
 **Upgrade step, once per instance that uses the wasm driver:** close every terminal and relay process that uses the instance (an older relay running the legacy wasm mode holds no lock, so it cannot be detected), then run `relay convert-journal --to wasm`. A native instance needs nothing.

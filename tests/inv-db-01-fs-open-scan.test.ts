@@ -66,6 +66,8 @@ const INVENTORY: Record<string, Entry> = {
   // --- config, keys, tokens, instance metadata ---
   "src/convert-journal.ts::writeDriverDeclaration::readFileSync": { n: 1, source: "the instance config.json beside the database (its canonical referent)" },
   "src/convert-journal.ts::writeDriverDeclaration::writeFileSync": { n: 1, source: "a temp file (wx) beside that config, renamed onto it" },
+  "src/owner-endpoint.ts::validOwnerEndpoint::readFileSync": { n: 1, source: "the owner endpoint record beside the DB (.<db>.relay-owner.json: a dotfile, not a DB-family name)" },
+  "src/owner-endpoint.ts::writeOwnerEndpoint::writeFileSync": { n: 1, source: "a NEW temp file (wx, 0600) beside the owner endpoint record, renamed onto it" },
   "src/config.ts::loadConfig::readFileSync": { n: 1, source: "config.json (getConfigPath())" },
   "src/config.ts::readConfigFileKeys::readFileSync": { n: 1, source: "config.json (getConfigPath())" },
   "src/config.ts::readSqliteDriverAt::openSync": { n: 1, source: "an instance's config.json (getConfigPath(), or the one colocated in an instance directory), one non-blocking descriptor" },

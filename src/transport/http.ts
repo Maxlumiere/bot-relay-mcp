@@ -19,6 +19,8 @@ import {
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
 import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
+import { ownedDbPath } from "../sqlite-compat.js";
+import { writeOwnerEndpoint, ownerIdAnswer, isChallenge, bindCoversLoopback } from "../owner-endpoint.js";
 import { authorizeAgentToken } from "../authorize-token.js";
 import { revalidate } from "../auth-verdict.js";
 import { startWakeCoverageSweep } from "../wake-coverage-detector.js";
@@ -316,6 +318,11 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   if (req.path === "/health") {
     return next();
   }
+  // Hook PR 1: the owner's challenge-response carries no credential and serves no secret (a hook proves the owner
+  // with it BEFORE sending one). It stays under the rate limit and the Host-header check.
+  if (req.path === "/owner-id") {
+    return next();
+  }
   // v2.1.7 Item 6: dashboard paths handle auth downstream.
   if (DASHBOARD_ROUTES_BYPASSING_HTTP_SECRET.has(req.path)) {
     return next();
@@ -582,6 +589,23 @@ export function startHttpServer(port: number, host: string): Server {
   // while getConfigPath() re-resolves the now-active instance, so a live call would
   // point a locked-out operator at a file the daemon is not reading.
   const bootConfigPath = getConfigPath();
+
+  // Hook PR 1 (as ruled): the owner's CHALLENGE-RESPONSE (auth-free: it carries no credential and serves no secret).
+  // GET /owner-id?c=<hex challenge> answers HMAC-SHA256(key, challenge ‖ port) with this owner's private key, so a hook
+  // can prove it is talking to the process that wrote the DB's 0600 endpoint record before it sends a token. Only a
+  // wasm OWNER answers it; anything else is 404.
+  app.get("/owner-id", (req: Request, res: Response) => {
+    if (ownedDbPath() === null) {
+      res.status(404).json({ error: "not a wasm DB owner" });
+      return;
+    }
+    const c = req.query.c;
+    if (!isChallenge(c)) {
+      res.status(400).json({ error: "a challenge (c: 16-128 hex characters) is required" });
+      return;
+    }
+    res.json({ mac: ownerIdAnswer(c, port) });
+  });
 
   // Health check (auth-free)
   app.get("/health", (req: Request, res: Response) => {
@@ -1971,6 +1995,21 @@ export function startHttpServer(port: number, host: string): Server {
 
   const server = app.listen(port, host, () => {
     log.info(`HTTP server listening on http://${host}:${port}`);
+    // Hook PR 1: once listening, a wasm OWNER writes its endpoint record (the hooks reach its mail through it). Only a
+    // bind a client reaches as 127.0.0.1; a record failure is logged, never fatal (the hooks then skip, by name).
+    const owned = ownedDbPath();
+    if (owned !== null) {
+      if (!bindCoversLoopback(host)) {
+        log.warn(`[owner-endpoint] this owner listens on ${host}, which 127.0.0.1 does not reach: no endpoint record is written, so the hooks read no mail from it.`);
+      } else {
+        try {
+          const f = writeOwnerEndpoint(owned, port, "http");
+          log.info(`[owner-endpoint] the owner endpoint record is ${f}`);
+        } catch (err) {
+          log.warn(`[owner-endpoint] could not write the owner endpoint record (${(err as Error).message}): the hooks read no mail from this owner.`);
+        }
+      }
+    }
     log.info(`  MCP endpoint: POST http://${host}:${port}/mcp`);
     log.info(`  Health check: GET http://${host}:${port}/health`);
     log.info(`  Dashboard:    GET http://${host}:${port}/`);

@@ -94,7 +94,7 @@ relay_where_load() {
   fi
   relay_run_pending "$secs" "$outf" "$errf" node "$cli" where --fields
   rc=$?
-  { IFS= read -r k; IFS= read -r d; IFS= read -r e; IFS= read -r why; IFS= read -r warn; IFS= read -r vault; IFS= read -r hookdb; } < "$outf"
+  { IFS= read -r k; IFS= read -r d; IFS= read -r e; IFS= read -r why; IFS= read -r warn; IFS= read -r vault; IFS= read -r hookdb; IFS= read -r ownerep; } < "$outf"
   nlines=$(wc -l < "$outf" 2>/dev/null | tr -d ' ')
   # Codex #391 R1: an EXACT record: every field newline-terminated, nothing after the last one (wc -l counts newlines,
   # awk counts records, so an unterminated trailing field makes them differ).
@@ -110,11 +110,15 @@ relay_where_load() {
     export RELAY_RES_REASON="relay where gave an invalid answer (exit $rc: ${nrec:-0} fields, ${nlines:-0} newline-terminated)"
     return 1
   fi
+  # Hook PR 1: line 8 is the owner endpoint ("URL KEY") when line 7 is "http", else empty: an EXACT count of 8. A 7- or
+  # 6-line answer is an older relay CLI than these hooks: the resolution stands, and the hooks read no DB (named skew).
+  export RELAY_RES_OWNER_ENDPOINT=""
   case "${nlines:-0}" in
-    7) export RELAY_RES_HOOK_DB="$hookdb" ;;
+    8) export RELAY_RES_HOOK_DB="$hookdb" RELAY_RES_OWNER_ENDPOINT="$ownerep" ;;
+    7) export RELAY_RES_HOOK_DB="(7-line answer)" ;;
     6) export RELAY_RES_HOOK_DB="(6-line answer)" ;;
     *)
-      export RELAY_RES_REASON="relay where gave an incomplete answer (exit $rc, ${nlines:-0} of 7 lines)"
+      export RELAY_RES_REASON="relay where gave an incomplete answer (exit $rc, ${nlines:-0} of 8 lines)"
       return 1
       ;;
   esac
@@ -165,6 +169,8 @@ relay_hook_db_native_ok() {
     skip-rlyw) why="the DB is stamped for the wasm driver's single owner (RLYW)"; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
     skip-unreadable) why="the instance's sqlite_driver or the DB header could not be read or judged (fail closed)" ;;
     skip-owner-locked) why="another relay process holds the DB's single-owner lock (a wasm owner, or a conversion running)" ;;
+    http) why="the DB belongs to a wasm owner"; then="The hooks read its mail over HTTP from that owner, and nothing else from this DB." ;;
+    "(7-line answer)") why="the relay CLI gave a 7-line answer: CLI/hook version skew (update the relay and its hooks together)" ;;
     "(6-line answer)") why="the relay CLI gave a 6-line answer: CLI/hook version skew (update the relay and its hooks together)" ;;
     "") why="the relay CLI gave no DB verdict" ;;
     *) why="the relay CLI gave an unknown DB verdict" ;;
@@ -264,6 +270,47 @@ relay_curl_config_line() {
   v=${v//\\/\\\\}
   v=${v//\"/\\\"}
   printf '%s = "%s"\n' "$1" "$v"
+}
+
+# relay_owner_prove — hook PR 1 (as ruled): before ANY credential goes to the DB's owner endpoint, prove it is the
+# process that wrote the 0600 record. RELAY_RES_OWNER_ENDPOINT is "URL KEY" from `relay where --fields` line 8:
+#   - the URL must be EXACTLY http://127.0.0.1:<port>, the key 32 lowercase hex: anything else is a named skip with no
+#     network call (return 2);
+#   - a FRESH random challenge goes to GET <URL>/owner-id?c=<challenge> (curl, no -L: a 3xx is never followed);
+#   - node verifies the answer is HMAC-SHA256(key, challenge‖port), the key on its STDIN (never argv or env).
+# Proved: RELAY_OWNER_PORT is set, return 0. Not proved (a wrong or replayed MAC, a 3xx, no answer): return 1. The
+# reason is in RELAY_OWNER_ERR either way; the caller names it and reads nothing else.
+relay_owner_prove() {
+  local ep="${RELAY_RES_OWNER_ENDPOINT:-}" url key port challenge resp
+  RELAY_OWNER_PORT="" RELAY_OWNER_ERR=""
+  url="${ep%% *}"
+  key="${ep#* }"
+  if [ "$url" = "$ep" ] || ! relay_whole_match "$url" '^http://127\.0\.0\.1:[0-9]{1,5}$' || ! relay_whole_match "$key" '^[0-9a-f]{32}$'; then
+    RELAY_OWNER_ERR="the owner endpoint record's line is malformed or not a loopback URL (it must be http://127.0.0.1:<port> and a 32-hex key)"
+    return 2
+  fi
+  port="${url##*:}"
+  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    RELAY_OWNER_ERR="the owner endpoint record's line is malformed (port $port)"
+    return 2
+  fi
+  command -v curl >/dev/null 2>&1 || { RELAY_OWNER_ERR="the owner endpoint could not be proved: curl not found"; return 1; }
+  command -v node >/dev/null 2>&1 || { RELAY_OWNER_ERR="the owner endpoint could not be proved: node not found"; return 1; }
+  challenge=$(node -e 'process.stdout.write(require("crypto").randomBytes(16).toString("hex"))' 2>/dev/null)
+  relay_whole_match "$challenge" '^[0-9a-f]{32}$' || { RELAY_OWNER_ERR="the owner endpoint could not be proved: no challenge could be made"; return 1; }
+  resp=$(curl -sS --max-redirs 0 -m "${RELAY_STEP_SECS:-2}" "${url}/owner-id?c=${challenge}" 2>/dev/null) || resp=""
+  if printf '%s\n%s\n' "$key" "$resp" | CH="$challenge" PORT="$port" node -e '
+    const lines = require("fs").readFileSync(0, "utf8").split("\n");
+    const key = lines[0]; let mac = "";
+    try { mac = String(JSON.parse(lines.slice(1).join("\n")).mac || ""); } catch {}
+    const want = require("crypto").createHmac("sha256", Buffer.from(key, "hex")).update(process.env.CH + process.env.PORT).digest("hex");
+    const a = Buffer.from(want, "hex"), b = Buffer.from(/^[0-9a-f]{64}$/.test(mac) ? mac : "", "hex");
+    process.exit(a.length === b.length && require("crypto").timingSafeEqual(a, b) ? 0 : 1);' 2>/dev/null; then
+    RELAY_OWNER_PORT="$port"
+    return 0
+  fi
+  RELAY_OWNER_ERR="the owner endpoint did not prove the record's key (it failed the challenge): no credential was sent"
+  return 1
 }
 
 # relay_curl_token_config TOKEN — the X-Agent-Token header as a curl config line (see relay_curl_config_line).

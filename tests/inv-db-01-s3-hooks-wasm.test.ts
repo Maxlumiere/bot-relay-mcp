@@ -161,7 +161,9 @@ describe("INV-DB-01 slice 3: `relay where --fields` line 7, the hooks' DB verdic
     FIXTURES[fixture]!();
     const r = where();
     const lines = r.stdout.split("\n");
-    expect(lines.length, `7 lines + the final newline: ${JSON.stringify(r.stdout)}`).toBe(8);
+    // Hook PR 1: 8 lines now (line 8, the owner endpoint, is empty for every verdict but http); lines 1-7 keep their places.
+    expect(lines.length, `8 lines + the final newline: ${JSON.stringify(r.stdout)}`).toBe(9);
+    expect(lines[7], "line 8: the owner endpoint (empty: no owner record here)").toBe("");
     expect(lines[0], "line 1: kind").toBe("explicit-db");
     expect(lines[1], "line 2: db_path").toBe(DB());
     expect(lines[5], "line 6: vault_dir").toBe(path.join(path.dirname(DB()), "agents"));
@@ -185,13 +187,14 @@ describe("INV-DB-01 slice 3: `relay where --fields` line 7, the hooks' DB verdic
     expect(r.stdout + r.stderr).toMatch(/could not be read[\s\S]*fix or remove that config\.json/i);
   });
 
-  it("a resolver ERROR still prints 7 lines (line 7 skip-unreadable), exit 1", () => {
+  it("a resolver ERROR still prints the full answer, 8 lines since hook PR 1 (line 7 skip-unreadable, line 8 empty), exit 1", () => {
     const r = where({ RELAY_DB_PATH: path.join(HOME, "a\nb", "relay.db") });
     expect(r.status).toBe(1);
     const lines = r.stdout.split("\n");
     expect(lines[0]).toBe("error");
-    expect(lines.length).toBe(8);
+    expect(lines.length).toBe(9);
     expect(lines[6]).toBe("skip-unreadable");
+    expect(lines[7]).toBe("");
   });
 
   it("`where` opens NO SQLite connection to compute it (a spy on better-sqlite3 and sql.js sees none on RLYW), with a positive control", () => {

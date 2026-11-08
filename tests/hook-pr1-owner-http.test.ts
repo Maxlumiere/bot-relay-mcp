@@ -137,7 +137,9 @@ describe("hook PR 1: the owner endpoint record and the challenge-response (every
     const rec = JSON.parse(fs.readFileSync(c.record, "utf-8")) as Record<string, unknown>;
     expect(rec).toMatchObject({ v: 1, host: "127.0.0.1", port: d.port, pid: d.child.pid, transport: "http" });
     expect(String(rec.key)).toMatch(KEY_RE);
-    expect(typeof rec.pid_start === "string" && rec.pid_start.length > 0, "the owner's start token is recorded").toBe(true);
+    // The start token comes from ps, which Windows lacks (there it is null, and `where` never says http: the bash hooks
+    // do not run there either).
+    if (process.platform !== "win32") expect(typeof rec.pid_start === "string" && rec.pid_start.length > 0, "the owner's start token is recorded").toBe(true);
     if (process.platform !== "win32") expect(fs.statSync(c.record).mode & 0o777).toBe(0o600);
     const challenge = crypto.randomBytes(16).toString("hex");
     const res = await fetch(`http://127.0.0.1:${d.port}/owner-id?c=${challenge}`);
@@ -151,7 +153,7 @@ describe("hook PR 1: the owner endpoint record and the challenge-response (every
     expect(fs.existsSync(c.record), "the record is never deleted, even on a clean exit").toBe(true);
   }, 90_000);
 
-  it("`relay where --fields`: a wasm DB with a VALID record → exactly 8 lines, line 7 `http`, line 8 `http://127.0.0.1:<port> <key>`", async () => {
+  it.skipIf(process.platform === "win32")("`relay where --fields`: a wasm DB with a VALID record → exactly 8 lines, line 7 `http`, line 8 `http://127.0.0.1:<port> <key>` (skipped on Windows: no ps start token there, and no bash hooks)", async () => {
     const c = newCase("where-http");
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
@@ -353,21 +355,31 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
 });
 
 describe("hook PR 1: the record is never deleted by relay code (a scan row)", () => {
-  it("no src module removes the owner endpoint record (no unlink/rm of a .relay-owner.json path)", () => {
+  it("no src code removes the owner endpoint record: no unlink/rm whose argument IS the record path (resolved through its declaration)", async () => {
+    const { srcProgram } = await import("./_helpers/ts-binding.js");
+    const ts = (await import("typescript-legacy")).default;
+    const program = srcProgram();
+    const checker = program.getTypeChecker();
     const hits: string[] = [];
-    const walk = (dir: string) => {
-      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, e.name);
-        if (e.isDirectory()) walk(full);
-        else if (e.name.endsWith(".ts")) {
-          const text = fs.readFileSync(full, "utf-8");
-          if (/relay-owner\.json/.test(text) && /\b(unlinkSync|rmSync|unlink|rm)\s*\(/.test(text)) hits.push(path.relative(REPO, full));
+    const namesRecord = (t: string) => /ownerEndpointPath\(|relay-owner\.json/.test(t);
+    for (const sf of program.getSourceFiles()) {
+      const rel = path.relative(REPO, sf.fileName).split(path.sep).join("/");
+      if (!rel.startsWith("src/") || sf.isDeclarationFile) continue;
+      const visit = (n: import("typescript-legacy").Node): void => {
+        if (ts.isCallExpression(n) && /\b(unlinkSync|rmSync|unlink|rm|rmdirSync)$/.test(n.expression.getText(sf)) && n.arguments[0]) {
+          const arg = n.arguments[0];
+          let text = arg.getText(sf);
+          if (ts.isIdentifier(arg)) {
+            const decl = checker.getSymbolAtLocation(arg)?.declarations?.[0];
+            if (decl && ts.isVariableDeclaration(decl) && decl.initializer) text += ` = ${decl.initializer.getText()}`;
+          }
+          if (namesRecord(text)) hits.push(`${rel}: ${n.getText(sf)} (${text})`);
         }
-      }
-    };
-    walk(path.join(REPO, "src"));
-    const recordModule = path.join(REPO, "src", "owner-endpoint.ts");
-    expect(fs.existsSync(recordModule), "the record has its own module").toBe(true);
-    expect(hits, "a module that names the record never removes a file").toEqual([]);
-  });
+        ts.forEachChild(n, visit);
+      };
+      visit(sf);
+    }
+    expect(fs.existsSync(path.join(REPO, "src", "owner-endpoint.ts")), "the record has its own module").toBe(true);
+    expect(hits, "no remove of the record path").toEqual([]);
+  }, 120_000);
 });

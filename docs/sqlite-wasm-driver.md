@@ -74,7 +74,12 @@ The driver is a property of the **instance**: a `sqlite_driver` key in the insta
   - a stdio MCP server MAY be the owner: it takes the owner lock like any owner (so a single terminal on a wasm DB works). A second stdio server, while one owns the database, is refused by name: wasm is single-process, so close the other one, or run one HTTP daemon and point every client at it;
   - so is a native opener;
   - so is every relay opener that reaches the database by its PATH on an instance that declares `"wasm"` (the declaration of the instance that HOLDS the database and the caller's own are both consulted, and an unreadable one refuses too) (the CLI verbs such as `relay bind`, `fleet`, `recover` and the `purge-*` verbs, and the synchronous fallback some callers use), even before the database exists: it names the HTTP client config and creates nothing;
-  - the hooks read no database on such an instance: SessionStart prints ONE notice ("hooks deliver no mail on a wasm instance; use the HTTP owner") instead of reading mail and tasks with `sqlite3` (the relay decides this for them: the 7th line of `relay where --fields`). Delivering mail to the hooks through the owner is a later release.
+  - the hooks never open such a database with `sqlite3` (the relay decides this for them: the 7th line of `relay where --fields`). When its owner is an HTTP DAEMON, the hooks read the agent's mail over HTTP from it instead:
+    - the daemon writes an owner endpoint record beside the database once it is listening (`.<db>.relay-owner.json`, mode 0600, never deleted);
+    - the 8th line of `relay where --fields` carries that endpoint;
+    - before any token is sent, the hook sends a fresh challenge to `/owner-id`, and the owner must answer with a key only it and the 0600 record hold;
+    - any failure is a named skip, never a `sqlite3` read, never a token sent.
+  - Other `sqlite3` reads (tasks, liveness) stay skipped there, and a stdio owner's mail is not reachable yet: those print ONE named notice.
 - **A backup or a restore** of an owned database runs under the lock when no owner is live, and is refused while one is. A database with more than one hard link is refused by both (the lock is keyed by the file's name, so a second name could be locked by another process): remove the extra links.
 
 **One mode only (5.0.0): every wasm database has its single owner.**
