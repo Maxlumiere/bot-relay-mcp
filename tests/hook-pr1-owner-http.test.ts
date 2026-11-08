@@ -235,9 +235,21 @@ async function startSpy(handler: (req: http.IncomingMessage, res: http.ServerRes
 /** A PATH stub for `node`: `node <relay> where --fields` prints FAKE_WHERE_FILE's content; anything else runs node. */
 const STUBS = path.join(ROOT, "stubs");
 fs.mkdirSync(STUBS, { recursive: true });
+const ARGV_LOG = path.join(ROOT, "argv.log");
+const RM_CAPTURE = path.join(ROOT, "rm-capture.log");
 fs.writeFileSync(
   path.join(STUBS, "node"),
-  `#!/bin/sh\ncase "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\nexec "${process.execPath}" "$@"\n`,
+  `#!/bin/sh\nprintf 'node %s\\n' "$*" >> "${ARGV_LOG}"\ncase "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\nexec "${process.execPath}" "$@"\n`,
+  { mode: 0o755 }
+);
+const REAL_CURL = spawnSync("sh", ["-c", "command -v curl"], { encoding: "utf-8" }).stdout.trim();
+const REAL_RM = spawnSync("sh", ["-c", "command -v rm"], { encoding: "utf-8" }).stdout.trim();
+/** curl: its argv logged, then the real curl (its stdin, the -K - config, passes through untouched). */
+fs.writeFileSync(path.join(STUBS, "curl"), `#!/bin/sh\nprintf 'curl %s\\n' "$*" >> "${ARGV_LOG}"\nexec "${REAL_CURL}" "$@"\n`, { mode: 0o755 });
+/** rm: every file the hook deletes (its temp files, the where capture) is COPIED into the capture log first. */
+fs.writeFileSync(
+  path.join(STUBS, "rm"),
+  `#!/bin/sh\nfor a in "$@"; do case "$a" in -*) ;; *) [ -f "$a" ] && { printf '== %s\\n' "$a"; cat "$a"; printf '\\n'; } >> "${RM_CAPTURE}" ;; esac; done\nexec "${REAL_RM}" "$@"\n`,
   { mode: 0o755 }
 );
 const SQLITE_LOG = path.join(ROOT, "sqlite3.log");
@@ -276,6 +288,46 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail over HTTP fro
     },
     120_000
   );
+
+  const SECRET = `pr1-http-secret-${crypto.randomBytes(16).toString("hex")}`;
+  it.each(["check-relay.sh", "stop-check.sh", "post-tool-use-check.sh"])(
+    "%s: the owner daemon has an http_secret → the mail is still read (the secret goes curl-config-on-stdin only), and NO secret byte is in any argv, any file the hook wrote, or its output",
+    async (hook) => {
+      const c = newCase(`secret-${hook.split(".")[0]}`);
+      const token = seedWasmDb(c, `pr1 secret mail for ${hook}`);
+      fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: SECRET }), { mode: 0o600 });
+      const d = await startOwnerDaemon(c);
+      fs.rmSync(ARGV_LOG, { force: true });
+      fs.rmSync(RM_CAPTURE, { force: true });
+      const input = hook === "check-relay.sh" ? "" : JSON.stringify({ session_id: "s-pr1", hook_event_name: hook === "stop-check.sh" ? "Stop" : "PostToolUse" });
+      const r = runHook(c, hook, { RELAY_AGENT_TOKEN: token }, input);
+      expect(r.out, `the mail arrives through the secret-protected owner\n${r.out}\n${d.stderr()}`).toMatch(new RegExp(`pr1 secret mail for ${hook.replace(".", "\\.")}|pr1-sender`));
+      const argv = fs.existsSync(ARGV_LOG) ? fs.readFileSync(ARGV_LOG, "utf-8") : "";
+      expect(argv.length, "precondition: the stubs logged the hook's curl/node runs").toBeGreaterThan(0);
+      expect(argv, "the secret is in no process argv").not.toContain(SECRET);
+      const captured = fs.existsSync(RM_CAPTURE) ? fs.readFileSync(RM_CAPTURE, "utf-8") : "";
+      expect(captured, "no file the hook wrote (its temp files, the where capture) held the secret").not.toContain(SECRET);
+      const tmp = path.join(c.home, ".tmp");
+      const leftovers = fs.existsSync(tmp) ? fs.readdirSync(tmp).map((f) => { try { return fs.readFileSync(path.join(tmp, f), "utf-8"); } catch { return ""; } }).join("\n") : "";
+      expect(leftovers, "nothing left in the hook's temp dir holds the secret").not.toContain(SECRET);
+      expect(r.out, "the secret is in no hook output").not.toContain(SECRET);
+      await stopDaemon(d.child);
+    },
+    120_000
+  );
+
+  it("a WRONG http_secret (the hook resolves a different one) is a NAMED failure: no mail, never a sqlite3 read", async () => {
+    const c = newCase("secret-wrong");
+    const token = seedWasmDb(c, "pr1 must not arrive");
+    fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm", http_secret: SECRET }), { mode: 0o600 });
+    const d = await startOwnerDaemon(c);
+    const r = runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_SECRET: `wrong-${SECRET}` });
+    expect(r.out).not.toMatch(/pr1 must not arrive/);
+    expect(r.out).toMatch(/remote relay read failed|could not be read|unauthorized/i);
+    expect(r.sqliteCalls).toEqual([]);
+    expect(r.out, "the secret is in no hook output").not.toContain(SECRET);
+    await stopDaemon(d.child);
+  }, 120_000);
 
   it("an IMPOSTOR on the record's port (a wrong MAC) receives ZERO token bytes, and the hook names the skip", async () => {
     const c = newCase("impostor");
@@ -361,7 +413,29 @@ describe("hook PR 1: the record is never deleted by relay code (a scan row)", ()
     const program = srcProgram();
     const checker = program.getTypeChecker();
     const hits: string[] = [];
-    const namesRecord = (t: string) => /ownerEndpointPath\(|relay-owner\.json/.test(t);
+    // The functions that DERIVE the record path: those naming it, then (a fixpoint) every function that calls one.
+    const derivers = new Set<string>(["ownerEndpointPath"]);
+    const bodies: Array<[string, string]> = [];
+    for (const sf of program.getSourceFiles()) {
+      if (!path.relative(REPO, sf.fileName).split(path.sep).join("/").startsWith("src/") || sf.isDeclarationFile) continue;
+      const collect = (n: import("typescript-legacy").Node): void => {
+        if (ts.isFunctionDeclaration(n) && n.name) bodies.push([n.name.text, n.getText(sf)]);
+        else if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer && (ts.isArrowFunction(n.initializer) || ts.isFunctionExpression(n.initializer))) bodies.push([n.name.text, n.initializer.getText(sf)]);
+        ts.forEachChild(n, collect);
+      };
+      collect(sf);
+    }
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const [name, body] of bodies) {
+        if (derivers.has(name)) continue;
+        if (/relay-owner\.json/.test(body) || [...derivers].some((d) => new RegExp(`\\b${d}\\(`).test(body))) {
+          derivers.add(name);
+          grew = true;
+        }
+      }
+    }
+    const namesRecord = (t: string) => /relay-owner\.json/.test(t) || [...derivers].some((d) => new RegExp(`\\b${d}\\(`).test(t));
     for (const sf of program.getSourceFiles()) {
       const rel = path.relative(REPO, sf.fileName).split(path.sep).join("/");
       if (!rel.startsWith("src/") || sf.isDeclarationFile) continue;
