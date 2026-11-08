@@ -363,12 +363,10 @@ async function convertViaSqlJs(dbPath: string, configPath: string, lock: OwnerLo
     if (inv.integrity !== "ok") throw new ConvertRefusal(`the DB at ${dbPath} fails integrity_check (${inv.integrity}). Nothing was changed.`);
     counts = inv.counts;
 
-    // The safety copy of the ORIGINAL bytes, BEFORE any edit (this path replaces the whole file).
-    safetyCopy = writeSafetyCopy(dbPath, first.bytes);
-
     img.exec("PRAGMA journal_mode = DELETE");
     img.exec(`PRAGMA application_id = ${RELAY_APP_ID_WASM}`);
     image = img.export();
+    safetyCopy = writeSafetyCopy(dbPath, first.bytes); // MUTATION: the copy moved AFTER the edits
   } finally {
     img.close();
   }
