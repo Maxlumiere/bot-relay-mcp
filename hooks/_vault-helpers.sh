@@ -698,15 +698,15 @@ relay_ps() {
 }
 
 relay_agent_pid() {
-  local pid ppid comm args depth=0 pat t0="$SECONDS"
+  local pid ppid comm args depth=0 pat
   pat='claude|codex|node|bun|deno'
   [ -n "${RELAY_AGENT_PROCESS_PATTERN:-}" ] && pat="${pat}|${RELAY_AGENT_PROCESS_PATTERN}"
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*) return ;;
   esac
   pid=$(relay_ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
-  # The walk is bounded as a whole too (each ps by relay_ps, the walk by RELAY_PS_TOTAL_SECS, 3s).
-  while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ] && [ $((SECONDS - t0)) -lt "${RELAY_PS_TOTAL_SECS:-3}" ]; do
+  # Each ps is bounded (relay_ps, 1s): a hung ps answers nothing, which ends the walk at its first step.
+  while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
     comm=$(relay_ps -o comm= -p "$pid" 2>/dev/null); comm="${comm##*/}"
     if printf '%s' "$comm" | grep -qiE "^(${pat})$"; then
       args=$(relay_ps -o args= -p "$pid" 2>/dev/null)
@@ -872,8 +872,7 @@ relay_pid_chain() {
         pid="$ppid"; depth=$((depth+1))
       done ;;
     *)
-      local t0="$SECONDS"
-      while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ] && [ $((SECONDS - t0)) -lt "${RELAY_PS_TOTAL_SECS:-3}" ]; do
+      while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
         chain="${chain:+$chain,}$pid"
         ppid=$(relay_ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
         case "$ppid" in ''|*[!0-9]*) break ;; esac

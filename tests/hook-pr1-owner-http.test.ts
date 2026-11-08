@@ -721,10 +721,6 @@ const V6_LOOPBACK = await new Promise<boolean>((resolve) => {
   srv.once("error", () => resolve(false));
   srv.listen(0, "::1", () => srv.close(() => resolve(true)));
 });
-const UNREACHABLE_BINDS: Array<[string, string | null]> = [
-  ["::1 (IPv6 loopback only)", V6_LOOPBACK ? "::1" : null],
-  ["one LAN IPv4 address (with an http_secret, as a non-loopback bind requires)", LAN_V4],
-];
 const PEEK_SECRET = `pr1-peek-secret-${crypto.randomBytes(16).toString("hex")}`;
 
 describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopback owner-peek listener, and the record names it", () => {
