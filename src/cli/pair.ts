@@ -337,6 +337,24 @@ export async function run(argv: string[]): Promise<number> {
     process.stderr.write(`relay pair: ${unresolvedMessage(hubRoute)}\n`);
     return 1;
   }
+  // The SELF-PAIR guard (as ruled; a correctness check, not a security predicate): two processes cannot both bind one
+  // port, so a TRUSTED local owner record naming the tunnel's port means the "hub" IS this machine's own relay.
+  if (isTunnel) {
+    try {
+      const { resolveInstance } = await import("../instance.js");
+      const { ownerEndpointVerdict } = await import("../owner-endpoint.js");
+      const r = resolveInstance({});
+      if (r.kind !== "error" && fs.existsSync(r.dbPath)) {
+        const v = ownerEndpointVerdict(r.dbPath, r.kind === "instance" ? r.id : "");
+        if (v.ok && v.port === hubPort) {
+          process.stderr.write(`relay pair: 127.0.0.1:${hubPort} is this machine's own relay, not a hub. Nothing is sent.\n`);
+          return 1;
+        }
+      }
+    } catch {
+      /* no local instance to compare with: not this machine's relay */
+    }
+  }
   const remoteHub = hubRoute.kind === "remote" ? hubRoute : { kind: "remote" as const, host: url.hostname.replace(/^\[|\]$/g, ""), port: hubPort, ip: "127.0.0.1", secure: url.protocol === "https:" };
 
   // PR-D (Codex R1 #3): the config carries credentials, so it only ever goes to a file. Checked BEFORE any network
