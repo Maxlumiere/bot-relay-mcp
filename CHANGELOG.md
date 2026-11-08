@@ -2,15 +2,21 @@
 
 ## Unreleased
 
-### The hooks read a wasm database's mail over HTTP from its daemon owner
+### The hooks read a wasm database's mail through its daemon owner's door
 
-- **Added:** a wasm database's DAEMON owner writes an owner endpoint record beside it once it is listening (`.<db>.relay-owner.json`: mode 0600, the host 127.0.0.1, its port, its pid and start, a per-owner key; never deleted, overwritten by the next owner). The record always names a listener the hooks reach as 127.0.0.1. A daemon that 127.0.0.1 cannot reach (e.g. bound to `::1` or a LAN address, or with a Host allowlist that leaves 127.0.0.1 out) also opens a second listener on 127.0.0.1 that answers only `/owner-id` and the hooks' mail read (every other request gets 403, a WebSocket upgrade is closed). `/owner-id` is Host-checked.
-- **Added:** `GET /owner-id?c=<challenge>` (no authentication, no secret served) answers HMAC-SHA256(key, challenge ‖ port), so a client holding the record can prove it is talking to the owner before it sends a credential.
-- **Changed:** `relay where --fields` prints an 8th line: the owner endpoint (`http://127.0.0.1:<port> <key>`), set only when line 7 is the new verdict `http`: a wasm database whose record is valid (the owner lock held, the pid alive with the same start). It is empty for every other verdict. An older relay CLI's 7-line answer is a named version-skew skip in the hooks.
-- **Changed:** the SessionStart, PostToolUse and Stop hooks read that owner's mail over HTTP (a `get_messages` peek):
-  - first a fresh challenge, whose answer they verify with the record's key (curl follows no redirect);
-  - only then the agent's token, plus the instance's `http_secret` when one is configured: the relay CLI writes it straight into curl's config on stdin (new `relay curl-auth-config`), so it is never in argv, an environment variable, a file or the hook's output;
-  - any failure is a named skip, never a `sqlite3` read and never a token sent.
+- **Added:** a wasm database's DAEMON owner writes an owner record beside it once it is listening (`.<db>.relay-owner.json`, version 2: the host 127.0.0.1, its port, its pid and start, a per-owner key; never deleted, overwritten by the next owner). The record is created empty and made private (mode 0600; on Windows an owner-only ACL, verified) before the key is written. If its ACL cannot be made private, no record is published. The record always names a listener the hooks reach as 127.0.0.1. A daemon that 127.0.0.1 cannot reach also opens a second listener on 127.0.0.1 that serves only the owner door (every other request gets 403, and a WebSocket upgrade is closed): for example one bound to `::1` or a LAN address, or one whose Host allowlist leaves 127.0.0.1 out.
+- **Added:** the OWNER DOOR, `POST /owner/v1/peek` and `POST /owner/v1/liveness`. They take no bearer credential: no agent token and no `http_secret`.
+  - A request carries an HMAC-SHA256 with the owner's key over its path, timestamp, nonce and body. The owner checks it in constant time, accepts it within 30 s, and accepts each nonce once.
+  - The reply carries its own HMAC, and the client verifies it before it shows anything. A process that takes the port without the key gets no credential and cannot forge or alter a reply.
+  - The peek is a pure read: `relay pending`'s query, with no read mark and no cursor or sequence stamp. Liveness restamps only the agent's pid and start (and a missing host id).
+- **Added:** `relay owner peek <agent> --json [--with-content N] [--timeout-ms MS]` (and `relay owner liveness`), the hooks' client of the door.
+  - It opens no database. It reads the record only if it is trusted: not a link, one link, owned by you, private, in a directory owned by you that no one else can write to (on Windows, owner-only).
+  - It makes one exchange with node's HTTP client: no proxy, no redirect, no curl configuration, bounded by `--timeout-ms`.
+  - It prints exactly what `relay pending --json` prints (plus `"source": "owner"`).
+- **Changed:** `relay where --fields` prints an 8th line: the owner record's URL (`http://127.0.0.1:<port>`), set only when line 7 is the new verdict `http` (a wasm database whose record is trusted and valid: the owner lock held, the pid alive with the same start). It is empty for every other verdict. The key is never printed. An older relay CLI's 7-line answer is a named version-skew skip in the hooks.
+- **Changed:** the SessionStart, PostToolUse and Stop hooks read that owner's mail through the door (`relay owner peek`) and render it with the same code as a local read. The key never passes through the hook's shell, a file, an environment variable or argv. Any failure is a named skip, never a `sqlite3` read.
+  - On such a database, SessionStart's token health check and its registration over HTTP run only when the configured endpoint IS the proven owner (127.0.0.1 at the record's port). Otherwise they are skipped by name ("register through your MCP connection"), and a door that fails sends no credential at all.
+  - The mail read and its renderer are bounded by the hook's time budget.
   - A stdio owner is not reachable yet.
 
 ### BREAKING (5.0.0): one wasm mode (the single owner), and `relay convert-journal`

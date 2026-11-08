@@ -116,7 +116,8 @@ export async function run(argv: string[]): Promise<number> {
     const oneLine = (v: string | undefined) => (v ?? "").replace(/[\x00-\x1f\x7f]+/g, " ");
     // INV-DB-01 slice 3: line 7 (APPENDED; lines 1-6 keep their positions) is the hooks' verdict on the sqlite3 CLI
     // (src/hook-db-verdict.ts): the relay's one reader of the declaration and the header decides, computed now.
-    // Hook PR 1: line 8 (APPENDED) is the owner endpoint "URL KEY" when line 7 is "http", else "" (exactly 8 lines).
+    // Hook PR 1: line 8 (APPENDED) is the owner endpoint's URL when line 7 is "http", else "" (exactly 8 lines). The key
+    // is NOT printed: it stays in the owner's 0600 record, which `relay owner` opens under the trust model.
     const { hookDbAnswer } = await import("../hook-db-verdict.js");
     const a = r.kind === "error" ? null : hookDbAnswer(r.dbPath);
     const lines =

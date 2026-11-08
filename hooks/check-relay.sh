@@ -665,13 +665,7 @@ relay_remote_failed() {
 
 # REMOTE mode only (relay pending said: no local instance; RELAY_HTTP_HOST set).
 relay_deliver_remote_mail() {
-  # `owner` (hook PR 1, as ruled): the record URL relay_owner_prove proved in THIS run, never RELAY_HTTP_HOST/PORT; the
-  # only route that sends the http_secret.
-  local route="${1:-remote}" host="$RELAY_HTTP_HOST" port="${RELAY_HTTP_PORT:-3777}" tok="${RELAY_AGENT_TOKEN:-}" payload resp block
-  if [ "$route" = owner ]; then
-    host=127.0.0.1
-    port="${RELAY_OWNER_PORT:-}"
-  fi
+  local host="$RELAY_HTTP_HOST" port="${RELAY_HTTP_PORT:-3777}" tok="${RELAY_AGENT_TOKEN:-}" payload resp block
   if ! relay_whole_match "$host" '^[A-Za-z0-9_.:-]{1,253}$' || ! relay_whole_match "$port" '^[0-9]{1,5}$' \
      || ! relay_whole_match "$tok" '^[A-Za-z0-9_=.-]{8,128}$' || ! command -v curl >/dev/null 2>&1; then
     relay_remote_failed "no usable remote relay settings, token or curl"
@@ -688,7 +682,7 @@ relay_deliver_remote_mail() {
     return 0
   fi
   # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
-  resp=$({ [ "$route" != owner ] || relay_owner_secret_curl_config; relay_curl_token_config "$tok" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
+  resp=$({ relay_curl_token_config "$tok" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
     -X POST "http://${host}:${port}/mcp" \
     -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
     2>/dev/null) || { relay_remote_failed "the remote relay did not answer"; return 0; }
@@ -721,19 +715,13 @@ relay_deliver_pending_mail() {
   # cannot trust: a 6-line answer, an unknown token) the hook reads no mail; the skip is named once by
   # relay_hook_db_native_ok. skip-unreadable keeps today's read: `relay pending` judges the file itself and reports
   # the failure by name (DEGRADED, "relay unreadable"), never as a wasm instance. A resolver error keeps its own path.
-  # Hook PR 1: a wasm DB with a VALID owner endpoint record: its mail is read over HTTP from that owner, after the owner
-  # proves the record's key (relay_owner_prove). Any failure is named, and nothing else is read: never sqlite3.
+  # Hook PR 1 (as ruled after Codex #418 R1): a wasm DB with a VALID owner endpoint record: its mail is read through
+  # the owner's DOOR by `relay owner peek` (one MAC'd exchange, no bearer credential), whose answer is `relay pending`'s:
+  # the SAME read and render below. Any failure is named, and nothing else is read: never sqlite3.
+  local verb=pending
   if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
-    if relay_owner_prove; then
-      relay_deliver_remote_mail owner
-    else
-      echo "[RELAY] mail not read: $RELAY_OWNER_ERR. Mail may be waiting: call get_messages."
-      RELAY_MAIL_MODE="owner-unproved"
-      relay_mail_verdict "CANNOT-JUDGE" "$RELAY_OWNER_ERR" mail
-    fi
-    return 0
-  fi
-  if [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_HOOK_DB:-}" != skip-unreadable ] && ! relay_hook_db_native_ok; then
+    verb=owner
+  elif [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_HOOK_DB:-}" != skip-unreadable ] && ! relay_hook_db_native_ok; then
     RELAY_MAIL_MODE="no-native-db-read"
     # Only the two wasm verdicts say "a wasm instance" (Codex #391 R1): the others do not know what the instance is.
     case "${RELAY_RES_HOOK_DB:-}" in
@@ -768,7 +756,13 @@ relay_deliver_pending_mail() {
         rc=125
         why="no time budget left (${SECONDS}s spent before the mail read)"
       fi
-      if [ "$rc" -ne 125 ]; then
+      if [ "$rc" -ne 125 ] && [ "$verb" = owner ]; then
+        # The owner's door, at the same deadline; its own --timeout-ms sits just inside it (relay_owner_read).
+        relay_owner_read "$bin" "$AGENT_NAME" "$deadline" --with-content "$RELAY_PENDING_SHOW"
+        rc=$?
+        out="$RELAY_OWNER_OUT"
+        why="$RELAY_OWNER_WHY"
+      elif [ "$rc" -ne 125 ]; then
         relay_run_pending "$deadline" "$outf" "$errf" node "$bin" pending "$AGENT_NAME" --json --with-content "$RELAY_PENDING_SHOW"
         rc=$?
         out=$(cat "$outf" 2>/dev/null)
@@ -785,8 +779,16 @@ relay_deliver_pending_mail() {
   fi
   case "$rc" in
     0)
-      block=$(printf '%s' "$out" | SRC=f1 AN="$AGENT_NAME" node -e "$RELAY_FRAME_JS$RELAY_MAIL_RENDER_JS" 2>/dev/null) \
-        || { RELAY_MAIL_MODE="unreadable"; relay_mail_unreadable "relay pending returned an answer this hook cannot trust"; return 0; }
+      # The renderer is bounded too (Codex #418 R1 P2-7): a hung node is killed at what is left, and named.
+      if ! relay_budget_for "the mail render" 2 margin; then
+        RELAY_MAIL_MODE="unreadable"; relay_mail_unreadable "no time budget left to show the mail"; return 0
+      fi
+      block=$(printf '%s' "$out" | relay_run_streamed "$RELAY_STEP_SECS" env SRC=f1 AN="$AGENT_NAME" node -e "$RELAY_FRAME_JS$RELAY_MAIL_RENDER_JS" 2>/dev/null)
+      case $? in
+        0) ;;
+        124) RELAY_MAIL_MODE="unreadable"; relay_mail_unreadable "the mail could not be shown: its renderer timed out after ${RELAY_STEP_SECS}s"; return 0 ;;
+        *) RELAY_MAIL_MODE="unreadable"; relay_mail_unreadable "relay ${verb} returned an answer this hook cannot trust"; return 0 ;;
+      esac
       ;;
     3)
       if [ -n "${RELAY_HTTP_HOST:-}" ]; then
@@ -805,7 +807,7 @@ relay_deliver_pending_mail() {
       ;;
   esac
   RELAY_MAIL_READ_DONE=1
-  RELAY_MAIL_MODE="local"
+  if [ "$verb" = owner ]; then RELAY_MAIL_MODE="owner"; else RELAY_MAIL_MODE="local"; fi
   if [ -n "$block" ]; then
     printf '%s\n\n' "$block"
     echo "[bot-relay] $AGENT_NAME has pending messages (delivered to context)." >&2
@@ -841,6 +843,30 @@ fi
 #
 # Required deps for this block: curl (standard on macOS/Linux). jq is NOT
 # required — we parse the fields we need with grep/sed.
+# --- Hook PR 1 (as ruled after Codex #418 R1; P1-3 as modified) -----------------------------------------------------
+# On a wasm DB (`http`) the verdict AND a door exchange come FIRST. The token health check, the recovery and the
+# registration below go ONLY to a configured endpoint that IS the proven owner (127.0.0.1 at the record's port: the
+# same configured-endpoint trust a native install has). Any other endpoint is skipped by name (register through your
+# MCP connection), and a door that fails makes NO credential-bearing call at all. On `http` every curl here ignores
+# curl's own config and every proxy (-q first, --noproxy '*').
+RELAY_CRED_OK=1
+RELAY_CURL_GUARD=()
+if [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
+  RELAY_CRED_OK=0
+  RELAY_CURL_GUARD=(-q --noproxy '*')
+  _door_bin="$(cd "$HOOKS_DIR/.." 2>/dev/null && pwd)/bin/relay"
+  _owner_port="${RELAY_RES_OWNER_ENDPOINT##*:}"
+  if ! relay_budget_for "the owner door check" 2; then
+    echo "[RELAY] the owner door was not checked (no time budget left): no credential is sent this session start." >&2
+  elif ! relay_owner_read "$_door_bin" "$AGENT_NAME" "$RELAY_STEP_SECS"; then
+    echo "[RELAY] the owner door failed (${RELAY_OWNER_WHY}): no credential is sent this session start." >&2
+  elif [ "$HTTP_HOST" = 127.0.0.1 ] && [ "$HTTP_PORT" = "$_owner_port" ]; then
+    RELAY_CRED_OK=1
+  else
+    echo "[RELAY] the configured relay endpoint (${HTTP_HOST}:${HTTP_PORT}) is not this wasm DB's proven owner: the token health check and registration over HTTP are skipped; register through your MCP connection." >&2
+  fi
+fi
+
 AUTH_ERROR=0
 AUTH_STATE=""
 RECOVERY_COMPLETED=0
@@ -848,9 +874,9 @@ RECOVERY_COMPLETED=0
 # proves it either way ("" = not known yet, 1 = answered, 0 = unreachable). The verdict
 # block after register reads it, so a daemon that never came up cannot print HEALTHY.
 DAEMON_REACHABLE=""
-if [ -n "${RELAY_AGENT_TOKEN:-}" ] && command -v curl >/dev/null 2>&1 && relay_budget_for "the token health check" 2; then
+if [ -n "${RELAY_AGENT_TOKEN:-}" ] && [ "$RELAY_CRED_OK" = 1 ] && command -v curl >/dev/null 2>&1 && relay_budget_for "the token health check" 2; then
   # The token rides curl's config on STDIN, never argv (relay_curl_config_line).
-  HEALTH_BODY=$(relay_curl_token_config "$RELAY_AGENT_TOKEN" | curl -s -m "$RELAY_STEP_SECS" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  HEALTH_BODY=$(relay_curl_token_config "$RELAY_AGENT_TOKEN" | curl "${RELAY_CURL_GUARD[@]}" -s -m "$RELAY_STEP_SECS" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"health_check","arguments":{}}}' 2>/dev/null)
@@ -895,7 +921,7 @@ if [ "$AUTH_ERROR" -eq 1 ]; then
     fi
     # The body holds the recovery token: it rides curl's config on STDIN, never argv (relay_curl_config_line).
     RECOVERY_BODY=$(relay_curl_config_line data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"recovery_token\":\"${RELAY_RECOVERY_TOKEN}\"}}}" \
-      | curl -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+      | curl "${RELAY_CURL_GUARD[@]}" -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
       -H "Content-Type: application/json" \
       -H "Accept: application/json, text/event-stream" \
       2>/dev/null)
@@ -1125,7 +1151,7 @@ fi
 # delivery path below is read-only and stays via sqlite3 (the fast path is
 # the point). Bootstrap without a daemon is deliberately not supported.
 REGISTER_RAN=0
-if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget_for "registration" 4; then
+if [ "$SKIP_REGISTER" -eq 0 ] && [ "$RELAY_CRED_OK" = 1 ] && command -v curl >/dev/null 2>&1 && relay_budget_for "registration" 4; then
   REGISTER_RAN=1
   # Carry the caller's token if they have one — active re-register requires
   # it; first-time bootstrap on a fresh row doesn't. Either way the request
@@ -1144,7 +1170,7 @@ if [ "$SKIP_REGISTER" -eq 0 ] && command -v curl >/dev/null 2>&1 && relay_budget
   RELAY_AGENT_PID_START=""
   [ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
   # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
-  REG_BODY=$({ relay_mint_secret_curl_config || true; relay_curl_token_config "${RELAY_AGENT_TOKEN:-}" || true; } | curl -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - \
+  REG_BODY=$({ relay_mint_secret_curl_config || true; relay_curl_token_config "${RELAY_AGENT_TOKEN:-}" || true; } | curl "${RELAY_CURL_GUARD[@]}" -s -m "$RELAY_STEP_SECS" -w "\nHTTP_STATUS:%{http_code}\n" -K - \
     -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"claude\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
@@ -1242,7 +1268,7 @@ fi
 if [ -z "$DAEMON_REACHABLE" ] && command -v curl >/dev/null 2>&1 && relay_budget_for "the daemon probe" 1; then
   # Register was skipped (a LIVE row or a completed recovery), so nothing above proved
   # the daemon is up. One bounded probe settles it.
-  if curl -fsS --max-time "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
+  if curl "${RELAY_CURL_GUARD[@]}" -fsS --max-time "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
     DAEMON_REACHABLE=1
   else
     DAEMON_REACHABLE=0

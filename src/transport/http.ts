@@ -18,15 +18,14 @@ import {
   ApiWakeAgentSchema,
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
-import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors, pendingMetadata, setAgentLivenessAnchor } from "../db.js";
 import { ownedDbPath } from "../sqlite-compat.js";
 import {
   writeOwnerEndpoint,
-  ownerIdAnswer,
-  isChallenge,
   addressReachesLoopback,
   ownerPeekRouteAllowed,
-  ownerPeekBodyAllowed,
+  verifyDoorRequest,
+  signDoorResponse,
   OWNER_PEEK_HOST,
   OWNER_PEEK_REFUSAL,
 } from "../owner-endpoint.js";
@@ -327,9 +326,9 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   if (req.path === "/health") {
     return next();
   }
-  // Hook PR 1: the owner's challenge-response carries no credential and serves no secret (a hook proves the owner
-  // with it BEFORE sending one). It stays under the rate limit and the Host-header check.
-  if (req.path === "/owner-id") {
+  // Hook PR 1 (as ruled after Codex #418 R1): the OWNER DOOR carries no bearer credential at all; it authenticates
+  // by the owner key's MACs (src/owner-endpoint.ts). It stays under the rate limit and the Host-header check.
+  if (req.path === "/owner/v1/peek" || req.path === "/owner/v1/liveness") {
     return next();
   }
   // v2.1.7 Item 6: dashboard paths handle auth downstream.
@@ -479,8 +478,8 @@ export function sdkParsedBody(req: Pick<Request, "body">): unknown {
 export interface StartHttpOptions {
   /**
    * Hook PR 1 (as ruled, Q9): the OWNER-PEEK listener. Bound to 127.0.0.1 ONLY (any other host throws), it serves ONLY
-   * GET /owner-id and the hooks' get_messages peek (src/owner-endpoint.ts), every other request a named 403, BEFORE
-   * any parsing or route; a WebSocket upgrade is destroyed. It runs none of the daemon's singletons (the mint
+   * the owner door (POST /owner/v1/peek and /owner/v1/liveness: src/owner-endpoint.ts), every other request a named
+   * 403, BEFORE any parsing or route; a WebSocket upgrade is destroyed. It runs none of the daemon's singletons (the mint
    * secret, the connector purge, the wake sweep, the dashboard). Its Host check is loopback-only.
    */
   ownerPeek?: boolean;
@@ -615,12 +614,6 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
   // SEC-24: the parsed body's structural bound (arrays <= 1000, nesting <= 64), right after parsing and BEFORE auth and
   // every route, so no schema (the relay's or the SDK's) ever validates an oversized structure. See structural-bound.ts.
   app.use(structuralBoundMiddleware);
-  if (ownerPeek) {
-    app.use((req: Request, res: Response, next: NextFunction) => {
-      if (req.method !== "POST" || ownerPeekBodyAllowed(req.body)) return next();
-      res.status(403).json({ error: OWNER_PEEK_REFUSAL });
-    });
-  }
 
   const config = loadConfig();
   // P2a — capture the config PATH at boot, next to the config the daemon actually
@@ -733,22 +726,57 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
   // regardless of HTTP secret state — 421 is distinct from 401/403 so
   // browsers/curl do not retry an auth handshake against a wrong Host.
   app.use(httpHostCheck);
-  // Hook PR 1 (as ruled): the owner's CHALLENGE-RESPONSE (auth-free: it carries no credential and serves no secret).
-  // GET /owner-id?c=<hex challenge> answers HMAC-SHA256(key, challenge ‖ port) with this owner's private key, so a hook
-  // can prove it is talking to the process that wrote the DB's 0600 endpoint record before it sends a token. Only a
-  // wasm OWNER answers it; anything else is 404. AFTER the Host check (a DNS-rebound page reads no MAC), before auth.
-  app.get("/owner-id", (req: Request, res: Response) => {
+  // Hook PR 1 (as ruled after Codex #418 R1): THE OWNER DOOR. No bearer credential: the request and the reply are
+  // MAC'd with this owner's key (src/owner-endpoint.ts verifyDoorRequest / signDoorResponse), so a process on the port
+  // without the key learns nothing it can reuse and cannot forge a reply. Only a wasm OWNER answers (else 404). AFTER
+  // the Host check (a DNS-rebound page gets 421), before auth (it carries none). The body is read RAW (text/plain): the
+  // MAC covers its exact bytes.
+  //   /owner/v1/peek     = a PURE read: `relay pending`'s query (pendingMetadata), no seq/epoch stamp, no read mark.
+  //   /owner/v1/liveness = the metadata-only anchor restamp (agent_pid, agent_pid_start; host_id when NULL).
+  const doorBody = express.text({ type: () => true, limit: "16kb" });
+  const doorReply = (res: Response, status: number, payload: unknown, nonce: string | undefined): void => {
+    const text = JSON.stringify(payload);
+    if (nonce) res.setHeader("X-Owner-MAC", signDoorResponse(nonce, status, text));
+    res.status(status).type("text/plain").send(text);
+  };
+  const doorHandler = (doorPath: "/owner/v1/peek" | "/owner/v1/liveness") => (req: Request, res: Response) => {
     if (ownedDbPath() === null) {
       res.status(404).json({ error: "not a wasm DB owner" });
       return;
     }
-    const c = req.query.c;
-    if (!isChallenge(c)) {
-      res.status(400).json({ error: "a challenge (c: 16-128 hex characters) is required" });
+    const v = verifyDoorRequest(doorPath, req.body, req.header("x-owner-mac"));
+    if (!v.ok) {
+      doorReply(res, v.status, { ok: false, error: v.error }, v.nonce);
       return;
     }
-    res.json({ mac: ownerIdAnswer(c, boundPort) });
-  });
+    const { agent_name, args, nonce } = v.req;
+    try {
+      if (doorPath === "/owner/v1/peek") {
+        const keys = Object.keys(args);
+        const n = args.with_content;
+        if (keys.some((k) => k !== "with_content") || (n !== undefined && (!Number.isInteger(n) || (n as number) < 0 || (n as number) > 50))) {
+          doorReply(res, 400, { ok: false, error: "peek args: only with_content (an integer 0-50)" }, nonce);
+          return;
+        }
+        const meta = pendingMetadata(getDb(), agent_name, { contentFor: (n as number | undefined) ?? 0 });
+        doorReply(res, 200, { ok: true, agent: agent_name, ...meta }, nonce);
+        return;
+      }
+      const keys = Object.keys(args);
+      const pid = args.agent_pid;
+      const start = args.agent_pid_start;
+      if (keys.some((k) => k !== "agent_pid" && k !== "agent_pid_start") || !Number.isInteger(pid) || (pid as number) <= 0 || (start !== undefined && (typeof start !== "string" || start.length > 200))) {
+        doorReply(res, 400, { ok: false, error: "liveness args: agent_pid (a positive integer) and optionally agent_pid_start (a string)" }, nonce);
+        return;
+      }
+      const updated = setAgentLivenessAnchor(agent_name, pid as number, (start as string | undefined) ?? null);
+      doorReply(res, updated ? 200 : 404, updated ? { ok: true, agent: agent_name } : { ok: false, error: `agent ${JSON.stringify(agent_name)} is not registered` }, nonce);
+    } catch (err) {
+      doorReply(res, 500, { ok: false, error: `the owner could not answer: ${(err as Error).message}` }, nonce);
+    }
+  };
+  app.post("/owner/v1/peek", doorBody, doorHandler("/owner/v1/peek"));
+  app.post("/owner/v1/liveness", doorBody, doorHandler("/owner/v1/liveness"));
 
   app.use(authMiddleware);
 

@@ -110,7 +110,7 @@ relay_where_load() {
     export RELAY_RES_REASON="relay where gave an invalid answer (exit $rc: ${nrec:-0} fields, ${nlines:-0} newline-terminated)"
     return 1
   fi
-  # Hook PR 1: line 8 is the owner endpoint ("URL KEY") when line 7 is "http", else empty: an EXACT count of 8. A 7- or
+  # Hook PR 1: line 8 is the owner endpoint's URL when line 7 is "http", else empty: an EXACT count of 8. A 7- or
   # 6-line answer is an older relay CLI than these hooks: the resolution stands, and the hooks read no DB (named skew).
   export RELAY_RES_OWNER_ENDPOINT=""
   case "${nlines:-0}" in
@@ -272,76 +272,42 @@ relay_curl_config_line() {
   printf '%s = "%s"\n' "$1" "$v"
 }
 
-# An inherited RELAY_OWNER_PORT (or ERR) proves nothing: only relay_owner_prove, in THIS hook run, sets them.
-unset RELAY_OWNER_PORT RELAY_OWNER_ERR
-
-# relay_owner_prove — hook PR 1 (as ruled): before ANY credential goes to the DB's owner endpoint, prove it is the
-# process that wrote the 0600 record. RELAY_RES_OWNER_ENDPOINT is "URL KEY" from `relay where --fields` line 8:
-#   - the URL must be EXACTLY http://127.0.0.1:<port>, the key 32 lowercase hex: anything else is a named skip with no
-#     network call (return 2);
-#   - a FRESH random challenge goes to GET <URL>/owner-id?c=<challenge> (curl, no -L: a 3xx is never followed);
-#   - node verifies the answer is HMAC-SHA256(key, challenge‖port), the key on its STDIN (never argv or env).
-# Proved: RELAY_OWNER_PORT is set, return 0. Not proved (a wrong or replayed MAC, a 3xx, no answer): return 1. The
-# reason is in RELAY_OWNER_ERR either way; the caller names it and reads nothing else.
-relay_owner_prove() {
-  local ep="${RELAY_RES_OWNER_ENDPOINT:-}" url key port challenge resp
-  RELAY_OWNER_PORT="" RELAY_OWNER_ERR=""
-  url="${ep%% *}"
-  key="${ep#* }"
-  if [ "$url" = "$ep" ] || ! relay_whole_match "$url" '^http://127\.0\.0\.1:[0-9]{1,5}$' || ! relay_whole_match "$key" '^[0-9a-f]{32}$'; then
-    RELAY_OWNER_ERR="the owner endpoint record's line is malformed or not a loopback URL (it must be http://127.0.0.1:<port> and a 32-hex key)"
-    return 2
+# relay_owner_read CLI AGENT SECS [ARG...] — hook PR 1 (as ruled after Codex #418 R1): a wasm DB's mail through its
+# OWNER DOOR, read by the relay CLI (`relay owner peek AGENT --json ARG...`, src/cli/owner.ts) under the watchdog at
+# SECS (the caller's relay_budget_for), its own --timeout-ms just inside it so its named reason wins. One MAC'd
+# exchange with the owner, no bearer credential; the key is read by the CLI from the owner's 0600 record (never by this
+# shell, never in a file, the environment or argv). Its answer is `relay pending --json`'s, so each hook renders it with
+# its LOCAL code. Sets RELAY_OWNER_OUT (the JSON) and RELAY_OWNER_WHY (a named failure, or ""); returns the CLI's exit
+# (124 = the watchdog fired).
+relay_owner_read() {
+  local cli="$1" agent="$2" secs="$3" outf errf rc ms
+  shift 3
+  RELAY_OWNER_OUT="" RELAY_OWNER_WHY=""
+  case "$secs" in ''|*[!0-9]*|0) RELAY_OWNER_WHY="no time budget left for the owner door read"; return 125 ;; esac
+  ms=$(( secs * 1000 - 300 ))
+  [ "$ms" -lt 100 ] && ms=100
+  outf="$(mktemp 2>/dev/null || printf '')"
+  errf="$(mktemp 2>/dev/null || printf '')"
+  if [ -z "$outf" ] || [ -z "$errf" ]; then
+    rm -f "$outf" "$errf" 2>/dev/null
+    RELAY_OWNER_WHY="could not create a private temp file for the owner door read"
+    return 1
   fi
-  port="${url##*:}"
-  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-    RELAY_OWNER_ERR="the owner endpoint record's line is malformed (port $port)"
-    return 2
-  fi
-  command -v curl >/dev/null 2>&1 || { RELAY_OWNER_ERR="the owner endpoint could not be proved: curl not found"; return 1; }
-  command -v node >/dev/null 2>&1 || { RELAY_OWNER_ERR="the owner endpoint could not be proved: node not found"; return 1; }
-  # The challenge: 128 bits from the kernel, no process that could hang.
-  challenge=$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')
-  relay_whole_match "$challenge" '^[0-9a-f]{32}$' || { RELAY_OWNER_ERR="the owner endpoint could not be proved: no challenge could be made"; return 1; }
-  relay_budget_for "the owner handshake" 1 margin || { RELAY_OWNER_ERR="the owner endpoint could not be proved: no time budget left for the handshake"; return 1; }
-  resp=$(curl -sS --max-redirs 0 -m "$RELAY_STEP_SECS" "${url}/owner-id?c=${challenge}" 2>/dev/null) || resp=""
-  relay_budget_for "the owner proof check" 1 margin || { RELAY_OWNER_ERR="the owner endpoint could not be proved: no time budget left for the proof check"; return 1; }
-  if printf '%s\n%s\n' "$key" "$resp" | CH="$challenge" PORT="$port" relay_run_streamed "$RELAY_STEP_SECS" node -e '
-    const lines = require("fs").readFileSync(0, "utf8").split("\n");
-    const key = lines[0]; let mac = "";
-    try { mac = String(JSON.parse(lines.slice(1).join("\n")).mac || ""); } catch {}
-    const want = require("crypto").createHmac("sha256", Buffer.from(key, "hex")).update(process.env.CH + process.env.PORT).digest("hex");
-    const a = Buffer.from(want, "hex"), b = Buffer.from(/^[0-9a-f]{64}$/.test(mac) ? mac : "", "hex");
-    process.exit(a.length === b.length && require("crypto").timingSafeEqual(a, b) ? 0 : 1);' 2>/dev/null; then
-    RELAY_OWNER_PORT="$port"
-    return 0
-  fi
-  RELAY_OWNER_ERR="the owner endpoint did not prove the record's key (it failed the challenge): no credential was sent"
-  return 1
-}
-
-# relay_owner_secret_curl_config — hook PR 1 (as ruled): ON THE OWNER ROUTE ONLY (relay_owner_prove proved the
-# endpoint: RELAY_OWNER_PORT is set), the instance's HTTP shared secret as a curl config line, written by the relay
-# CLI STRAIGHT into the caller's `{ ...; } | curl -K -` stream. It is never in a shell variable, an env var, a file,
-# argv or this hook's output. Off the owner route it prints nothing.
-# Bounded in TIME (relay_run_streamed, its own 1s cap from what is left): curl waits for this config to end before
-# its own -m clock starts, so the owner route's worst case is this read plus the peek's -m, inside the 3s margin.
-relay_owner_secret_curl_config() {
-  local rc
-  [ -n "${RELAY_OWNER_PORT:-}" ] || return 0
-  relay_budget_for "the http_secret read" 1 margin || return 0
-  relay_run_streamed "$RELAY_STEP_SECS" node "$(relay_helpers_cli)" curl-auth-config 2>/dev/null </dev/null
+  relay_run_pending "$secs" "$outf" "$errf" node "$cli" owner peek "$agent" --json "$@" --timeout-ms "$ms"
   rc=$?
-  # Exit 3: a secret the curl config cannot carry was DECLINED (never printed): named here, on stderr, never into the
-  # config stream this function writes to.
-  case "$rc" in
-    3) echo "[RELAY] http_secret can't be sent safely: it contains a character curl config can't carry. Use printable characters without quotes or backslashes." >&2 ;;
-    124) echo "[RELAY] the http_secret could not be read in time (${RELAY_STEP_SECS}s): the mail read goes without it." >&2 ;;
-  esac
-  return 0
+  RELAY_OWNER_OUT=$(cat "$outf" 2>/dev/null)
+  RELAY_OWNER_WHY=$(grep -m 1 '^relay owner:' "$errf" 2>/dev/null | tr -cd 'A-Za-z0-9 _./:()=,"-' | cut -c1-300)
+  rm -f "$outf" "$errf" "$outf.timedout" 2>/dev/null
+  if [ "$rc" -eq 124 ]; then
+    RELAY_OWNER_WHY="the owner door read timed out after ${secs}s"
+  elif [ "$rc" -ne 0 ] && [ -z "$RELAY_OWNER_WHY" ]; then
+    RELAY_OWNER_WHY="relay owner peek failed (exit $rc)"
+  fi
+  return "$rc"
 }
 
 # relay_run_streamed SECS CMD... — CMD killed at SECS (124 = timed out), its stdin, stdout and stderr this function's
-# OWN (no file: for a stream that must never touch disk, the http_secret's curl config, or a check fed on stdin).
+# OWN (no file): for a step that is fed and read through a pipe (a renderer, a parser) and must stay inside the budget.
 relay_run_streamed() {
   local secs="$1" pid wd rc wrc
   shift

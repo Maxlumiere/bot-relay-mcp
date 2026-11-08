@@ -74,12 +74,13 @@ The driver is a property of the **instance**: a `sqlite_driver` key in the insta
   - a stdio MCP server MAY be the owner: it takes the owner lock like any owner (so a single terminal on a wasm DB works). A second stdio server, while one owns the database, is refused by name: wasm is single-process, so close the other one, or run one HTTP daemon and point every client at it;
   - so is a native opener;
   - so is every relay opener that reaches the database by its PATH on an instance that declares `"wasm"` (the declaration of the instance that HOLDS the database and the caller's own are both consulted, and an unreadable one refuses too) (the CLI verbs such as `relay bind`, `fleet`, `recover` and the `purge-*` verbs, and the synchronous fallback some callers use), even before the database exists: it names the HTTP client config and creates nothing;
-  - the hooks never open such a database with `sqlite3` (the relay decides this for them: the 7th line of `relay where --fields`). When its owner is an HTTP DAEMON, the hooks read the agent's mail over HTTP from it instead:
-    - the daemon writes an owner endpoint record beside the database once it is listening (`.<db>.relay-owner.json`, mode 0600, never deleted);
-    - the record always names a listener the hooks reach as `127.0.0.1`. A daemon that 127.0.0.1 cannot reach (bound to `::1`, `::` or one LAN address, or with a Host allowlist that leaves `127.0.0.1` out) also opens a second listener on `127.0.0.1` (a port the kernel picks), and the record names that one. That listener answers only `/owner-id` and the hooks' mail read, and refuses everything else with 403;
-    - the 8th line of `relay where --fields` carries that endpoint;
-    - before any token is sent, the hook sends a fresh challenge to `/owner-id`, and the owner must answer with a key only it and the 0600 record hold;
-    - any failure is a named skip, never a `sqlite3` read, never a token sent.
+  - the hooks never open such a database with `sqlite3` (the relay decides this for them: the 7th line of `relay where --fields`). When its owner is an HTTP DAEMON, the hooks read the agent's mail through the owner's DOOR instead:
+    - the daemon writes an owner record beside the database once it is listening (`.<db>.relay-owner.json`: private, never deleted). The record always names a listener the hooks reach as `127.0.0.1`. A daemon that 127.0.0.1 cannot reach also opens a second listener on `127.0.0.1` (a port the kernel picks) that serves only the door, and the record names that one. This covers a daemon bound to `::1`, `::` or one LAN address, or one whose Host allowlist leaves `127.0.0.1` out;
+    - the door (`POST /owner/v1/peek`, `/owner/v1/liveness`) takes no agent token and no `http_secret`. Requests and replies are authenticated by HMACs with the owner's key, and the hook's client (`relay owner peek`) verifies the reply before it shows anything;
+    - the client trusts the record only if it is a private file you own, not a link, in a directory no one else can write to. **Keep a custom `RELAY_DB_PATH` out of shared or group-writable directories**: there the door is refused by name;
+    - the 8th line of `relay where --fields` is the record's URL (the key is never printed);
+    - any failure is a named skip, never a `sqlite3` read;
+    - SessionStart registers over HTTP there only when the configured endpoint IS that owner. Otherwise: register through your MCP connection.
   - Other `sqlite3` reads (tasks, liveness) stay skipped there, and a stdio owner's mail is not reachable yet: those print ONE named notice.
 - **A backup or a restore** of an owned database runs under the lock when no owner is live, and is refused while one is. A database with more than one hard link is refused by both (the lock is keyed by the file's name, so a second name could be locked by another process): remove the extra links.
 

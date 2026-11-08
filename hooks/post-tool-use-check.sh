@@ -455,19 +455,11 @@ http_peek() {
   # of this hook's budget (relay_budget_for); with no time left it is skipped
   # (exit 125: this runs in a $(...) subshell, so the caller records the skip;
   # DEGRADED "no time budget left for the remote read", in the verdict below).
-  # As ruled (a STRUCTURAL skip): the `owner` route goes ONLY to the record URL relay_owner_prove proved in THIS run
-  # (127.0.0.1:RELAY_OWNER_PORT; never HTTP_HOST/HTTP_PORT), and that handshake IS its liveness probe, so it never
-  # calls /health (which the owner-peek listener refuses). Every other route keeps its /health probe.
-  local route="${1:-remote}" base
-  if [ "$route" = owner ]; then
-    [ -n "${RELAY_OWNER_PORT:-}" ] || return 1
-    base="http://127.0.0.1:${RELAY_OWNER_PORT}"
-  else
-    base="http://${HTTP_HOST}:${HTTP_PORT}"
-    relay_budget_for "the remote health probe" 1 margin || return 125
-    if ! curl -fsS -m "$RELAY_STEP_SECS" "${base}/health" >/dev/null 2>&1; then
-      return 1
-    fi
+  # The REMOTE route only (a wasm DB's owner is read through its door: relay_owner_read).
+  local base="http://${HTTP_HOST}:${HTTP_PORT}"
+  relay_budget_for "the remote health probe" 1 margin || return 125
+  if ! curl -fsS -m "$RELAY_STEP_SECS" "${base}/health" >/dev/null 2>&1; then
+    return 1
   fi
 
   # peek:true is the whole fix on this path: the same get_messages the agent
@@ -499,7 +491,7 @@ print(json.dumps({
   local response
   relay_budget_for "the remote mail read" 2 margin || return 125
   # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
-  response=$({ [ "$route" != owner ] || relay_owner_secret_curl_config; relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
+  response=$({ relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
     -X POST "${base}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
@@ -775,21 +767,24 @@ case "$F1_RC" in
   *)
     MODE=unreadable
     # Hook PR 1: `relay pending` cannot open a wasm DB (it has ONE opener, its owner). With a VALID owner endpoint
-    # record (`relay where` line 7 "http"), its mail is read over HTTP from that owner, after the owner proves the
-    # record's key (relay_owner_prove); a failure is named, and nothing else is read. Native instances never get here.
+    # record (`relay where` line 7 "http"), its mail is read through the owner's DOOR (relay_owner_read: one MAC'd
+    # exchange, no bearer credential, the answer `relay pending`'s, parsed here like the local read, under the
+    # budget); a failure is named, and nothing else is read. Native instances never get here.
     if relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS" && [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
-      if relay_owner_prove; then
-        MODE=remote
-        [ -n "$AGENT_TOKEN" ] || relay_hydrate_token
-        SUMMARY=$(http_peek owner)
-        case $? in
-          0) READ_OK=1 ;;
-          125) RELAY_BUDGET_SKIPPED="${RELAY_BUDGET_SKIPPED:-the remote read}" ;;
-        esac
+      MODE=remote
+      if relay_budget_for "the owner door read" 3 margin; then
+        relay_owner_read "$RELAY_CLI" "$AGENT_NAME" "$RELAY_STEP_SECS"
+        _owner_rc=$?
+        if [ "$_owner_rc" -eq 0 ] && relay_budget_for "the owner answer summary" 1 margin \
+          && SUMMARY=$(printf '%s' "$RELAY_OWNER_OUT" | relay_run_streamed "$RELAY_STEP_SECS" env SRC=f1 AN="$AGENT_NAME" python3 -c "$NOTICE_PY" 2>/dev/null); then
+          READ_OK=1
+        else
+          MODE=owner-unproved
+          F1_ERR="${RELAY_OWNER_WHY:-the owner door answer could not be read}"
+          echo "[RELAY] mail not read: ${F1_ERR}. Mail may be waiting: call get_messages." >&2
+        fi
       else
-        MODE=owner-unproved
-        F1_ERR="$RELAY_OWNER_ERR"
-        echo "[RELAY] mail not read: ${RELAY_OWNER_ERR}. Mail may be waiting: call get_messages." >&2
+        RELAY_BUDGET_SKIPPED="${RELAY_BUDGET_SKIPPED:-the owner door read}"
       fi
     fi
     ;;
