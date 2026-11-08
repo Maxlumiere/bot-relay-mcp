@@ -898,6 +898,20 @@ describe("INV-DB-01 slice 4, Codex #401 R1 P1-3 (ruled): native openers during a
     expect(readOther(dbPath).rows, "the foreign commit is still in the file (never overwritten)").toEqual(["a", "foreign"]);
   }, 60_000);
 
+  it("Codex #401 R2 P1 (ruled), the byte check alone: a foreign UPDATE (the row counts unchanged) landing before the first header write is a FAILURE too, the updated value still in the file (mutation r2a survived the INSERT row: its counts check also refuses)", async () => {
+    makeDb(dbPath, 0, ["a", "b"], "DELETE");
+    writeCfg({});
+    wasmOnly();
+    const foreign = () => {
+      const d = new Database(dbPath);
+      d.prepare("UPDATE kept SET v = 'changed-by-another-process' WHERE v = 'a'").run();
+      d.close();
+    };
+    const err = await (await convertMod()).convertJournal({ to: "wasm", _beforePatchForTests: foreign }).then(() => null, (e: Error) => e);
+    expect(err?.message, "never a success").toMatch(/convert-journal (refused|FAILED)[\s\S]*(another process wrote|changed outside)/i);
+    expect(readOther(dbPath).rows, "the foreign update is still in the file").toEqual(["changed-by-another-process", "b"]);
+  }, 60_000);
+
   it("Codex #401 R2 P1 (ruled) CONFORMANCE: the header the sql.js converter patches in place is byte-equal to the one the NATIVE converter produces from the same fixture (the counter bytes aside), and its page data is untouched", async () => {
     const fixture = path.join(caseDir, "fixture.db");
     makeDb(fixture, NATIVE, ["r1", "r2", "r3"]); // WAL mode, cleanly closed: no side files
