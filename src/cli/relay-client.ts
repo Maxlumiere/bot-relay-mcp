@@ -26,6 +26,7 @@ import crypto from "crypto";
 import { classifyHost } from "../host-class.js";
 import { remoteScope } from "./remote.js";
 import { sameFileIdentity } from "../file-identity.js";
+import { privacyFaults } from "../fs-perms.js";
 
 export class RelayClientError extends Error {
   /** The socket error code when the relay could not be reached (e.g. ECONNREFUSED), for callers that branch on it. */
@@ -243,7 +244,8 @@ function posixFault(p: string, st: fs.BigIntStats, kind: "agents" | "scope" | "f
  * refused: a scope linked to the local vault or to another remote's scope yields nothing); the file is opened without
  * following a link and must be the file its name names (one link); POSIX: each owned by this user, the scope and the
  * file private; after the read, the scope and agents/ must still be the directories that were checked (a replacement
- * in between is refused). Windows: the same link and identity checks (its ACLs are set by the writers, not re-read).
+ * in between is refused). Windows: the same link and identity checks, and each element's ACL must be owner-only
+ * (privacyFaults), as the supported writers set it.
  * A refusal is NAMED on stderr and yields null (no credential is sent).
  */
 async function scopedLine(host: string, port: number, name: string): Promise<string | null> {
@@ -280,7 +282,13 @@ async function scopedLine(host: string, port: number, name: string): Promise<str
     if (process.platform !== "win32") {
       const fault = posixFault(agents, a0, "agents") ?? posixFault(scope, s0, "scope");
       if (fault) return refuse(fault);
-    } else if (!a0.isDirectory() || !s0.isDirectory()) return refuse(`${scope} is not a real directory`);
+    } else {
+      if (!a0.isDirectory() || !s0.isDirectory()) return refuse(`${scope} is not a real directory`);
+      // Windows: the supported writers set an owner-only ACL (relay remote set-*: restrictToOwnerWindows); a chain other
+      // accounts can read (or write) is refused.
+      const faults = [...privacyFaults(agents, 0o700), ...privacyFaults(scope, 0o700), ...privacyFaults(file, 0o600)];
+      if (faults.length > 0) return refuse(`it is not private to you (${faults.join("; ")})`);
+    }
     if (!f0.isFile()) return refuse("not a regular file");
     scopeReadHookForTests?.();
     try {
