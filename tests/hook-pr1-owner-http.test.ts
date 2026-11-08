@@ -1353,6 +1353,38 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 3 (as ruled): EVERY local credential
     }
   }, 120_000);
 
+  // As ruled: a loopback bearer (no local DB) is refused by default; RELAY_HTTP_TRUSTED_TUNNEL_PORT=<port> opts in ONE port.
+  it.each([
+    { what: "no opt-in", tag: "off", verdict: "REFUSED", optIn: (_p: number): Record<string, string> => ({}), delivered: false },
+    { what: "the opt-in for ANOTHER port", tag: "other", verdict: "REFUSED", optIn: (p: number): Record<string, string> => ({ RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(p + 1) }), delivered: false },
+    { what: "the opt-in for THIS port", tag: "on", verdict: "DELIVERED", optIn: (p: number): Record<string, string> => ({ RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(p) }), delivered: true },
+  ])("a LOOPBACK relay with NO local DB (a tunnel), $what: the bearer is $verdict", async ({ tag, optIn, delivered }) => {
+    const c = newCase(`p3-tunnel-${tag}`);
+    const spy = await recorder();
+    const env = { RELAY_AGENT_TOKEN: TOKEN, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port), ...optIn(spy.port) };
+    const r = await runHook(c, "check-relay.sh", env);
+    const r2 = await runHook(c, "stop-check.sh", env, inputFor("stop-check.sh"));
+    if (delivered) {
+      expect(spy.bytes(), `the trusted tunnel got the bearer\n${r.out}`).toContain(TOKEN);
+      expect(r.out, "the risk is named every session").toMatch(new RegExp(`bearer to a trusted tunnel on 127\\.0\\.0\\.1:${spy.port}: if the tunnel drops, another local user could take that port`));
+    } else {
+      noCredential(spy, TOKEN);
+      expect(r.out + r2.out, "the default skip names the opt-in").toMatch(/RELAY_HTTP_TRUSTED_TUNNEL_PORT/);
+    }
+  }, 120_000);
+
+  it("the tunnel opt-in WITH a local DB is ignored: the local DB's door is the only route; zero bearer bytes to the opted-in port", async () => {
+    const c = newCase("p3-tunnel-local");
+    const token = seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const spy = await recorder();
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port), RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(spy.port) });
+    noCredential(spy, token);
+    expect(r.argv, "the door was used").toMatch(/owner tool (health_check|register_agent)/);
+    expect(r.out).not.toMatch(/bearer to a trusted tunnel/);
+    await stopDaemon(d.child);
+  }, 120_000);
+
   it("an OLD daemon (a native DB, no owner record) → no credential to the configured local endpoint, and the skip names the fix (restart the relay daemon)", async () => {
     const c = newCase("p3-old-daemon");
     const token = seedNativeDb(c);
@@ -1435,7 +1467,8 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (a structural skip): the
     });
     const port = String(spy.port);
     const input = JSON.stringify({ session_id: "s-pr1", hook_event_name: hook === "stop-check.sh" ? "Stop" : "PostToolUse" });
-    const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: TOKEN, FAKE_PENDING_RC: "3", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: port, RELAY_OWNER_PORT: port }, input);
+    // Hook PR 3 (as ruled): a loopback remote is a trusted tunnel only when opted in for THIS port.
+    const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: TOKEN, FAKE_PENDING_RC: "3", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: port, RELAY_OWNER_PORT: port, RELAY_HTTP_TRUSTED_TUNNEL_PORT: port }, input);
     expect(spy.requests.length, `precondition: the remote route ran (${r.out})`).toBeGreaterThan(0);
     expect(spy.requests.some((q) => q.url === "/health"), "the remote route probes /health (an inherited RELAY_OWNER_PORT proves nothing)").toBe(true);
     expect(spy.bytes(), "no http_secret goes to an unproved endpoint").not.toContain(secret);

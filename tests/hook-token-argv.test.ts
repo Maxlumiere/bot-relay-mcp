@@ -350,7 +350,10 @@ function localEnv(name: string, h: string, token?: string): Record<string, strin
   };
 }
 
-/** A remote-mode env: a HOME with no relay instance at all, the relay reachable only over HTTP. */
+/**
+ * A remote-mode env: a HOME with no relay instance at all, the relay reachable only over HTTP. On loopback that is a
+ * tunnel, which hook PR 3 (as ruled) refuses unless RELAY_HTTP_TRUSTED_TUNNEL_PORT opts THIS port in.
+ */
 function remoteEnv(name: string, h: string, token: string): Record<string, string> {
   return {
     HOME: h,
@@ -358,6 +361,7 @@ function remoteEnv(name: string, h: string, token: string): Record<string, strin
     RELAY_AGENT_TOKEN: token,
     RELAY_HTTP_HOST: "127.0.0.1",
     RELAY_HTTP_PORT: String(proxyPort),
+    RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(proxyPort),
     RELAY_HOOK_NOTICE_REMIND_SECS: "0",
     RELAY_STOP_WAKE_DAMPER_SECS: "0",
   };
