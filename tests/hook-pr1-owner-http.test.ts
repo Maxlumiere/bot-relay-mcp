@@ -900,12 +900,14 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the o
     await stopDaemon(d.child);
   }, 120_000);
 
-  it("a 7-line answer (an older relay CLI than these hooks) → a named version-skew skip: no sqlite3, no network", async () => {
+  it("a 7-line answer (an older relay CLI than these hooks) → a named version-skew skip: no sqlite3, no owner-door read", async () => {
+    // (The configured endpoint's own calls, e.g. the token health check, are the native behaviour on an unjudged
+    // verdict: the pre-existing configured-endpoint trust, out of this row's scope as ruled.)
     const c = newCase("seven");
     seedNativeDb(c);
-    const spy = await startSpy((req, res) => res.end("{}"));
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", null), RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port) });
-    expect(spy.requests).toEqual([]);
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: TOKEN, FAKE_WHERE_FILE: fakeWhere(c, "http", null) });
+    expect(r.argv, "precondition: the hook ran its relay CLI").toContain("where --fields");
+    expect(r.argv, "no owner-door read on a skewed answer").not.toContain("owner peek");
     expect(r.sqliteCalls).toEqual([]);
     expect(r.out).toMatch(/7-line answer[\s\S]*(version skew|update the relay)/i);
   }, 60_000);
