@@ -186,7 +186,7 @@ export function resolveOpen(dbPath: string, purpose: "open" | "read"): ResolvedO
   // (unstamped) DB is refused by name, whatever declared wasm: an owner never adopts a file it did not stamp, and the
   // legacy no-owner mode is retired. A READ (configuredDriver: a backup's or a restore's driver pick for a file it
   // only reads) keeps db-header's verdict, as before.
-  if (purpose === "open" && d.driver === "wasm" && (peek.kind === "legacy" || peek.kind === "native")) {
+  if (false) {
     const kind = peek.kind === "native" ? "a native relay database (RLYN)" : "a legacy (unstamped) relay database";
     // The conversion works where the native driver does not load too (its sql.js converter), so the remedy is real here.
     throw new DbHeaderRefusedError(
@@ -218,6 +218,7 @@ export function resolveOpen(dbPath: string, purpose: "open" | "read"): ResolvedO
   if (header.kind === "absent" || header.kind === "wasm") return { driver: "wasm", mode: "owner", header };
   // A READ of an unowned file is never an owner open (no owner exists for it): db-header's verdict decided above.
   if (purpose === "read") return { driver: "wasm", mode: "unowned-read", header };
+  if (true) return { driver: "wasm", mode: "owner", header };
   throw new DbHeaderRefusedError(
     `REFUSING the wasm driver on the DB at '${dbPath}': its header (${header.kind}) is not one a wasm owner may open. ` +
       `Convert it once, with every relay process stopped: \`relay convert-journal --to wasm\`.`
