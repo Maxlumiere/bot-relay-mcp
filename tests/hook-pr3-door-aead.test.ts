@@ -344,3 +344,27 @@ describe("hook PR 3, as ruled: /owner/v1/session (ONE agent's own session_id; no
   }, 90_000);
 });
 
+
+describe("hook PR 3 (#433 macOS): a process-lookup cut is never hidden (every OS, structural)", () => {
+  // relay_pid_chain / relay_agent_pid / relay_pid_start print exactly one thing on stderr: relay_ps's NAMED cut ("no
+  // time budget left for a process lookup"). A call site that sends their stderr to /dev/null hides the cut: on macOS
+  // (#433, job 128832503669) the first walk (relay_pid_chain) took the cut silently and the hook named nothing.
+  const WALKERS = /\brelay_(?:pid_chain|agent_pid|pid_start)\b/;
+  const hidden = (src: string, file: string) =>
+    src.split("\n").flatMap((line, i) => {
+      if (/^\s*#/.test(line) || /\(\)\s*\{/.test(line) || !WALKERS.test(line) || /command -v/.test(line)) return [];
+      return /2>\s*\/dev\/null|&>\s*\/dev\/null/.test(line) ? [`${file}:${i + 1}: ${line.trim()}`] : [];
+    });
+  it("no hook call site of a ps-walking helper discards its stderr (the cut stays named); a planted one is caught", () => {
+    const hooks = path.join(REPO, "hooks");
+    const files = [
+      ...fs.readdirSync(hooks).filter((f) => f.endsWith(".sh") && f !== "_vault-helpers.sh").map((f) => path.join(hooks, f)),
+      ...fs.readdirSync(path.join(hooks, "codex")).filter((f) => f.endsWith(".sh")).map((f) => path.join(hooks, "codex", f)),
+    ];
+    expect(files.length, "precondition: the hook entrypoints").toBeGreaterThanOrEqual(4);
+    const sites = files.flatMap((f) => fs.readFileSync(f, "utf-8").split("\n").filter((l) => WALKERS.test(l) && !/^\s*#/.test(l) && !/command -v/.test(l)));
+    expect(sites.length, "precondition: the scan sees the walk call sites").toBeGreaterThanOrEqual(5);
+    expect(hidden('  X=$(relay_pid_chain 2>/dev/null || printf "")', "planted"), "control: a hidden cut is caught").toHaveLength(1);
+    expect(files.flatMap((f) => hidden(fs.readFileSync(f, "utf-8"), path.relative(REPO, f))), "no call site hides a cut").toEqual([]);
+  });
+});
