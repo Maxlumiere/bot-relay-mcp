@@ -297,9 +297,12 @@ export async function convertJournal(opts: ConvertOptions): Promise<ConvertRepor
 
 // --- The wasm-only converter (sql.js, native→wasm only; the slice-4 wasm-only ruling) ---
 
-/** The ONE sql.js construction here: the image load, and the fresh verify load. */
+/**
+ * The ONE sql.js construction here: the image load, and the fresh verify load. sql.js ADOPTS the array it is given (its
+ * edits change it), so it is given a COPY: the caller's bytes stay exactly what was read.
+ */
 function loadImage(SQL: any, bytes: Uint8Array): any {
-  return new SQL.Database(bytes);
+  return new SQL.Database(Uint8Array.from(bytes));
 }
 /** integrity_check and every table's row count, on a loaded image. */
 function inventory(img: any): { integrity: string; counts: Record<string, number> } {
@@ -349,10 +352,9 @@ async function convertViaSqlJs(dbPath: string, configPath: string, lock: OwnerLo
   }
 
   const first = identityOf(dbPath);
-  // sql.js may ADOPT the array it is given (its in-memory file then IS that array), so the image is loaded from a COPY:
-  // `first.bytes` must stay the original, byte for byte, for the safety copy (measured on sql.js 1.14.2: with the array
-  // passed directly, the DELETE + RLYW edits changed it, so the "safety copy" was the edited image).
-  const img = loadImage(SQL, Uint8Array.from(first.bytes));
+  // `first.bytes` must stay the original, byte for byte, for the safety copy: loadImage copies it (measured on sql.js
+  // 1.14.2: with the array passed directly, the DELETE + RLYW edits changed it, so the "safety copy" was the edited image).
+  const img = loadImage(SQL, first.bytes);
   let image: Uint8Array;
   let counts: Record<string, number>;
   let safetyCopy: string;

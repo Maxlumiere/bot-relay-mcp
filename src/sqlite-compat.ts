@@ -259,7 +259,7 @@ export async function restampStagedCopy(file: string, kind: SqliteDriver): Promi
   if (kind === "wasm") {
     if (id === RELAY_APP_ID_WASM && journal === JOURNAL_BYTES_DELETE) return;
     const SQL = await loadSqlJs();
-    const db = new SQL.Database(bytes);
+    const db = new SQL.Database(Uint8Array.from(bytes)); // a copy: sql.js adopts the array it is given
     let image: Uint8Array;
     try {
       db.exec("PRAGMA journal_mode = DELETE");
@@ -1151,7 +1151,7 @@ async function createOwnedWasmDb(dbPath: string, header: DriverHeader): Promise<
       if (bytes.length < 72 || bytes.readUInt32BE(68) !== RELAY_APP_ID_WASM) {
         throw new OwnerLockError(`the DB at ${dbPath} changed while it was being opened (it is no longer stamped RLYW); not opened.`);
       }
-      const w = new WasmDatabase(new SQL.Database(bytes), dbPath);
+      const w = new WasmDatabase(new SQL.Database(Uint8Array.from(bytes)), dbPath); // a copy: sql.js adopts its array
       w.ownerLock = lock;
       w.canonicalPath = canonical;
       w.lastIdentity = readIdentity;
@@ -1400,7 +1400,7 @@ async function openWasmFromBytes(bytes: Buffer, dbPath: string): Promise<CompatD
     );
   }
   const SQL = await initSqlJs();
-  return new WasmDatabase(new SQL.Database(bytes), dbPath);
+  return new WasmDatabase(new SQL.Database(Uint8Array.from(bytes)), dbPath); // a copy: sql.js adopts the array
 }
 
 // --- Public API ---
