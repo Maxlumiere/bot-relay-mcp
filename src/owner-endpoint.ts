@@ -42,6 +42,15 @@ export function ownerEndpointPath(dbPath: string): string {
   return path.join(path.dirname(real), `.${path.basename(real)}.relay-owner.json`);
 }
 
+function recordFile(dbPath: string): string {
+  return ownerEndpointPath(dbPath);
+}
+/** PROBE: an indirect removal through a wrapper. */
+export function forgetOwnerEndpoint(dbPath: string): void {
+  const p = recordFile(dbPath);
+  fs.rmSync(p, { force: true });
+}
+
 /** A bind address that a client reaches as 127.0.0.1 (the record's host is always 127.0.0.1). */
 export function bindCoversLoopback(host: string): boolean {
   return ["127.0.0.1", "localhost", "0.0.0.0", "::", "::ffff:127.0.0.1"].includes(host);
