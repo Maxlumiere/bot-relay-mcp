@@ -637,9 +637,12 @@ const persistWrite = (dbPath: string, bytes: Buffer) => {
   fs.writeFileSync(dbPath, bytes);
 };
 let wasmPersistWrite: (dbPath: string, bytes: Buffer) => void = persistWrite;
-/** Test-only: replaces the wasm write-back's file write (e.g. with one that fails, like a full disk). */
+/** Set only by the test seam below: replaces the OWNER persist's temp-file write too (slice 4: every wasm writer is one). */
+let ownerTempWriteForTests: ((file: string, bytes: Buffer) => void) | null = null;
+/** Test-only: replaces the wasm write-back's file write (e.g. with one that fails, like a full disk), owner or not. */
 export function _setWasmPersistWriteForTests(fn: ((dbPath: string, bytes: Buffer) => void) | null): void {
   wasmPersistWrite = fn ?? persistWrite;
+  ownerTempWriteForTests = fn;
 }
 let wasmExport: (rawDb: any) => Uint8Array = (rawDb) => rawDb.export();
 /**
@@ -1044,7 +1047,8 @@ function ownerPersist(w: WasmDatabase, data: Buffer): void {
   const tmp = `${target}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
   let wrote: string;
   try {
-    fs.writeFileSync(tmp, data, { mode: 0o600, flag: "wx" });
+    if (ownerTempWriteForTests) ownerTempWriteForTests(tmp, data);
+    else fs.writeFileSync(tmp, data, { mode: 0o600, flag: "wx" });
     // Codex #385 R1 P1-4: the identity of the file THIS persist wrote (a rename keeps its inode, size and mtime), never
     // whatever sits at the name after the rename (another writer's replacement would be adopted as the owner's own).
     // Read after the write is closed (a filesystem may settle timestamps at close).
