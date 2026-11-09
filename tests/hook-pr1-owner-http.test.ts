@@ -1662,6 +1662,9 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the de
     const env = { RELAY_AGENT_TOKEN: "", RELAY_HTTP_HOST: REMOTE_NAME, RELAY_HTTP_PORT: String(remote.port) };
     const r = await runEntry(c, entry, env, pinnedRemoteHooks());
     expect(remote.bytes(), `${entry}: the LOCAL token never reaches the remote through a linked scope\n${JSON.stringify(r).slice(0, 1500)}`).not.toContain(localTok);
+    // ...and the refusal is NAMED on the entry point's warning channel (a silent refusal hid the cause, as the ps cut did)
+    const said = "out" in r ? String(r.out) : `${r.stdout}\n${r.stderr}`;
+    expect(said, `${entry}: the linked scope's refusal is named\n${said.slice(0, 1500)}`).toMatch(/refusing the remote credential/);
     // control: the same remote with a REAL private scope and its own token → that token is used
     fs.unlinkSync(path.join(c.dir, "agents", `remote-${REMOTE_NAME}-${remote.port}`));
     const scope = path.join(c.dir, "agents", `remote-${REMOTE_NAME}-${remote.port}`);
