@@ -658,7 +658,7 @@ process.stdout.write(JSON.stringify({ tok: await m.remoteToken("203.0.113.10", 3
     expect(r.stderr, "named").toMatch(/refusing the remote credential/);
   }, 60_000);
 
-  it.skipIf(process.platform === "win32")("POSIX: a scope readable by others, or a token file readable by others → refused, named", async () => {
+  it.skipIf(process.platform === "win32")("POSIX, a scope readable by others, or a token file readable by others → refused, named", async () => {
     const c = newCase("scope-priv");
     seedNativeDb(c);
     const scope = scopeOf(c, "203.0.113.10");
