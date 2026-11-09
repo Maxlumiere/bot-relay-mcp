@@ -592,6 +592,39 @@ print(json.dumps(args))
   return 0
 }
 
+# liveness_self_heal_owner — hook PR 2 (as ruled, Q8): the wasm instance's liveness self-heal, on the owner route only
+# (the mail was just read through the door). The gate moves OFF the DB: a per-(instance, agent) cache (0600, in the
+# hook state dir) of the last SUCCESSFULLY reported (pid, start). Current == cache -> no-op, ZERO calls. Otherwise ONE
+# `relay owner liveness` (sealed; report_liveness's own auth with the agent's token inside), inside the budget; only a
+# verified success is cached. The cache is a hint: a wrong one costs at most one idempotent call. No agent token -> no
+# call (as the native self-heal: liveness_self_heal).
+liveness_self_heal_owner() {
+  [ -z "$AGENT_TOKEN" ] && return 0
+  [ "${RELAY_RES_HOOK_DB:-}" = http ] && [ -n "${RELAY_RES_DB_PATH:-}" ] || return 0
+  command -v relay_agent_pid >/dev/null 2>&1 || return 0
+  relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$' || return 0
+  local cur_pid cur_start key sdir cache want have
+  # The walkers' stderr is relay_ps's NAMED cut (nothing else): never discarded.
+  cur_pid=$(relay_agent_pid || printf '')
+  case "$cur_pid" in ''|*[!0-9]*) return 0 ;; esac
+  cur_start=$(relay_pid_start "$cur_pid" || printf '')
+  key=$(printf '%s' "$RELAY_RES_DB_PATH" | cksum 2>/dev/null | cut -d' ' -f1)
+  case "$key" in ''|*[!0-9]*) return 0 ;; esac
+  # Its own state dir (the global STATE_DIR is set later in this hook than this call): the same directory.
+  sdir="${RELAY_HOME:-$HOME/.bot-relay}/hook-state"
+  cache="$sdir/liveness-owner-${key}-${AGENT_NAME}"
+  want="$cur_pid $cur_start"
+  if [ -f "$cache" ] && [ ! -L "$cache" ]; then
+    IFS= read -r have < "$cache" 2>/dev/null || have=""
+    [ "$have" = "$want" ] && return 0
+  fi
+  relay_budget_for "the liveness restamp" 2 margin || return 0
+  relay_owner_liveness "$RELAY_CLI" "$AGENT_NAME" "$RELAY_STEP_SECS" "$cur_pid" "$cur_start" || return 0
+  mkdir -p "$sdir" 2>/dev/null || return 0
+  ( umask 077; printf '%s\n' "$want" > "$cache.$$" 2>/dev/null && mv -f "$cache.$$" "$cache" 2>/dev/null ) || rm -f "$cache.$$" 2>/dev/null
+  return 0
+}
+
 # --- Damper helpers -------------------------------------------------------------
 # notice_is_damped returns 0 (suppress) ONLY on positive evidence: a readable
 # state file holding the SAME fingerprint, with an mtime inside the window and
@@ -813,6 +846,10 @@ if [ "$MODE" = local ] && [ "$READ_OK" -eq 1 ]; then
     relay_hydrate_token
   fi
   liveness_self_heal "$F1_DB"
+fi
+# Hook PR 2 (Q8): the wasm instance's self-heal, through the owner's door (never a native read).
+if [ "$MODE" = remote ] && [ "$READ_OK" -eq 1 ] && [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
+  liveness_self_heal_owner
 fi
 
 # THE ONLY UPGRADE. Positive evidence is a mailbox read that SUCCEEDED. An empty

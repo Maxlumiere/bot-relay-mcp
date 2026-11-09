@@ -165,10 +165,11 @@ relay_hook_db_native_ok() {
   # Only the two wasm verdicts may say "a wasm instance": the others do not know what the instance is.
   then="The hooks read nothing from this DB with sqlite3."
   case "${RELAY_RES_HOOK_DB:-}" in
-    skip-declared-wasm) why="the instance declares sqlite_driver \"wasm\""; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
-    skip-rlyw) why="the DB is stamped for the wasm driver's single owner (RLYW)"; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
+    skip-declared-wasm) why="the instance declares sqlite_driver \"wasm\""; then="Hooks read a wasm DB's mail only through its running owner, and no relay process owns it now: start one (a stdio session or the HTTP daemon)." ;;
+    skip-rlyw) why="the DB is stamped for the wasm driver's single owner (RLYW)"; then="Hooks read a wasm DB's mail only through its running owner, and no relay process owns it now: start one (a stdio session or the HTTP daemon)." ;;
     skip-unreadable) why="the instance's sqlite_driver or the DB header could not be read or judged (fail closed)" ;;
     skip-owner-locked) why="another relay process holds the DB's single-owner lock (a wasm owner, or a conversion running)" ;;
+    skip-no-endpoint) why="the DB's wasm owner is running, but the owner has no hook endpoint (its loopback listener could not open, it is an older relay, or a conversion holds the lock)"; then="Mail may be waiting: call get_messages." ;;
     http) why="the DB belongs to a wasm owner"; then="The hooks read its mail over HTTP from that owner, and nothing else from this DB." ;;
     "(7-line answer)") why="the relay CLI gave a 7-line answer: CLI/hook version skew (update the relay and its hooks together)" ;;
     "(6-line answer)") why="the relay CLI gave a 6-line answer: CLI/hook version skew (update the relay and its hooks together)" ;;
@@ -422,6 +423,35 @@ relay_owner_read() {
   elif [ "$rc" -ne 0 ] && [ -z "$RELAY_OWNER_WHY" ]; then
     RELAY_OWNER_WHY="relay owner peek failed (exit $rc)"
   fi
+  return "$rc"
+}
+
+# relay_owner_liveness CLI AGENT SECS PID [START] — hook PR 2 (as ruled, Q8): the wasm liveness self-heal's ONE door
+# exchange (`relay owner liveness`: sealed to /owner/v1/liveness, where report_liveness runs its normal auth with the
+# agent's own token SEALED in) under the watchdog at SECS. The token is the caller's AGENT_TOKEN, handed to the CLI in
+# its environment (RELAY_AGENT_TOKEN, as relay_owner_tool does): never argv, never a file, never logged. Returns its
+# exit; RELAY_OWNER_WHY names a failure.
+relay_owner_liveness() {
+  local cli="$1" agent="$2" secs="$3" pid="$4" start="${5:-}" outf errf rc ms
+  RELAY_OWNER_WHY=""
+  case "$secs" in ''|*[!0-9]*|0) RELAY_OWNER_WHY="no time budget left for the liveness restamp"; return 125 ;; esac
+  ms=$(( secs * 1000 - 300 ))
+  [ "$ms" -lt 100 ] && ms=100
+  outf="$(mktemp 2>/dev/null || printf '')"
+  errf="$(mktemp 2>/dev/null || printf '')"
+  if [ -z "$outf" ] || [ -z "$errf" ]; then
+    rm -f "$outf" "$errf" 2>/dev/null
+    RELAY_OWNER_WHY="could not create a private temp file for the liveness restamp"
+    return 1
+  fi
+  if [ -n "$start" ]; then
+    RELAY_AGENT_TOKEN="${AGENT_TOKEN:-}" relay_run_pending "$secs" "$outf" "$errf" node "$cli" owner liveness "$agent" --pid "$pid" --start "$start" --timeout-ms "$ms"
+  else
+    RELAY_AGENT_TOKEN="${AGENT_TOKEN:-}" relay_run_pending "$secs" "$outf" "$errf" node "$cli" owner liveness "$agent" --pid "$pid" --timeout-ms "$ms"
+  fi
+  rc=$?
+  RELAY_OWNER_WHY=$(grep -m 1 '^relay owner:' "$errf" 2>/dev/null | tr -cd 'A-Za-z0-9 _./:()=,"-' | cut -c1-300)
+  rm -f "$outf" "$errf" "$outf.timedout" 2>/dev/null
   return "$rc"
 }
 

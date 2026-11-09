@@ -13,7 +13,8 @@ import { startStdioServer } from "./transport/stdio.js";
 import { startHttpServer } from "./transport/http.js";
 import { registerConfigSecret } from "./secret-registry.js";
 import { closeDb, initializeDb } from "./db.js";
-import { markInstanceServer, markStdioServer } from "./sqlite-compat.js";
+import { markInstanceServer, markStdioServer, ownedDbPath } from "./sqlite-compat.js";
+import { OWNER_PEEK_HOST } from "./owner-endpoint.js";
 import { assertInstanceResolution } from "./instance.js";
 import { startOutboxTail, stopOutboxTail } from "./outbox-tail.js";
 import { log } from "./logger.js";
@@ -268,6 +269,20 @@ async function main(): Promise<void> {
     startOutboxTail();
   }
 
+  // Hook PR 2 (as ruled): a STDIO process that OWNS a wasm DB (lock -> DB, above) opens the loopback owner-peek
+  // listener (src/transport/http.ts owner-peek mode: 127.0.0.1, a kernel port, the owner door only), and its v3 record
+  // names it (transport "stdio"), so the hooks reach its agents' mail and liveness through the AEAD door. A failure is
+  // logged and the stdio server keeps serving; the hooks then name "the owner has no hook endpoint". A stdio NATIVE
+  // owner opens none (the hooks read a native DB themselves); `both` needs none (its HTTP listener records itself).
+  let ownerPeekServer: HttpServer | null = null;
+  if (config.transport === "stdio" && ownedDbPath() !== null) {
+    try {
+      ownerPeekServer = startHttpServer(0, OWNER_PEEK_HOST, { ownerPeek: true, ownerTransport: "stdio" });
+    } catch (err) {
+      log.warn(`[owner-endpoint] could not open the owner-peek listener (${(err as Error).message}): the hooks read no mail from this stdio owner.`);
+    }
+  }
+
   if (config.transport === "stdio" || config.transport === "both") {
     await startStdioServer(stdinForMcp);
   }
@@ -280,6 +295,9 @@ async function main(): Promise<void> {
     stopOutboxTail();
     if (httpServer) {
       httpServer.close();
+    }
+    if (ownerPeekServer) {
+      ownerPeekServer.close();
     }
     closeDb();
     process.exit(0);
