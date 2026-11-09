@@ -20,6 +20,7 @@ import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { sandboxEnv } from "./_helpers/sandbox-env.js";
+import ts from "typescript-legacy";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_INDEX = path.join(REPO, "dist", "index.js");
@@ -219,22 +220,25 @@ function relayAsync(c: Case, args: string[], extra: Record<string, string> = {},
 
 // ---------------------------------------------------------------------------------------------------------------------
 // THE SCAN (every OS): every network client SITE in src/cli/, bin/ and tools/ is CLASSIFIED; a new one fails CI.
-// As ruled after #434 R1 (P2-5): a file's LANGUAGE is decided by its extension or, extensionless, its shebang (bin/relay
-// is node); a code site is a fetch call (any spacing), ANY import / require / dynamic import of a network module, or a
-// curl/wget SUBPROCESS; a shell site is a curl/wget invocation. Health probes are not trusted by their line: they all
-// go through relay-client's healthGet (no headers parameter), and a recording row proves it carries no credential.
-type Klass = "door-client" | "relay-client" | "port-probe" | "hooks-family";
+// As ruled after #434 R2 (P2-3): JS/TS is read as SYNTAX (the TypeScript parser over the whole file, so a call split
+// across lines, a bare `import "node:https"` and a comment are all what they are), not as lines. A code site is: a
+// fetch CALL; ANY import / export-from / import-equals / require / dynamic import() of a network module; a dynamic
+// import() or require() whose module is not a literal (it could be anything: a dispatcher, listed); a curl/wget
+// SUBPROCESS (spawn/exec family with that program). A file's language is its extension or, extensionless, its shebang
+// (bin/relay is node). Shell (bin/, tools/) keeps the command-position check for curl/wget.
+type Klass = "door-client" | "relay-client" | "port-probe" | "hooks-family" | "dispatch";
 const HTTP_REGISTRY: Record<string, Record<string, { n: number; klass: Klass }>> = {
   "src/cli/owner.ts": { net: { n: 1, klass: "door-client" } },
   "src/cli/relay-client.ts": { net: { n: 2, klass: "relay-client" } },
   "src/cli/mint-token.ts": { net: { n: 1, klass: "port-probe" } },
   "src/cli/open.ts": { net: { n: 1, klass: "port-probe" } },
   "src/cli/recover.ts": { net: { n: 1, klass: "port-probe" } },
+  // the subcommand dispatcher: import(`../dist/cli/${sub}.js`), whose targets are src/cli/*, scanned here themselves
+  "bin/relay": { "import(?)": { n: 1, klass: "dispatch" } },
   "bin/codex-relay": { curl: { n: 2, klass: "hooks-family" } },
 };
-const NET_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)["'`](?:node:)?(?:https?|http2|net|tls|undici|dgram)["'`]/g;
-const FETCH_RE = /\bfetch\s*\(/g;
-const SUBPROC_RE = /\b(?:spawn|spawnSync|execFile|execFileSync|exec|execSync|fork)\s*\(\s*["'`](?:[^"'`]*[\\/])?(?:curl|wget)(?:\.exe)?\b/g;
+const NET_MODULE = /^(?:node:)?(?:https?|http2|net|tls|undici|dgram)$/;
+const SUBPROC = new Set(["spawn", "spawnSync", "execFile", "execFileSync", "exec", "execSync", "fork"]);
 // curl/wget at a command position followed by an argument (not `route=curl`, `command -v curl` or `= curl ]`).
 const SHELL_RE = /(?:^|[\s;|&(!`])(?:curl|wget)\s+[-"'$\w]/g;
 function langOf(file: string, src: string): "code" | "shell" | null {
@@ -244,16 +248,40 @@ function langOf(file: string, src: string): "code" | "shell" | null {
   if (/^#!.*\b(?:ba|z|da|k)?sh\b/.test(src)) return "shell";
   return null;
 }
+const calleeName = (e: ts.Expression): string | null => (ts.isIdentifier(e) ? e.text : ts.isPropertyAccessExpression(e) ? e.name.text : null);
+/** Every site in one file, by kind ("fetch", "net", "import(?)", "require(?)", "subprocess", "curl"; "health" = healthGet calls). */
 function httpSites(file: string, src: string): Record<string, string[]> {
   const out: Record<string, string[]> = {};
   const lang = langOf(file, src);
   if (!lang) return out;
-  const pats: Record<string, RegExp> = lang === "code" ? { fetch: FETCH_RE, net: NET_RE, subprocess: SUBPROC_RE } : { curl: SHELL_RE };
-  src.split("\n").forEach((line, i) => {
-    const t = line.trim();
-    if (lang === "shell" ? t.startsWith("#") : /^(\/\/|\*|\/\*)/.test(t)) return;
-    for (const [k, re] of Object.entries(pats)) for (const _m of line.matchAll(re)) (out[k] ??= []).push(`${file}:${i + 1}: ${t.slice(0, 140)}`);
-  });
+  if (lang === "shell") {
+    src.split("\n").forEach((line, i) => {
+      const t = line.trim();
+      if (t.startsWith("#")) return;
+      for (const _m of line.matchAll(SHELL_RE)) (out.curl ??= []).push(`${file}:${i + 1}: ${t.slice(0, 140)}`);
+    });
+    return out;
+  }
+  const sf = ts.createSourceFile(file, src.replace(/^#!.*/, ""), ts.ScriptTarget.Latest, true, /\.(ts|mts|cts)$/.test(file) ? ts.ScriptKind.TS : ts.ScriptKind.JS);
+  const add = (k: string, n: ts.Node) => (out[k] ??= []).push(`${file}:${sf.getLineAndCharacterOfPosition(n.getStart()).line + 1}: ${n.getText().replace(/\s+/g, " ").slice(0, 140)}`);
+  const visit = (n: ts.Node): void => {
+    if ((ts.isImportDeclaration(n) || ts.isExportDeclaration(n)) && n.moduleSpecifier && ts.isStringLiteralLike(n.moduleSpecifier) && NET_MODULE.test(n.moduleSpecifier.text)) add("net", n);
+    if (ts.isImportEqualsDeclaration(n) && ts.isExternalModuleReference(n.moduleReference) && ts.isStringLiteralLike(n.moduleReference.expression) && NET_MODULE.test(n.moduleReference.expression.text)) add("net", n);
+    if (ts.isCallExpression(n)) {
+      const a0 = n.arguments[0];
+      const name = calleeName(n.expression);
+      if (n.expression.kind === ts.SyntaxKind.ImportKeyword || name === "require") {
+        const k = name === "require" ? "require(?)" : "import(?)";
+        if (!a0 || !ts.isStringLiteralLike(a0)) add(k, n);
+        else if (NET_MODULE.test(a0.text)) add("net", n);
+      }
+      if (name === "fetch") add("fetch", n);
+      if (name && SUBPROC.has(name) && a0 && ts.isStringLiteralLike(a0) && /(?:^|[\\/])(?:curl|wget)(?:\.exe)?$/.test(a0.text)) add("subprocess", n);
+      if (name === "healthGet" || name === "healthGetHost") add("health", n);
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
   return out;
 }
 function walk(dir: string): string[] {
@@ -264,47 +292,83 @@ function walk(dir: string): string[] {
     return e.isDirectory() ? walk(p) : [p];
   });
 }
+/** The tree's sites (health calls kept apart: they are asserted per verb, not registered). */
+function scanTree(): { sites: Record<string, Record<string, string[]>>; health: Record<string, number>; scanned: number } {
+  const sites: Record<string, Record<string, string[]>> = {};
+  const health: Record<string, number> = {};
+  let scanned = 0;
+  for (const f of [...walk(path.join(REPO, "src", "cli")), ...walk(path.join(REPO, "bin")), ...walk(path.join(REPO, "tools"))]) {
+    const rel = path.relative(REPO, f).split(path.sep).join("/");
+    const src = fs.readFileSync(f, "utf-8");
+    if (langOf(rel, src)) scanned++;
+    const { health: h, ...rest } = httpSites(rel, src);
+    if (h) health[rel] = h.length;
+    if (Object.keys(rest).length > 0) sites[rel] = rest;
+  }
+  return { sites, health, scanned };
+}
+/** Where the found sites differ from the registry ([] = every site classified, none stale). */
+function registryDiff(sites: Record<string, Record<string, string[]>>): string[] {
+  const out: string[] = [];
+  const keys = new Set([...Object.keys(sites), ...Object.keys(HTTP_REGISTRY)]);
+  for (const f of keys) {
+    const kinds = new Set([...Object.keys(sites[f] ?? {}), ...Object.keys(HTTP_REGISTRY[f] ?? {})]);
+    for (const k of kinds) {
+      const got = sites[f]?.[k]?.length ?? 0;
+      const want = HTTP_REGISTRY[f]?.[k]?.n ?? 0;
+      if (got !== want) out.push(`${f} ${k}: found ${got}, registered ${want}${got ? ` (${sites[f]![k]!.join(" | ")})` : ""}`);
+    }
+  }
+  return out;
+}
 
 describe("PR 4: every HTTP client call site in src/cli, bin and tools is classified (a scan, every OS)", () => {
-  it("NEGATIVE CONTROLS (#434 R1 P2-5): each client form is a site, in every language the tree uses", () => {
-    const n = (file: string, src: string, k: string) => (httpSites(file, src)[k] ?? []).length;
-    expect(n("src/cli/x.ts", 'const r = await fetch(`${base}/mcp`, { headers: { "X-Agent-Token": t } });', "fetch"), "fetch(").toBe(1);
-    expect(n("src/cli/x.ts", "const r = await fetch (url, init);", "fetch"), "fetch (url").toBe(1);
-    expect(n("src/cli/x.ts", 'const h = await import("node:https");\nh.request(o);', "net"), "a dynamic import of node:https").toBe(1);
-    expect(n("src/cli/x.ts", 'const h = require("http");', "net"), "require(http)").toBe(1);
-    expect(n("src/cli/x.ts", 'import * as u from "undici";', "net"), "undici").toBe(1);
-    expect(n("src/cli/x.ts", 'spawn("curl", ["-s", url]);', "subprocess"), "spawn(curl)").toBe(1);
-    expect(n("src/cli/x.ts", 'execFileSync("/usr/bin/wget", [url]);', "subprocess"), "execFile(wget)").toBe(1);
-    expect(n("bin/relay-x", "#!/usr/bin/env node\nfetch(url);", "fetch"), "an extensionless NODE file in bin").toBe(1);
-    expect(n("tools/x.sh", 'curl -fsS "$url"', "curl"), "a tools/ shell script").toBe(1);
-    expect(n("bin/x", "#!/usr/bin/env bash\nwget -q \"$u\"", "curl"), "an extensionless shell file, wget").toBe(1);
-    expect(n("bin/x", '#!/bin/sh\ncommand -v curl >/dev/null && route=curl', "curl"), "control: not an invocation").toBe(0);
+  it("NEGATIVE CONTROLS (#434 R1 P2-5, R2 P2-3): each forbidden form, ADDED to the real tree, makes the registry check FAIL", () => {
+    const { sites } = scanTree();
+    expect(registryDiff(sites), "control: the real tree is clean").toEqual([]);
+    const forms: Array<[string, string, string]> = [
+      ["src/cli/x.ts", 'const r = await fetch(`${base}/mcp`, { headers: { "X-Agent-Token": t } });', "fetch("],
+      ["src/cli/x.ts", "const r = await fetch\n  (url, init);", "a fetch split across lines"],
+      ["src/cli/x.ts", "const r = await globalThis.fetch(url);", "globalThis.fetch("],
+      ["src/cli/x.ts", 'const h = await import(\n  "node:https"\n);\nh.request(o);', "a dynamic import split across lines"],
+      ["src/cli/x.ts", 'import "node:https";', "a bare import"],
+      ["src/cli/x.ts", 'import type { IncomingMessage } from "http";', "a type-only import (still a network module)"],
+      ["src/cli/x.ts", 'export { request } from "node:http";', "a re-export"],
+      ["src/cli/x.ts", 'const h = require(\n  "http"\n);', "require split across lines"],
+      ["src/cli/x.ts", 'import * as u from "undici";', "undici"],
+      ["src/cli/x.ts", "const m = await import(name);", "a dynamic import of a non-literal"],
+      ["src/cli/x.ts", 'spawn(\n  "curl",\n  ["-s", url]\n);', "spawn(curl) split across lines"],
+      ["src/cli/x.ts", 'execFileSync("/usr/bin/wget", [url]);', "execFile(wget)"],
+      ["bin/relay-x", "#!/usr/bin/env node\nfetch(url);", "an extensionless NODE file in bin"],
+      ["tools/x.sh", 'curl -fsS "$url"', "a tools/ shell script"],
+      ["bin/x", '#!/usr/bin/env bash\nwget -q "$u"', "an extensionless shell file, wget"],
+    ];
+    for (const [file, src, what] of forms) {
+      const planted = { ...sites, [file]: httpSites(file, src) };
+      expect(registryDiff(planted).length, `${what}: the registry check must FAIL`).toBeGreaterThan(0);
+    }
+    for (const [file, src, what] of [
+      ["bin/x", '#!/bin/sh\ncommand -v curl >/dev/null && route=curl', "a shell mention, not an invocation"],
+      ["src/cli/x.ts", "// fetch(url)\n/* import(\"node:https\") */ const s = \"fetch(x)\";", "comments and strings"],
+    ] as const) {
+      expect(registryDiff({ ...sites, [file]: httpSites(file, src) }), `${what}: not a site`).toEqual([]);
+    }
   });
 
-  it("each site is in the registry with its class; no fetch anywhere; every health probe is healthGet; port probes write nothing; the credential verbs use relay-client", () => {
-    const files = [...walk(path.join(REPO, "src", "cli")), ...walk(path.join(REPO, "bin")), ...walk(path.join(REPO, "tools"))];
-    const found: Record<string, Record<string, string[]>> = {};
-    let scanned = 0;
-    for (const f of files) {
-      const rel = path.relative(REPO, f).split(path.sep).join("/");
-      const src = fs.readFileSync(f, "utf-8");
-      if (langOf(rel, src)) scanned++;
-      const s = httpSites(rel, src);
-      if (Object.keys(s).length > 0) found[rel] = s;
-    }
+  it("each site is in the registry with its class; no fetch anywhere; every health probe is a healthGet CALL; port probes write nothing; the credential verbs use relay-client", () => {
+    const { sites, health, scanned } = scanTree();
     expect(scanned, "precondition: the scan reads the CLI, bin and tools").toBeGreaterThan(30);
     expect(langOf("bin/relay", fs.readFileSync(path.join(REPO, "bin", "relay"), "utf-8")), "precondition: bin/relay is read as code").toBe("code");
-    const shape = (o: Record<string, Record<string, unknown[]>>) =>
-      Object.fromEntries(Object.entries(o).map(([f, ps]) => [f, Object.fromEntries(Object.entries(ps).map(([p, v]) => [p, v.length]))]));
-    const want = Object.fromEntries(Object.entries(HTTP_REGISTRY).map(([f, ps]) => [f, Object.fromEntries(Object.entries(ps).map(([p, v]) => [p, v.n]))]));
-    expect(shape(found), `every site classified (found:\n${Object.values(found).flatMap((p) => Object.values(p).flat()).join("\n")})`).toEqual(want);
+    expect(registryDiff(sites), "every site classified").toEqual([]);
     for (const [f, ps] of Object.entries(HTTP_REGISTRY)) {
       if (ps.net?.klass !== "port-probe") continue;
       const src = fs.readFileSync(path.join(REPO, f), "utf-8");
       expect(src, `${f}: a port probe only connects (it writes nothing to the socket)`).not.toMatch(/\b(?:sock|socket|s|conn)\.(?:write|end)\s*\(\s*[^)\s]/);
     }
+    // a CALL node, never a comment: R2 found the old text match satisfied by comments alone
+    expect(httpSites("src/cli/x.ts", "// healthGet(t)\nconst s = 'healthGetHost(h)';").health ?? [], "control: comments and strings are no call").toEqual([]);
     for (const f of ["doctor.ts", "init.ts", "watch.ts", "test.ts", "pair.ts"]) {
-      expect(fs.readFileSync(path.join(REPO, "src", "cli", f), "utf-8"), `${f}'s health probe is relay-client's healthGet`).toMatch(/\bhealthGet\s*\(/);
+      expect(health[`src/cli/${f}`] ?? 0, `${f}'s health probe is a healthGet / healthGetHost CALL`).toBeGreaterThan(0);
     }
     for (const f of ["send.ts", "resolve.ts", "pair.ts", "doctor.ts", "test.ts"]) {
       expect(fs.readFileSync(path.join(REPO, "src", "cli", f), "utf-8"), `${f} reaches its relay through relay-client`).toMatch(/from "\.\/relay-client\.js"|import\("\.\/relay-client\.js"\)/);
@@ -699,3 +763,72 @@ describe("#434 R1 P2-5: every health probe is credential-free BY RECORDING", () 
 function m_parseHeaders(reqs: Array<{ method: string; url: string; headers: http.IncomingHttpHeaders }>): string[] {
   return reqs.map((q) => `${q.method} ${q.url} ${Object.keys(q.headers).sort().join(",")}`);
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// #434 Codex R2 (each RED from the review's own inputs).
+const DIST_OWNER = pathToFileURL(path.join(REPO, "dist", "cli", "owner.js")).href;
+/** A listener that answers 200 and then trickles one byte every 30 ms for `secs` (a stale owner port, a slow thief). */
+async function trickler(secs = 40, host = "127.0.0.1", atPort = 0) {
+  const s = http.createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    let n = 0;
+    const t = setInterval(() => {
+      res.write("x");
+      if (++n > (secs * 1000) / 30) {
+        clearInterval(t);
+        res.end();
+      }
+    }, 30);
+    res.on("close", () => clearInterval(t));
+  });
+  servers.push(s);
+  await new Promise<void>((r, j) => {
+    s.once("error", j);
+    s.listen(atPort, host, () => r());
+  });
+  return (s.address() as { port: number }).port;
+}
+
+describe("#434 R2 P2-2: the owner door's deadline is ABSOLUTE (send, resolve, doctor's local token check)", () => {
+  it("doorExchange and localTool with a 70 ms deadline against a 30 ms trickle → rejected near 70 ms, not when the reply ends", async () => {
+    const c = newCase("door-deadline");
+    const token = seedNativeDb(c);
+    const d = await startDaemon(c);
+    const port = await trickler();
+    // the record now names the trickler's port (a stale record / a thief on the port): the door client must give up on time
+    fs.writeFileSync(c.record, JSON.stringify({ ...readRecord(c), port }), { mode: 0o600 });
+    const r = await probeAsync(c, `const o = await import(${JSON.stringify(DIST_OWNER)});
+const rec = JSON.parse((await import("node:fs")).readFileSync(${JSON.stringify(c.record)}, "utf-8"));
+const time = async (f) => { const s = Date.now(); try { await f(); return { ok: true, ms: Date.now() - s }; } catch (e) { return { ok: false, ms: Date.now() - s, why: String(e.message) }; } };
+const exchange = await time(() => o.doorExchange(rec.port, rec.key, { instance_id: rec.instance_id, db_path: rec.db_path }, "/owner/v1/tool", { agent_name: "x", args: {} }, Date.now() + 70));
+const out = { exchange };
+for (const tool of ["send_message", "resolve_messages", "health_check"]) out[tool] = await time(() => m.localTool(tool, {}, { agentToken: ${JSON.stringify(token)} }, { timeoutMs: 70 }));
+process.stdout.write(JSON.stringify(out));`);
+    await stopDaemon(d.child);
+    expect(r.status, r.stderr).toBe(0);
+    const o = JSON.parse(r.stdout) as Record<string, { ok: boolean; ms: number; why?: string }>;
+    for (const [k, v] of Object.entries(o)) {
+      expect(v.ok, `${k}: rejected (${JSON.stringify(v)})`).toBe(false);
+      expect(v.ms, `${k}: near its 70 ms deadline, not the trickle's end (${JSON.stringify(v)})`).toBeLessThan(1000);
+    }
+  }, 120_000);
+});
+
+describe.skipIf(!V6_LOOPBACK)("#434 R2 P2-4: the self-pair guard compares the checked ADDRESS and the port (skipped by name where ::1 cannot be bound)", () => {
+  it("an owner on 127.0.0.1:P + a trusted tunnel on [::1]:P → pair proceeds to ::1; `pair http://127.0.0.1:P` (the owner's own address) → refused", async () => {
+    const c = newCase("pair-self-v6");
+    seedNativeDb(c);
+    const d = await startDaemon(c);
+    const P = readRecord(c).port;
+    const v6 = await recorder("::1", undefined, P).catch(() => null);
+    expect(v6, "precondition: a ::1 listener on the owner's port").not.toBeNull();
+    const env = { RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(P) };
+    const secret = "pr4-v6-hub-secret-bbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+    const go = await relayAsync(c, ["pair", `http://[::1]:${P}`, "--name", "pr4-v6-self", "--yes", "--output", path.join(c.home, "v6.json"), "--secret-stdin"], env, secret);
+    expect(go.stderr, "the ::1 tunnel is not this machine's own relay").not.toMatch(/this machine's own relay/);
+    expect(v6!.reqs.map((q) => `${q.method} ${q.url}`), `the ::1 tunnel was paired\n${go.stderr}`).toEqual(["GET /health", "POST /mcp"]);
+    const self = await relayAsync(c, ["pair", `http://127.0.0.1:${P}`, "--name", "pr4-v4-self", "--yes", "--output", path.join(c.home, "v4.json"), "--secret-stdin"], env, secret);
+    expect(self.stderr).toMatch(new RegExp(`127\\.0\\.0\\.1:${P} is this machine's own relay, not a hub`));
+    await stopDaemon(d.child);
+  }, 120_000);
+});

@@ -1645,6 +1645,46 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the de
     expect(proxy.requests.length, `${entry}: zero requests at the proxy`).toBe(0);
   }, 120_000);
 
+  // #434 R2 P2-1: a REMOTE's credentials (its token, its registration secret) are read only through the trusted chain
+  // (relay remote read: the scope a real private directory, no link, the file the one checked): a scope LINKED to the
+  // local vault must put ZERO bytes of the local token or the local registration secret at the remote.
+  const linkScope = (c: Case, target: string, port: number) => {
+    fs.mkdirSync(path.join(c.dir, "agents"), { recursive: true, mode: 0o700 });
+    fs.symlinkSync(target, path.join(c.dir, "agents", `remote-${REMOTE_NAME}-${port}`), "dir");
+  };
+  it.each(ENTRY_POINTS)("R2 P2-1 (%s): a remote's scope LINKED to the local agents/ → zero bytes of the local token at the remote; a real private scope's own token → reaches it (control)", async (entry) => {
+    const c = newCase(`r2-scope-link-${entry.replace(/[^a-z0-9]/gi, "")}`);
+    const localTok = seedNativeDb(c);
+    fs.mkdirSync(path.join(c.dir, "agents"), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(c.dir, "agents", `${AGENT}.token`), `${localTok}\n`, { mode: 0o600 });
+    const remote = await spy();
+    linkScope(c, path.join(c.dir, "agents"), remote.port);
+    const env = { RELAY_AGENT_TOKEN: "", RELAY_HTTP_HOST: REMOTE_NAME, RELAY_HTTP_PORT: String(remote.port) };
+    const r = await runEntry(c, entry, env, pinnedRemoteHooks());
+    expect(remote.bytes(), `${entry}: the LOCAL token never reaches the remote through a linked scope\n${JSON.stringify(r).slice(0, 1500)}`).not.toContain(localTok);
+    // control: the same remote with a REAL private scope and its own token → that token is used
+    fs.unlinkSync(path.join(c.dir, "agents", `remote-${REMOTE_NAME}-${remote.port}`));
+    const scope = path.join(c.dir, "agents", `remote-${REMOTE_NAME}-${remote.port}`);
+    fs.mkdirSync(scope, { mode: 0o700 });
+    const ownTok = `pr4-remote-own-token-${crypto.randomBytes(8).toString("hex")}`;
+    fs.writeFileSync(path.join(scope, `${AGENT}.token`), `${ownTok}\n`, { mode: 0o600 });
+    const ok = await runEntry(c, entry, env, pinnedRemoteHooks());
+    expect(remote.bytes(), `${entry}: control: the remote's own token reaches it\n${JSON.stringify(ok).slice(0, 1500)}`).toContain(ownTok);
+  }, 120_000);
+  it.each(["check-relay.sh", "codex/codex-session-start.sh", "bin/codex-relay"] as const)("R2 P2-1 (%s): a remote's scope LINKED to the local secrets/ → zero bytes of the local registration secret at the remote", async (entry) => {
+    const c = newCase(`r2-mint-link-${entry.replace(/[^a-z0-9]/gi, "")}`);
+    seedNativeDb(c);
+    const secrets = path.join(c.dir, "secrets");
+    fs.mkdirSync(secrets, { recursive: true, mode: 0o700 });
+    const localSecret = `pr4-local-mint-secret-${crypto.randomBytes(16).toString("hex")}`;
+    fs.writeFileSync(path.join(secrets, "mint.secret"), `${localSecret}\n`, { mode: 0o600 });
+    const remote = await spy();
+    linkScope(c, secrets, remote.port);
+    const env = { RELAY_AGENT_TOKEN: "", RELAY_HTTP_HOST: REMOTE_NAME, RELAY_HTTP_PORT: String(remote.port) };
+    const r = await runEntry(c, entry, env, pinnedRemoteHooks());
+    expect(remote.bytes(), `${entry}: the LOCAL registration secret never reaches the remote\n${JSON.stringify(r).slice(0, 1500)}`).not.toContain(localSecret);
+  }, 120_000);
+
   // #433 R2 P1-1: relay pending's exit 3 is a ROUTING policy, not evidence that no local DB exists. An AUTO-DISCOVERED
   // flat DB (no RELAY_DB_PATH, no RELAY_INSTANCE_ID), a loopback host and a matching tunnel opt-in: the local vault's
   // UNSCOPED token must never go over the tunnel.
