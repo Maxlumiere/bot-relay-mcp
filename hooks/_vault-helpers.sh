@@ -576,14 +576,8 @@ relay_remote_scoped_read() {
 relay_mint_secret_curl_config() {
   local file secret=""
   file=$(relay_mint_secret_file) || return 1
-  if [ -n "${RELAY_VAULT_SCOPE:-}" ]; then
-    # a REMOTE's own secret: only through the trusted reader (a linked scope is refused, never followed)
-    { [ -e "$file" ] || [ -L "$file" ]; } || return 1
-    secret=$(relay_remote_scoped_read read-secret mint) || return 1
-  else
-    [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
-    IFS= read -r secret < "$file" || [ -n "$secret" ] || return 1
-  fi
+  [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
+  IFS= read -r secret < "$file" || [ -n "$secret" ] || return 1
   # Shape check mirrors src/mint-secret.ts (>= 32 chars of printable ASCII, no
   # space, no quote, no backslash): nothing that could end the quoted curl config
   # value or add a directive. LC_ALL=C so the range is bytes, not locale letters.
@@ -600,22 +594,12 @@ relay_mint_secret_curl_config() {
 read_relay_token_from_vault() {
   local name="$1"
   local token_path
-  # A local vault miss is a clean cache miss (nothing to say). What it lets through on stderr are NAMED refusals only
-  # (an invalid agent name, from resolve_relay_token_path; a remote scope's refusal, from relay remote read-token), so
-  # callers must not discard stderr.
   token_path=$(resolve_relay_token_path "$name") || return 1
-  local token
-  if [ -n "${RELAY_VAULT_SCOPE:-}" ]; then
-    # #434 R2 P2-1: a REMOTE's token only through the trusted reader (a scope linked to the local vault, or to another
-    # remote's, is refused there, never followed here).
-    { [ -e "$token_path" ] || [ -L "$token_path" ]; } || return 1
-    token=$(relay_remote_scoped_read read-token "$name" | tr -d '[:space:]')
-  else
-    if [ ! -f "$token_path" ]; then
-      return 1
-    fi
-    token=$(head -n 1 "$token_path" 2>/dev/null | tr -d '[:space:]')
+  if [ ! -f "$token_path" ]; then
+    return 1
   fi
+  local token
+  token=$(head -n 1 "$token_path" 2>/dev/null | tr -d '[:space:]')
   if [ -z "$token" ]; then
     return 1
   fi
