@@ -1653,18 +1653,30 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the de
     fs.symlinkSync(target, path.join(c.dir, "agents", `remote-${REMOTE_NAME}-${port}`), "dir");
   };
   it.each(ENTRY_POINTS)("R2 P2-1 (%s): a remote's scope LINKED to the local agents/ → zero bytes of the local token at the remote; a real private scope's own token → reaches it (control)", async (entry) => {
-    const c = newCase(`r2-scope-link-${entry.replace(/[^a-z0-9]/gi, "")}`);
-    // stop-check and post-tool-use read a vault ONLY in remote mode, which they take only when no local instance exists
-    // ("REMOTE mode only: never called when a local instance exists"): for them the instance holds a local vault token
-    // and NO DB, or this row would never reach their vault read (vacuous). The others take the remote route with a DB.
+    // stop-check and post-tool-use read a vault ONLY in remote mode, which they take only when NO local instance exists
+    // ("REMOTE mode only: never called when a local instance exists"). An explicit RELAY_DB_PATH IS a local instance,
+    // even when its file is absent (the probe on #437 measured "PENDING_FAILED: no relay DB at … (RELAY_DB_PATH)").
+    // So for them: an AUTO-DISCOVERED home (no DB/config override) holding a local vault token and NO DB; else this row
+    // never reaches their vault read (vacuous). The others take the remote route with a DB.
     const remoteModeOnly = entry === "stop-check.sh" || entry === "post-tool-use-check.sh";
+    const tag = `r2-scope-link-${entry.replace(/[^a-z0-9]/gi, "")}`;
+    const c: Case = remoteModeOnly
+      ? (() => {
+          const home = fs.mkdtempSync(path.join(ROOT, `${tag}-`));
+          const dir = path.join(home, ".bot-relay");
+          fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+          return { home, dir, db: path.join(dir, "relay.db"), cfg: path.join(dir, "config.json"), record: path.join(dir, ".relay.db.relay-owner.json") };
+        })()
+      : newCase(tag);
+    const go = (e: Record<string, string>) => (remoteModeOnly ? runHook(c, entry, e, inputFor(entry), pinnedRemoteHooks(), true) : runEntry(c, entry, e, pinnedRemoteHooks()));
     const localTok = remoteModeOnly ? `pr4-a-local-vault-token-${crypto.randomBytes(8).toString("hex")}` : seedNativeDb(c);
     fs.mkdirSync(path.join(c.dir, "agents"), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(c.dir, "agents", `${AGENT}.token`), `${localTok}\n`, { mode: 0o600 });
     const remote = await spy();
     linkScope(c, path.join(c.dir, "agents"), remote.port);
     const env = { RELAY_AGENT_TOKEN: "", RELAY_HTTP_HOST: REMOTE_NAME, RELAY_HTTP_PORT: String(remote.port) };
-    const r = await runEntry(c, entry, env, pinnedRemoteHooks());
+    const r = await go(env);
+    if (remoteModeOnly) expect(fs.existsSync(c.db), "precondition: no local DB (remote mode)").toBe(false);
     expect(remote.bytes(), `${entry}: the LOCAL token never reaches the remote through a linked scope\n${JSON.stringify(r).slice(0, 1500)}`).not.toContain(localTok);
     // ...and the refusal is NAMED on the entry point's warning channel (a silent refusal hid the cause, as the ps cut did)
     const said = "out" in r ? String(r.out) : `${r.stdout}\n${r.stderr}`;
@@ -1675,7 +1687,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the de
     fs.mkdirSync(scope, { mode: 0o700 });
     const ownTok = `pr4-remote-own-token-${crypto.randomBytes(8).toString("hex")}`;
     fs.writeFileSync(path.join(scope, `${AGENT}.token`), `${ownTok}\n`, { mode: 0o600 });
-    const ok = await runEntry(c, entry, env, pinnedRemoteHooks());
+    const ok = await go(env);
     expect(remote.bytes(), `${entry}: control: the remote's own token reaches it\n${JSON.stringify(ok).slice(0, 1500)}`).toContain(ownTok);
   }, 120_000);
   it.each(["check-relay.sh", "codex/codex-session-start.sh", "bin/codex-relay"] as const)("R2 P2-1 (%s): a remote's scope LINKED to the local secrets/ → zero bytes of the local registration secret at the remote", async (entry) => {
