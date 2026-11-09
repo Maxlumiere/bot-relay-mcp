@@ -39,7 +39,10 @@
 - **Changed:** every CLI health probe (`doctor`, `init`, `watch`, `test`, `pair`) uses one credential-free request (no headers of its own).
 - **Fixed:** the owner door's body limit fits the largest valid call (a message at `RELAY_MAX_PAYLOAD_BYTES`, however it is escaped); it is still bounded.
 - **Changed:** a remote's credential files are read only through real, private directories (a link or junction is refused, so a remote's scope can never point at the local vault or another remote's), and a directory replaced while it is read is refused, named.
-- A scan row classifies every network client in `src/cli/`, `bin/` and `tools/` (by language: a fetch call, any network-module import, a curl or wget subprocess, a curl or wget command); a new one fails CI until it is classified.
+- **Changed:** the hooks and `codex-relay` read a remote's token and registration secret only through `relay remote read-token` / `read-secret <host:port>` (the same trusted read: a scope linked to the local vault or to another remote's is refused, named, and nothing is sent).
+- **Fixed:** a local CLI call through the owner door has an absolute deadline: a stale owner port that trickles bytes can no longer keep `send`, `resolve` or `doctor` waiting past it.
+- **Fixed:** `relay pair`'s self-pair check compares the address as well as the port, so a tunnel on `[::1]:P` is not mistaken for a local relay on `127.0.0.1:P`.
+- A scan row classifies every network client in `src/cli/`, `bin/` and `tools/`, reading JS/TS as syntax (a fetch call, any network-module import or re-export, a dynamic import of a non-literal, a curl or wget subprocess) and shell by command position; a new one fails CI until it is classified.
 
 ### BREAKING (5.0.0): one wasm mode (the single owner), and `relay convert-journal`
 

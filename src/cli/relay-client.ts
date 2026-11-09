@@ -318,6 +318,8 @@ async function scopedLine(host: string, port: number, name: string): Promise<str
     if (fd !== null) fs.closeSync(fd);
   }
 }
+/** The trusted chain read, for `relay remote read-token / read-secret` (the hooks' and the launcher's only way in). */
+export const readRemoteScoped = (host: string, port: number, name: string): Promise<string | null> => scopedLine(host, port, name);
 /**
  * The agent token for a REMOTE (as ruled on #434): RELAY_AGENT_TOKEN ONLY when the SAME environment selected that
  * remote (RELAY_HTTP_HOST names it: `envSelected`), because a launcher-set token usually belongs to the LOCAL relay;

@@ -564,11 +564,26 @@ relay_remote_mint_hint() {
   printf "provision the remote's mint secret: relay remote set-mint-secret %s:%s, reading STDIN" "${RELAY_HTTP_HOST:-127.0.0.1}" "${RELAY_HTTP_PORT:-3777}"
 }
 
+# relay_remote_scoped_read <read-token AGENT | read-secret KIND> — #434 R2 P2-1: a REMOTE scope's credential ONLY
+# through the trusted chain reader (`relay remote read-*`: real private directories, no link, the file the one checked;
+# a refusal is named on stderr), under the budget. The value on stdout (for a command substitution); non-zero and
+# nothing on a miss or a refusal. The shell never opens a remote scope's credential itself.
+relay_remote_scoped_read() {
+  relay_budget_for "a remote credential read" 3 "${RELAY_REMOTE_READ_BUDGET:-margin}" || return 1
+  relay_run_streamed "$RELAY_STEP_SECS" node "$(relay_helpers_cli)" remote "$1" "${RELAY_HTTP_HOST:-127.0.0.1}:${RELAY_HTTP_PORT:-3777}" "$2"
+}
+
 relay_mint_secret_curl_config() {
   local file secret=""
   file=$(relay_mint_secret_file) || return 1
-  [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
-  IFS= read -r secret < "$file" || [ -n "$secret" ] || return 1
+  if [ -n "${RELAY_VAULT_SCOPE:-}" ]; then
+    # a REMOTE's own secret: only through the trusted reader (a linked scope is refused, never followed)
+    { [ -e "$file" ] || [ -L "$file" ]; } || return 1
+    secret=$(relay_remote_scoped_read read-secret mint) || return 1
+  else
+    [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
+    IFS= read -r secret < "$file" || [ -n "$secret" ] || return 1
+  fi
   # Shape check mirrors src/mint-secret.ts (>= 32 chars of printable ASCII, no
   # space, no quote, no backslash): nothing that could end the quoted curl config
   # value or add a directive. LC_ALL=C so the range is bytes, not locale letters.
@@ -586,11 +601,18 @@ read_relay_token_from_vault() {
   local name="$1"
   local token_path
   token_path=$(resolve_relay_token_path "$name") || return 1
-  if [ ! -f "$token_path" ]; then
-    return 1
-  fi
   local token
-  token=$(head -n 1 "$token_path" 2>/dev/null | tr -d '[:space:]')
+  if [ -n "${RELAY_VAULT_SCOPE:-}" ]; then
+    # #434 R2 P2-1: a REMOTE's token only through the trusted reader (a scope linked to the local vault, or to another
+    # remote's, is refused there, never followed here).
+    { [ -e "$token_path" ] || [ -L "$token_path" ]; } || return 1
+    token=$(relay_remote_scoped_read read-token "$name" | tr -d '[:space:]')
+  else
+    if [ ! -f "$token_path" ]; then
+      return 1
+    fi
+    token=$(head -n 1 "$token_path" 2>/dev/null | tr -d '[:space:]')
+  fi
   if [ -z "$token" ]; then
     return 1
   fi

@@ -352,7 +352,8 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   // The SELF-PAIR guard (as ruled; a correctness check, not a security predicate): two processes cannot both bind one
-  // port, so a TRUSTED local owner record naming the tunnel's port means the "hub" IS this machine's own relay.
+  // ADDRESS and port, so a TRUSTED local owner record naming the tunnel's port, at the address the owner door is reached
+  // at, means the "hub" IS this machine's own relay.
   if (isTunnel) {
     try {
       const { resolveInstance } = await import("../instance.js");
@@ -360,7 +361,9 @@ export async function run(argv: string[]): Promise<number> {
       const r = resolveInstance({});
       if (r.kind !== "error" && fs.existsSync(r.dbPath)) {
         const v = ownerEndpointVerdict(r.dbPath, r.kind === "instance" ? r.id : "");
-        if (v.ok && v.port === hubPort) {
+        // #434 R2 P2-4: the ADDRESS too: an owner on 127.0.0.1:P and a tunnel on [::1]:P are two listeners.
+        const { OWNER_DOOR_HOST } = await import("./owner.js");
+        if (v.ok && v.port === hubPort && hubRoute.kind === "local" && hubRoute.ip === OWNER_DOOR_HOST) {
           process.stderr.write(`relay pair: 127.0.0.1:${hubPort} is this machine's own relay, not a hub. Nothing is sent.\n`);
           return 1;
         }

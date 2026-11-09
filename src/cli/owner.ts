@@ -110,6 +110,8 @@ function parse(argv: string[]): Args | string {
   return a;
 }
 
+/** The ONE address the owner door is reached at (the self-pair guard compares a hub's checked address with it). */
+export const OWNER_DOOR_HOST = "127.0.0.1";
 /** ONE sealed exchange; resolves to the OPENED reply, or rejects with a named reason. */
 export function doorExchange(
   port: number,
@@ -122,23 +124,36 @@ export function doorExchange(
   const ts = Math.floor(Date.now() / 1000);
   const nonce = crypto.randomBytes(16).toString("hex");
   const body = JSON.stringify({ ts, client_nonce: nonce, ...doorSeal(doorKey(key, "req"), doorRequestAad(binding, doorPath, ts, nonce), plain) });
+  // #434 R2 P2-2: an ABSOLUTE deadline (as relay-client's pinnedRequest): the timer starts before the request and, on
+  // expiry, destroys the request and its response, however the reply trickles; every path settles once and clears it.
   return new Promise((resolve, reject) => {
+    let done = false;
+    let res: http.IncomingMessage | null = null;
+    const finish = (err: Error | null, value?: { status: number; payload: Record<string, unknown> }) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (err) {
+        res?.destroy();
+        req.destroy();
+        reject(err);
+      } else resolve(value!);
+    };
     const req = http.request(
-      { host: "127.0.0.1", port, path: doorPath, method: "POST", agent: false, headers: { "Content-Type": "text/plain", "Content-Length": Buffer.byteLength(body) } },
-      (res) => {
+      { host: OWNER_DOOR_HOST, port, path: doorPath, method: "POST", agent: false, headers: { "Content-Type": "text/plain", "Content-Length": Buffer.byteLength(body) } },
+      (m) => {
+        res = m;
         const chunks: Buffer[] = [];
         let size = 0;
-        res.on("data", (c: Buffer) => {
+        m.on("data", (c: Buffer) => {
           size += c.length;
-          if (size > 8 * 1024 * 1024) {
-            req.destroy();
-            reject(new Error("the owner's reply is too large"));
-          } else chunks.push(c);
+          if (size > 8 * 1024 * 1024) finish(new Error("the owner's reply is too large"));
+          else chunks.push(c);
         });
-        res.on("end", () => {
+        m.on("end", () => {
           // A callback failure REJECTS (never an uncaught exception, never an unsettled promise).
           try {
-            const status = res.statusCode ?? 0;
+            const status = m.statusCode ?? 0;
             let env: unknown = null;
             try {
               env = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
@@ -147,22 +162,19 @@ export function doorExchange(
             }
             const opened = doorOpen(doorKey(key, "resp"), doorResponseAad(binding, doorPath, ts, nonce, status), env);
             if (opened === null || typeof opened !== "object" || Array.isArray(opened)) {
-              reject(new Error("the owner's reply failed its authentication (a forged or altered reply, or no owner): nothing from it is shown"));
+              finish(new Error("the owner's reply failed its authentication (a forged or altered reply, or no owner): nothing from it is shown"));
               return;
             }
-            resolve({ status, payload: opened as Record<string, unknown> });
+            finish(null, { status, payload: opened as Record<string, unknown> });
           } catch (err) {
-            reject(new Error(`the owner's reply could not be read (${(err as Error).message})`));
+            finish(new Error(`the owner's reply could not be read (${(err as Error).message})`));
           }
         });
-        res.on("error", (e) => reject(e));
+        m.on("error", (e) => finish(e));
       },
     );
-    req.setTimeout(Math.max(1, deadlineMs - Date.now()), () => {
-      req.destroy();
-      reject(new Error("the owner did not answer in time (timed out)"));
-    });
-    req.on("error", (e) => reject(new Error(`the owner door could not be reached (${(e as NodeJS.ErrnoException).code ?? e.message})`)));
+    const timer = setTimeout(() => finish(new Error("the owner did not answer in time (timed out)")), Math.max(1, deadlineMs - Date.now()));
+    req.on("error", (e) => finish(new Error(`the owner door could not be reached (${(e as NodeJS.ErrnoException).code ?? e.message})`)));
     req.end(body);
   });
 }

@@ -22,7 +22,9 @@ import { sameFileIdentity } from "../file-identity.js";
 const USAGE =
   "Usage: relay remote set-mint-secret <host:port>        (the remote's registration secret, on STDIN)\n" +
   "       relay remote set-http-secret <host:port>        (the remote's transport secret, on STDIN)\n" +
-  "       relay remote set-dashboard-secret <host:port>   (the remote's operator secret, on STDIN)\n";
+  "       relay remote set-dashboard-secret <host:port>   (the remote's operator secret, on STDIN)\n" +
+  "       relay remote read-token <host:port> <agent>     (that remote's own vault token, on stdout: for the hooks)\n" +
+  "       relay remote read-secret <host:port> <mint|http|dashboard>   (that remote's own secret, on stdout: for the hooks)\n";
 /** Each subcommand's file in the remote's scope (as ruled: per-remote provisioned secrets). */
 const SECRET_FILES: Readonly<Record<string, string>> = { "set-mint-secret": "mint.secret", "set-http-secret": "http.secret", "set-dashboard-secret": "dashboard.secret" };
 /** The hooks' scope name for a remote (hooks/_vault-helpers.sh relay_scope_vault_to_remote): keep them identical. */
@@ -120,8 +122,38 @@ export function writeRemoteMintSecret(dir: string, secret: string, fileName = "m
   return file;
 }
 
+/**
+ * #434 R2 P2-1: the hooks' and the launcher's ONLY way to a REMOTE scope's credential: the trusted chain read
+ * (relay-client readRemoteScoped: real private directories, no link, the file the one checked; a refusal is named on
+ * stderr). The value goes to stdout for the caller's command substitution, never a file, argv or the environment.
+ * Exit 3 = none (absent or refused), 2 = usage.
+ */
+async function readCredential(sub: string, target: string | undefined, rest: string[]): Promise<number> {
+  const m = /^([A-Za-z0-9_.:-]{1,253}):([0-9]{1,5})$/.exec(target ?? "");
+  if (!m || rest.length !== 1) return fail(`${sub} takes <host:port> and one name\n${USAGE}`, 2);
+  const [, host, port] = m as unknown as [string, string, string];
+  const what = rest[0]!;
+  let file: string;
+  let shape: RegExp;
+  if (sub === "read-token") {
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(what)) return fail("read-token takes an agent name", 2);
+    file = `${what}.token`;
+    shape = /^[A-Za-z0-9_=.-]{8,128}$/;
+  } else {
+    if (!["mint", "http", "dashboard"].includes(what)) return fail("read-secret takes mint, http or dashboard", 2);
+    file = `${what}.secret`;
+    shape = /^[!-~]{16,4096}$/;
+  }
+  const { readRemoteScoped } = await import("./relay-client.js");
+  const v = await readRemoteScoped(host, Number(port), file);
+  if (v === null || !shape.test(v)) return 3;
+  process.stdout.write(`${v}\n`);
+  return 0;
+}
+
 export async function run(argv: string[]): Promise<number> {
   const [sub, target, ...rest] = argv;
+  if (sub === "read-token" || sub === "read-secret") return readCredential(sub, target, rest);
   const fileName = SECRET_FILES[sub ?? ""];
   if (!fileName) return fail(`unknown subcommand ${JSON.stringify(sub ?? "")}\n${USAGE}`, 2);
   if (rest.length > 0) return fail(`the secret is read from STDIN, never argv (got ${rest.length} extra argument(s))\n${USAGE}`, 2);
