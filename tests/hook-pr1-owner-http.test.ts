@@ -1654,7 +1654,11 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the de
   };
   it.each(ENTRY_POINTS)("R2 P2-1 (%s): a remote's scope LINKED to the local agents/ → zero bytes of the local token at the remote; a real private scope's own token → reaches it (control)", async (entry) => {
     const c = newCase(`r2-scope-link-${entry.replace(/[^a-z0-9]/gi, "")}`);
-    const localTok = seedNativeDb(c);
+    // stop-check and post-tool-use read a vault ONLY in remote mode, which they take only when no local instance exists
+    // ("REMOTE mode only: never called when a local instance exists"): for them the instance holds a local vault token
+    // and NO DB, or this row would never reach their vault read (vacuous). The others take the remote route with a DB.
+    const remoteModeOnly = entry === "stop-check.sh" || entry === "post-tool-use-check.sh";
+    const localTok = remoteModeOnly ? `pr4-a-local-vault-token-${crypto.randomBytes(8).toString("hex")}` : seedNativeDb(c);
     fs.mkdirSync(path.join(c.dir, "agents"), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(c.dir, "agents", `${AGENT}.token`), `${localTok}\n`, { mode: 0o600 });
     const remote = await spy();
