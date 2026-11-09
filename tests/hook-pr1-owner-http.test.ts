@@ -686,7 +686,7 @@ describe("hook PR 1: the record TRUST model (cross-user), as ruled", () => {
 });
 
 describe("hook PR 1: `relay owner peek` (the hooks' client): the door's one exchange, printed as `relay pending --json` prints (every OS)", () => {
-  it("its JSON has exactly `relay pending --json`'s keys (plus source: owner), with the content; it opens NO DB (a spy with a positive control)", async () => {
+  it("its JSON has exactly `relay pending --json`'s keys (plus source: owner, registered, and the agent's stored anchor), with the content; it opens NO DB (a spy with a positive control)", async () => {
     const twin = newCase("owner-cli-twin");
     seedNativeDb(twin);
     const pend = spawnSync(process.execPath, [RELAY, "pending", AGENT, "--json", "--with-content", "5"], { encoding: "utf-8", env: baseEnv(twin) });
@@ -714,7 +714,14 @@ describe("hook PR 1: `relay owner peek` (the hooks' client): the door's one exch
     const r = spawnSync(process.execPath, ["--require", spy, RELAY, "owner", "peek", AGENT, "--json", "--with-content", "5", "--timeout-ms", "5000"], { encoding: "utf-8", env: baseEnv(c) });
     expect(r.status, r.stderr).toBe(0);
     const out = JSON.parse(r.stdout) as Record<string, unknown> & { messages: Array<{ content?: string }> };
-    expect(Object.keys(out).filter((k) => k !== "source" && k !== "registered").sort()).toEqual(pendKeys);
+    // EXACT (not a subset): pending's keys plus the owner's three. #423 R1 P2-3 (as ruled) added `anchor`: the named
+    // agent's stored (agent_pid, agent_pid_start), which only PostToolUse's self-heal reads (every renderer reads named
+    // keys; the stdio mail rows assert none renders it).
+    expect(Object.keys(out).sort()).toEqual([...new Set([...pendKeys, "source", "registered", "anchor"])].sort());
+    const anchor = out.anchor as { agent_pid?: unknown; agent_pid_start?: unknown } | null;
+    expect(Object.keys(anchor ?? {}).sort(), "the anchor's shape").toEqual(["agent_pid", "agent_pid_start"]);
+    expect(anchor!.agent_pid === null || Number.isInteger(anchor!.agent_pid), "an integer pid, or null").toBe(true);
+    expect(anchor!.agent_pid_start === null || typeof anchor!.agent_pid_start === "string", "a start token, or null").toBe(true);
     expect(out.registered).toBe(true);
     expect(out.source).toBe("owner");
     expect(out.messages[0]?.content).toBe("pr1 cli mail");

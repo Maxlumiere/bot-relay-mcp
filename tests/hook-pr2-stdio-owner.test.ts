@@ -309,6 +309,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 2: the hooks read a stdio owner's ma
     expect(r.sqliteCalls).toEqual([]);
     expect(r.out, `${r.out}\n${o.stderr()}`).toMatch(new RegExp(`pr2 stdio mail for ${hook.replace(".", "\\.")}|${SENDER}`));
     expect(onlyJsonRpc(o.stdout()), `the stdio owner's stdout holds only JSON-RPC frames:\n${o.stdout()}`).toBe(true);
+    expect(r.out, "the peek's stored anchor is never rendered (only the self-heal reads it)").not.toMatch(/"anchor"|agent_pid/);
     await stop(o.child);
   }, 120_000);
 
