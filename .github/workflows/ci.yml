@@ -412,7 +412,7 @@ jobs:
         run: npx vitest run tests/hook-pr2-stdio-owner.test.ts --reporter=verbose --reporter=json --outputFile.json=pr2-win.json
       - name: "Hook PR 2: the named rows PASSED on Windows"
         if: ${{ !cancelled() }}
-        run: node tools/ci/require-rows-passed.mjs pr2-win.json "lock → DB → listen → record" "the stdio listener serves ONLY the door" "a SECOND stdio process on the same wasm DB is refused by name" "stdin EOF alone (no signal)" "a listener that did not BIND publishes no record" "the REQUESTING agent's stored anchor"
+        run: node tools/ci/require-rows-passed.mjs pr2-win.json "lock → DB → listen → record" "the stdio listener serves ONLY the door" "a SECOND stdio process on the same wasm DB is refused by name" "stdin EOF alone (no signal)" "an HTTP-only daemon whose port is already taken" "with its HTTP port taken DEGRADES to stdio" "EOF DRAINS before the process ends" "the REQUESTING agent's stored anchor"
 
   # REQUIRED CHECK. macOS launchd side-effect guard. The Ubuntu jobs structurally CANNOT catch a test that shells
   # to real `launchctl` — init.ts's daemon bootstrap is darwin-gated, so a `runInit` test that forgets
@@ -481,7 +481,7 @@ jobs:
         run: npx vitest run tests/hook-pr2-stdio-owner.test.ts --reporter=verbose --reporter=json --outputFile.json=pr2-macos.json
       - name: "Hook PR 2: the named rows PASSED on macOS"
         if: ${{ !cancelled() }}
-        run: node tools/ci/require-rows-passed.mjs pr2-macos.json "lock → DB → listen → record" "the stdio listener serves ONLY the door" "a SECOND stdio process on the same wasm DB is refused by name" "check-relay.sh" "stop-check.sh" "post-tool-use-check.sh" "the owner EXITED (its record left behind)" "the owner holds the lock but has NO hook endpoint" "a CHANGED pid → PostToolUse restamps the anchor" "a STALE stored start" "NO agent token → no liveness call" "a FORGED liveness reply" "stdin EOF alone (no signal)" "a listener that did not BIND publishes no record" "the REQUESTING agent's stored anchor" "a TRANSIENT start-time lookup failure" "ANOTHER writer moves the stored anchor" "a WRONG agent token at the hook"
+        run: node tools/ci/require-rows-passed.mjs pr2-macos.json "lock → DB → listen → record" "the stdio listener serves ONLY the door" "a SECOND stdio process on the same wasm DB is refused by name" "check-relay.sh" "stop-check.sh" "post-tool-use-check.sh" "the owner EXITED (its record left behind)" "the owner holds the lock but has NO hook endpoint" "a CHANGED pid → PostToolUse restamps the anchor" "a STALE stored start" "NO agent token → no liveness call" "a FORGED liveness reply" "stdin EOF alone (no signal)" "an HTTP-only daemon whose port is already taken" "with its HTTP port taken DEGRADES to stdio" "EOF DRAINS before the process ends" "the REQUESTING agent's stored anchor" "a TRANSIENT start-time lookup failure" "ANOTHER writer moves the stored anchor" "a WRONG agent token at the hook" "a VAULT-only agent token reaches the wasm self-heal" "SIGINT → the shutdown" "SIGTERM → the shutdown" "SIGHUP → the shutdown"
       - name: "PR 4: the CLI's credential clients (macOS)"
         if: ${{ !cancelled() }}
         run: npx vitest run tests/cli-door-clients.test.ts --reporter=verbose --reporter=json --outputFile.json=pr4-cli-macos.json

@@ -59,7 +59,7 @@ const baseEnv = (c: Case, extra: Record<string, string> = {}): NodeJS.ProcessEnv
   return { ...env, RELAY_DB_PATH: c.db, RELAY_CONFIG_PATH: c.cfg, RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(c.home, "wc.json"), ...extra };
 };
 /** A native DB with AGENT and SENDER, one message for AGENT, converted to wasm; the config then declares wasm. */
-function seedWasmDb(c: Case, message: string, cfg: Record<string, unknown> = {}): { token: string; senderToken: string } {
+function seedWasmDb(c: Case, message: string, cfg: Record<string, unknown> = {}, bigMessages = 0): { token: string; senderToken: string } {
   fs.writeFileSync(c.cfg, "{}", { mode: 0o600 });
   const script = path.join(c.home, "seed.mjs");
   fs.writeFileSync(
@@ -68,6 +68,7 @@ function seedWasmDb(c: Case, message: string, cfg: Record<string, unknown> = {})
      const a = db.registerAgent(${JSON.stringify(AGENT)}, "r", []);
      const s = db.registerAgent(${JSON.stringify(SENDER)}, "r", []);
      db.sendMessage(${JSON.stringify(SENDER)}, ${JSON.stringify(AGENT)}, ${JSON.stringify(message)}, "normal");
+     for (let i = 0; i < ${bigMessages}; i++) db.sendMessage(${JSON.stringify(SENDER)}, ${JSON.stringify(AGENT)}, "B" + String(i).padStart(3, "0") + "x".repeat(60000), "normal");
      db.closeDb();
      process.stdout.write(JSON.stringify({ token: a.plaintext_token, senderToken: s.plaintext_token }));`
   );
@@ -417,6 +418,10 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 2: the hooks read a stdio owner's ma
       expect(seen.some((s) => s.startsWith(LIVENESS)), "precondition: the relay saw the liveness request").toBe(true);
       expect(cacheFiles(c), "a forged reply is never cached as a success").toEqual([]);
       expect(seen.join("\n"), "the agent's token never crosses the door in clear (it is sealed)").not.toContain(token);
+      // the CLI itself refuses the forged reply: a non-zero exit, named
+      const cli = spawnSync(process.execPath, [RELAY, "owner", "liveness", AGENT, "--pid", "4242", "--timeout-ms", "5000"], { encoding: "utf-8", env: baseEnv(c, { RELAY_AGENT_TOKEN: token }) });
+      expect(cli.status, `the forged reply is refused\n${cli.stdout}${cli.stderr}`).not.toBe(0);
+      expect(cli.stderr).toMatch(/failed its authentication/);
     } finally {
       await new Promise<void>((r) => mitm.close(() => r()));
       await stop(o.child);
@@ -463,13 +468,10 @@ describe("#423 R1 P2-3: the sealed peek carries the REQUESTING agent's stored an
   }, 90_000);
 });
 
-describe("#423 R1 P3-4: a listener that did not BIND publishes no record (every OS)", () => {
-  it("the daemon's port is already taken → no owner record (it would name another process's port), and the bind failure is named", async () => {
+describe("#423 R1 P3-4 / R2 P2-4: a listener that did not BIND publishes no record; HTTP-only exits, `both` degrades to stdio (every OS)", () => {
+  it("an HTTP-only daemon whose port is already taken → exit 1 on its own (no intervention), no owner record, the failure and its policy named; its wasm lock is released (a successor owns the DB)", async () => {
     const c = newCase("bind-denied");
-    // a NATIVE DB: every daemon owner writes a record once it listens
-    fs.writeFileSync(c.cfg, "{}", { mode: 0o600 });
-    const seed = spawnSync(process.execPath, ["--input-type=module", "-e", `const db = await import(${JSON.stringify(DIST_DB)}); db.registerAgent(${JSON.stringify(AGENT)}, "r", []); db.closeDb();`], { encoding: "utf-8", env: baseEnv(c) });
-    expect(seed.status, seed.stderr).toBe(0);
+    seedWasmDb(c, "pr2 bind mail");
     const squatter = http.createServer((_q, r) => r.end("not a relay"));
     await new Promise<void>((r) => squatter.listen(0, "127.0.0.1", () => r()));
     const port = (squatter.address() as { port: number }).port;
@@ -478,14 +480,48 @@ describe("#423 R1 P3-4: a listener that did not BIND publishes no record (every 
       procs.push(d);
       let err = "";
       d.stderr!.on("data", (x: Buffer) => (err += x));
-      await exitWithin(d, 8_000);
-      if (d.exitCode === null) d.kill("SIGKILL");
+      const code = await exitWithin(d, 15_000);
+      expect(code, `it exits 1 by itself (not killed by the test)\n${err}`).toBe(1);
       expect(fs.existsSync(c.record), `no record for a listener that never bound\n${err}`).toBe(false);
-      expect(err, "the bind failure is named").toMatch(/EADDRINUSE|could not listen|address already in use/i);
+      expect(err, "the bind failure is named").toMatch(/EADDRINUSE/);
+      expect(err, "the policy and the remedies are named").toMatch(/HTTP-only[^\n]*exits[\s\S]*(another port|stop the)/i);
+      const next = await startStdioOwner(c);
+      expect(record(c).pid, "the lock was released: a successor owns the DB").toBe(next.child.pid);
+      await stop(next.child);
     } finally {
       await new Promise<void>((r) => squatter.close(() => r()));
     }
-  }, 60_000);
+  }, 90_000);
+
+  it("`both` with its HTTP port taken DEGRADES to stdio: it keeps serving stdio, names the policy and the remedies, and (a wasm owner) still opens its loopback owner listener for the hooks", async () => {
+    const c = newCase("both-degrade");
+    seedWasmDb(c, "pr2 both mail");
+    const squatter = http.createServer((_q, r) => r.end("not a relay"));
+    await new Promise<void>((r) => squatter.listen(0, "127.0.0.1", () => r()));
+    const port = (squatter.address() as { port: number }).port;
+    try {
+      const child = spawn(process.execPath, [DIST_INDEX], { env: baseEnv(c, { RELAY_TRANSPORT: "both", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(port) }), stdio: ["pipe", "pipe", "pipe"] });
+      procs.push(child);
+      let out = "";
+      let err = "";
+      child.stdout!.on("data", (x: Buffer) => (out += x));
+      child.stderr!.on("data", (x: Buffer) => (err += x));
+      child.stdin!.write(INITIALIZE);
+      const end = Date.now() + 20_000;
+      while (Date.now() < end && !(fs.existsSync(c.record) && out.includes('"id":0'))) await new Promise((r) => setTimeout(r, 100));
+      expect(child.exitCode, `still running (stdio keeps serving)\n${err}`).toBeNull();
+      expect(onlyJsonRpc(out), `the initialize reply arrived over stdio\n${out}`).toBe(true);
+      expect(err, "the degrade policy and the remedies are named").toMatch(/degrad[\s\S]*stdio[\s\S]*(another port|stop the)/i);
+      const rec = record(c);
+      expect(rec, "the owner listener's record (the hooks still work)").toMatchObject({ v: 3, host: "127.0.0.1", pid: child.pid, transport: "stdio" });
+      expect(rec.port).not.toBe(port);
+      const peek = await door(rec, PEEK, { with_content: 1 });
+      expect(JSON.stringify(peek.opened), "its door answers").toContain("pr2 both mail");
+      await stop(child);
+    } finally {
+      await new Promise<void>((r) => squatter.close(() => r()));
+    }
+  }, 90_000);
 });
 
 describe.skipIf(WIN_NO_BASH_HOOKS)("#423 R1: the wasm self-heal keeps the PID-reuse guard and the DB's truth (POSIX)", () => {
@@ -523,10 +559,68 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#423 R1: the wasm self-heal keeps the PID-re
     const { token } = seedWasmDb(c, "pr2 wrongtok mail");
     const o = await startStdioOwner(c);
     const bad = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: "pr2-not-the-agents-token-bbbbbbbb" }, PTU);
+    expect(bad.livenessCalls, `the bad-token report WAS attempted (once)\n${bad.out}`).toBe(1);
     expect(cacheFiles(c), `a refused report is never recorded as a success\n${bad.out}`).toEqual([]);
+    // the anchor BEFORE any successful report: the refused one wrote nothing
+    await stop(o.child);
+    expect((await anchorOf(c, AGENT)).agent_pid, "the refused report left the anchor untouched").not.toBe(process.pid);
+    const o2 = await startStdioOwner(c);
     const good = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token }, PTU);
     expect(good.livenessCalls, `the right token still reports\n${good.out}`).toBe(1);
+    await stop(o2.child);
+    expect((await anchorOf(c, AGENT)).agent_pid).toBe(process.pid);
+  }, 150_000);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// #423 Codex R2 (each RED from the review's own inputs).
+describe("#423 R2 P2-1: EOF DRAINS before the process ends (every OS)", () => {
+  it("a ~2 MB reply in flight when the client closes stdin → the full, valid JSON-RPC frame is delivered, then the process exits", async () => {
+    const c = newCase("eof-drain");
+    const { token } = seedWasmDb(c, "pr2 drain mail", {}, 36); // 36 messages of ~60 KB: a ~2 MB get_messages reply
+    const o = await startStdioOwner(c);
+    const call = JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "get_messages", arguments: { agent_name: AGENT, limit: 50, agent_token: token } } }) + "\n";
+    o.child.stdin!.write(call);
+    o.child.stdin!.end(); // EOF right behind the request: the reply is still being made and written
+    const code = await exitWithin(o.child, 30_000);
+    expect(code, `the owner ended by itself\n${o.stderr()}`).toBe(0);
+    const frame = o.stdout().split("\n").find((l) => l.includes('"id":7'));
+    expect(frame, "the reply frame was written").toBeDefined();
+    const parsed = JSON.parse(frame!) as { result?: { content?: Array<{ text?: string }> } };
+    const text = parsed.result?.content?.[0]?.text ?? "";
+    expect(text.length, "the whole reply (~2 MB)").toBeGreaterThan(2_000_000);
+    expect(text).toContain("B035");
+  }, 120_000);
+});
+
+describe.skipIf(WIN_NO_BASH_HOOKS)("#423 R2 P2-2: a VAULT-only agent token reaches the wasm self-heal (POSIX)", () => {
+  it("RELAY_AGENT_TOKEN unset + the agent's token in the instance vault + a stored anchor that differs → ONE liveness call (as the native self-heal hydrates)", async () => {
+    const c = newCase("live-vault");
+    const { token } = seedWasmDb(c, "pr2 vault mail");
+    const vault = path.join(c.dir, "agents");
+    fs.mkdirSync(vault, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(vault, `${AGENT}.token`), `${token}\n`, { mode: 0o600 });
+    const o = await startStdioOwner(c);
+    const r = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: "" }, PTU);
+    expect(r.peekCalls, `precondition: the mail was read through the door\n${r.out}`).toBeGreaterThanOrEqual(1);
+    expect(r.livenessCalls, `the vault's token is used: ONE call\n${r.out}`).toBe(1);
     await stop(o.child);
     expect((await anchorOf(c, AGENT)).agent_pid).toBe(process.pid);
   }, 150_000);
+});
+
+describe.skipIf(process.platform === "win32")("#423 R2 P2-3: every signal goes through the ONE shutdown (POSIX signals)", () => {
+  it.each([["SIGINT", 130], ["SIGTERM", 143], ["SIGHUP", 129]] as const)("%s → the shutdown closes the owner listener and the DB, then exits %i; a successor owns the DB", async (sig, want) => {
+    const c = newCase(`signal-${sig.toLowerCase()}`);
+    seedWasmDb(c, "pr2 signal mail");
+    const o = await startStdioOwner(c);
+    o.child.kill(sig);
+    const code = await exitWithin(o.child, 15_000);
+    expect(code, `${sig}: its exit code\n${o.stderr()}`).toBe(want);
+    expect(o.stderr(), `${sig}: the listeners were closed by the shutdown`).toMatch(/\[shutdown\] listeners closed/);
+    expect(o.stderr(), `${sig}: the DB was closed by the shutdown`).toMatch(/\[shutdown\] database closed/);
+    const next = await startStdioOwner(c);
+    expect(record(c).pid).toBe(next.child.pid);
+    await stop(next.child);
+  }, 90_000);
 });
