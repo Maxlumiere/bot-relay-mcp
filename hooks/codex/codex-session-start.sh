@@ -144,7 +144,7 @@ fi
 # remote's own vault entries.
 command -v relay_scope_vault_to_remote >/dev/null 2>&1 && relay_scope_vault_to_remote
 if [ -z "${RELAY_AGENT_TOKEN:-}" ] && command -v read_relay_token_from_vault >/dev/null 2>&1; then
-  if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
+  if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME"); then
     export RELAY_AGENT_TOKEN="$VAULT_TOKEN"
   fi
 fi

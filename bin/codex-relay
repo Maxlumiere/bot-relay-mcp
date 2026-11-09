@@ -119,7 +119,7 @@ register_at_launch() {
   command -v relay_scope_vault_to_remote >/dev/null 2>&1 && relay_scope_vault_to_remote
   local token="${RELAY_AGENT_TOKEN:-}"
   if [ -z "$token" ] && command -v read_relay_token_from_vault >/dev/null 2>&1; then
-    token=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null) || token=""
+    token=$(read_relay_token_from_vault "$AGENT_NAME") || token=""
   fi
   if [ -n "$token" ] && ! echo "$token" | grep -Eq '^[A-Za-z0-9_=.-]{8,128}$'; then
     token=""

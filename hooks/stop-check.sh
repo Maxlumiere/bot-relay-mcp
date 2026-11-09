@@ -321,7 +321,7 @@ relay_hydrate_token() {
   # Once per run: the tunnel gate may already have asked it.
   [ -n "${RELAY_RES_HOOK_DB:-}" ] || { relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"; }
   local t
-  if t=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
+  if t=$(read_relay_token_from_vault "$AGENT_NAME"); then
     AGENT_TOKEN="$t"
     export RELAY_AGENT_TOKEN="$t"
   fi

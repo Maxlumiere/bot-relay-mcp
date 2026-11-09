@@ -624,7 +624,7 @@ notice_is_damped() {
 relay_hydrate_token() {
   [ -n "$AGENT_TOKEN" ] && return 0
   local t
-  if t=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
+  if t=$(read_relay_token_from_vault "$AGENT_NAME"); then
     AGENT_TOKEN="$t"
     export RELAY_AGENT_TOKEN="$t"
   fi

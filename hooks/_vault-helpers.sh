@@ -600,7 +600,9 @@ relay_mint_secret_curl_config() {
 read_relay_token_from_vault() {
   local name="$1"
   local token_path
-  token_path=$(resolve_relay_token_path "$name") || return 1
+  # Quiet on its own: a local vault miss is a clean cache miss (nothing to say). The ONE line it lets through is a
+  # remote scope's REFUSAL (relay remote read-token's named stderr), so callers must not discard stderr.
+  token_path=$(resolve_relay_token_path "$name" 2>/dev/null) || return 1
   local token
   if [ -n "${RELAY_VAULT_SCOPE:-}" ]; then
     # #434 R2 P2-1: a REMOTE's token only through the trusted reader (a scope linked to the local vault, or to another
