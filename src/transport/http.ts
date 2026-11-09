@@ -78,6 +78,7 @@ import { LOADED_BUILD } from "../loaded-build.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import type { Server } from "http";
 import { structuralBoundMiddleware } from "../structural-bound.js";
+import { shutdown } from "../shutdown.js";
 
 /**
  * v2.7 Tether Phase 5 — SSE keepalive helper.
@@ -505,6 +506,8 @@ export interface StartHttpOptions {
   ownerPeek?: boolean;
   /** The owner-peek listener's record `transport` (the process that owns the DB). */
   ownerTransport?: "http" | "stdio";
+  /** #423 R2 P2-4: the caller decides what a failed bind means (HTTP-only: exit; `both`: degrade to stdio). */
+  onListenError?: (err: Error) => void;
 }
 
 export function startHttpServer(port: number, host: string, opts: StartHttpOptions = {}): Server {
@@ -2168,10 +2171,12 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
     // failure is named here; the server's 'error' handler keeps its own behaviour.
     if (listenErr) {
       log.error(`[http] could not listen on ${host}:${port} (${(listenErr as NodeJS.ErrnoException).code ?? listenErr.message}): no owner record is written.`);
-      // The MAIN listener's failure ends the process (exit 1): Express routes the error here, so nothing else would, and
-      // a daemon left running with no listener would keep its DB (a wasm owner's lock) from every successor. The
-      // owner-peek listener's failure is logged and its process (a stdio owner, or the daemon) keeps serving.
-      if (!ownerPeek) process.exit(1);
+      // Express routes the error HERE, so nothing else would act on it. The caller decides (src/index.ts: HTTP-only exits
+      // 1 through the one shutdown, `both` degrades to stdio); with no decider, the MAIN listener's failure ends the
+      // process through the one shutdown (a daemon left with no listener would keep its DB, a wasm owner's lock, from
+      // every successor). The owner-peek listener's failure is logged and its process keeps serving.
+      if (opts.onListenError) opts.onListenError(listenErr);
+      else if (!ownerPeek) void shutdown(1, "listen-failure");
       return;
     }
     const addr = server.address();

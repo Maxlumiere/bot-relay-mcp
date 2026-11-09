@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
+import { onShutdown, SHUTDOWN_PHASE } from "../shutdown.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import type { Readable, Writable } from "node:stream";
 import { createServer } from "../server.js";
 import { endAgentSessionOnSignal, getAgentSessionId, logAudit, recordOwnConnector, setAgentLivenessAnchor } from "../db.js";
@@ -225,34 +227,11 @@ export function performAutoUnregister(
 }
 
 function installAutoUnregister(): void {
-  let fired = false;
-  // v2.8 — SIGHUP added per the v2.8 dashboard state-machine design.
-  // iTerm2 / Terminal.app tab-close + ssh-disconnect both deliver SIGHUP;
-  // pre-v2.8 the relay would never mark the agent closed in that path
-  // and the dashboard saw a perpetually-alive ghost. SIGINT (Ctrl-C)
-  // and SIGTERM (graceful shutdown) preserved verbatim.
-  //
-  // Exit-code semantics:
-  //   SIGINT  → 130 (POSIX convention)
-  //   SIGTERM → 143 (POSIX convention)
-  //   SIGHUP  → 129 (POSIX convention — 128 + signal number 1)
-  const exitCodeFor = (signal: NodeJS.Signals): number => {
-    if (signal === "SIGINT") return 130;
-    if (signal === "SIGHUP") return 129;
-    return 143; // SIGTERM + catch-all
-  };
-  const handler = (signal: NodeJS.Signals) => {
-    if (fired) {
-      process.exit(exitCodeFor(signal));
-      return;
-    }
-    fired = true;
-    performAutoUnregister(process.env.RELAY_AGENT_NAME, capturedSessionId, signal);
-    process.exit(exitCodeFor(signal));
-  };
-  process.on("SIGINT", handler);
-  process.on("SIGTERM", handler);
-  process.on("SIGHUP", handler);
+  // #423 R2 P2-3: the auto-unregister is the ONE shutdown's first step (src/shutdown.ts), never its own exit. SIGINT,
+  // SIGTERM and SIGHUP (v2.8: a tab close or an ssh disconnect), and a client closing stdin, all reach it through the
+  // shutdown, which then answers in-flight requests, closes the listeners and the DB, drains stdout and exits (130 /
+  // 143 / 129 for the signals, as before; 0 for EOF).
+  onShutdown(SHUTDOWN_PHASE.UNREGISTER, "the stdio session ended", (ctx) => performAutoUnregister(process.env.RELAY_AGENT_NAME, capturedSessionId, ctx.reason));
 }
 
 /**
@@ -330,4 +309,48 @@ export async function startStdioServer(
   }
   installAutoUnregister();
   await server.connect(transport);
+  trackInFlight(transport);
+}
+
+/**
+ * #423 R2 P2-1: the requests this stdio server has RECEIVED but not yet answered. A client closing stdin right behind a
+ * request (a 2 MB get_messages, say) must still get the whole reply: the shutdown waits for these to be answered
+ * (bounded), and then for stdout to drain, before it exits.
+ */
+const inFlight = new Set<string | number>();
+let idleWaiters: Array<() => void> = [];
+function trackInFlight(transport: StdioServerTransport): void {
+  const onmessage = transport.onmessage;
+  transport.onmessage = (msg: JSONRPCMessage) => {
+    const m = msg as { id?: string | number; method?: string };
+    if (m.id !== undefined && typeof m.method === "string") inFlight.add(m.id);
+    onmessage?.(msg);
+  };
+  const send = transport.send.bind(transport);
+  transport.send = async (msg: JSONRPCMessage) => {
+    try {
+      await send(msg);
+    } finally {
+      const m = msg as { id?: string | number; method?: string };
+      if (m.id !== undefined && m.method === undefined && inFlight.delete(m.id) && inFlight.size === 0) {
+        const w = idleWaiters;
+        idleWaiters = [];
+        for (const f of w) f();
+      }
+    }
+  };
+  onShutdown(SHUTDOWN_PHASE.IN_FLIGHT, "in-flight requests answered", () => {
+    if (inFlight.size === 0) return;
+    return new Promise<void>((resolve) => {
+      const t = setTimeout(() => {
+        log.warn(`[shutdown] ${inFlight.size} request(s) still unanswered after 5000ms: not waiting for them`);
+        resolve();
+      }, 5_000);
+      t.unref();
+      idleWaiters.push(() => {
+        clearTimeout(t);
+        resolve();
+      });
+    });
+  });
 }

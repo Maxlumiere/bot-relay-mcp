@@ -858,6 +858,9 @@ if [ "$MODE" = local ] && [ "$READ_OK" -eq 1 ]; then
 fi
 # Hook PR 2 (Q8): the wasm instance's self-heal, through the owner's door (never a native read).
 if [ "$MODE" = remote ] && [ "$READ_OK" -eq 1 ] && [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
+  # #423 R2 P2-2: a vault-only agent (no RELAY_AGENT_TOKEN) gets its token from the instance vault, as on the native
+  # route (the resolver was loaded for this owner route above, so the vault is the one beside its DB).
+  relay_hydrate_token
   liveness_self_heal_owner
 fi
 

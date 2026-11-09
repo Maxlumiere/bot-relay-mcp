@@ -15,6 +15,7 @@ import { registerConfigSecret } from "./secret-registry.js";
 import { closeDb, initializeDb } from "./db.js";
 import { markInstanceServer, markStdioServer, ownedDbPath } from "./sqlite-compat.js";
 import { OWNER_PEEK_HOST } from "./owner-endpoint.js";
+import { onShutdown, shutdown, SHUTDOWN_PHASE } from "./shutdown.js";
 import { assertInstanceResolution } from "./instance.js";
 import { startOutboxTail, stopOutboxTail } from "./outbox-tail.js";
 import { log } from "./logger.js";
@@ -258,8 +259,35 @@ async function main(): Promise<void> {
 
   let httpServer: HttpServer | null = null;
 
+  // #423 R2 P2-4: the MAIN listener's bind failure is decided HERE, per transport (the listener names it first).
+  // - http: the relay IS its HTTP listener, so it exits 1 (through the one shutdown), naming the policy and remedies.
+  // - both: it DEGRADES to stdio: the stdio server keeps serving, and a wasm owner opens its loopback owner listener so
+  //   the hooks still work; from then on its stdio client closing stdin ends it, as a stdio-only relay.
+  let httpDegraded = false;
+  const onMainListenError = (err: Error): void => {
+    const why = `${(err as NodeJS.ErrnoException).code ?? err.message}`;
+    const fix = `stop the process that holds ${config.http_host}:${config.http_port}, choose another port (RELAY_HTTP_PORT), or run stdio-only (RELAY_TRANSPORT=stdio)`;
+    if (config.transport !== "both") {
+      log.error(`[http] the HTTP listener could not bind ${config.http_host}:${config.http_port} (${why}): this is an HTTP-only relay, so it exits (1). To fix: ${fix}.`);
+      void shutdown(1, "listen-failure");
+      return;
+    }
+    httpDegraded = true;
+    log.warn(`[http] the HTTP listener could not bind ${config.http_host}:${config.http_port} (${why}): transport "both" degrades to stdio only; the stdio server keeps serving. To restore HTTP: ${fix.replace(", or run stdio-only (RELAY_TRANSPORT=stdio)", "")}.`);
+    if (ownedDbPath() !== null && !ownerPeekServer) {
+      try {
+        ownerPeekServer = startHttpServer(0, OWNER_PEEK_HOST, { ownerPeek: true, ownerTransport: "stdio" });
+      } catch (e) {
+        log.warn(`[owner-endpoint] could not open the owner-peek listener (${(e as Error).message}): the hooks read no mail from this stdio owner.`);
+      }
+    }
+    if (mcpInput?.readableEnded) void shutdown(0, "EOF");
+  };
+  let ownerPeekServer: HttpServer | null = null;
+  let mcpInput: import("node:stream").Readable | null = null;
+
   if (config.transport === "http" || config.transport === "both") {
-    httpServer = startHttpServer(config.http_port, config.http_host);
+    httpServer = startHttpServer(config.http_port, config.http_host, { onListenError: onMainListenError });
     // v2.7 / Tether Phase 3b — cross-process notification tail. Only the
     // HTTP daemon needs it: stdio sessions have direct access to the
     // in-process bus, and there is no supported topology where one stdio
@@ -274,7 +302,6 @@ async function main(): Promise<void> {
   // names it (transport "stdio"), so the hooks reach its agents' mail and liveness through the AEAD door. A failure is
   // logged and the stdio server keeps serving; the hooks then name "the owner has no hook endpoint". A stdio NATIVE
   // owner opens none (the hooks read a native DB themselves); `both` needs none (its HTTP listener records itself).
-  let ownerPeekServer: HttpServer | null = null;
   if (config.transport === "stdio" && ownedDbPath() !== null) {
     try {
       ownerPeekServer = startHttpServer(0, OWNER_PEEK_HOST, { ownerPeek: true, ownerTransport: "stdio" });
@@ -291,36 +318,38 @@ async function main(): Promise<void> {
     throw new Error("Failed to start HTTP server");
   }
 
-  let shuttingDown = false;
-  const shutdown = () => {
-    if (shuttingDown) return; // idempotent: a signal and an EOF may both arrive
-    shuttingDown = true;
+  // #423 R2 P2-3: the ONE shutdown (src/shutdown.ts). This process's own steps, in its phases; the stdio session's
+  // auto-unregister and its in-flight requests registered theirs in startStdioServer.
+  onShutdown(SHUTDOWN_PHASE.LISTENERS, "listeners closed", () => {
     stopOutboxTail();
-    if (httpServer) {
-      httpServer.close();
-    }
-    if (ownerPeekServer) {
-      ownerPeekServer.close();
-    }
-    closeDb();
-    process.exit(0);
-  };
-
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
-  // #423 R1 P1: a STDIO server lives and dies with its client. Its client closing stdin (EOF, no signal) ends it. Before
-  // the owner listener that happened by itself (nothing else held the event loop); with it, the process stayed alive
-  // and its wasm DB lock was held forever, locking out every successor. (`both` keeps its HTTP daemon running.)
-  if (config.transport === "stdio") {
-    const mcpIn = stdinForMcp ?? process.stdin;
-    mcpIn.once("end", shutdown);
-    mcpIn.once("close", shutdown);
-    if (mcpIn.readableEnded) shutdown();
+    httpServer?.close();
+    ownerPeekServer?.close();
+  });
+  onShutdown(SHUTDOWN_PHASE.DB, "database closed", () => closeDb());
+  const SIGNAL_EXIT: Readonly<Record<string, number>> = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };
+  for (const sig of Object.keys(SIGNAL_EXIT) as NodeJS.Signals[]) process.on(sig, () => void shutdown(SIGNAL_EXIT[sig]!, sig));
+  // #423 R1 P1 / R2 P2-1: a STDIO server lives and dies with its client: its client closing stdin (EOF, no signal) ends
+  // it, after its in-flight replies are written and stdout has drained. `both` keeps its HTTP daemon running, unless
+  // that listener could not bind (it degraded to stdio).
+  if (config.transport === "stdio" || config.transport === "both") {
+    mcpInput = stdinForMcp ?? process.stdin;
+    const onEof = () => {
+      if (config.transport === "stdio" || httpDegraded) void shutdown(0, "EOF");
+    };
+    mcpInput.once("end", onEof);
+    mcpInput.once("close", onEof);
+    if (mcpInput.readableEnded) onEof();
   }
 }
 
+process.on("uncaughtException", (err) => {
+  log.error("Uncaught exception:", err);
+  void shutdown(1, "uncaught-exception");
+});
+
 main().catch((err) => {
   log.error("Fatal error:", err);
-  closeDb();
-  process.exit(1);
+  // the one shutdown: its DB step closes the DB if it was opened (and a no-op otherwise)
+  onShutdown(SHUTDOWN_PHASE.DB, "database closed", () => closeDb());
+  void shutdown(1, "startup-failure");
 });
