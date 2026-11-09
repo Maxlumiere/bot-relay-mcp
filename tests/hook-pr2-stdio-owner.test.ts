@@ -88,7 +88,11 @@ interface StdioOwner {
 /** An MCP client's first frame: a stdio server waits for its client's first byte before it starts (src/index.ts). */
 const INITIALIZE = JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "hook-pr2-test", version: "1" } } }) + "\n";
 /** Every stdout line is a JSON-RPC frame (stdout is MCP-only). */
-const onlyJsonRpc = (out: string) => out.split("\n").filter(Boolean).every((l) => { try { return (JSON.parse(l) as { jsonrpc?: string }).jsonrpc === "2.0"; } catch { return false; } });
+/** Every stdout line is a JSON-RPC frame, and there IS at least one (the initialize reply): "" is not a pass. */
+const onlyJsonRpc = (out: string) => {
+  const lines = out.split("\n").filter(Boolean);
+  return lines.length > 0 && lines.every((l) => { try { return (JSON.parse(l) as { jsonrpc?: string }).jsonrpc === "2.0"; } catch { return false; } });
+};
 /** A STDIO relay process on the case's wasm DB: its client sends `initialize` and keeps stdin open. Resolves once its record names a stdio owner. */
 async function startStdioOwner(c: Case): Promise<StdioOwner> {
   const child = spawn(process.execPath, [DIST_INDEX], { env: baseEnv(c, { RELAY_TRANSPORT: "stdio" }), stdio: ["pipe", "pipe", "pipe"] });
@@ -111,13 +115,24 @@ async function startStdioOwner(c: Case): Promise<StdioOwner> {
   }
   throw new Error(`the stdio owner did not write its record (exit ${child.exitCode}):\n${err}`);
 }
+/** The stdio owner's exit, or null after `ms` (an MCP client closing stdin must END it: #423 R1 P1). */
+function exitWithin(child: ChildProcess, ms: number): Promise<number | null | "timeout"> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(child.exitCode);
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve("timeout"), ms);
+    child.once("exit", (code) => {
+      clearTimeout(t);
+      resolve(code);
+    });
+  });
+}
+/** Stop an owner the way an MCP client does: close stdin, WAIT for it to end; only a stuck one gets a signal. */
 async function stop(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null) return;
-  const exited = new Promise<void>((r) => child.once("exit", () => r()));
-  child.stdin?.end(); // an MCP client closing: the stdio server ends
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.stdin?.end();
+  if ((await exitWithin(child, 10_000)) !== "timeout") return;
   child.kill("SIGTERM");
-  await Promise.race([exited, new Promise((r) => setTimeout(r, 10_000))]);
-  if (child.exitCode === null) child.kill("SIGKILL");
+  if ((await exitWithin(child, 10_000)) === "timeout") child.kill("SIGKILL");
 }
 interface Rec { v: number; host: string; port: number; pid: number; key: string; transport: string; instance_id: string; db_path: string }
 const record = (c: Case) => JSON.parse(fs.readFileSync(c.record, "utf-8")) as Rec;
@@ -208,12 +223,16 @@ describe("hook PR 2: a stdio wasm owner opens the loopback owner-peek listener (
     }
     const wrong = await door(rec, LIVENESS, livenessArgs(1111, "t-wrong", "pr2-not-the-agents-token-aaaaaaaa"));
     expect(JSON.stringify(wrong.opened), "a wrong token is the handler's own refusal").toMatch(/AUTH_FAILED/);
-    const live = await door(rec, LIVENESS, livenessArgs(4242, "t0", token));
+    // the anchor BEFORE any successful request: the wrong token wrote nothing
+    await stop(o.child);
+    expect((await anchorOf(c, AGENT)).agent_pid, "the wrong token did not restamp").not.toBe(1111);
+    const o2 = await startStdioOwner(c);
+    const live = await door(record(c), LIVENESS, livenessArgs(4242, "t0", token));
     expect(live.status).toBe(200);
     expect(live.opened, "the owner's reply authenticates").not.toBeNull();
     expect(JSON.stringify(live.opened)).not.toMatch(/AUTH_FAILED|isError":true/);
-    await stop(o.child);
-    expect((await anchorOf(c, AGENT)).agent_pid, "the right token restamped; the wrong one did not").toBe(4242);
+    await stop(o2.child);
+    expect((await anchorOf(c, AGENT)).agent_pid, "the right token restamped").toBe(4242);
   }, 90_000);
 
   it("a SECOND stdio process on the same wasm DB is refused by name, opens no listener, and leaves the first owner's record", async () => {
@@ -237,6 +256,9 @@ const SQLITE_LOG = path.join(ROOT, "sqlite3.log");
 const CURL_LOG = path.join(ROOT, "curl.log");
 const ARGV_LOG = path.join(ROOT, "argv.log");
 fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${SQLITE_LOG}"\nexit 1\n`, { mode: 0o755 });
+/** ps: FAKE_PS_NO_LSTART makes ONLY the start-time lookup fail (a transient failure); everything else is the real ps. */
+const REAL_PS = spawnSync("sh", ["-c", "command -v ps"], { encoding: "utf-8" }).stdout.trim();
+fs.writeFileSync(path.join(STUBS, "ps"), `#!/bin/sh\nif [ -n "$FAKE_PS_NO_LSTART" ]; then case "$*" in *lstart*) exit 1 ;; esac; fi\nexec "${REAL_PS}" "$@"\n`, { mode: 0o755 });
 const REAL_CURL = spawnSync("sh", ["-c", "command -v curl"], { encoding: "utf-8" }).stdout.trim();
 fs.writeFileSync(path.join(STUBS, "curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${CURL_LOG}"\nexec "${REAL_CURL}" "$@"\n`, { mode: 0o755 });
 /** node: `node <relay> where --fields` prints FAKE_WHERE_FILE when set; anything else runs node. */
@@ -398,5 +420,112 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 2: the hooks read a stdio owner's ma
       await new Promise<void>((r) => mitm.close(() => r()));
       await stop(o.child);
     }
+  }, 150_000);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// #423 Codex R1 (each RED from the review's own inputs).
+describe("#423 R1 P1: a stdio owner ENDS when its client closes stdin (every OS)", () => {
+  it("stdin EOF alone (no signal) → the stdio owner exits, its lock is released, and a successor becomes the owner", async () => {
+    const c = newCase("stdio-eof");
+    seedWasmDb(c, "pr2 eof mail");
+    const o = await startStdioOwner(c);
+    o.child.stdin!.end(); // the MCP client goes away: no SIGTERM, no SIGINT
+    const code = await exitWithin(o.child, 15_000);
+    expect(code, `the owner ended on EOF alone (it kept running: the listener held the process)\n${o.stderr()}`).not.toBe("timeout");
+    const next = await startStdioOwner(c);
+    expect(record(c).pid, "the successor took ownership (the lock was released)").toBe(next.child.pid);
+    await stop(next.child);
+  }, 90_000);
+});
+
+describe("#423 R1 P2-3: the sealed peek carries the REQUESTING agent's stored anchor (every OS)", () => {
+  it("peek as A → A's stored anchor (pid, start), and nothing of B's; the peek stays a PURE read (the anchors are unchanged)", async () => {
+    const c = newCase("peek-anchor");
+    const { token, senderToken } = seedWasmDb(c, "pr2 anchor mail");
+    const o = await startStdioOwner(c);
+    const rec = record(c);
+    const setA = await door(rec, LIVENESS, livenessArgs(424_242, "t-A", token));
+    expect(JSON.stringify(setA.opened), "precondition: A's anchor set").not.toMatch(/AUTH_FAILED|isError":true/);
+    const setB = await door(rec, LIVENESS, {
+      rpc: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "report_liveness", arguments: { agent_name: SENDER, agent_pid: 535_353, agent_pid_start: "t-B" } } },
+      agent_token: senderToken,
+    }, SENDER);
+    expect(JSON.stringify(setB.opened), "precondition: B's anchor set").not.toMatch(/AUTH_FAILED|isError":true/);
+    const peek = await door(rec, PEEK, { with_content: 0 });
+    expect(peek.status).toBe(200);
+    expect((peek.opened as { anchor?: unknown } | null)?.anchor, "the requesting agent's stored anchor").toEqual({ agent_pid: 424_242, agent_pid_start: "t-A" });
+    expect(JSON.stringify(peek.opened), "nothing of another agent's").not.toMatch(/535353|t-B/);
+    await stop(o.child);
+    expect(await anchorOf(c, AGENT), "a pure read: A's anchor is unchanged").toEqual({ agent_pid: 424_242, agent_pid_start: "t-A" });
+    expect(await anchorOf(c, SENDER), "and B's").toEqual({ agent_pid: 535_353, agent_pid_start: "t-B" });
+  }, 90_000);
+});
+
+describe("#423 R1 P3-4: a listener that did not BIND publishes no record (every OS)", () => {
+  it("the daemon's port is already taken → no owner record (it would name another process's port), and the bind failure is named", async () => {
+    const c = newCase("bind-denied");
+    // a NATIVE DB: every daemon owner writes a record once it listens
+    fs.writeFileSync(c.cfg, "{}", { mode: 0o600 });
+    const seed = spawnSync(process.execPath, ["--input-type=module", "-e", `const db = await import(${JSON.stringify(DIST_DB)}); db.registerAgent(${JSON.stringify(AGENT)}, "r", []); db.closeDb();`], { encoding: "utf-8", env: baseEnv(c) });
+    expect(seed.status, seed.stderr).toBe(0);
+    const squatter = http.createServer((_q, r) => r.end("not a relay"));
+    await new Promise<void>((r) => squatter.listen(0, "127.0.0.1", () => r()));
+    const port = (squatter.address() as { port: number }).port;
+    try {
+      const d = spawn(process.execPath, [DIST_INDEX], { env: baseEnv(c, { RELAY_TRANSPORT: "http", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(port) }), stdio: ["ignore", "pipe", "pipe"] });
+      procs.push(d);
+      let err = "";
+      d.stderr!.on("data", (x: Buffer) => (err += x));
+      await exitWithin(d, 8_000);
+      if (d.exitCode === null) d.kill("SIGKILL");
+      expect(fs.existsSync(c.record), `no record for a listener that never bound\n${err}`).toBe(false);
+      expect(err, "the bind failure is named").toMatch(/EADDRINUSE|could not listen|address already in use/i);
+    } finally {
+      await new Promise<void>((r) => squatter.close(() => r()));
+    }
+  }, 60_000);
+});
+
+describe.skipIf(WIN_NO_BASH_HOOKS)("#423 R1: the wasm self-heal keeps the PID-reuse guard and the DB's truth (POSIX)", () => {
+  it("P2-2: a TRANSIENT start-time lookup failure (same pid) → no report, and the stored start is kept (never downgraded to NULL)", async () => {
+    const c = newCase("live-nostart");
+    const { token } = seedWasmDb(c, "pr2 nostart mail");
+    const o = await startStdioOwner(c);
+    const first = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token }, PTU);
+    expect(first.livenessCalls, `precondition: the first run restamped\n${first.out}`).toBe(1);
+    const failing = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token, FAKE_PS_NO_LSTART: "1" }, PTU);
+    expect(failing.peekCalls, "precondition: the mail was read").toBeGreaterThanOrEqual(1);
+    expect(failing.livenessCalls, `an unreadable start for the SAME pid reports nothing\n${failing.out}`).toBe(0);
+    await stop(o.child);
+    const a = await anchorOf(c, AGENT);
+    expect(a.agent_pid).toBe(process.pid);
+    expect(a.agent_pid_start, "the known start is kept").not.toBeNull();
+  }, 150_000);
+
+  it("P2-3: ANOTHER writer moves the stored anchor (B) after this agent's report (A) → the next run makes ONE call and the anchor is A again (no stale hit)", async () => {
+    const c = newCase("live-interleave");
+    const { token } = seedWasmDb(c, "pr2 interleave mail");
+    const o = await startStdioOwner(c);
+    const a = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token }, PTU);
+    expect(a.livenessCalls, `precondition: A reported\n${a.out}`).toBe(1);
+    const b = await door(record(c), LIVENESS, livenessArgs(999_999, "t-B", token));
+    expect(JSON.stringify(b.opened), "precondition: B's report landed").not.toMatch(/AUTH_FAILED|isError":true/);
+    const again = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token }, PTU);
+    expect(again.livenessCalls, `the DB holds B, not A: ONE call\n${again.out}`).toBe(1);
+    await stop(o.child);
+    expect((await anchorOf(c, AGENT)).agent_pid, "the anchor is A's again").toBe(process.pid);
+  }, 150_000);
+
+  it("a WRONG agent token at the hook → the liveness call is refused: nothing recorded, the anchor untouched, and the next run with the right token still reports", async () => {
+    const c = newCase("live-wrongtok");
+    const { token } = seedWasmDb(c, "pr2 wrongtok mail");
+    const o = await startStdioOwner(c);
+    const bad = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: "pr2-not-the-agents-token-bbbbbbbb" }, PTU);
+    expect(cacheFiles(c), `a refused report is never recorded as a success\n${bad.out}`).toEqual([]);
+    const good = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token }, PTU);
+    expect(good.livenessCalls, `the right token still reports\n${good.out}`).toBe(1);
+    await stop(o.child);
+    expect((await anchorOf(c, AGENT)).agent_pid).toBe(process.pid);
   }, 150_000);
 });
