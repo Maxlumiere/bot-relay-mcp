@@ -338,15 +338,14 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 2: the hooks read a stdio owner's ma
     await stop(o.child);
   }, 120_000);
 
-  it("Q8: a CHANGED pid → PostToolUse restamps the anchor through the door (ONE `relay owner liveness`), caches it (0600); the steady state makes ZERO liveness calls", async () => {
+  it("Q8: a CHANGED pid → PostToolUse restamps the anchor through the door (ONE `relay owner liveness`), gated on the DB's stored anchor (no second copy kept); the steady state makes ZERO liveness calls", async () => {
     const c = newCase("live-restamp");
     const { token } = seedWasmDb(c, "pr2 live mail");
     const o = await startStdioOwner(c);
     const first = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token }, PTU);
     expect(first.peekCalls, `precondition: the mail was read through the door\n${first.out}`).toBeGreaterThanOrEqual(1);
     expect(first.livenessCalls, `ONE liveness call\n${first.out}`).toBe(1);
-    expect(cacheFiles(c).length, "the restamp was cached").toBe(1);
-    expect(fs.statSync(cacheFiles(c)[0]!).mode & 0o777).toBe(0o600);
+    expect(cacheFiles(c), "no second copy of the anchor (#423 R1 P2-3: the gate is the DB's truth)").toEqual([]);
     const steady = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token }, PTU);
     expect(steady.peekCalls, "precondition: the steady run read the mail").toBeGreaterThanOrEqual(1);
     expect(steady.livenessCalls, `the steady state: zero liveness calls\n${steady.out}`).toBe(0);
@@ -354,19 +353,20 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 2: the hooks read a stdio owner's ma
     expect((await anchorOf(c, AGENT)).agent_pid, "the anchor is the hook's agent pid (this test process)").toBe(process.pid);
   }, 150_000);
 
-  it("Q8: a STALE cache → one call, the right anchor, the cache corrected", async () => {
+  it("Q8: a STALE stored start (the same pid, another start, set through the door) → one call, and the anchor is the agent's real one again", async () => {
     const c = newCase("live-stale");
     const { token } = seedWasmDb(c, "pr2 stale mail");
     const o = await startStdioOwner(c);
-    await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token }, PTU);
-    const [cache] = cacheFiles(c);
-    expect(cache, "precondition: a cache exists").toBeDefined();
-    fs.writeFileSync(cache!, "999999 stale-start\n", { mode: 0o600 });
+    const first = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token }, PTU);
+    expect(first.livenessCalls, `precondition: the first run restamped\n${first.out}`).toBe(1);
+    const stale = await door(record(c), LIVENESS, livenessArgs(process.pid, "a stale start", token));
+    expect(JSON.stringify(stale.opened), "precondition: the stale start landed").not.toMatch(/AUTH_FAILED|isError":true/);
     const r = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token }, PTU);
     expect(r.livenessCalls, r.out).toBe(1);
-    expect(fs.readFileSync(cache!, "utf-8")).not.toContain("999999");
     await stop(o.child);
-    expect((await anchorOf(c, AGENT)).agent_pid).toBe(process.pid);
+    const a = await anchorOf(c, AGENT);
+    expect(a.agent_pid).toBe(process.pid);
+    expect(a.agent_pid_start, "the real start again").not.toBe("a stale start");
   }, 150_000);
 
   it("Q8: NO agent token → no liveness call at all (parity with the native self-heal); the mail is still read", async () => {

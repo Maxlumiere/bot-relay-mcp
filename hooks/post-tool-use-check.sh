@@ -592,36 +592,45 @@ print(json.dumps(args))
   return 0
 }
 
-# liveness_self_heal_owner — hook PR 2 (as ruled, Q8): the wasm instance's liveness self-heal, on the owner route only
-# (the mail was just read through the door). The gate moves OFF the DB: a per-(instance, agent) cache (0600, in the
-# hook state dir) of the last SUCCESSFULLY reported (pid, start). Current == cache -> no-op, ZERO calls. Otherwise ONE
-# `relay owner liveness` (sealed; report_liveness's own auth with the agent's token inside), inside the budget; only a
-# verified success is cached. The cache is a hint: a wrong one costs at most one idempotent call. No agent token -> no
-# call (as the native self-heal: liveness_self_heal).
+# liveness_self_heal_owner — hook PR 2 (as ruled, Q8; #423 R1 P2-2/P2-3): the wasm instance's liveness self-heal, on
+# the owner route only. It gates on the DB's TRUTH, as the native self-heal does: the stored anchor (agent_pid,
+# agent_pid_start) comes back in the sealed peek this run just made (RELAY_OWNER_OUT), so there is no second copy of it
+# to go stale. The native rule exactly: a different pid, or a READABLE start that differs, reports; a start that cannot
+# be read now never downgrades a known one (same pid: no report). The steady state is zero calls; a mismatch is ONE
+# `relay owner liveness` (sealed; report_liveness's own auth with the agent's token), inside the budget. No agent token,
+# or an older owner whose peek carries no anchor: no call.
 liveness_self_heal_owner() {
   [ -z "$AGENT_TOKEN" ] && return 0
-  [ "${RELAY_RES_HOOK_DB:-}" = http ] && [ -n "${RELAY_RES_DB_PATH:-}" ] || return 0
+  [ "${RELAY_RES_HOOK_DB:-}" = http ] || return 0
   command -v relay_agent_pid >/dev/null 2>&1 || return 0
   relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$' || return 0
-  local cur_pid cur_start key sdir cache want have
+  local stored stored_pid stored_start cur_pid cur_start need=0
+  relay_budget_for "the stored anchor's parse" 1 margin || return 0
+  stored=$(printf '%s' "${RELAY_OWNER_OUT:-}" | relay_run_streamed "$RELAY_STEP_SECS" python3 -c '
+import json, sys
+try:
+    a = json.loads(sys.stdin.read()).get("anchor")
+except Exception:
+    sys.exit(1)
+if not isinstance(a, dict):
+    sys.exit(1)
+pid, st = a.get("agent_pid"), a.get("agent_pid_start")
+sys.stdout.write("%s\x1f%s" % ("" if pid is None else int(pid), "" if st is None else st))
+' 2>/dev/null) || return 0
+  stored_pid="${stored%%$'\x1f'*}"
+  stored_start="${stored#*$'\x1f'}"
   # The walkers' stderr is relay_ps's NAMED cut (nothing else): never discarded.
   cur_pid=$(relay_agent_pid || printf '')
   case "$cur_pid" in ''|*[!0-9]*) return 0 ;; esac
   cur_start=$(relay_pid_start "$cur_pid" || printf '')
-  key=$(printf '%s' "$RELAY_RES_DB_PATH" | cksum 2>/dev/null | cut -d' ' -f1)
-  case "$key" in ''|*[!0-9]*) return 0 ;; esac
-  # Its own state dir (the global STATE_DIR is set later in this hook than this call): the same directory.
-  sdir="${RELAY_HOME:-$HOME/.bot-relay}/hook-state"
-  cache="$sdir/liveness-owner-${key}-${AGENT_NAME}"
-  want="$cur_pid $cur_start"
-  if [ -f "$cache" ] && [ ! -L "$cache" ]; then
-    IFS= read -r have < "$cache" 2>/dev/null || have=""
-    [ "$have" = "$want" ] && return 0
+  if [ "$stored_pid" != "$cur_pid" ]; then
+    need=1
+  elif [ -n "$cur_start" ] && [ "$stored_start" != "$cur_start" ]; then
+    need=1
   fi
+  [ "$need" -eq 0 ] && return 0
   relay_budget_for "the liveness restamp" 2 margin || return 0
   relay_owner_liveness "$RELAY_CLI" "$AGENT_NAME" "$RELAY_STEP_SECS" "$cur_pid" "$cur_start" || return 0
-  mkdir -p "$sdir" 2>/dev/null || return 0
-  ( umask 077; printf '%s\n' "$want" > "$cache.$$" 2>/dev/null && mv -f "$cache.$$" "$cache" 2>/dev/null ) || rm -f "$cache.$$" 2>/dev/null
   return 0
 }
 

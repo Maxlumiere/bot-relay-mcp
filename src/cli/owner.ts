@@ -110,6 +110,12 @@ function parse(argv: string[]): Args | string {
   return a;
 }
 
+/** A stored anchor as the door returns it: an integer pid (or null) and a start token (or null). */
+const isAnchor = (a: unknown): a is { agent_pid: number | null; agent_pid_start: string | null } => {
+  if (a === null || typeof a !== "object" || Array.isArray(a)) return false;
+  const o = a as Record<string, unknown>;
+  return (o.agent_pid === null || Number.isInteger(o.agent_pid)) && (o.agent_pid_start === null || typeof o.agent_pid_start === "string");
+};
 /** The ONE address the owner door is reached at (the self-pair guard compares a hub's checked address with it). */
 export const OWNER_DOOR_HOST = "127.0.0.1";
 /** ONE sealed exchange; resolves to the OPENED reply, or rejects with a named reason. */
@@ -300,6 +306,8 @@ export async function run(argv: string[]): Promise<number> {
         top_priority: registered ? p.top_priority : null,
         messages: registered ? p.messages : [],
         registered,
+        // #423 R1 P2-3: the agent's stored anchor, as the owner read it (absent from an older owner: no self-heal).
+        ...(registered && isAnchor(p.anchor) ? { anchor: p.anchor } : {}),
         source: "owner",
       }) + "\n",
     );

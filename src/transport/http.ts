@@ -808,7 +808,14 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
           reply(400, { ok: false, error: "peek args: only with_content (an integer 0-50)" });
           return;
         }
-        reply(200, { ok: true, agent: agent_name, ...pendingMetadata(getDb(), agent_name, { contentFor: (n as number | undefined) ?? 0 }) });
+        // #423 R1 P2-3 (as ruled): the reply carries the NAMED agent's stored anchor (one indexed read, no write: the peek
+        // stays pure), under the same owner-key authority as its mail. Never another agent's. PostToolUse's wasm
+        // self-heal gates on it (the DB's truth), as the native self-heal gates on its own DB read.
+        const anchorRow = getDb().prepare("SELECT agent_pid, agent_pid_start FROM agents WHERE name = ?").get(agent_name) as
+          | { agent_pid: number | null; agent_pid_start: string | null }
+          | undefined;
+        const anchor = anchorRow ? { agent_pid: anchorRow.agent_pid ?? null, agent_pid_start: anchorRow.agent_pid_start ?? null } : null;
+        reply(200, { ok: true, agent: agent_name, ...pendingMetadata(getDb(), agent_name, { contentFor: (n as number | undefined) ?? 0 }), anchor });
         return;
       }
       if (doorPath === "/owner/v1/session") {
@@ -2155,9 +2162,24 @@ export function startHttpServer(port: number, host: string, opts: StartHttpOptio
     res.status(204).end();
   });
 
-  const server = app.listen(port, host, () => {
+  const server = app.listen(port, host, (listenErr?: Error) => {
+    // #423 R1 P3-4: Express calls this on a FAILED listen too (with the error, and address() null). Nothing below may
+    // run then: above all, no owner record (it would name the requested port, which another process holds). The
+    // failure is named here; the server's 'error' handler keeps its own behaviour.
+    if (listenErr) {
+      log.error(`[http] could not listen on ${host}:${port} (${(listenErr as NodeJS.ErrnoException).code ?? listenErr.message}): no owner record is written.`);
+      // The MAIN listener's failure ends the process (exit 1): Express routes the error here, so nothing else would, and
+      // a daemon left running with no listener would keep its DB (a wasm owner's lock) from every successor. The
+      // owner-peek listener's failure is logged and its process (a stdio owner, or the daemon) keeps serving.
+      if (!ownerPeek) process.exit(1);
+      return;
+    }
     const addr = server.address();
-    boundPort = addr !== null && typeof addr === "object" ? addr.port : port;
+    if (addr === null || typeof addr !== "object") {
+      log.error(`[http] the listener on ${host}:${port} reports no bound address: no owner record is written.`);
+      return;
+    }
+    boundPort = addr.port;
     log.info(`HTTP server listening on http://${host}:${boundPort}${ownerPeek ? " (the owner-peek listener: the hooks' mail only)" : ""}`);
     // Hook PR 1 (as ruled, Q9): once listening, a wasm OWNER writes its endpoint record, which ALWAYS names a listener
     // the hooks reach as 127.0.0.1. Judged on the address actually BOUND and on this listener's own Host check: when

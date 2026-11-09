@@ -291,7 +291,10 @@ async function main(): Promise<void> {
     throw new Error("Failed to start HTTP server");
   }
 
+  let shuttingDown = false;
   const shutdown = () => {
+    if (shuttingDown) return; // idempotent: a signal and an EOF may both arrive
+    shuttingDown = true;
     stopOutboxTail();
     if (httpServer) {
       httpServer.close();
@@ -305,6 +308,15 @@ async function main(): Promise<void> {
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  // #423 R1 P1: a STDIO server lives and dies with its client. Its client closing stdin (EOF, no signal) ends it. Before
+  // the owner listener that happened by itself (nothing else held the event loop); with it, the process stayed alive
+  // and its wasm DB lock was held forever, locking out every successor. (`both` keeps its HTTP daemon running.)
+  if (config.transport === "stdio") {
+    const mcpIn = stdinForMcp ?? process.stdin;
+    mcpIn.once("end", shutdown);
+    mcpIn.once("close", shutdown);
+    if (mcpIn.readableEnded) shutdown();
+  }
 }
 
 main().catch((err) => {

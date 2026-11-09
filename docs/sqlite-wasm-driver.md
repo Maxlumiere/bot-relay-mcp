@@ -82,7 +82,7 @@ The driver is a property of the **instance**: a `sqlite_driver` key in the insta
     - any failure is a named skip, never a `sqlite3` read;
     - every credential call the hooks make to a local relay (registration, the token health check, liveness) goes through the door, never as a bearer to any port. With no valid door, none is sent, and the skip is named. An explicit non-loopback `RELAY_HTTP_HOST` declares a remote relay instead: its own token goes there by bearer, never a local one.
     - a stdio owner opens the same loopback listener (it serves only the door), and its record names it;
-    - PostToolUse's liveness self-heal goes through the door too (`relay owner liveness`, the agent's own token sealed in), only when the agent's pid or start differs from its last cached report, and only with the agent's token (as on a native instance);
+    - PostToolUse's liveness self-heal goes through the door too (`relay owner liveness`, the agent's own token sealed in), only when the agent's pid or start differs from the anchor stored in the database (the door's peek returns it, for the agent it names only), and only with the agent's token (as on a native instance);
     - an owner that holds the lock but has no hook endpoint is named as such (`skip-no-endpoint`).
   - Other `sqlite3` reads (tasks) stay skipped there: those print ONE named notice.
 - **A backup or a restore** of an owned database runs under the lock when no owner is live, and is refused while one is. A database with more than one hard link is refused by both (the lock is keyed by the file's name, so a second name could be locked by another process): remove the extra links.

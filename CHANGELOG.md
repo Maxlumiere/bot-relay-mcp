@@ -30,7 +30,9 @@
 ### A stdio session that owns a wasm database serves the hooks through its owner door
 
 - **Added:** a stdio relay process that owns a wasm database opens the loopback owner listener (127.0.0.1, the owner door only) and records it, so the hooks read its agents' mail through the door, as they do for an HTTP daemon. A listener that cannot open is logged; the stdio server keeps serving.
-- **Added:** PostToolUse's liveness self-heal on a wasm database goes through the door (`relay owner liveness`: the agent's own token sealed in, the normal authentication), only when the agent's pid or start differs from its last successful report (a 0600 cache). With no agent token there is no self-heal, as on a native database.
+- **Added:** PostToolUse's liveness self-heal on a wasm database goes through the door (`relay owner liveness`: the agent's own token sealed in, the normal authentication), only when the agent's pid or start differs from the anchor stored in the database. The door's mail peek now returns that anchor, for the agent it names only. The rule is the native self-heal's: a start that cannot be read now never replaces a known one. With no agent token, or an older relay whose peek has no anchor, there is no self-heal.
+- **Fixed:** a stdio relay process ends when its client closes stdin, so it no longer keeps a wasm database's lock after its client is gone.
+- **Fixed:** a listener that fails to bind writes no owner record (it would have named the requested port, which another process holds); the HTTP daemon then exits 1, naming the failure, instead of running with no listener.
 - **Added:** an owner that holds a wasm database's lock but has no valid owner record is named: the hook verdict `skip-no-endpoint` ("the owner has no hook endpoint").
 - **Changed:** with no running owner, the hooks' wasm notice says so ("no relay process owns it now: start one").
 
