@@ -108,7 +108,9 @@ async function startStdioOwner(c: Case): Promise<StdioOwner> {
     if (child.exitCode !== null) break;
     try {
       const rec = JSON.parse(fs.readFileSync(c.record, "utf-8")) as { pid: number; transport: string };
-      if (rec.pid === child.pid && rec.transport === "stdio") return { child, stdout: () => out, stderr: () => err };
+      // the record AND the client's handshake (its initialize reply): they land within a millisecond or two of each
+      // other (MEASURED), so a row that snapshots stdout must not race the reply
+      if (rec.pid === child.pid && rec.transport === "stdio" && out.includes('"id":0')) return { child, stdout: () => out, stderr: () => err };
     } catch {
       /* not yet */
     }
@@ -419,9 +421,18 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 2: the hooks read a stdio owner's ma
       expect(cacheFiles(c), "a forged reply is never cached as a success").toEqual([]);
       expect(seen.join("\n"), "the agent's token never crosses the door in clear (it is sealed)").not.toContain(token);
       // the CLI itself refuses the forged reply: a non-zero exit, named
-      const cli = spawnSync(process.execPath, [RELAY, "owner", "liveness", AGENT, "--pid", "4242", "--timeout-ms", "5000"], { encoding: "utf-8", env: baseEnv(c, { RELAY_AGENT_TOKEN: token }) });
+      // ASYNC: the forger lives in THIS process, and a spawnSync would starve it (the CLI would only time out)
+      const cli = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+        const p = spawn(process.execPath, [RELAY, "owner", "liveness", AGENT, "--pid", "4242", "--timeout-ms", "5000"], { env: baseEnv(c, { RELAY_AGENT_TOKEN: token }), stdio: ["ignore", "pipe", "pipe"] });
+        procs.push(p);
+        let so = "";
+        let se = "";
+        p.stdout!.on("data", (d: Buffer) => (so += d));
+        p.stderr!.on("data", (d: Buffer) => (se += d));
+        p.once("close", (status) => resolve({ status, stdout: so, stderr: se }));
+      });
       expect(cli.status, `the forged reply is refused\n${cli.stdout}${cli.stderr}`).not.toBe(0);
-      expect(cli.stderr).toMatch(/failed its authentication/);
+      expect(cli.stderr, "refused as a forgery, not a timeout").toMatch(/failed its authentication/);
     } finally {
       await new Promise<void>((r) => mitm.close(() => r()));
       await stop(o.child);

@@ -326,7 +326,11 @@ async function main(): Promise<void> {
     ownerPeekServer?.close();
   });
   onShutdown(SHUTDOWN_PHASE.DB, "database closed", () => closeDb());
-  const SIGNAL_EXIT: Readonly<Record<string, number>> = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };
+  // The exit codes are each transport's, unchanged: a process with a stdio session (stdio, both) exits 130 / 143 / 129
+  // (its auto-unregister's POSIX convention, v2.8); an HTTP-only daemon exits 0 on SIGINT / SIGTERM (a graceful stop)
+  // and keeps the default action for SIGHUP (it installs no handler for it).
+  const hasStdio = config.transport === "stdio" || config.transport === "both";
+  const SIGNAL_EXIT: Readonly<Record<string, number>> = hasStdio ? { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 } : { SIGINT: 0, SIGTERM: 0 };
   for (const sig of Object.keys(SIGNAL_EXIT) as NodeJS.Signals[]) process.on(sig, () => void shutdown(SIGNAL_EXIT[sig]!, sig));
   // #423 R1 P1 / R2 P2-1: a STDIO server lives and dies with its client: its client closing stdin (EOF, no signal) ends
   // it, after its in-flight replies are written and stdout has drained. `both` keeps its HTTP daemon running, unless
