@@ -406,6 +406,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: npx vitest run tests/hook-pr1-owner-http.test.ts --reporter=verbose
 
+      # Hook PR 2: a stdio wasm owner's door (every OS); the hook rows are POSIX (no bash hooks on native Windows).
+      - name: "Hook PR 2: a stdio owner's door (Windows)"
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/hook-pr2-stdio-owner.test.ts --reporter=verbose --reporter=json --outputFile.json=pr2-win.json
+      - name: "Hook PR 2: the named rows PASSED on Windows"
+        if: ${{ !cancelled() }}
+        run: node tools/ci/require-rows-passed.mjs pr2-win.json "lock → DB → listen → record" "the stdio listener serves ONLY the door" "a SECOND stdio process on the same wasm DB is refused by name"
+
   # REQUIRED CHECK. macOS launchd side-effect guard. The Ubuntu jobs structurally CANNOT catch a test that shells
   # to real `launchctl` — init.ts's daemon bootstrap is darwin-gated, so a `runInit` test that forgets
   # RELAY_SKIP_DAEMON silently installs a real launchd KeepAlive service + a :3777 daemon on a contributor's Mac
@@ -467,6 +475,13 @@ jobs:
       # PR 4: the CLI's credential clients are claimed on EVERY OS, but the macOS PR subset is chosen by text patterns
       # and this file matches none of them (it ran ZERO lines on macOS at 863832e, job 128911588305). So it runs HERE,
       # and the next step fails unless each named row PASSED, with the macOS-only ones (an IPv6 tunnel, POSIX privacy).
+      # Hook PR 2: a stdio wasm owner's door and its hooks (mail, Q5, Q8): every named row must PASS on macOS.
+      - name: "Hook PR 2: a stdio owner's mail and liveness (macOS)"
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/hook-pr2-stdio-owner.test.ts --reporter=verbose --reporter=json --outputFile.json=pr2-macos.json
+      - name: "Hook PR 2: the named rows PASSED on macOS"
+        if: ${{ !cancelled() }}
+        run: node tools/ci/require-rows-passed.mjs pr2-macos.json "lock → DB → listen → record" "the stdio listener serves ONLY the door" "a SECOND stdio process on the same wasm DB is refused by name" "check-relay.sh" "stop-check.sh" "post-tool-use-check.sh" "the owner EXITED (its record left behind)" "the owner holds the lock but has NO hook endpoint" "a CHANGED pid → PostToolUse restamps the anchor" "a STALE cache → one call" "NO agent token → no liveness call" "a FORGED liveness reply"
       - name: "PR 4: the CLI's credential clients (macOS)"
         if: ${{ !cancelled() }}
         run: npx vitest run tests/cli-door-clients.test.ts --reporter=verbose --reporter=json --outputFile.json=pr4-cli-macos.json

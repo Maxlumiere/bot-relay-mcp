@@ -416,7 +416,7 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
 
   it("the closed verdict set is pinned EXACTLY (TS), and the hooks' gate names each", async () => {
     const { HOOK_DB_VERDICTS } = (await import("../src/hook-db-verdict.js")) as { HOOK_DB_VERDICTS: readonly string[] };
-    expect([...HOOK_DB_VERDICTS]).toEqual(["sqlite3", "skip-declared-wasm", "skip-rlyw", "skip-unreadable", "skip-owner-locked", "http"]);
+    expect([...HOOK_DB_VERDICTS]).toEqual(["sqlite3", "skip-declared-wasm", "skip-rlyw", "skip-unreadable", "skip-owner-locked", "skip-no-endpoint", "http"]);
     const src = fs.readFileSync(path.join(HOOKS, "_vault-helpers.sh"), "utf-8");
     for (const v of HOOK_DB_VERDICTS) expect(src, `the hooks know ${v}`).toMatch(new RegExp(`\\b${v.replace(/-/g, "\\-")}\\)`));
   });
