@@ -23,6 +23,8 @@ import path from "path";
 import os from "os";
 import type { Server as HttpServer } from "http";
 import { mintHeaders } from "./_helpers/mint.js";
+// PR 4: a local send/resolve goes through the owner door; these in-process rows keep their fake daemon via the adapter.
+vi.mock("../src/cli/relay-client.js", async (orig) => (await import("./_helpers/door-via-fetch.js")).doorViaFetch(await orig()));
 
 const SHAPE_VALID_TOKEN = "AbCd1234efGH5678ijKL9012mnOP3456"; // matches TOKEN_SHAPE_RE → env path, no DB
 

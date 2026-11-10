@@ -115,8 +115,16 @@ export function windowsOwnerInfo(path: string): string | null {
   }
 }
 
-/** A Windows system tool by its TRUSTED ABSOLUTE PATH (SEC-22): src/system-binary.ts spawnSystem. */
-const runSystem = spawnSystem;
+/**
+ * A Windows system tool by its TRUSTED ABSOLUTE PATH (SEC-22): src/system-binary.ts spawnSystem. Hook PR 1 (as ruled,
+ * Codex #418 R2 P2 (iii)): a caller with a deadline (the owner-door client) bounds every tool spawned here by it.
+ */
+let systemSpawnDeadlineMs: number | null = null;
+export function setSystemSpawnDeadline(deadlineMs: number | null): void {
+  systemSpawnDeadlineMs = deadlineMs;
+}
+const runSystem: typeof spawnSystem = (name, args, opts) =>
+  spawnSystem(name, args, systemSpawnDeadlineMs === null ? opts : { ...opts, timeout: Math.max(1, systemSpawnDeadlineMs - Date.now()) });
 
 let currentUserSid: string | null | undefined;
 let currentUserSidFailure: string | null = null;
@@ -264,6 +272,61 @@ export function sddlAllowSids(sddl: string): string[] {
 }
 
 const ALLOW_ACE_TYPES: ReadonlySet<string> = new Set(["A", "OA", "XA", "ZA"]);
+
+/** SDDL rights that can WRITE, delete, create or re-permission (string tokens; a hex mask is decoded). */
+const WRITE_RIGHT_TOKENS: ReadonlySet<string> = new Set(["FA", "FW", "GA", "GW", "WD", "WO", "SD", "DC", "CC", "WP", "SW", "DT"]);
+const WRITE_RIGHT_MASK = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000;
+function rightsCanWrite(rights: string): boolean {
+  if (/^0x[0-9a-f]+$/i.test(rights)) return (parseInt(rights, 16) & WRITE_RIGHT_MASK) !== 0;
+  for (let k = 0; k + 1 < rights.length; k += 2) if (WRITE_RIGHT_TOKENS.has(rights.slice(k, k + 2))) return true;
+  return rights.length % 2 !== 0; // an odd token string is not understood: fail closed (write-capable)
+}
+
+/**
+ * Hook PR 1 (as ruled, option A): the SIDs an allow ACE in `sddl` grants a WRITE-capable right, other than those in
+ * `tolerated`. An ACE the parser does not understand is returned as a sentinel (fail closed). Pure: unit-testable.
+ */
+export function sddlForeignWriteSids(sddl: string, tolerated: ReadonlySet<string>): string[] {
+  const text = sddl.replace(/\s+/g, "");
+  let i = text.indexOf("D:");
+  const out: string[] = [];
+  if (i < 0) return ["NO-DACL"];
+  i += 2;
+  while (i < text.length && /[A-Z]/.test(text[i]) && text[i] !== "(") i++;
+  while (text[i] === "(") {
+    const close = text.indexOf(")", i);
+    if (close < 0) break;
+    const f = text.slice(i + 1, close).split(";");
+    i = close + 1;
+    if (f.length < 6) {
+      out.push("UNPARSED-ACE");
+      continue;
+    }
+    if (DENY_ACE_TYPES.has(f[0])) continue;
+    if (!ALLOW_ACE_TYPES.has(f[0])) {
+      out.push(`UNKNOWN-ACE-TYPE(${f[0]})`);
+      continue;
+    }
+    const sid = SDDL_ALIASES[f[5]] ?? f[5];
+    if (!tolerated.has(sid) && rightsCanWrite(f[2])) out.push(sid);
+  }
+  return out;
+}
+
+/** BUILTIN TrustedInstaller (NT SERVICE\TrustedInstaller): tolerated on a directory like SYSTEM. */
+const TRUSTED_INSTALLER_SID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+/**
+ * Hook PR 1 (as ruled, option A): a Windows DIRECTORY's allow ACEs that grant WRITE to anyone but this user, SYSTEM,
+ * Administrators, TrustedInstaller or CREATOR OWNER. [] = no foreign writer. Throws when it cannot be read.
+ */
+export function windowsForeignWriteSids(path: string): string[] {
+  const user = windowsUserSid();
+  if (!user) throw new Error(sidUnreadable());
+  const tolerated = new Set([user, SYSTEM_SID, ADMINISTRATORS_SID, TRUSTED_INSTALLER_SID, "S-1-3-0"]);
+  const tok = windowsOwnerSddlToken();
+  if (tok) tolerated.add(tok);
+  return sddlForeignWriteSids(windowsDaclSddl(path), tolerated);
+}
 const DENY_ACE_TYPES: ReadonlySet<string> = new Set(["D", "OD", "XD", "ZD"]);
 
 /** The OWNER token of an SDDL owner string ("O:BA", "O:S-1-5-…"), aliases mapped to SIDs; null when absent. */
@@ -321,6 +384,11 @@ export function windowsOwnerFault(path: string): string | null {
  * PSModulePath, so PowerShell is not used. Throws when the ACL cannot be read: a check that cannot read must not pass.
  */
 export function windowsAllowSids(path: string): string[] {
+  return sddlAllowSids(windowsDaclSddl(path));
+}
+
+/** The DACL of `path` as SDDL (icacls /save; see windowsAllowSids). Throws when it cannot be read. */
+function windowsDaclSddl(path: string): string {
   const tmp = pathJoin(osTmpdir(), `relay-acl-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.sddl`);
   try {
     const r = runSystem("icacls", [path, "/save", tmp], { encoding: "utf-8", windowsHide: true });
@@ -330,7 +398,7 @@ export function windowsAllowSids(path: string): string[] {
     const text = raw.toString(raw[0] === 0xff && raw[1] === 0xfe ? "utf16le" : raw.includes(0) ? "utf16le" : "utf8").replace(/^\uFEFF/, "");
     const sddl = text.split(/\r?\n/).find((l) => /D:/.test(l));
     if (!sddl) throw new Error(`icacls /save for "${path}" produced no DACL`);
-    return sddlAllowSids(sddl);
+    return sddl;
   } finally {
     fs.rmSync(tmp, { force: true });
   }

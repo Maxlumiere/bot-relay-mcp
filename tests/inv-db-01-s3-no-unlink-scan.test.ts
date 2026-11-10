@@ -22,10 +22,11 @@ import { fsOpenSites, REMOVERS } from "./_helpers/fs-open-sites.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const rel = (f: string) => path.relative(REPO, f).split(path.sep).join("/");
-const DB_MODULES = ["src/backup.ts", "src/db-owner-lock.ts", "src/sqlite-compat.ts", "src/db.ts", "src/db-header.ts", "src/cli/_instance-db.ts"];
+const DB_MODULES = ["src/backup.ts", "src/db-owner-lock.ts", "src/sqlite-compat.ts", "src/db.ts", "src/db-header.ts", "src/cli/_instance-db.ts", "src/owner-endpoint.ts"];
 
 /** `<key> <call text>` → what it removes (never a DB-family file). */
 const ALLOWED: Record<string, string> = {
+  "src/owner-endpoint.ts::writeOwnerEndpoint::rmSync fs.rmSync(tmp, { force: true })": "the owner's own record temp file, when its rename fails (never the record, never a DB-family name)",
   "src/backup.ts::takeSnapshot::rmSync fs.rmSync(snapshotDbPath, { force: true })": "a torn snapshot COPY in the staging directory (never the live DB)",
   "src/backup.ts::exportRelayState::rmSync fs.rmSync(stagingDir, { recursive: true, force: true })": "the export's own staging directory under $TMPDIR",
   "src/backup.ts::importRelayState::rmSync fs.rmSync(plainTar, { force: true })": "the decompressed archive in the staging directory",

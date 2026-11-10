@@ -318,9 +318,10 @@ sys.stdout.write("%d\x1f%s\x1f%s" % (n, who, top))
 # token means the remote read reports it cannot authenticate, as before.
 relay_hydrate_token() {
   [ -n "$AGENT_TOKEN" ] && return 0
-  relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"
+  # Once per run: the tunnel gate may already have asked it.
+  [ -n "${RELAY_RES_HOOK_DB:-}" ] || { relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"; }
   local t
-  if t=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
+  if t=$(read_relay_token_from_vault "$AGENT_NAME"); then
     AGENT_TOKEN="$t"
     export RELAY_AGENT_TOKEN="$t"
   fi
@@ -336,8 +337,10 @@ http_peek() {
   # of this hook's budget (relay_budget_for); with no time left it is skipped
   # (exit 125: this runs in a $(...) subshell, so the caller records the skip;
   # DEGRADED "no time budget left for the remote read", in the verdict below).
+  # The REMOTE route only (a wasm DB's owner is read through its door: relay_owner_read).
+  local base="http://${HTTP_HOST}:${HTTP_PORT}"
   relay_budget_for "the remote health probe" 1 margin || return 125
-  if ! curl -fsS -m "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
+  if ! curl "${RELAY_CURL_REMOTE[@]}" -fsS -m "$RELAY_STEP_SECS" "${base}/health" >/dev/null 2>&1; then
     return 1
   fi
 
@@ -364,8 +367,8 @@ print(json.dumps({
   local response
   relay_budget_for "the remote mail read" 2 margin || return 125
   # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
-  response=$({ relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
-    -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  response=$({ relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl "${RELAY_CURL_REMOTE[@]}" -fsS -m "$RELAY_STEP_SECS" -K - \
+    -X POST "${base}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     2>/dev/null) || return 1
@@ -488,8 +491,18 @@ case "$F1_RC" in
     fi
     ;;
   3)
-    if [ -n "${RELAY_HTTP_HOST:-}" ]; then
+    # #433 R2 P1-1: exit 3 is a routing policy, not "no local DB": a loopback host's tunnel gate needs the RESOLVER's
+    # answer (exists=false), asked once here under the margin budget. A declared remote needs none.
+    [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_remote_declared && relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"
+    if [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_bearer_allowed; then
+      # Hook PR 3 (as ruled): a loopback bearer is refused (the port-theft class) unless it is a trusted tunnel.
       MODE=remote
+      echo "[RELAY] mail not read: $(relay_bearer_refusal). Mail may be waiting: call get_messages." >&2
+    elif [ -n "${RELAY_HTTP_HOST:-}" ]; then
+      MODE=remote
+      # #433 R1: pinned to the checked address, no curl config, no proxy.
+      relay_curl_remote
+      relay_scope_vault_to_remote
       relay_hydrate_token
       SUMMARY=$(http_peek)
       case $? in
@@ -502,6 +515,27 @@ case "$F1_RC" in
     ;;
   *)
     MODE=unreadable
+    # Hook PR 1: `relay pending` cannot open a wasm DB (it has ONE opener, its owner). With a VALID owner endpoint
+    # record (`relay where` line 7 "http"), its mail is read through the owner's DOOR (relay_owner_read: one MAC'd
+    # exchange, no bearer credential, the answer `relay pending`'s, parsed here like the local read, under the
+    # budget); a failure is named, and nothing else is read. Native instances never get here.
+    if relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS" && [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
+      MODE=remote
+      if relay_budget_for "the owner door read" 3 margin; then
+        relay_owner_read "$RELAY_CLI" "$AGENT_NAME" "$RELAY_STEP_SECS"
+        _owner_rc=$?
+        if [ "$_owner_rc" -eq 0 ] && relay_budget_for "the owner answer summary" 1 margin \
+          && SUMMARY=$(printf '%s' "$RELAY_OWNER_OUT" | relay_run_streamed "$RELAY_STEP_SECS" python3 -c "$F1_SUMMARY_PY" 2>/dev/null); then
+          READ_OK=1
+        else
+          MODE=owner-unproved
+          F1_ERR="${RELAY_OWNER_WHY:-the owner door answer could not be read}"
+          echo "[RELAY] mail not read: ${F1_ERR}. Mail may be waiting: call get_messages." >&2
+        fi
+      else
+        RELAY_BUDGET_SKIPPED="${RELAY_BUDGET_SKIPPED:-the owner door read}"
+      fi
+    fi
     ;;
 esac
 
@@ -525,6 +559,8 @@ if command -v relay_verdict_set >/dev/null 2>&1; then
     relay_verdict_set "DEGRADED" "no time budget left for ${RELAY_BUDGET_SKIPPED}" " agent=\"${AGENT_NAME}\""
   elif [ "$MODE" = remote ]; then
     relay_verdict_set "CANNOT-JUDGE" "remote relay read failed (unreachable, unauthorized or no token)" " agent=\"${AGENT_NAME}\""
+  elif [ "$MODE" = owner-unproved ]; then
+    relay_verdict_set "CANNOT-JUDGE" "${F1_ERR:-the owner endpoint was not proved}" " agent=\"${AGENT_NAME}\""
   else
     relay_verdict_set "CANNOT-JUDGE" "no local relay instance and no remote relay configured" " agent=\"${AGENT_NAME}\""
   fi

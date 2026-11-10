@@ -65,6 +65,30 @@ process.env.RELAY_WAKE_COVERAGE_STATUS_PATH = path.join(TEST_DIR, "wake-coverage
 const { startHttpServer } = await import("../src/transport/http.js");
 const { closeDb, getDb, registerAgent: dbRegister, revokeAgentToken } = await import("../src/db.js");
 const { ERROR_CODES } = await import("../src/error-codes.js");
+const OE = await import("../src/owner-endpoint.js");
+
+/**
+ * Hook PR 3: a LOCAL DB's credential calls go ONLY through its owner door (sealed exchanges with the record's port).
+ * The record is pointed at the recording proxy (the test is the owner's user and holds its key), and the proxy OPENS
+ * each sealed request with that key and records the plaintext tool call as the bearer route recorded it: the agent
+ * token as x-agent-token, the registration secret as x-relay-secret, the JSON-RPC call as the body. A forced reply
+ * (rewrite) is SEALED with the response key, so the hook's client accepts it. Remote mode (no local DB) still records
+ * the bearer requests as they are.
+ */
+let doorRec: { key: string; instance_id: string; db_path: string } | null = null;
+function retargetRecordToProxy(port: number): void {
+  const p = OE.ownerEndpointPath(TEST_DB_PATH);
+  const rec = JSON.parse(fs.readFileSync(p, "utf-8")) as { key: string; instance_id: string; db_path: string };
+  doorRec = rec;
+  const tmp = `${p}.retarget-${process.pid}`;
+  const fd = fs.openSync(tmp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify({ ...rec, port }));
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, p);
+}
 
 // A hook run starts dozens of processes, each through a shim: allow for it.
 const SLOW = { timeout: 30_000 };
@@ -122,6 +146,8 @@ interface Seen {
   headers: http.IncomingHttpHeaders;
   body: string;
   reply: string;
+  /** "door": a sealed owner-door exchange, recorded as its plaintext. */
+  via?: "door";
 }
 let relay: HttpServer;
 let relayPort = 0;
@@ -138,6 +164,10 @@ function startProxy(): Promise<void> {
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const body = Buffer.concat(chunks).toString("utf-8");
+      if (doorRec !== null && (req.url ?? "").startsWith("/owner/v1/")) {
+        doorExchange(req, res, body, doorRec);
+        return;
+      }
       const headers = { ...req.headers };
       delete headers["content-length"];
       const up = http.request(
@@ -168,6 +198,53 @@ function startProxy(): Promise<void> {
     });
   });
   return new Promise((r) => proxy.listen(0, "127.0.0.1", () => r()));
+}
+
+/** A sealed door exchange: forwarded as is, recorded as its plaintext; a forced reply sealed with the response key. */
+function doorExchange(req: http.IncomingMessage, res: http.ServerResponse, body: string, rec: { key: string; instance_id: string; db_path: string }): void {
+  const url = req.url ?? "";
+  const binding = { instance_id: rec.instance_id, db_path: rec.db_path };
+  let env: { ts?: unknown; client_nonce?: unknown } = {};
+  try {
+    env = JSON.parse(body) as typeof env;
+  } catch {
+    /* not an envelope */
+  }
+  const ts = typeof env.ts === "number" ? env.ts : -1;
+  const nonce = typeof env.client_nonce === "string" ? env.client_nonce : "";
+  const plain = (ts >= 0 ? OE.doorOpen(OE.doorKey(rec.key, "req"), OE.doorRequestAad(binding, url, ts, nonce), env as Partial<import("../src/owner-endpoint.js").SealedEnvelope>) : null) as
+    | { agent_name?: string; args?: { rpc?: unknown; agent_token?: string; mint_secret?: string } }
+    | null;
+  const rpcBody = plain?.args?.rpc !== undefined ? JSON.stringify(plain.args.rpc) : "";
+  const headers: http.IncomingHttpHeaders = { ...req.headers };
+  if (plain?.args?.agent_token) headers["x-agent-token"] = plain.args.agent_token;
+  if (plain?.args?.mint_secret) headers["x-relay-secret"] = plain.args.mint_secret;
+  const up = http.request({ host: "127.0.0.1", port: relayPort, path: url, method: req.method, headers: { "content-type": "text/plain", "content-length": Buffer.byteLength(body) } }, (ur) => {
+    const out: Buffer[] = [];
+    ur.on("data", (c) => out.push(c));
+    ur.on("end", () => {
+      const real = Buffer.concat(out).toString("utf-8");
+      const status = ur.statusCode ?? 502;
+      const opened = OE.doorOpen(OE.doorKey(rec.key, "resp"), OE.doorResponseAad(binding, url, ts, nonce, status), JSON.parse(real || "{}") as Partial<import("../src/owner-endpoint.js").SealedEnvelope>) as { result?: unknown } | null;
+      const forced = rewrite && rpcBody ? rewrite(rpcBody) : null;
+      if (forced !== null) {
+        const result = (JSON.parse(forced) as { result?: unknown }).result;
+        seen.push({ url: rpcBody ? "/mcp" : url, headers, body: rpcBody, reply: forced, via: "door" });
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end(JSON.stringify(OE.doorSeal(OE.doorKey(rec.key, "resp"), OE.doorResponseAad(binding, url, ts, nonce, 200), { ok: true, result })));
+        return;
+      }
+      const reply = opened?.result !== undefined ? JSON.stringify({ jsonrpc: "2.0", id: 1, result: opened.result }) : JSON.stringify(opened ?? {});
+      seen.push({ url: rpcBody ? "/mcp" : url, headers, body: rpcBody, reply, via: "door" });
+      res.writeHead(status, { "content-type": "text/plain" });
+      res.end(real);
+    });
+  });
+  up.on("error", () => {
+    res.writeHead(502);
+    res.end();
+  });
+  up.end(body);
 }
 
 /** Calls to one MCP tool the proxy saw, with the tool's arguments parsed out of the body. */
@@ -243,7 +320,10 @@ function run(args: string[], env: Record<string, string>, stdin = "", fd5?: stri
 /** THE HARM, refused: no process the run started held any of `secrets` in its argv. */
 function expectNoArgvHolds(secrets: string[]): void {
   const procs = loggedProcs();
-  expect(procs.filter((p) => p[0] === "curl").length, "precondition: the shim saw curl run").toBeGreaterThan(0);
+  // The credential-carrying process: curl (the bearer route) or, hook PR 3, the relay CLI's door client (node
+  // ... owner tool|session|liveness: the token in its environment, never its argv). The shim logs both.
+  const carriers = procs.filter((p) => p[0] === "curl" || (p[0] === "node" && p.some((a) => a === "owner")));
+  expect(carriers.length, "precondition: the shim saw a credential-carrying process run (curl, or the door client)").toBeGreaterThan(0);
   for (const secret of secrets) {
     expect(secret.length, "precondition: a real secret").toBeGreaterThanOrEqual(8);
     const holders = procs.filter((p) => p.some((a) => a.includes(secret))).map((p) => p.join(" "));
@@ -273,7 +353,10 @@ function localEnv(name: string, h: string, token?: string): Record<string, strin
   };
 }
 
-/** A remote-mode env: a HOME with no relay instance at all, the relay reachable only over HTTP. */
+/**
+ * A remote-mode env: a HOME with no relay instance at all, the relay reachable only over HTTP. On loopback that is a
+ * tunnel, which hook PR 3 (as ruled) refuses unless RELAY_HTTP_TRUSTED_TUNNEL_PORT opts THIS port in.
+ */
 function remoteEnv(name: string, h: string, token: string): Record<string, string> {
   return {
     HOME: h,
@@ -281,6 +364,7 @@ function remoteEnv(name: string, h: string, token: string): Record<string, strin
     RELAY_AGENT_TOKEN: token,
     RELAY_HTTP_HOST: "127.0.0.1",
     RELAY_HTTP_PORT: String(proxyPort),
+    RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(proxyPort),
     RELAY_HOOK_NOTICE_REMIND_SECS: "0",
     RELAY_STOP_WAKE_DAMPER_SECS: "0",
   };
@@ -341,6 +425,10 @@ beforeAll(async () => {
   await startProxy();
   const p = proxy.address();
   proxyPort = typeof p === "object" && p ? p.port : 0;
+  // Hook PR 3: every daemon writes its owner record; the test points it at the recording proxy (see doorExchange).
+  const recEnd = Date.now() + 10_000;
+  while (!fs.existsSync(OE.ownerEndpointPath(TEST_DB_PATH)) && Date.now() < recEnd) await new Promise((r) => setTimeout(r, 50));
+  retargetRecordToProxy(proxyPort);
   await warmShims();
 }, 60_000);
 
@@ -520,7 +608,7 @@ describe("the reply summary every print site uses: a fixed line, never the reply
 });
 
 describe("check-relay.sh (SessionStart)", SLOW, () => {
-  it("health_check + re-register: the agent token reaches the relay as a header, and no argv held it", async () => {
+  it("health_check + re-register: the agent token reaches the relay inside the SEALED door request (hook PR 3: a local DB), and no argv held it", async () => {
     const name = "argv-cr-reg";
     const token = dbRegister(name, "tester", []).plaintext_token as string;
     const r = await run([CHECK_RELAY], localEnv(name, home("cr-reg"), token));
@@ -530,6 +618,7 @@ describe("check-relay.sh (SessionStart)", SLOW, () => {
     expect(reg.length, `precondition: register_agent ran. stderr: ${r.stderr}`).toBeGreaterThan(0);
     expect(health[0].headers["x-agent-token"]).toBe(token);
     expect(reg[0].headers["x-agent-token"]).toBe(token);
+    expect([health[0].via, reg[0].via], "both went through the owner door").toEqual(["door", "door"]);
     expectNoArgvHolds([token]);
   });
 
@@ -684,7 +773,7 @@ describe("stop-check.sh (Stop) and post-tool-use-check.sh (every tool call)", SL
   // of the hooks whose budget arithmetic reads a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts), so this
   // precondition never depends on the runner; the CONTROL below starves CI's step and reproduces CI's failure.
   const ptuSeamed = (tag: string) => path.join(budgetTree(path.join(TEST_DIR, `seamed-${tag}`), HOOKS_DIR, path.join(REPO_ROOT, "bin")), "post-tool-use-check.sh");
-  it("PostToolUse liveness restamp: report_liveness carries the token in header and body, no argv held it (a fixed budget clock)", async () => {
+  it("PostToolUse liveness restamp: report_liveness carries the token inside the SEALED door request (hook PR 3), no argv held it (a fixed budget clock)", async () => {
     const name = "argv-ptu-liveness";
     const token = dbRegister(name, "tester", []).plaintext_token as string;
     // A stored anchor that is NOT this hook's process, so the self-heal fires.
@@ -694,35 +783,35 @@ describe("stop-check.sh (Stop) and post-tool-use-check.sh (every tool call)", SL
     const calls = toolCalls("report_liveness");
     expect(calls.length, `precondition: the restamp ran. stderr: ${r.stderr}`).toBe(1);
     expect(calls[0].headers["x-agent-token"]).toBe(token);
-    expect(calls[0].args.agent_token).toBe(token);
+    expect(calls[0].via, "through the owner door").toBe("door");
     expectNoArgvHolds([token]);
   });
-  it("CONTROL: the same run with ONLY the liveness health probe starved reproduces CI's failure: no restamp, the skip names the probe", async () => {
+  it("CONTROL: the same run with ONLY the liveness restamp step starved: no restamp, the skip names the step", async () => {
     const name = "argv-ptu-liveness-ctl";
     const token = dbRegister(name, "tester", []).plaintext_token as string;
     getDb().prepare("UPDATE agents SET agent_pid = 999999, agent_pid_start = 'never' WHERE name = ?").run(name);
-    const r = await run([ptuSeamed("ptu-live-ctl")], { ...localEnv(name, home("ptu-live-ctl"), token), RELAY_TEST_CLOCK: "0", RELAY_TEST_STARVE: "the liveness health probe" }, PTU_STDIN);
-    expect(toolCalls("report_liveness").length, "the restamp never ran: CI's precondition failure, made deterministic").toBe(0);
-    expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the liveness health probe \(\d+s of 5s spent\): skipped\./);
+    const r = await run([ptuSeamed("ptu-live-ctl")], { ...localEnv(name, home("ptu-live-ctl"), token), RELAY_TEST_CLOCK: "0", RELAY_TEST_STARVE: "the liveness restamp" }, PTU_STDIN);
+    expect(toolCalls("report_liveness").length, "the restamp never ran: the starved step, made deterministic").toBe(0);
+    expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the liveness restamp \(\d+s of 5s spent\): skipped\./);
   });
 });
 
 describe("Codex: hooks/codex/codex-session-start.sh and bin/codex-relay", SLOW, () => {
-  it("SessionStart with a launch marker: discover_agents AND register_agent carry the token as a header, no argv held it", async () => {
+  it("SessionStart with a launch marker (a LOCAL DB): register_agent goes through the owner door with the token sealed; no discover_agents (the door serves none: the hook registers normally); no argv held it", async () => {
     const name = "argv-codex-hook";
     const token = dbRegister(name, "auditor", []).plaintext_token as string;
     const env = { ...localEnv(name, home("codex-hook"), token), RELAY_AGENT_ROLE: "auditor", RELAY_LAUNCH_SESSION: "0123abcd-0000-0000-0000-000000000000" };
     const r = await run([CODEX_HOOK], env, JSON.stringify({ session_id: "c0dec0de-0000-0000-0000-000000000001", hook_event_name: "SessionStart" }));
     const disc = toolCalls("discover_agents");
     const reg = toolCalls("register_agent");
-    expect(disc.length, `precondition: discover ran. stderr: ${r.stderr}`).toBe(1);
+    expect(disc.length, "no token-bearing discover on the door route").toBe(0);
     expect(reg.length, `precondition: register ran. stderr: ${r.stderr}`).toBe(1);
-    expect(disc[0].headers["x-agent-token"]).toBe(token);
     expect(reg[0].headers["x-agent-token"]).toBe(token);
+    expect(reg[0].via).toBe("door");
     expectNoArgvHolds([token]);
   });
 
-  it("the launcher's launch register carries the token as a header, no argv held it (Codex itself is stubbed)", async () => {
+  it("the launcher's launch register (a LOCAL DB) goes through the owner door with the token sealed, no argv held it (Codex itself is stubbed)", async () => {
     const name = "argv-codex-launch";
     const token = dbRegister(name, "auditor", []).plaintext_token as string;
     const h = home("codex-launch");
@@ -734,6 +823,7 @@ describe("Codex: hooks/codex/codex-session-start.sh and bin/codex-relay", SLOW, 
     const reg = toolCalls("register_agent");
     expect(reg.length, `precondition: the launch register ran. stderr: ${r.stderr}`).toBe(1);
     expect(reg[0].headers["x-agent-token"]).toBe(token);
+    expect(reg[0].via).toBe("door");
     expectNoArgvHolds([token]);
   });
 });

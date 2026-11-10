@@ -353,10 +353,12 @@ async function checkDaemon(): Promise<CheckResult> {
   const host = process.env.RELAY_HTTP_HOST || "127.0.0.1";
   try {
     const probe = await withDeadline(1000, "daemon /health", async (signal) => {
-      const res = await fetch(`http://${host}:${port}/health`, { signal });
-      if (!res.ok) return { ok: false as const, status: res.status };
-      // Body read inside the bound — `res.json()` used to sit past the cleared timer.
-      return { ok: true as const, data: (await res.json()) as { version?: string; protocol_version?: string } };
+      // #434 R1 P2-5: relay-client's healthGet (pinned to the checked address; no credential can ride it).
+      const { healthGetHost } = await import("./relay-client.js");
+      const res = await healthGetHost(host, port, 1000, signal);
+      if (res.status < 200 || res.status >= 300) return { ok: false as const, status: res.status };
+      // Body read inside the bound.
+      return { ok: true as const, data: JSON.parse(res.text) as { version?: string; protocol_version?: string } };
     });
     if (probe.ok) {
       return {
@@ -429,9 +431,12 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
   let health: HealthBody | null = null;
   try {
     const probe = await withDeadline(5000, `hub ${base}/health`, async (signal) => {
-      const res = await fetch(`${base}/health`, { signal });
-      if (!res.ok) return { ok: false as const, status: res.status };
-      return { ok: true as const, body: (await res.json()) as HealthBody };
+      // #434 R1 P2-5: relay-client's healthGet (pinned to the checked address; no credential can ride it).
+      const { healthGetHost } = await import("./relay-client.js");
+      const hp = hubUrl.port ? Number(hubUrl.port) : hubUrl.protocol === "https:" ? 443 : 80;
+      const res = await healthGetHost(hubUrl.hostname, hp, 5000, signal, hubUrl.protocol === "https:");
+      if (res.status < 200 || res.status >= 300) return { ok: false as const, status: res.status };
+      return { ok: true as const, body: JSON.parse(res.text) as HealthBody };
     });
     if (!probe.ok) {
       results.push({
@@ -485,33 +490,35 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
   const token = process.env.RELAY_AGENT_TOKEN;
   if (token) {
     try {
-      const { body, httpStatus } = await withDeadline(5000, `hub ${base}/mcp token check`, async (signal) => {
-        const res = await fetch(`${base}/mcp`, {
-          method: "POST",
-          signal,
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json, text/event-stream",
-            "X-Agent-Token": token,
-          },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            id: 1,
-            method: "tools/call",
-            params: { name: "health_check", arguments: {} },
-          }),
-        });
-        // SSE body — read inside the bound.
-        const text = await res.text();
-        const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-        const rpcResp = dataLine ? JSON.parse(dataLine.slice(5).trim()) : JSON.parse(text || "{}");
-        const parsed = rpcResp?.result?.content?.[0]?.text
-          ? JSON.parse(rpcResp.result.content[0].text)
-          : rpcResp;
-        // httpStatus is carried OUT of the closure: the response object itself
-        // must not escape, or a caller could drain it past the deadline again.
-        return { body: parsed, httpStatus: res.status };
-      });
+      // PR 4 (as ruled): the token goes through relay-client. A LOOPBACK hub URL (any spelling) is this machine's
+      // relay, reached only through its owner door; a remote hub by a hardened bearer (no redirect, no proxy, the
+      // checked address); an unresolved host gets nothing.
+      const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, mcpResultOf, remoteToken, envSelects, RelayClientError } = await import("./relay-client.js");
+      const hubPort = hubUrl.port ? Number(hubUrl.port) : hubUrl.protocol === "https:" ? 443 : 80;
+      const route = await routeFor(hubUrl.hostname.replace(/^\[|\]$/g, ""), hubPort, hubUrl.protocol === "https:");
+      if (route.kind === "unresolved") throw new RelayClientError(unresolvedMessage(route));
+      let body: Record<string, unknown> | null;
+      let httpStatus: number;
+      if (route.kind === "local") {
+        const result = await localTool("health_check", {}, { agentToken: token }, { timeoutMs: 5000 });
+        body = toolJson(result);
+        httpStatus = result.isError ? 400 : 200;
+      } else {
+        // As ruled on #434: a flag-chosen remote never gets the launcher's RELAY_AGENT_TOKEN (it usually belongs to the
+        // LOCAL relay): only when RELAY_HTTP_HOST names this hub; otherwise the hub's own vault entry.
+        const remoteTok = await remoteToken(route.host, route.port, process.env.RELAY_AGENT_NAME ?? "", { envSelected: envSelects(route.host) });
+        if (!remoteTok) throw new RelayClientError(`no token for this hub: RELAY_AGENT_TOKEN is used only when RELAY_HTTP_HOST names the hub; otherwise its own vault entry (agents/remote-${route.host}-${route.port}/<agent>.token)`);
+        const r = await remotePost(
+          route,
+          "/mcp",
+          { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Agent-Token": remoteTok },
+          JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "health_check", arguments: {} } }),
+          5000,
+        );
+        const result = mcpResultOf(r.text);
+        body = result ? toolJson(result) : null;
+        httpStatus = r.status;
+      }
       if (body?.auth_error === true) {
         results.push({
           name: "token auth",

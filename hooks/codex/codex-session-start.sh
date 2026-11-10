@@ -140,9 +140,11 @@ if [ -f "$HOOKS_DIR/_vault-helpers.sh" ]; then
 fi
 
 # Vault-first: if no token in env but one is on disk for this agent, reuse it
-# (lossless restart — same as check-relay.sh).
+# (lossless restart — same as check-relay.sh). Hook PR 3 (as ruled): on a declared remote with a local DB, only that
+# remote's own vault entries.
+command -v relay_scope_vault_to_remote >/dev/null 2>&1 && relay_scope_vault_to_remote
 if [ -z "${RELAY_AGENT_TOKEN:-}" ] && command -v read_relay_token_from_vault >/dev/null 2>&1; then
-  if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
+  if VAULT_TOKEN=$(read_relay_token_from_vault "$AGENT_NAME"); then
     export RELAY_AGENT_TOKEN="$VAULT_TOKEN"
   fi
 fi
@@ -189,9 +191,47 @@ sys.stdout.write(json.dumps({
   exit 0
 }
 
-# curl is required to register; without it, still emit the inbox nudge so the
+# --- Hook PR 3 (as ruled after Codex #418 R2): a LOCAL DB's credential calls go ONLY through its owner door ---
+# The route, from the resolver (relay where): a local relay DB with a valid owner record → "door" (the registration is
+# a sealed exchange with that DB's own daemon, relay_owner_tool: the token from the environment, the registration
+# secret from its file, never argv; never to a configured endpoint). A local DB with no valid door → "none": NO
+# credential is sent, named in the context. REMOTE mode (no local DB; RELAY_HTTP_HOST a non-loopback host) → "curl",
+# its bearer, as before. Without the shared helpers the hook sends no credential at all (it never could).
+# On the door route the cold-start handoff check asks the door for THIS agent's own session_id (/owner/v1/session, as
+# ruled: one name, its own token, no enumeration) instead of discover_agents.
+CODEX_ROUTE=curl
+RELAY_CURL_REMOTE=()
+if command -v relay_owner_tool >/dev/null 2>&1 && command -v relay_where_load >/dev/null 2>&1 && ! relay_remote_declared; then
+  CODEX_CLI="$HOOKS_DIR/../bin/relay"
+  CODEX_ROUTE=none
+  CODEX_WHY="the relay CLI could not resolve this instance"
+  # The margin budget: this hook reads no mail, so it keeps no pre-mail reserve.
+  if relay_budget_for "the resolver" 2 margin && relay_where_load "$CODEX_CLI" "$RELAY_STEP_SECS" && [ "${RELAY_RES_KIND:-error}" != error ] && [ "${RELAY_RES_EXISTS:-}" = true ]; then
+    case "${RELAY_RES_HOOK_DB:-}" in
+      http|sqlite3)
+        if [ -n "${RELAY_RES_OWNER_ENDPOINT:-}" ]; then CODEX_ROUTE=door; else CODEX_WHY="this DB has no valid owner record: restart the relay daemon if it is running"; fi
+        ;;
+      *) CODEX_WHY="the relay CLI's DB verdict (${RELAY_RES_HOOK_DB:-none}) has no owner door" ;;
+    esac
+  elif relay_trusted_tunnel; then
+    CODEX_ROUTE=curl
+    echo "[RELAY] bearer to a trusted tunnel on 127.0.0.1:${HTTP_PORT}: if the tunnel drops, another local user could take that port." >&2
+  else
+    CODEX_WHY="no local relay DB, and no declared remote RELAY_HTTP_HOST (${RELAY_TUNNEL_HINT})"
+  fi
+  if [ "$CODEX_ROUTE" = none ]; then
+    echo "[RELAY] no credential is sent this session start: ${CODEX_WHY}." >&2
+    RELAY_CTX_WARNING="NOT REGISTERED by this hook: ${CODEX_WHY}. You can read mail; register through your MCP connection. "
+    emit_context_and_exit
+  fi
+fi
+
+# #433 R1: a bearer to a remote or a tunnel is pinned to the checked address, without curl config or proxy.
+[ "$CODEX_ROUTE" = curl ] && command -v relay_curl_remote >/dev/null 2>&1 && relay_curl_remote
+
+# curl is required to register on the curl route; without it, still emit the inbox nudge so the
 # model checks mail (its own get_messages call surfaces any error).
-command -v curl >/dev/null 2>&1 || emit_context_and_exit
+[ "$CODEX_ROUTE" = door ] || command -v curl >/dev/null 2>&1 || emit_context_and_exit
 
 CAPS_JSON=$(build_caps_json)
 
@@ -199,7 +239,8 @@ CAPS_JSON=$(build_caps_json)
 # Best-effort: empty / [] → the field is omitted (graceful — registration never
 # fails over the handshake, Tether falls back to name matching). Byte-parity with
 # check-relay.sh so a Codex agent's host_id agrees with the extension's reader.
-RELAY_HOST_PID_CHAIN=$(relay_pid_chain 2>/dev/null || printf '')
+# The walkers' stderr is relay_ps's NAMED cut (nothing else): never discarded.
+RELAY_HOST_PID_CHAIN=$(relay_pid_chain || printf '')
 [ "$RELAY_HOST_PID_CHAIN" = "[]" ] && RELAY_HOST_PID_CHAIN=""
 RELAY_HOST_GUID=$(relay_machine_guid 2>/dev/null || printf '')
 # terminal_title_ref: only sent when the launcher exports RELAY_TERMINAL_TITLE
@@ -220,9 +261,9 @@ if [ -n "$RELAY_TERMINAL_TITLE_VALUE" ] && ! [[ "$RELAY_TERMINAL_TITLE_VALUE" =~
 fi
 
 # v2.14.1 — capture the agent's own process for presence (best-effort).
-RELAY_AGENT_PID=$(relay_agent_pid 2>/dev/null || printf '')
+RELAY_AGENT_PID=$(relay_agent_pid || printf '')
 RELAY_AGENT_PID_START=""
-[ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" 2>/dev/null || printf '')
+[ -n "$RELAY_AGENT_PID" ] && RELAY_AGENT_PID_START=$(relay_pid_start "$RELAY_AGENT_PID" || printf '')
 
 # The token is never a header in argv: it rides curl's config on STDIN (relay_curl_token_config, from
 # _vault-helpers.sh). Without the helpers no token is sent, and the register fails loudly instead.
@@ -240,8 +281,8 @@ relay_token_config() { command -v relay_curl_token_config >/dev/null 2>&1 && rel
 # session_id (filtered by AGENT_NAME) also means a marker for a DIFFERENT agent
 # can never make us skip (no cross-agent leakage).
 SKIP_REGISTER_HANDOFF=0
-if relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$'; then
-  DISCOVER_BODY=$(relay_token_config | curl -fsS --connect-timeout 1 --max-time 2 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+if [ "$CODEX_ROUTE" = curl ] && relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$'; then
+  DISCOVER_BODY=$(relay_token_config | curl ${RELAY_CURL_REMOTE[@]+"${RELAY_CURL_REMOTE[@]}"} -fsS --connect-timeout 1 --max-time 2 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
     "${REG_HEADERS[@]}" \
     --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"discover_agents","arguments":{}}}' 2>/dev/null) || DISCOVER_BODY=""
   if [ -n "$DISCOVER_BODY" ] && command -v python3 >/dev/null 2>&1; then
@@ -272,11 +313,32 @@ except Exception:
 fi
 
 if [ "$SKIP_REGISTER_HANDOFF" -eq 0 ]; then
-  # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
-  REG_BODY=$({ command -v relay_mint_secret_curl_config >/dev/null 2>&1 && relay_mint_secret_curl_config || true; relay_token_config || true; } | curl -s -m 4 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
-    "${REG_HEADERS[@]}" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"codex\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}}}" \
-    2>/dev/null)
+  CODEX_REG_ARGS="{\"name\":\"${AGENT_NAME}\",\"role\":\"${AGENT_ROLE}\",\"capabilities\":${CAPS_JSON},\"cli_profile\":\"codex\"${RELAY_TERMINAL_TITLE_VALUE:+,\"terminal_title_ref\":\"${RELAY_TERMINAL_TITLE_VALUE}\"}${RELAY_HOST_PID_CHAIN:+,\"host_shell_pids\":${RELAY_HOST_PID_CHAIN}}${RELAY_HOST_GUID:+,\"host_id\":\"${RELAY_HOST_GUID}\"}${RELAY_AGENT_PID:+,\"agent_pid\":${RELAY_AGENT_PID}}${RELAY_AGENT_PID_START:+,\"agent_pid_start\":\"${RELAY_AGENT_PID_START}\"}}"
+  REG_BODY=""
+  if [ "$CODEX_ROUTE" = curl ]; then
+    # PR-D: the registration secret, and the token, ride curl's config on STDIN (never argv, never env).
+    # #433 R1 P1-2 (as ruled): a remote is presented ITS OWN registration secret only, never the local one.
+    if [ -n "${RELAY_VAULT_SCOPE:-}" ] && command -v relay_mint_secret_curl_config >/dev/null 2>&1 && ! relay_mint_secret_curl_config >/dev/null 2>&1; then
+      echo "[RELAY] no registration secret for the remote relay: $(relay_remote_mint_hint)." >&2
+    fi
+    REG_BODY=$({ command -v relay_mint_secret_curl_config >/dev/null 2>&1 && relay_mint_secret_curl_config || true; relay_token_config || true; } | curl ${RELAY_CURL_REMOTE[@]+"${RELAY_CURL_REMOTE[@]}"} -s -m 4 -K - -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+      "${REG_HEADERS[@]}" \
+      -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":${CODEX_REG_ARGS}}}" \
+      2>/dev/null)
+  else
+    # Hook PR 3 (as ruled): the door route's handoff check asks the door for THIS agent's own session_id
+    # (/owner/v1/session: one name, its own token, no enumeration). A launch-bound session is not re-registered.
+    CODEX_DOOR_SID=""
+    if [ -n "${RELAY_AGENT_TOKEN:-}" ] && relay_whole_match "${RELAY_LAUNCH_SESSION:-}" '^[0-9a-fA-F-]{8,64}$' && relay_budget_for "the launch session check" 2 margin; then
+      CODEX_DOOR_SID=$(RELAY_AGENT_TOKEN="$RELAY_AGENT_TOKEN" relay_owner_session "$CODEX_CLI" "$RELAY_STEP_SECS" "$AGENT_NAME") || CODEX_DOOR_SID=""
+    fi
+    if [ -n "$CODEX_DOOR_SID" ] && [ "$CODEX_DOOR_SID" = "${RELAY_LAUNCH_SESSION:-}" ]; then
+      SKIP_REGISTER_HANDOFF=1
+    elif relay_budget_for "registration" 4 margin; then
+      # A sealed exchange through the owner door (the token from the environment, never argv).
+      REG_BODY=$(RELAY_AGENT_TOKEN="${RELAY_AGENT_TOKEN:-}" relay_owner_tool "$CODEX_CLI" "$RELAY_STEP_SECS" register_agent "$CODEX_REG_ARGS" 2>/dev/null) || REG_BODY=""
+    fi
+  fi
 
   # Capture a freshly-minted token (first register only) and persist it to the
   # vault so the stdio MCP server's resolveToken can authenticate this agent's

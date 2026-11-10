@@ -18,6 +18,9 @@ import path from "path";
  *                                     loop). With 0, every budgeted step gets exactly min(own, what an instant
  *                                     arrival leaves), whatever the runner's speed.
  *   RELAY_TEST_STARVE=<case pattern>  those steps get 0s: the REAL skip path runs.
+ *   RELAY_TEST_STARVE_AFTER=<n>       with RELAY_TEST_STARVE_COUNT=<file>: the matching steps run normally for their
+ *                                     first n calls (counted in that file: the calls run in subshells), then starve. A
+ *                                     walk is cut MID-WAY by the budget at an exact call, whatever the runner's speed.
  *
  * Drift guard: the clock seam rewrites the ONE `${SECONDS:-0}` read inside each of those two functions, and REFUSES
  * (throws) when a function is missing or holds another count, or when any hook line reads SECONDS in a way not
@@ -109,7 +112,8 @@ export function budgetTree(dir: string, hooksDir: string, binDir: string): strin
           "",
           "# TEST ONLY (budgetTree): RELAY_TEST_STARVE. See tests/_helpers/hook-budget-tree.ts.",
           `eval "$(declare -f relay_budget_for | sed '1s/^relay_budget_for/relay_budget_for_real/')"`,
-          'relay_budget_for() { case "$1" in $RELAY_TEST_STARVE) relay_budget_for_real "$1" 0 "${3:-}" ;; *) relay_budget_for_real "$@" ;; esac; }',
+          'relay_budget_for() { case "$1" in ${RELAY_TEST_STARVE:-}) relay_test_starve_now && { relay_budget_for_real "$1" 0 "${3:-}"; return; }; relay_budget_for_real "$@" ;; *) relay_budget_for_real "$@" ;; esac; }',
+          'relay_test_starve_now() { [ -n "${RELAY_TEST_STARVE_AFTER:-}" ] && [ -n "${RELAY_TEST_STARVE_COUNT:-}" ] || return 0; local n; n=$(cat "$RELAY_TEST_STARVE_COUNT" 2>/dev/null); n=$(( ${n:-0} + 1 )); printf \'%s\' "$n" > "$RELAY_TEST_STARVE_COUNT"; [ "$n" -gt "$RELAY_TEST_STARVE_AFTER" ]; }',
           "",
         ].join("\n"),
     );

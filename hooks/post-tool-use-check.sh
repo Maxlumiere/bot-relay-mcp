@@ -455,8 +455,10 @@ http_peek() {
   # of this hook's budget (relay_budget_for); with no time left it is skipped
   # (exit 125: this runs in a $(...) subshell, so the caller records the skip;
   # DEGRADED "no time budget left for the remote read", in the verdict below).
+  # The REMOTE route only (a wasm DB's owner is read through its door: relay_owner_read).
+  local base="http://${HTTP_HOST}:${HTTP_PORT}"
   relay_budget_for "the remote health probe" 1 margin || return 125
-  if ! curl -fsS -m "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1; then
+  if ! curl "${RELAY_CURL_REMOTE[@]}" -fsS -m "$RELAY_STEP_SECS" "${base}/health" >/dev/null 2>&1; then
     return 1
   fi
 
@@ -489,8 +491,8 @@ print(json.dumps({
   local response
   relay_budget_for "the remote mail read" 2 margin || return 125
   # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
-  response=$({ relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
-    -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
+  response=$({ relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl "${RELAY_CURL_REMOTE[@]}" -fsS -m "$RELAY_STEP_SECS" -K - \
+    -X POST "${base}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     2>/dev/null) || return 1
@@ -526,12 +528,12 @@ print(json.dumps({
 liveness_self_heal() {
   local db="$1"
   [ -z "$AGENT_TOKEN" ] && return 0
-  command -v curl >/dev/null 2>&1 || return 0
   command -v relay_agent_pid >/dev/null 2>&1 || return 0
   local cur_pid cur_start stored_pid stored_start
-  cur_pid=$(relay_agent_pid 2>/dev/null || printf '')
+  # The walkers' stderr is relay_ps's NAMED cut (nothing else): never discarded.
+  cur_pid=$(relay_agent_pid || printf '')
   [ -z "$cur_pid" ] && return 0
-  cur_start=$(relay_pid_start "$cur_pid" 2>/dev/null || printf '')
+  cur_start=$(relay_pid_start "$cur_pid" || printf '')
   # Read the stored anchor from the DB F1 read; if unavailable we can't compute
   # the gate → skip (SessionStart still carries the anchor).
   { [ -n "$db" ] && [ -f "$db" ]; } || return 0
@@ -566,25 +568,69 @@ sys.stdout.write("%s\x1f%s" % (r[0], r[1]))
     need=1
   fi
   [ "$need" -eq 0 ] && return 0
-  # Only over a reachable daemon.
-  relay_budget_for "the liveness health probe" 1 margin || return 0
-  curl -fsS -m "$RELAY_STEP_SECS" "http://${HTTP_HOST}:${HTTP_PORT}/health" >/dev/null 2>&1 || return 0
-  local payload
-  payload=$(AN="$AGENT_NAME" AT="$AGENT_TOKEN" PID="$cur_pid" ST="$cur_start" python3 -c '
+  # Hook PR 3 (as ruled after Codex #418 R2): the restamp carries the token to a LOCAL DB's daemon, so it goes ONLY
+  # through that DB's owner door (relay_owner_tool: a sealed exchange; the token from the environment, never argv),
+  # never to a configured endpoint. No valid door (no daemon, or one too old to write its record) = no restamp.
+  # The owner endpoint is `relay where`'s line 8: the local read's embedded resolution does not carry it (it sets no
+  # verdict either), so ask the resolver unless this run already did.
+  if [ -z "${RELAY_RES_HOOK_DB:-}" ]; then
+    relay_budget_for "the resolver" 2 margin || return 0
+    relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS" || return 0
+  fi
+  [ -n "${RELAY_RES_OWNER_ENDPOINT:-}" ] || return 0
+  local args
+  args=$(AN="$AGENT_NAME" PID="$cur_pid" ST="$cur_start" python3 -c '
 import json, os
-args = {"agent_name": os.environ["AN"], "agent_pid": int(os.environ["PID"]), "agent_token": os.environ["AT"]}
+args = {"agent_name": os.environ["AN"], "agent_pid": int(os.environ["PID"])}
 st = os.environ.get("ST", "")
 if st:
     args["agent_pid_start"] = st
-print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"report_liveness","arguments":args}}))
+print(json.dumps(args))
 ' 2>/dev/null) || return 0
   relay_budget_for "the liveness restamp" 2 margin || return 0
-  # The token (header AND body) rides curl's config on STDIN, never argv (relay_curl_config_line).
-  { relay_curl_token_config "$AGENT_TOKEN" && relay_curl_config_line data "$payload"; } | curl -fsS -m "$RELAY_STEP_SECS" -K - \
-    -X POST "http://${HTTP_HOST}:${HTTP_PORT}/mcp" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    >/dev/null 2>&1 || return 0
+  RELAY_AGENT_TOKEN="$AGENT_TOKEN" relay_owner_tool "$RELAY_CLI" "$RELAY_STEP_SECS" report_liveness "$args" >/dev/null 2>&1 || return 0
+  return 0
+}
+
+# liveness_self_heal_owner — hook PR 2 (as ruled, Q8; #423 R1 P2-2/P2-3): the wasm instance's liveness self-heal, on
+# the owner route only. It gates on the DB's TRUTH, as the native self-heal does: the stored anchor (agent_pid,
+# agent_pid_start) comes back in the sealed peek this run just made (RELAY_OWNER_OUT), so there is no second copy of it
+# to go stale. The native rule exactly: a different pid, or a READABLE start that differs, reports; a start that cannot
+# be read now never downgrades a known one (same pid: no report). The steady state is zero calls; a mismatch is ONE
+# `relay owner liveness` (sealed; report_liveness's own auth with the agent's token), inside the budget. No agent token,
+# or an older owner whose peek carries no anchor: no call.
+liveness_self_heal_owner() {
+  [ -z "$AGENT_TOKEN" ] && return 0
+  [ "${RELAY_RES_HOOK_DB:-}" = http ] || return 0
+  command -v relay_agent_pid >/dev/null 2>&1 || return 0
+  relay_whole_match "$AGENT_NAME" '^[A-Za-z0-9_.-]{1,64}$' || return 0
+  local stored stored_pid stored_start cur_pid cur_start need=0
+  relay_budget_for "the stored anchor's parse" 1 margin || return 0
+  stored=$(printf '%s' "${RELAY_OWNER_OUT:-}" | relay_run_streamed "$RELAY_STEP_SECS" python3 -c '
+import json, sys
+try:
+    a = json.loads(sys.stdin.read()).get("anchor")
+except Exception:
+    sys.exit(1)
+if not isinstance(a, dict):
+    sys.exit(1)
+pid, st = a.get("agent_pid"), a.get("agent_pid_start")
+sys.stdout.write("%s\x1f%s" % ("" if pid is None else int(pid), "" if st is None else st))
+' 2>/dev/null) || return 0
+  stored_pid="${stored%%$'\x1f'*}"
+  stored_start="${stored#*$'\x1f'}"
+  # The walkers' stderr is relay_ps's NAMED cut (nothing else): never discarded.
+  cur_pid=$(relay_agent_pid || printf '')
+  case "$cur_pid" in ''|*[!0-9]*) return 0 ;; esac
+  cur_start=$(relay_pid_start "$cur_pid" || printf '')
+  if [ "$stored_pid" != "$cur_pid" ]; then
+    need=1
+  elif [ -n "$cur_start" ] && [ "$stored_start" != "$cur_start" ]; then
+    need=1
+  fi
+  [ "$need" -eq 0 ] && return 0
+  relay_budget_for "the liveness restamp" 2 margin || return 0
+  relay_owner_liveness "$RELAY_CLI" "$AGENT_NAME" "$RELAY_STEP_SECS" "$cur_pid" "$cur_start" || return 0
   return 0
 }
 
@@ -620,7 +666,7 @@ notice_is_damped() {
 relay_hydrate_token() {
   [ -n "$AGENT_TOKEN" ] && return 0
   local t
-  if t=$(read_relay_token_from_vault "$AGENT_NAME" 2>/dev/null); then
+  if t=$(read_relay_token_from_vault "$AGENT_NAME"); then
     AGENT_TOKEN="$t"
     export RELAY_AGENT_TOKEN="$t"
   fi
@@ -746,11 +792,22 @@ case "$F1_RC" in
     fi
     ;;
   3)
-    if [ -n "${RELAY_HTTP_HOST:-}" ]; then
+    # #433 R2 P1-1: exit 3 is a routing policy, not "no local DB": a loopback host's tunnel gate needs the RESOLVER's
+    # answer (exists=false), asked once here under the margin budget. A declared remote needs none.
+    [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_remote_declared && relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"
+    if [ -n "${RELAY_HTTP_HOST:-}" ] && ! relay_bearer_allowed; then
+      # Hook PR 3 (as ruled): a loopback bearer is refused (the port-theft class) unless it is a trusted tunnel.
       MODE=remote
-      # The vault location is the resolver's answer: one `relay where`, remote only.
+      echo "[RELAY] mail not read: $(relay_bearer_refusal). Mail may be waiting: call get_messages." >&2
+    elif [ -n "${RELAY_HTTP_HOST:-}" ]; then
+      MODE=remote
+      # #433 R1: pinned to the checked address, no curl config, no proxy.
+      relay_curl_remote
+      # The vault (scoped to the remote when it must be) is beside the resolver's DB: one `relay where`, remote only.
+      relay_scope_vault_to_remote
       if [ -z "$AGENT_TOKEN" ]; then
-        relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"
+        # Once per run: the tunnel gate may already have asked it.
+        [ -n "${RELAY_RES_HOOK_DB:-}" ] || { relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS"; }
         relay_hydrate_token
       fi
       SUMMARY=$(http_peek)
@@ -764,6 +821,27 @@ case "$F1_RC" in
     ;;
   *)
     MODE=unreadable
+    # Hook PR 1: `relay pending` cannot open a wasm DB (it has ONE opener, its owner). With a VALID owner endpoint
+    # record (`relay where` line 7 "http"), its mail is read through the owner's DOOR (relay_owner_read: one MAC'd
+    # exchange, no bearer credential, the answer `relay pending`'s, parsed here like the local read, under the
+    # budget); a failure is named, and nothing else is read. Native instances never get here.
+    if relay_budget_for "the resolver" 2 margin && relay_where_load "$RELAY_CLI" "$RELAY_STEP_SECS" && [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
+      MODE=remote
+      if relay_budget_for "the owner door read" 3 margin; then
+        relay_owner_read "$RELAY_CLI" "$AGENT_NAME" "$RELAY_STEP_SECS"
+        _owner_rc=$?
+        if [ "$_owner_rc" -eq 0 ] && relay_budget_for "the owner answer summary" 1 margin \
+          && SUMMARY=$(printf '%s' "$RELAY_OWNER_OUT" | relay_run_streamed "$RELAY_STEP_SECS" env SRC=f1 AN="$AGENT_NAME" python3 -c "$NOTICE_PY" 2>/dev/null); then
+          READ_OK=1
+        else
+          MODE=owner-unproved
+          F1_ERR="${RELAY_OWNER_WHY:-the owner door answer could not be read}"
+          echo "[RELAY] mail not read: ${F1_ERR}. Mail may be waiting: call get_messages." >&2
+        fi
+      else
+        RELAY_BUDGET_SKIPPED="${RELAY_BUDGET_SKIPPED:-the owner door read}"
+      fi
+    fi
     ;;
 esac
 
@@ -777,6 +855,13 @@ if [ "$MODE" = local ] && [ "$READ_OK" -eq 1 ]; then
     relay_hydrate_token
   fi
   liveness_self_heal "$F1_DB"
+fi
+# Hook PR 2 (Q8): the wasm instance's self-heal, through the owner's door (never a native read).
+if [ "$MODE" = remote ] && [ "$READ_OK" -eq 1 ] && [ "${RELAY_RES_HOOK_DB:-}" = http ]; then
+  # #423 R2 P2-2: a vault-only agent (no RELAY_AGENT_TOKEN) gets its token from the instance vault, as on the native
+  # route (the resolver was loaded for this owner route above, so the vault is the one beside its DB).
+  relay_hydrate_token
+  liveness_self_heal_owner
 fi
 
 # THE ONLY UPGRADE. Positive evidence is a mailbox read that SUCCEEDED. An empty
@@ -800,6 +885,8 @@ if command -v relay_verdict_set >/dev/null 2>&1; then
     relay_verdict_set "DEGRADED" "no time budget left for ${RELAY_BUDGET_SKIPPED}" " agent=\"${AGENT_NAME}\""
   elif [ "$MODE" = remote ]; then
     relay_verdict_set "CANNOT-JUDGE" "remote relay read failed (unreachable, unauthorized or no token)" " agent=\"${AGENT_NAME}\""
+  elif [ "$MODE" = owner-unproved ]; then
+    relay_verdict_set "CANNOT-JUDGE" "${F1_ERR:-the owner endpoint was not proved}" " agent=\"${AGENT_NAME}\""
   else
     relay_verdict_set "CANNOT-JUDGE" "no local relay instance and no remote relay configured" " agent=\"${AGENT_NAME}\""
   fi

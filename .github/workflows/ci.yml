@@ -380,9 +380,39 @@ jobs:
       - name: INV-DB-01 slice 3 by-path rows + the never-unlink scan (Windows)
         if: ${{ !cancelled() }}
         run: npx vitest run tests/inv-db-01-s3-by-path.test.ts tests/inv-db-01-s3-no-unlink-scan.test.ts --reporter=verbose
+      # #433 R2 P1-2: the remote mint.secret's directory chain is private BEFORE its temp file exists. Its WINDOWS leg (a
+      # parent with an inheritable foreign ACE) is the point, so it runs HERE, and the next step fails unless the JSON
+      # report shows that ONE row PASSED (a filter that matched nothing, or a skip, would otherwise read as green).
+      - name: "#433 R2 P1-2: the remote secret's directory chain row (Windows)"
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/hook-pr3-door-aead.test.ts -t "directory chain is private and verified BEFORE" --reporter=verbose --reporter=json --outputFile.json=r2-p1-2.json
+      - name: "#433 R2 P1-2: that row PASSED (not skipped, not filtered away)"
+        if: ${{ !cancelled() }}
+        run: node -e "const j=require('./r2-p1-2.json');const rows=j.testResults.flatMap(f=>f.assertionResults).filter(a=>a.fullName.includes('directory chain is private and verified BEFORE'));console.log(rows.map(r=>r.status+' | '+r.fullName).join(' ; '));if(rows.length!==1||rows[0].status!=='passed'){console.error('the R2 P1-2 row did not PASS on Windows');process.exit(1)}"
+      # PR 4: the CLI's credential clients (the door for a local relay; the hardened bearer for a remote) are claimed on
+      # EVERY OS. This job runs a fixed list, so the file runs HERE, and the next step fails unless every row outside the
+      # LAN describes PASSED (the LAN rows may skip, by name, on a runner with no LAN address).
+      - name: "PR 4: the CLI's credential clients (Windows)"
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/cli-door-clients.test.ts --reporter=verbose --reporter=json --outputFile.json=pr4-cli.json
+      - name: "PR 4: the named critical rows PASSED (not skipped, not filtered away)"
+        if: ${{ !cancelled() }}
+        run: node tools/ci/require-rows-passed.mjs pr4-cli.json "a tool outside the allowlist is refused" "zero credential bytes to the configured port" "its token check goes through the door, never to that port" "an UNRESOLVED relay host gets nothing" "RELAY_AGENT_TOKEN is honoured for a remote ONLY" "a remote's TRANSPORT secret" "THE ALLOWLIST, both ways" "pair proceeds to it (not the loopback refusal)" "a VALID local owner record's port" "one byte every 30 ms" "a boundary-size message goes through the door" "a private scope → its token" "REPLACED between the check and the read" "WINDOWS, an inheritable foreign ACE" "healthGet sends only GET /health" "NEGATIVE CONTROLS" "each site is in the registry" "the owner door's deadline is ABSOLUTE"
       - name: INV-DB-01 slice 4 convert-journal + the flip + the doorbell lock (Windows)
         if: ${{ !cancelled() }}
         run: npx vitest run tests/inv-db-01-s4-convert.test.ts tests/inv-db-01-s4-doorbell.test.ts --reporter=verbose
+
+      - name: Hook PR 1 mail over HTTP from a daemon owner (Windows)
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/hook-pr1-owner-http.test.ts --reporter=verbose
+
+      # Hook PR 2: a stdio wasm owner's door (every OS); the hook rows are POSIX (no bash hooks on native Windows).
+      - name: "Hook PR 2: a stdio owner's door (Windows)"
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/hook-pr2-stdio-owner.test.ts --reporter=verbose --reporter=json --outputFile.json=pr2-win.json
+      - name: "Hook PR 2: the named rows PASSED on Windows"
+        if: ${{ !cancelled() }}
+        run: node tools/ci/require-rows-passed.mjs pr2-win.json "lock → DB → listen → record" "the stdio listener serves ONLY the door" "a SECOND stdio process on the same wasm DB is refused by name" "stdin EOF alone (no signal)" "an HTTP-only daemon whose port is already taken" "with its HTTP port taken DEGRADES to stdio" "EOF DRAINS before the process ends" "the REQUESTING agent's stored anchor"
 
   # REQUIRED CHECK. macOS launchd side-effect guard. The Ubuntu jobs structurally CANNOT catch a test that shells
   # to real `launchctl` — init.ts's daemon bootstrap is darwin-gated, so a `runInit` test that forgets
@@ -442,6 +472,22 @@ jobs:
 
       # INV-DB-01 2b-ii: the macOS single-owner primitive (an O_EXLOCK dotfile) is measured here, serial and alone, on
       # every PR and on main; and the owner behaviour rows (not in the PR subset otherwise).
+      # PR 4: the CLI's credential clients are claimed on EVERY OS, but the macOS PR subset is chosen by text patterns
+      # and this file matches none of them (it ran ZERO lines on macOS at 863832e, job 128911588305). So it runs HERE,
+      # and the next step fails unless each named row PASSED, with the macOS-only ones (an IPv6 tunnel, POSIX privacy).
+      # Hook PR 2: a stdio wasm owner's door and its hooks (mail, Q5, Q8): every named row must PASS on macOS.
+      - name: "Hook PR 2: a stdio owner's mail and liveness (macOS)"
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/hook-pr2-stdio-owner.test.ts --reporter=verbose --reporter=json --outputFile.json=pr2-macos.json
+      - name: "Hook PR 2: the named rows PASSED on macOS"
+        if: ${{ !cancelled() }}
+        run: node tools/ci/require-rows-passed.mjs pr2-macos.json "lock → DB → listen → record" "the stdio listener serves ONLY the door" "a SECOND stdio process on the same wasm DB is refused by name" "check-relay.sh" "stop-check.sh" "post-tool-use-check.sh" "the owner EXITED (its record left behind)" "the owner holds the lock but has NO hook endpoint" "a CHANGED pid → PostToolUse restamps the anchor" "a STALE stored start" "NO agent token → no liveness call" "a FORGED liveness reply" "stdin EOF alone (no signal)" "an HTTP-only daemon whose port is already taken" "with its HTTP port taken DEGRADES to stdio" "EOF DRAINS before the process ends" "the REQUESTING agent's stored anchor" "a TRANSIENT start-time lookup failure" "ANOTHER writer moves the stored anchor" "a WRONG agent token at the hook" "a VAULT-only agent token reaches the wasm self-heal" "SIGINT → the shutdown" "SIGTERM → the shutdown" "SIGHUP → the shutdown"
+      - name: "PR 4: the CLI's credential clients (macOS)"
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/cli-door-clients.test.ts --reporter=verbose --reporter=json --outputFile.json=pr4-cli-macos.json
+      - name: "PR 4: the named critical rows PASSED on macOS (not skipped, not filtered away)"
+        if: ${{ !cancelled() }}
+        run: node tools/ci/require-rows-passed.mjs pr4-cli-macos.json "a tool outside the allowlist is refused" "zero credential bytes to the configured port" "its token check goes through the door, never to that port" "an UNRESOLVED relay host gets nothing" "RELAY_AGENT_TOKEN is honoured for a remote ONLY" "a remote's TRANSPORT secret" "THE ALLOWLIST, both ways" "pair proceeds to it (not the loopback refusal)" "a VALID local owner record's port" "one byte every 30 ms" "a boundary-size message goes through the door" "a private scope → its token" "REPLACED between the check and the read" "healthGet sends only GET /health" "NEGATIVE CONTROLS" "each site is in the registry" "the owner door's deadline is ABSOLUTE" "EVERY pair request goes to the checked address" "POSIX, a scope readable by others" "the self-pair guard compares the checked ADDRESS and the port"
       - name: INV-DB-01 single-owner measurements, serial (macOS)
         if: ${{ !cancelled() }}
         run: npx vitest run --config vitest.serial.config.ts --reporter=verbose
@@ -454,6 +500,10 @@ jobs:
       - name: INV-DB-01 slice 4 convert-journal + the flip + the doorbell lock (macOS)
         if: ${{ !cancelled() }}
         run: npx vitest run tests/inv-db-01-s4-convert.test.ts tests/inv-db-01-s4-doorbell.test.ts --reporter=verbose
+
+      - name: Hook PR 1 mail over HTTP from a daemon owner (macOS)
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/hook-pr1-owner-http.test.ts --reporter=verbose
 
       - name: Timing bars, serial and isolated (failed-auth loop + availability)
         # Latency bars run ALONE after the tests; scripts/run-timing-bars.mjs asserts the EXACT set ran and passed.

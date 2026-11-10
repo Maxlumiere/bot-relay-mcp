@@ -333,15 +333,64 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
 
+  // PR 4 (as ruled): a hub is REMOTE by definition. Its host is CHECKED (src/host-class.ts): a loopback hub (any
+  // spelling) is this machine's own relay, refused by name; an unresolved one gets nothing; a remote one is reached
+  // by a hardened bearer (relay-client: the checked address, no redirect, no proxy).
+  const { routeFor, unresolvedMessage, remotePost, healthGet, mcpResultOf, toolJson } = await import("./relay-client.js");
+  const hubPort = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+  const hubRoute = await routeFor(url.hostname.replace(/^\[|\]$/g, ""), hubPort, url.protocol === "https:");
+  // As ruled on #434: a loopback hub is refused by name UNLESS RELAY_HTTP_TRUSTED_TUNNEL_PORT equals its port (a hub
+  // reached through an ssh tunnel): then it is a remote pinned to 127.0.0.1.
+  const tunnelPort = process.env.RELAY_HTTP_TRUSTED_TUNNEL_PORT;
+  const isTunnel = hubRoute.kind === "local" && typeof tunnelPort === "string" && /^[0-9]{1,5}$/.test(tunnelPort) && Number(tunnelPort) === hubPort;
+  if (hubRoute.kind === "local" && !isTunnel) {
+    process.stderr.write(`relay pair: pair is for a remote hub: ${hubBase} is this machine's loopback. Use the local relay directly (relay init), or set RELAY_HTTP_TRUSTED_TUNNEL_PORT to this port for a hub reached through a tunnel.\n`);
+    return 1;
+  }
+  if (hubRoute.kind === "unresolved") {
+    process.stderr.write(`relay pair: ${unresolvedMessage(hubRoute)}\n`);
+    return 1;
+  }
+  // The SELF-PAIR guard (as ruled; a correctness check, not a security predicate): two processes cannot both bind one
+  // ADDRESS and port, so a TRUSTED local owner record naming the tunnel's port, at the address the owner door is reached
+  // at, means the "hub" IS this machine's own relay.
+  if (isTunnel) {
+    try {
+      const { resolveInstance } = await import("../instance.js");
+      const { ownerEndpointVerdict } = await import("../owner-endpoint.js");
+      const r = resolveInstance({});
+      if (r.kind !== "error" && fs.existsSync(r.dbPath)) {
+        const v = ownerEndpointVerdict(r.dbPath, r.kind === "instance" ? r.id : "");
+        // #434 R2 P2-4: the ADDRESS too: an owner on 127.0.0.1:P and a tunnel on [::1]:P are two listeners.
+        const { OWNER_DOOR_HOST } = await import("./owner.js");
+        if (v.ok && v.port === hubPort && hubRoute.kind === "local" && hubRoute.ip === OWNER_DOOR_HOST) {
+          process.stderr.write(`relay pair: 127.0.0.1:${hubPort} is this machine's own relay, not a hub. Nothing is sent.\n`);
+          return 1;
+        }
+      }
+    } catch {
+      /* no local instance to compare with: not this machine's relay */
+    }
+  }
+  // #434 R1 P1: a tunnel is pinned to the CHECKED loopback address (::1 stays ::1): every request below goes there.
+  const remoteHub = hubRoute.kind === "remote" ? hubRoute : { host: url.hostname.replace(/^\[|\]$/g, ""), port: hubPort, ip: hubRoute.ip, secure: url.protocol === "https:" };
+
   // --- Step 1: probe /health ---
   let healthBody: any = null;
   try {
     // The body read is INSIDE the deadline — that is the whole fix. A hub that
     // sends headers and stalls now fails at 5s instead of hanging forever.
+    // #434 R1 P1: pinned to the same checked address as the register (relay-client healthGet: no credential).
     const probe = await withDeadline(5000, "hub health probe", async (signal) => {
-      const res = await fetch(`${hubBase}/health`, { signal });
-      if (!res.ok) return { ok: false as const, status: res.status };
-      return { ok: true as const, body: await res.json().catch(() => ({})) };
+      const res = await healthGet(remoteHub, 5000, signal);
+      if (res.status < 200 || res.status >= 300) return { ok: false as const, status: res.status };
+      let body: unknown = {};
+      try {
+        body = JSON.parse(res.text);
+      } catch {
+        /* a non-JSON health body: reachable, no version */
+      }
+      return { ok: true as const, body };
     });
     if (!probe.ok) {
       process.stderr.write(
@@ -406,11 +455,11 @@ export async function run(argv: string[]): Promise<number> {
     // frames, so this is exactly the shape most likely to deliver headers and
     // then stall — the register step was the second unbounded body read.
     return await withDeadline(10_000, "hub register_agent", async (signal) => {
-      const res = await fetch(`${hubBase}/mcp`, {
-        method: "POST",
+      const r = await remotePost(
+        remoteHub,
+        "/mcp",
         headers,
-        signal,
-        body: JSON.stringify({
+        JSON.stringify({
           jsonrpc: "2.0",
           id: 1,
           method: "tools/call",
@@ -423,14 +472,18 @@ export async function run(argv: string[]): Promise<number> {
             },
           },
         }),
-      });
-      const text = await res.text();
-      // The HTTP transport emits SSE frames; pull the data line when present.
-      const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-      const rpcResp = dataLine ? JSON.parse(dataLine.slice(5).trim()) : JSON.parse(text || "{}");
-      const body = rpcResp?.result?.content?.[0]?.text
-        ? JSON.parse(rpcResp.result.content[0].text)
-        : rpcResp;
+        10_000,
+        signal, // #434 R1 P2-2: the outer deadline cancels the request itself
+      );
+      const result = mcpResultOf(r.text);
+      const body: any = result ? (toolJson(result) ?? result) : (() => {
+        try {
+          return JSON.parse(r.text || "{}");
+        } catch {
+          return {};
+        }
+      })();
+      const res = { status: r.status };
       return { status: res.status, body };
     });
   };

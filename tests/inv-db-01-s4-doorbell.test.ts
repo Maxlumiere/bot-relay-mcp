@@ -52,7 +52,8 @@ describe("INV-DB-01 slice 4: the doorbell lock never opens a relay DB natively",
   it.skipIf(WIN_DOORBELL_REFUSES_EVERY_STATE_DIR)("twin: a normal doorbell lock is still acquired and released (skipped on Windows: the doorbell refuses every state dir there, as on main)", () => {
     const stateDir = fs.mkdtempSync(path.join(ROOT, "plain-"));
     const r = acquireInstanceLock(stateDir, me);
-    expect(r.ok, JSON.stringify(r)).toBe(true);
+    // The handle's (dev, ino) are BigInts (exact identity): the diagnostic shows the refusal, never the handle.
+    expect(r.ok, r.ok ? "" : JSON.stringify(r)).toBe(true);
     if (r.ok) releaseInstanceLock(r.handle);
   });
 });

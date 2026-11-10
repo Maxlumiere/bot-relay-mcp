@@ -1513,6 +1513,14 @@ export function initializeDb(dbPath: string): Promise<CompatDatabase> {
 export function getInitializedDb(): CompatDatabase | null {
   return _initializedDb;
 }
+/**
+ * Hook PR 1: the CANONICAL path of the DB this process OWNS (its initialized connection is a wasm owner's, its lock
+ * held), or null. The owner writes its endpoint record for that DB once it is listening.
+ */
+export function ownedDbPath(): string | null {
+  const db = _initializedDb;
+  return db instanceof WasmDatabase && db.ownerLock && db.canonicalPath ? db.canonicalPath : null;
+}
 
 export function getActiveDriver(): SqliteDriver | null {
   return _driverUsed;

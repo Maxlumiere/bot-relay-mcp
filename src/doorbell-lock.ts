@@ -38,6 +38,7 @@
  *     held connection is pinned HERE, in a module-level set, until releaseInstanceLock: the lock can
  *     never depend on a caller happening to keep its handle alive.
  */
+import { sameFileIdentity } from "./file-identity.js";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
@@ -81,8 +82,8 @@ export const EXIT_ALREADY_RUNNING = 4;
 export interface LockHandle {
   db: Database.Database;
   path: string;
-  dev: number;
-  ino: number;
+  dev: bigint;
+  ino: bigint;
 }
 export interface HolderInfo {
   pid: number;
@@ -132,7 +133,7 @@ export function acquireInstanceLock(stateDir: string, me: { pid: number; proc_st
   } catch (err) {
     if ((err as { code?: string }).code !== "EEXIST") throw err;
   }
-  const pre = fs.lstatSync(lockPath);
+  const pre = fs.lstatSync(lockPath, { bigint: true });
   if (pre.isSymbolicLink() || !pre.isFile()) throw new Error(`${lockPath} is not a regular file (a symlink or another type): refusing to lock through it`);
   const db = openLockFile(lockPath); // the file exists: created above, lstat-checked
   try {
@@ -183,8 +184,8 @@ function writeHolderSidecar(stateDir: string, info: HolderInfo, holderFile: stri
 /** Does the lock path still name the inode we hold? (lstat only: never a second descriptor.) */
 export function lockStillOurs(h: LockHandle): boolean {
   try {
-    const st = fs.lstatSync(h.path);
-    return st.isFile() && st.dev === h.dev && st.ino === h.ino;
+    const st = fs.lstatSync(h.path, { bigint: true });
+    return st.isFile() && sameFileIdentity(st, h);
   } catch {
     return false;
   }

@@ -94,7 +94,7 @@ relay_where_load() {
   fi
   relay_run_pending "$secs" "$outf" "$errf" node "$cli" where --fields
   rc=$?
-  { IFS= read -r k; IFS= read -r d; IFS= read -r e; IFS= read -r why; IFS= read -r warn; IFS= read -r vault; IFS= read -r hookdb; } < "$outf"
+  { IFS= read -r k; IFS= read -r d; IFS= read -r e; IFS= read -r why; IFS= read -r warn; IFS= read -r vault; IFS= read -r hookdb; IFS= read -r ownerep; } < "$outf"
   nlines=$(wc -l < "$outf" 2>/dev/null | tr -d ' ')
   # Codex #391 R1: an EXACT record: every field newline-terminated, nothing after the last one (wc -l counts newlines,
   # awk counts records, so an unterminated trailing field makes them differ).
@@ -110,11 +110,15 @@ relay_where_load() {
     export RELAY_RES_REASON="relay where gave an invalid answer (exit $rc: ${nrec:-0} fields, ${nlines:-0} newline-terminated)"
     return 1
   fi
+  # Hook PR 1: line 8 is the owner endpoint's URL when line 7 is "http", else empty: an EXACT count of 8. A 7- or
+  # 6-line answer is an older relay CLI than these hooks: the resolution stands, and the hooks read no DB (named skew).
+  export RELAY_RES_OWNER_ENDPOINT=""
   case "${nlines:-0}" in
-    7) export RELAY_RES_HOOK_DB="$hookdb" ;;
+    8) export RELAY_RES_HOOK_DB="$hookdb" RELAY_RES_OWNER_ENDPOINT="$ownerep" ;;
+    7) export RELAY_RES_HOOK_DB="(7-line answer)" ;;
     6) export RELAY_RES_HOOK_DB="(6-line answer)" ;;
     *)
-      export RELAY_RES_REASON="relay where gave an incomplete answer (exit $rc, ${nlines:-0} of 7 lines)"
+      export RELAY_RES_REASON="relay where gave an incomplete answer (exit $rc, ${nlines:-0} of 8 lines)"
       return 1
       ;;
   esac
@@ -161,10 +165,13 @@ relay_hook_db_native_ok() {
   # Only the two wasm verdicts may say "a wasm instance": the others do not know what the instance is.
   then="The hooks read nothing from this DB with sqlite3."
   case "${RELAY_RES_HOOK_DB:-}" in
-    skip-declared-wasm) why="the instance declares sqlite_driver \"wasm\""; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
-    skip-rlyw) why="the DB is stamped for the wasm driver's single owner (RLYW)"; then="Hooks deliver no mail on a wasm instance; use the HTTP owner." ;;
+    skip-declared-wasm) why="the instance declares sqlite_driver \"wasm\""; then="Hooks read a wasm DB's mail only through its running owner, and no relay process owns it now: start one (a stdio session or the HTTP daemon)." ;;
+    skip-rlyw) why="the DB is stamped for the wasm driver's single owner (RLYW)"; then="Hooks read a wasm DB's mail only through its running owner, and no relay process owns it now: start one (a stdio session or the HTTP daemon)." ;;
     skip-unreadable) why="the instance's sqlite_driver or the DB header could not be read or judged (fail closed)" ;;
     skip-owner-locked) why="another relay process holds the DB's single-owner lock (a wasm owner, or a conversion running)" ;;
+    skip-no-endpoint) why="the DB's wasm owner is running, but the owner has no hook endpoint (its loopback listener could not open, it is an older relay, or a conversion holds the lock)"; then="Mail may be waiting: call get_messages." ;;
+    http) why="the DB belongs to a wasm owner"; then="The hooks read its mail over HTTP from that owner, and nothing else from this DB." ;;
+    "(7-line answer)") why="the relay CLI gave a 7-line answer: CLI/hook version skew (update the relay and its hooks together)" ;;
     "(6-line answer)") why="the relay CLI gave a 6-line answer: CLI/hook version skew (update the relay and its hooks together)" ;;
     "") why="the relay CLI gave no DB verdict" ;;
     *) why="the relay CLI gave an unknown DB verdict" ;;
@@ -237,7 +244,126 @@ resolve_relay_token_path() {
   fi
   local db_path
   db_path=$(resolve_relay_db_path) || return 1
-  echo "$(dirname "$db_path")/agents/${name}.token"
+  # Hook PR 3 (as ruled): on a DECLARED remote with a local DB, the vault entries are that remote's own
+  # (relay_scope_vault_to_remote), never the local instance's.
+  if [ -n "${RELAY_VAULT_SCOPE:-}" ]; then
+    echo "$(dirname "$db_path")/agents/${RELAY_VAULT_SCOPE}/${name}.token"
+  else
+    echo "$(dirname "$db_path")/agents/${name}.token"
+  fi
+  return 0
+}
+
+# relay_remote_declared — 0 when RELAY_HTTP_HOST is an EXPLICIT non-loopback host: the remote-client declaration (hook
+# PR 3, as ruled: no other flag). Its credentials go to that remote by bearer.
+relay_remote_declared() {
+  [ -n "${RELAY_HTTP_HOST:-}" ] || return 1
+  relay_host_classify
+  [ "${RELAY_HOST_CLASS:-}" = remote ]
+}
+
+# relay_host_classify — #433 Codex R1 P1-1: classify RELAY_HTTP_HOST ONCE per run (cached) through `relay host-class`
+# (src/host-class.ts: every loopback spelling normalized, a name resolved under a deadline). Sets RELAY_HOST_CLASS
+# (loopback | remote | unresolved), RELAY_HOST_PIN (the CHECKED address: every bearer curl is pinned to it,
+# relay_curl_remote) and RELAY_HOST_WHY. Unresolved is fail-closed: no credential goes to it. Its budget is the
+# margin, or RELAY_HOST_BUDGET (SessionStart: premail).
+relay_host_classify() {
+  [ -n "${RELAY_HOST_CLASS:-}" ] && return 0
+  local h="${RELAY_HTTP_HOST:-127.0.0.1}" cli out ms
+  RELAY_HOST_PIN="" RELAY_HOST_WHY=""
+  # A CANONICAL dotted quad (four decimal octets, no leading zero) is unambiguous: classified here, its own pin.
+  # Every other spelling (numeric forms, IPv6, a name) goes to the normalizing check.
+  local quad='^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$'
+  if [[ "$h" =~ $quad ]]; then
+    case "$h" in
+      127.*|0.0.0.0) RELAY_HOST_CLASS=loopback ;;
+      *) RELAY_HOST_CLASS=remote ;;
+    esac
+    RELAY_HOST_PIN="$h"
+    return 0
+  fi
+  RELAY_HOST_SECS=0
+  if ! relay_budget_for "the relay host check" 2 "${RELAY_HOST_BUDGET:-margin}"; then
+    RELAY_HOST_CLASS=unresolved RELAY_HOST_WHY="no time budget left for the relay host check"
+    return 0
+  fi
+  RELAY_HOST_SECS="$RELAY_STEP_SECS"
+  cli="$(relay_helpers_cli)"
+  ms=$(( RELAY_STEP_SECS * 1000 - 300 ))
+  [ "$ms" -lt 100 ] && ms=100
+  out=$(relay_run_streamed "$RELAY_STEP_SECS" node "$cli" host-class "$h" --timeout-ms "$ms" 2>/dev/null) || out=""
+  case "$out" in
+    "loopback "*) RELAY_HOST_CLASS=loopback RELAY_HOST_PIN="${out#loopback }" ;;
+    "remote "*) RELAY_HOST_CLASS=remote RELAY_HOST_PIN="${out#remote }" ;;
+    "unresolved "*) RELAY_HOST_CLASS=unresolved RELAY_HOST_WHY="$(printf '%s' "${out#unresolved }" | tr -cd 'A-Za-z0-9 ._:()-' | cut -c1-120)" ;;
+    *) RELAY_HOST_CLASS=unresolved RELAY_HOST_WHY="the relay host check gave no answer" ;;
+  esac
+  case "$RELAY_HOST_PIN" in
+    *[!0-9a-fA-F.:]*) RELAY_HOST_CLASS=unresolved RELAY_HOST_WHY="the checked address is not an IP address" RELAY_HOST_PIN="" ;;
+  esac
+  return 0
+}
+
+# relay_curl_remote — #433 Codex R1 P1-1/P1-4: the arguments EVERY bearer credential curl (a declared remote or a
+# trusted tunnel) starts with, as the array RELAY_CURL_REMOTE: -q FIRST (no curl configuration file), --noproxy '*'
+# (no proxy from the environment), and --resolve pinning the host to its CHECKED address (curl never resolves again).
+relay_curl_remote() {
+  relay_host_classify
+  local pin="${RELAY_HOST_PIN:-}"
+  case "$pin" in *:*) pin="[$pin]" ;; esac
+  RELAY_CURL_REMOTE=(-q --noproxy '*')
+  [ -n "$pin" ] && RELAY_CURL_REMOTE+=(--resolve "${RELAY_HTTP_HOST:-127.0.0.1}:${RELAY_HTTP_PORT:-3777}:${pin}")
+  return 0
+}
+
+# relay_bearer_refusal — the named reason a bearer credential is NOT sent to the configured endpoint.
+relay_bearer_refusal() {
+  relay_host_classify
+  if [ "${RELAY_HOST_CLASS:-}" = unresolved ]; then
+    printf 'the remote host %s did not resolve within %ss (%s); nothing is sent' "${RELAY_HTTP_HOST:-127.0.0.1}" "${RELAY_HOST_SECS:-0}" "${RELAY_HOST_WHY:-unknown}"
+  else
+    printf 'no token is sent to the loopback port %s (%s)' "${RELAY_HTTP_PORT:-3777}" "$RELAY_TUNNEL_HINT"
+  fi
+}
+
+# relay_trusted_tunnel — 0 when RELAY_HTTP_TRUSTED_TUNNEL_PORT opts THIS loopback port in (hook PR 3, as ruled: a
+# narrow opt-in, never a blanket boolean): it equals the configured RELAY_HTTP_PORT, the configured host is loopback,
+# and the resolver found NO local DB (with one, it is ignored: the local DB's door is the only route). A loopback
+# bearer is otherwise refused: whoever holds that port would get the token (the port-theft class).
+relay_trusted_tunnel() {
+  local t="${RELAY_HTTP_TRUSTED_TUNNEL_PORT:-}" p="${RELAY_HTTP_PORT:-3777}"
+  case "$t" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$t" = "$p" ] || return 1
+  relay_host_classify
+  [ "${RELAY_HOST_CLASS:-}" = loopback ] || return 1
+  # #433 R2 P1-1: "no local DB" is ONLY the resolver's own answer (exists=false). relay pending's exit 3 is a ROUTING
+  # policy (an auto-discovered DB can still exist), never evidence of absence.
+  [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
+  [ "${RELAY_RES_KIND:-error}" = error ] && return 1
+  [ "${RELAY_RES_EXISTS:-}" = true ] && return 1
+  return 0
+}
+
+# relay_bearer_allowed — 0 when a bearer credential may go to the configured endpoint: a declared remote
+# (relay_remote_declared) or a trusted tunnel (relay_trusted_tunnel). Never a loopback port otherwise.
+relay_bearer_allowed() {
+  relay_remote_declared || relay_trusted_tunnel
+}
+
+# RELAY_TUNNEL_HINT — what a refused loopback bearer names (as ruled: the default skip names the opt-in).
+RELAY_TUNNEL_HINT="a relay reached through an ssh tunnel on this loopback port needs RELAY_HTTP_TRUSTED_TUNNEL_PORT set to that port"
+
+# relay_scope_vault_to_remote — a local instance's token never reaches a remote, and one remote's never reaches
+# another (#433 Codex R1 P1-3): on a declared remote or a trusted tunnel, the vault entries this run reads and writes
+# are THAT destination's own, always (agents/remote-<host>-<port>/<name>.token, whether or not a local DB exists), and
+# its registration secret beside them (relay_mint_secret_file). Nothing unscoped is ever imported into a scope.
+relay_scope_vault_to_remote() {
+  if relay_remote_declared || relay_trusted_tunnel; then
+    local h="${RELAY_HTTP_HOST:-127.0.0.1}" p="${RELAY_HTTP_PORT:-3777}"
+    h="${h//[^A-Za-z0-9_.-]/_}"
+    p="${p//[^0-9]/}"
+    RELAY_VAULT_SCOPE="remote-${h}-${p:-3777}"
+  fi
   return 0
 }
 
@@ -264,6 +390,124 @@ relay_curl_config_line() {
   v=${v//\\/\\\\}
   v=${v//\"/\\\"}
   printf '%s = "%s"\n' "$1" "$v"
+}
+
+# relay_owner_read CLI AGENT SECS [ARG...] — hook PR 1 (as ruled after Codex #418 R1): a wasm DB's mail through its
+# OWNER DOOR, read by the relay CLI (`relay owner peek AGENT --json ARG...`, src/cli/owner.ts) under the watchdog at
+# SECS (the caller's relay_budget_for), its own --timeout-ms just inside it so its named reason wins. One MAC'd
+# exchange with the owner, no bearer credential; the key is read by the CLI from the owner's 0600 record (never by this
+# shell, never in a file, the environment or argv). Its answer is `relay pending --json`'s, so each hook renders it with
+# its LOCAL code. Sets RELAY_OWNER_OUT (the JSON) and RELAY_OWNER_WHY (a named failure, or ""); returns the CLI's exit
+# (124 = the watchdog fired).
+relay_owner_read() {
+  local cli="$1" agent="$2" secs="$3" outf errf rc ms
+  shift 3
+  RELAY_OWNER_OUT="" RELAY_OWNER_WHY=""
+  case "$secs" in ''|*[!0-9]*|0) RELAY_OWNER_WHY="no time budget left for the owner door read"; return 125 ;; esac
+  ms=$(( secs * 1000 - 300 ))
+  [ "$ms" -lt 100 ] && ms=100
+  outf="$(mktemp 2>/dev/null || printf '')"
+  errf="$(mktemp 2>/dev/null || printf '')"
+  if [ -z "$outf" ] || [ -z "$errf" ]; then
+    rm -f "$outf" "$errf" 2>/dev/null
+    RELAY_OWNER_WHY="could not create a private temp file for the owner door read"
+    return 1
+  fi
+  relay_run_pending "$secs" "$outf" "$errf" node "$cli" owner peek "$agent" --json "$@" --timeout-ms "$ms"
+  rc=$?
+  RELAY_OWNER_OUT=$(cat "$outf" 2>/dev/null)
+  RELAY_OWNER_WHY=$(grep -m 1 '^relay owner:' "$errf" 2>/dev/null | tr -cd 'A-Za-z0-9 _./:()=,"-' | cut -c1-300)
+  rm -f "$outf" "$errf" "$outf.timedout" 2>/dev/null
+  if [ "$rc" -eq 124 ]; then
+    RELAY_OWNER_WHY="the owner door read timed out after ${secs}s"
+  elif [ "$rc" -ne 0 ] && [ -z "$RELAY_OWNER_WHY" ]; then
+    RELAY_OWNER_WHY="relay owner peek failed (exit $rc)"
+  fi
+  return "$rc"
+}
+
+# relay_owner_liveness CLI AGENT SECS PID [START] — hook PR 2 (as ruled, Q8): the wasm liveness self-heal's ONE door
+# exchange (`relay owner liveness`: sealed to /owner/v1/liveness, where report_liveness runs its normal auth with the
+# agent's own token SEALED in) under the watchdog at SECS. The token is the caller's AGENT_TOKEN, handed to the CLI in
+# its environment (RELAY_AGENT_TOKEN, as relay_owner_tool does): never argv, never a file, never logged. Returns its
+# exit; RELAY_OWNER_WHY names a failure.
+relay_owner_liveness() {
+  local cli="$1" agent="$2" secs="$3" pid="$4" start="${5:-}" outf errf rc ms
+  RELAY_OWNER_WHY=""
+  case "$secs" in ''|*[!0-9]*|0) RELAY_OWNER_WHY="no time budget left for the liveness restamp"; return 125 ;; esac
+  ms=$(( secs * 1000 - 300 ))
+  [ "$ms" -lt 100 ] && ms=100
+  outf="$(mktemp 2>/dev/null || printf '')"
+  errf="$(mktemp 2>/dev/null || printf '')"
+  if [ -z "$outf" ] || [ -z "$errf" ]; then
+    rm -f "$outf" "$errf" 2>/dev/null
+    RELAY_OWNER_WHY="could not create a private temp file for the liveness restamp"
+    return 1
+  fi
+  if [ -n "$start" ]; then
+    RELAY_AGENT_TOKEN="${AGENT_TOKEN:-}" relay_run_pending "$secs" "$outf" "$errf" node "$cli" owner liveness "$agent" --pid "$pid" --start "$start" --timeout-ms "$ms"
+  else
+    RELAY_AGENT_TOKEN="${AGENT_TOKEN:-}" relay_run_pending "$secs" "$outf" "$errf" node "$cli" owner liveness "$agent" --pid "$pid" --timeout-ms "$ms"
+  fi
+  rc=$?
+  RELAY_OWNER_WHY=$(grep -m 1 '^relay owner:' "$errf" 2>/dev/null | tr -cd 'A-Za-z0-9 _./:()=,"-' | cut -c1-300)
+  rm -f "$outf" "$errf" "$outf.timedout" 2>/dev/null
+  return "$rc"
+}
+
+# relay_owner_tool CLI SECS TOOL ARGS_JSON [--with-recovery-token] — hook PR 3 (as ruled after Codex #418 R2): ONE
+# credential-bearing tool call (register_agent, health_check, report_liveness) to the local DB's own daemon, as a
+# SEALED exchange through its owner door (`relay owner tool …`, src/cli/owner.ts), under the watchdog at SECS. The
+# agent token comes from RELAY_AGENT_TOKEN in the CALLER'S environment (pass it as a prefix assignment), the recovery
+# token from RELAY_RECOVERY_TOKEN, the registration secret from its file: none on argv (ARGS_JSON is name, role,
+# capabilities, pids). The answer STREAMS to stdout (a register reply carries a minted token: never a file), in the
+# shape the hooks' curl call printed (the JSON-RPC answer + `HTTP_STATUS:200`); a failure is one stderr line
+# `relay owner: <why>` and a non-zero exit (124 = the watchdog fired).
+relay_owner_tool() {
+  local cli="$1" secs="$2" tool="$3" args="$4" ms
+  shift 4
+  case "$secs" in ''|*[!0-9]*|0) echo "relay owner: no time budget left for the owner door call" >&2; return 125 ;; esac
+  ms=$(( secs * 1000 - 300 ))
+  [ "$ms" -lt 100 ] && ms=100
+  relay_run_streamed "$secs" node "$cli" owner tool "$tool" --args-json "$args" "$@" --timeout-ms "$ms"
+}
+
+# relay_owner_session CLI SECS AGENT — hook PR 3 (as ruled): AGENT's own session_id from its local daemon's door
+# (`relay owner session`, the token from RELAY_AGENT_TOKEN in the caller's environment), under the watchdog at SECS.
+# Prints the session id (empty when it has none) and returns 0; non-zero when the door refused or failed.
+relay_owner_session() {
+  local cli="$1" secs="$2" agent="$3" ms out
+  case "$secs" in ''|*[!0-9]*|0) return 125 ;; esac
+  ms=$(( secs * 1000 - 300 ))
+  [ "$ms" -lt 100 ] && ms=100
+  out=$(relay_run_streamed "$secs" node "$cli" owner session "$agent" --timeout-ms "$ms" 2>/dev/null) || return 1
+  printf '%s' "$out" | grep -oE '"session_id":"[0-9a-fA-F-]{8,64}"' | head -1 | sed -E 's/.*:"([0-9a-fA-F-]{8,64})"$/\1/'
+  return 0
+}
+
+# relay_run_streamed SECS CMD... — CMD killed at SECS (124 = timed out), its stdin, stdout and stderr this function's
+# OWN (no file): for a step that is fed and read through a pipe (a renderer, a parser) and must stay inside the budget.
+relay_run_streamed() {
+  local secs="$1" pid wd rc wrc
+  shift
+  "$@" <&0 &
+  pid=$!
+  (
+    trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    sleep "$secs" &
+    s=$!
+    wait "$s"
+    kill -KILL "$pid" 2>/dev/null
+    exit 124
+  ) >/dev/null 2>&1 &
+  wd=$!
+  wait "$pid" 2>/dev/null
+  rc=$?
+  kill -TERM "$wd" 2>/dev/null
+  wait "$wd" 2>/dev/null
+  wrc=$?
+  [ "$wrc" -eq 124 ] && return 124
+  return "$rc"
 }
 
 # relay_curl_token_config TOKEN — the X-Agent-Token header as a curl config line (see relay_curl_config_line).
@@ -336,14 +580,40 @@ relay_reply_summary() {
 relay_mint_secret_file() {
   local db_path
   db_path=$(resolve_relay_db_path 2>/dev/null) || return 1
-  printf '%s\n' "$(dirname "$db_path")/secrets/mint.secret"
+  # #433 Codex R1 P1-2 (as ruled): a REMOTE's registration secret is its own (relay remote set-mint-secret), beside its
+  # vault scope. NEVER the local instance's: no fallback.
+  if [ -n "${RELAY_VAULT_SCOPE:-}" ]; then
+    printf '%s\n' "$(dirname "$db_path")/agents/${RELAY_VAULT_SCOPE}/mint.secret"
+  else
+    printf '%s\n' "$(dirname "$db_path")/secrets/mint.secret"
+  fi
+}
+
+# relay_remote_mint_hint — the named skip when a remote's own secret is absent (as ruled).
+relay_remote_mint_hint() {
+  printf "provision the remote's mint secret: relay remote set-mint-secret %s:%s, reading STDIN" "${RELAY_HTTP_HOST:-127.0.0.1}" "${RELAY_HTTP_PORT:-3777}"
+}
+
+# relay_remote_scoped_read <read-token AGENT | read-secret KIND> — #434 R2 P2-1: a REMOTE scope's credential ONLY
+# through the trusted chain reader (`relay remote read-*`: real private directories, no link, the file the one checked;
+# a refusal is named on stderr), under the budget. The value on stdout (for a command substitution); non-zero and
+# nothing on a miss or a refusal. The shell never opens a remote scope's credential itself.
+relay_remote_scoped_read() {
+  relay_budget_for "a remote credential read" 3 "${RELAY_REMOTE_READ_BUDGET:-margin}" || return 1
+  relay_run_streamed "$RELAY_STEP_SECS" node "$(relay_helpers_cli)" remote "$1" "${RELAY_HTTP_HOST:-127.0.0.1}:${RELAY_HTTP_PORT:-3777}" "$2"
 }
 
 relay_mint_secret_curl_config() {
   local file secret=""
   file=$(relay_mint_secret_file) || return 1
-  [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
-  IFS= read -r secret < "$file" || [ -n "$secret" ] || return 1
+  if [ -n "${RELAY_VAULT_SCOPE:-}" ]; then
+    # a REMOTE's own secret: only through the trusted reader (a linked scope is refused, never followed)
+    { [ -e "$file" ] || [ -L "$file" ]; } || return 1
+    secret=$(relay_remote_scoped_read read-secret mint) || return 1
+  else
+    [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] || return 1
+    IFS= read -r secret < "$file" || [ -n "$secret" ] || return 1
+  fi
   # Shape check mirrors src/mint-secret.ts (>= 32 chars of printable ASCII, no
   # space, no quote, no backslash): nothing that could end the quoted curl config
   # value or add a directive. LC_ALL=C so the range is bytes, not locale letters.
@@ -360,12 +630,22 @@ relay_mint_secret_curl_config() {
 read_relay_token_from_vault() {
   local name="$1"
   local token_path
+  # A local vault miss is a clean cache miss (nothing to say). What it lets through on stderr are NAMED refusals only
+  # (an invalid agent name, from resolve_relay_token_path; a remote scope's refusal, from relay remote read-token), so
+  # callers must not discard stderr.
   token_path=$(resolve_relay_token_path "$name") || return 1
-  if [ ! -f "$token_path" ]; then
-    return 1
-  fi
   local token
-  token=$(head -n 1 "$token_path" 2>/dev/null | tr -d '[:space:]')
+  if [ -n "${RELAY_VAULT_SCOPE:-}" ]; then
+    # #434 R2 P2-1: a REMOTE's token only through the trusted reader (a scope linked to the local vault, or to another
+    # remote's, is refused there, never followed here).
+    { [ -e "$token_path" ] || [ -L "$token_path" ]; } || return 1
+    token=$(relay_remote_scoped_read read-token "$name" | tr -d '[:space:]')
+  else
+    if [ ! -f "$token_path" ]; then
+      return 1
+    fi
+    token=$(head -n 1 "$token_path" 2>/dev/null | tr -d '[:space:]')
+  fi
   if [ -z "$token" ]; then
     return 1
   fi
@@ -626,6 +906,24 @@ write_relay_token_to_vault() {
 # dist/index.js entrypoint). Starts from the hook's PARENT (the hook is never
 # the agent). Extensible via RELAY_AGENT_PROCESS_PATTERN. Empty → agent_pid
 # omitted → age-based fallback (graceful). POSIX only (Windows omit).
+# relay_ps_run CMD... / relay_ps ARGS... — a process lookup bounded in TIME by the hook's SEAMED budget (Codex #418 R2
+# P2-7, as asked at verify): every call first takes relay_budget_for (its own 1s cap from what is left, in mode
+# RELAY_PS_BUDGET: margin by default, premail where the mail read keeps its reserve), then runs under
+# relay_run_streamed at that cap. With no time left the call is refused (124) and relay_budget_for NAMES the cut on
+# stderr; a walk ends at its first refused or empty step. Its stdout is the caller's.
+relay_ps_run() {
+  relay_budget_for "a process lookup (ps)" 1 "${RELAY_PS_BUDGET:-margin}" || return 124
+  local rc=0
+  relay_run_streamed "$RELAY_STEP_SECS" "$@" 2>/dev/null || rc=$?
+  # A lookup killed by its step deadline is a CUT like a skipped one, and a cut is named: silent, the caller (a pid
+  # walk) reads an empty answer and stops as if the chain had ended.
+  [ "$rc" -eq 124 ] && echo "[bot-relay] a process lookup (ps) did not finish within ${RELAY_STEP_SECS}s: the process walk stops there." >&2
+  return "$rc"
+}
+relay_ps() {
+  relay_ps_run ps "$@"
+}
+
 relay_agent_pid() {
   local pid ppid comm args depth=0 pat
   pat='claude|codex|node|bun|deno'
@@ -633,14 +931,15 @@ relay_agent_pid() {
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*) return ;;
   esac
-  pid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
+  pid=$(relay_ps -o ppid= -p $$ | tr -d ' ')
+  # Each ps takes the seamed budget (relay_ps): a hung or slow chain ends where the budget does, named.
   while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null); comm="${comm##*/}"
+    comm=$(relay_ps -o comm= -p "$pid"); comm="${comm##*/}"
     if printf '%s' "$comm" | grep -qiE "^(${pat})$"; then
-      args=$(ps -o args= -p "$pid" 2>/dev/null)
+      args=$(relay_ps -o args= -p "$pid")
       case "$args" in *dist/index.js*) ;; *) printf '%s' "$pid"; return ;; esac
     fi
-    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    ppid=$(relay_ps -o ppid= -p "$pid" | tr -d ' ')
     case "$ppid" in ''|*[!0-9]*) break ;; esac
     [ "$ppid" -le 1 ] && break
     pid="$ppid"; depth=$((depth+1))
@@ -660,7 +959,7 @@ RELAY_START_TOKEN_UTC_SUFFIX=' UTC'
 relay_pid_start() {
   local pid="$1" t
   [ -n "$pid" ] || return
-  t=$(TZ=UTC LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  t=$(relay_ps_run env TZ=UTC LC_ALL=C ps -o lstart= -p "$pid" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
   [ -n "$t" ] || return
   printf '%s%s' "$t" "$RELAY_START_TOKEN_UTC_SUFFIX"
 }
@@ -673,7 +972,7 @@ relay_pid_start() {
 relay_pid_start_legacy() {
   local pid="$1"
   [ -n "$pid" ] || return
-  env -u TZ LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+  relay_ps_run env -u TZ LC_ALL=C ps -o lstart= -p "$pid" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
 # Is PID a live process on THIS host? The signal-0 probe. It mirrored the old boolean
@@ -802,7 +1101,7 @@ relay_pid_chain() {
     *)
       while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
         chain="${chain:+$chain,}$pid"
-        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        ppid=$(relay_ps -o ppid= -p "$pid" | tr -d ' ')
         case "$ppid" in ''|*[!0-9]*) break ;; esac
         [ "$ppid" -le 1 ] && break
         pid="$ppid"; depth=$((depth+1))

@@ -66,6 +66,12 @@ const INVENTORY: Record<string, Entry> = {
   // --- config, keys, tokens, instance metadata ---
   "src/convert-journal.ts::writeDriverDeclaration::readFileSync": { n: 1, source: "the instance config.json beside the database (its canonical referent)" },
   "src/convert-journal.ts::writeDriverDeclaration::writeFileSync": { n: 1, source: "a temp file (wx) beside that config, renamed onto it" },
+  "src/owner-endpoint.ts::readTrustedRecord::openSync": { n: 1, source: "the owner endpoint record, a dotfile next to the database file (.<name>.relay-owner.json, not a DB-family name), opened O_NOFOLLOW for its trust checks (fstat) and its read" },
+  "src/owner-endpoint.ts::readTrustedRecord::readFileSync": { n: 1, source: "the owner endpoint record, read through its trusted descriptor after the identity check" },
+  "src/cli/relay-client.ts::scopedLine::openSync": { n: 1, source: "the same remote-scope file, opened O_RDONLY|O_NOFOLLOW after the chain check (then fstat identity == the checked lstat); not a DB-family name" },
+  "src/cli/relay-client.ts::scopedLine::readFileSync": { n: 1, source: "a REMOTE's own scope (agents/remote-<host>-<port>/<agent>.token or <kind>.secret: a regular file checked with lstat first; not a DB-family name)" },
+  "src/cli/remote.ts::writePrivateFile::openSync": { n: 1, source: "a NEW temp file (O_CREAT|O_EXCL|O_NOFOLLOW, 0600) beside a remote's mint.secret (agents/remote-<host>-<port>/, not a DB-family name): made private and verified through its one descriptor, written, fsync'd, renamed" },
+  "src/owner-endpoint.ts::writeOwnerEndpoint::openSync": { n: 1, source: "a NEW temp file (O_CREAT|O_EXCL|O_NOFOLLOW, 0600) beside the owner endpoint record: protected and verified through its one descriptor, which then receives the key; renamed onto the record" },
   "src/config.ts::loadConfig::readFileSync": { n: 1, source: "config.json (getConfigPath())" },
   "src/config.ts::readConfigFileKeys::readFileSync": { n: 1, source: "config.json (getConfigPath())" },
   "src/config.ts::readSqliteDriverAt::openSync": { n: 1, source: "an instance's config.json (getConfigPath(), or the one colocated in an instance directory), one non-blocking descriptor" },
@@ -131,7 +137,7 @@ const INVENTORY: Record<string, Entry> = {
   "src/fleet-system.ts::<module>::readFileSync": { n: 1, source: "/proc/<pid>/cmdline" },
   "src/deploy-gate.ts::defaultGateDeps::readFileSync": { n: 1, source: "/proc/<pid>/environ" },
   "src/liveness.ts::readMachineIdFile::readFileSync": { n: 1, source: "/etc/machine-id" },
-  "src/fs-perms.ts::windowsAllowSids::readFileSync": { n: 1, source: "a temp SDDL file in os.tmpdir()" },
+  "src/fs-perms.ts::windowsDaclSddl::readFileSync": { n: 1, source: "a temp SDDL file in os.tmpdir()" },
   "src/fs-perms.ts::windowsOwnerSddlToken::writeFileSync": { n: 1, source: "a probe file in a temp directory" },
 };
 

@@ -121,6 +121,27 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
 
+  // --- PR 4 (as ruled): the ROUTE first (src/cli/relay-client.ts). A LOCAL relay (loopback, any spelling) is
+  // reached only through its owner door; a REMOTE one by a hardened bearer with per-remote credentials; an
+  // unresolved host gets nothing. Host/port: the config, then the environment.
+  let host = "127.0.0.1";
+  let port = 3777;
+  try {
+    const { loadConfig } = await import("../config.js");
+    const cfg = loadConfig();
+    host = cfg.http_host || host;
+    port = cfg.http_port || port;
+  } catch {
+    host = process.env.RELAY_HTTP_HOST || host;
+    port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
+  }
+  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteToken, remoteSecret, envSelects, RelayClientError } = await import("./relay-client.js");
+  const route = await routeFor(host, port);
+  if (route.kind === "unresolved") {
+    process.stderr.write(`relay send: ${unresolvedMessage(route)}\n`);
+    return 2;
+  }
+
   // --- Resolve + LOCALLY VALIDATE the sender's token (never send a bad cred) ---
   // Precedence: $RELAY_AGENT_TOKEN (operator-explicit — trusted as-provided,
   // since it may target a remote hub whose agent isn't in the local DB) → the
@@ -131,7 +152,17 @@ export async function run(argv: string[]): Promise<number> {
   // to the daemon and mapped to a confusing exit 1 (codex v2.17.1 fix).
   let token: string | null = null;
   const envToken = process.env.RELAY_AGENT_TOKEN;
-  if (isValidTokenShape(envToken)) {
+  if (route.kind === "remote") {
+    // A REMOTE gets only ITS credential: RELAY_AGENT_TOKEN, or its own vault scope. Never the local vault.
+    token = await remoteToken(route.host, route.port, from, { envSelected: envSelects(route.host) });
+    if (!token) {
+      process.stderr.write(
+        `relay send: no token for "${from}" on the remote relay ${route.host}:${route.port}: set RELAY_AGENT_TOKEN ` +
+          "(the local vault is never sent to a remote).\n"
+      );
+      return 2;
+    }
+  } else if (isValidTokenShape(envToken)) {
     token = envToken;
   } else {
     // ADR-0048: the ONE strict resolver; a fault is said and ends the verb.
@@ -230,50 +261,29 @@ export async function run(argv: string[]): Promise<number> {
     return 2;
   }
 
-  // --- Resolve host/port + the OPERATOR (dashboard) secret ---
-  // /api/send-message is an operator-authed endpoint (ADR-0006), so present the
-  // dashboard/operator secret via the SHARED resolver — NOT http_secret. This was
-  // the fourth copy of the resolution logic; wiring it in fixes two bugs at once:
-  // it stops presenting an agent transport credential (which no longer
-  // authenticates operator endpoints — the removed escalation) and it reads the
-  // stored `dashboard_secret`, which the old `http_secret`-only path never did.
-  let host = "127.0.0.1";
-  let port = 3777;
-  let secret: string | null = null;
+  let status = 0;
+  let text = "";
   try {
-    const { loadConfig, resolveDashboardSecret } = await import("../config.js");
-    const cfg = loadConfig();
-    host = cfg.http_host || host;
-    port = cfg.http_port || port;
-    secret = resolveDashboardSecret(cfg);
-  } catch {
-    host = process.env.RELAY_HTTP_HOST || host;
-    port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
-    secret = process.env.RELAY_DASHBOARD_SECRET || null;
-  }
-
-  const url = `http://${host}:${port}/api/send-message`;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (secret) headers["Authorization"] = `Bearer ${secret}`;
-  const payload = JSON.stringify({
-    from,
-    to: args.to,
-    content: args.content,
-    priority: args.priority,
-    from_agent_token: token,
-  });
-
-  let res: Response;
-  try {
-    res = await fetch(url, { method: "POST", headers, body: payload });
+    if (route.kind === "remote") {
+      // /api/send-message is operator-authed (ADR-0006): a remote's operator secret is ITS OWN (relay remote
+      // set-dashboard-secret) or RELAY_DASHBOARD_SECRET, never this machine's config.
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const secret = await remoteSecret(route.host, route.port, "dashboard");
+      if (secret) headers["Authorization"] = `Bearer ${secret}`;
+      const payload = JSON.stringify({ from, to: args.to, content: args.content, priority: args.priority, from_agent_token: token });
+      ({ status, text } = await remotePost(route, "/api/send-message", headers, payload));
+    } else {
+      // LOCAL: send_message through the owner door (the sender's token inside the ciphertext; the tool's own auth).
+      const result = await localTool("send_message", { from, to: args.to, content: args.content, priority: args.priority }, { agentToken: token });
+      const parsedResult = toolJson(result);
+      status = result.isError ? 400 : 200;
+      text = parsedResult ? JSON.stringify(parsedResult) : JSON.stringify(result);
+    }
   } catch (err) {
-    process.stderr.write(
-      `relay send: could not reach the daemon at ${url} — is it running? (${err instanceof Error ? err.message : String(err)})\n`
-    );
+    const why = err instanceof RelayClientError || err instanceof Error ? err.message : String(err);
+    process.stderr.write(`relay send: could not reach the daemon at ${host}:${port} — is it running? (${why})\n`);
     return 2;
   }
-
-  const text = await res.text();
   let parsed: any = null;
   try {
     parsed = JSON.parse(text);
@@ -281,9 +291,9 @@ export async function run(argv: string[]): Promise<number> {
     /* non-JSON error body */
   }
 
-  if (!res.ok || (parsed && parsed.success === false)) {
+  if (status < 200 || status >= 300 || (parsed && parsed.success === false)) {
     process.stderr.write(
-      `relay send: daemon returned ${res.status} — ${parsed?.error ?? text.slice(0, 300)}\n`
+      `relay send: daemon returned ${status} — ${parsed?.error ?? text.slice(0, 300)}\n`
     );
     return 1;
   }

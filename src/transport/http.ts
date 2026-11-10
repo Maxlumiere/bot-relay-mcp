@@ -16,9 +16,39 @@ import {
   ApiSetStatusSchema,
   ApiDashboardThemeSchema,
   ApiWakeAgentSchema,
+  payloadMaxBytes,
 } from "../types.js";
 import { touchMarker, markerPath, markersEnabled } from "../filesystem-marker.js";
-import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors } from "../db.js";
+import { getDb, sendMessage, unregisterAgent, setAgentStatus, SenderNotRegisteredError, logAudit, getAgentAuthData, getAuthGeneration, setDashboardPrefs, getDashboardAgentSnapshots, markAgentAuthenticated, purgeDeadConnectors, pendingMetadata, getDbPath } from "../db.js";
+import { ownedDbPath } from "../sqlite-compat.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
+
+/**
+ * Hook PR 3: the DB this process serves through the owner door: a wasm DB it OWNS, else (every daemon, native
+ * included, writes its record) the DB its daemon has open. null when it serves none.
+ */
+function doorDbPath(): string | null {
+  const owned = ownedDbPath();
+  if (owned !== null) return owned;
+  try {
+    return getDbPath();
+  } catch {
+    return null;
+  }
+}
+import { resolveInstance } from "../instance.js";
+import {
+  writeOwnerEndpoint,
+  addressReachesLoopback,
+  ownerPeekRouteAllowed,
+  openDoorRequest,
+  sealDoorResponse,
+  OWNER_DOOR_PATHS,
+  OWNER_DOOR_TOOL_ALLOWLIST,
+  OWNER_PEEK_HOST,
+  OWNER_PEEK_REFUSAL,
+} from "../owner-endpoint.js";
 import { authorizeAgentToken } from "../authorize-token.js";
 import { revalidate } from "../auth-verdict.js";
 import { startWakeCoverageSweep } from "../wake-coverage-detector.js";
@@ -48,6 +78,7 @@ import { LOADED_BUILD } from "../loaded-build.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import type { Server } from "http";
 import { structuralBoundMiddleware } from "../structural-bound.js";
+import { shutdown } from "../shutdown.js";
 
 /**
  * v2.7 Tether Phase 5 — SSE keepalive helper.
@@ -316,6 +347,11 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   if (req.path === "/health") {
     return next();
   }
+  // Hook PR 1 (as ruled after Codex #418 R1): the OWNER DOOR carries no bearer credential at all; it authenticates
+  // by the owner key's MACs (src/owner-endpoint.ts). It stays under the rate limit and the Host-header check.
+  if (OWNER_DOOR_PATHS.has(req.path)) {
+    return next();
+  }
   // v2.1.7 Item 6: dashboard paths handle auth downstream.
   if (DASHBOARD_ROUTES_BYPASSING_HTTP_SECRET.has(req.path)) {
     return next();
@@ -460,16 +496,43 @@ export function sdkParsedBody(req: Pick<Request, "body">): unknown {
   return req.body === undefined ? null : req.body;
 }
 
-export function startHttpServer(port: number, host: string): Server {
+export interface StartHttpOptions {
+  /**
+   * Hook PR 1 (as ruled, Q9): the OWNER-PEEK listener. Bound to 127.0.0.1 ONLY (any other host throws), it serves ONLY
+   * the owner door (POST /owner/v1/peek and /owner/v1/liveness: src/owner-endpoint.ts), every other request a named
+   * 403, BEFORE any parsing or route; a WebSocket upgrade is destroyed. It runs none of the daemon's singletons (the mint
+   * secret, the connector purge, the wake sweep, the dashboard). Its Host check is loopback-only.
+   */
+  ownerPeek?: boolean;
+  /** The owner-peek listener's record `transport` (the process that owns the DB). */
+  ownerTransport?: "http" | "stdio";
+  /** #423 R2 P2-4: the caller decides what a failed bind means (HTTP-only: exit; `both`: degrade to stdio). */
+  onListenError?: (err: Error) => void;
+}
+
+export function startHttpServer(port: number, host: string, opts: StartHttpOptions = {}): Server {
+  const ownerPeek = opts.ownerPeek === true;
+  if (ownerPeek && host !== OWNER_PEEK_HOST) {
+    throw new Error(`the owner-peek listener binds ${OWNER_PEEK_HOST} only (asked for "${host}")`);
+  }
   // v2.1 Phase 4n: bind-safety check BEFORE any express setup so we fail
   // fast and never accidentally bind to a risky host.
   const preflightConfig = loadConfig();
   assertBindSafety(host, preflightConfig.http_secret ?? null);
   // PR-D: the registration secret exists before the first request (or the daemon refuses an open mint on a
   // public bind). Never fatal otherwise: an unusable secret fails closed at the gate, loudly.
-  prepareMintSecret(LOOPBACK_HOSTS.has(host.trim().toLowerCase()), preflightConfig.http_secret ?? null, log);
+  if (!ownerPeek) prepareMintSecret(LOOPBACK_HOSTS.has(host.trim().toLowerCase()), preflightConfig.http_secret ?? null, log);
 
   const app = express();
+  let boundPort = port; // the port actually bound (set once listening: port 0 is the kernel's pick)
+  // Hook PR 1 (Q9): the owner-peek gate is the FIRST middleware: method + path, before the rate limit, the body parser
+  // and every route. (The JSON-RPC shape is checked right after the parse, below.)
+  if (ownerPeek) {
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if (ownerPeekRouteAllowed(req.method, req.path, req.headers["mcp-session-id"] !== undefined)) return next();
+      res.status(403).json({ error: OWNER_PEEK_REFUSAL });
+    });
+  }
   // v2.0 final (#14): outer HTTP body limit. Tighter inner limits apply to
   // specific content fields via zod refines — RELAY_MAX_PAYLOAD_BYTES (default
   // 64KB) on message/task content. 1MB here guards against pathological
@@ -663,7 +726,8 @@ export function startHttpServer(port: number, host: string): Server {
   // helper in boundary-checks.ts. Parse the allowlist once at startup
   // (env override captured for the lifetime of this process); the
   // per-request path is a pure function call.
-  const hostAllowlistOverride = parseHostAllowlist(process.env);
+  // The owner-peek listener is bound to 127.0.0.1 and serves only the hooks: its Host check is the loopback default.
+  const hostAllowlistOverride = ownerPeek ? null : parseHostAllowlist(process.env);
   const httpHostCheck = (req: Request, res: Response, next: NextFunction) => {
     if (req.path === "/health") return next();
     const r = checkHostHeader(req.headers.host, hostAllowlistOverride);
@@ -685,6 +749,136 @@ export function startHttpServer(port: number, host: string): Server {
   // regardless of HTTP secret state — 421 is distinct from 401/403 so
   // browsers/curl do not retry an auth handshake against a wrong Host.
   app.use(httpHostCheck);
+  // Hook PR 1 (as ruled after Codex #418 R1): THE OWNER DOOR. No bearer credential: the request and the reply are
+  // MAC'd with this owner's key (src/owner-endpoint.ts verifyDoorRequest / signDoorResponse), so a process on the port
+  // without the key learns nothing it can reuse and cannot forge a reply. Only a wasm OWNER answers (else 404). AFTER
+  // the Host check (a DNS-rebound page gets 421), before auth (it carries none). The body is read RAW (text/plain): the
+  // MAC covers its exact bytes.
+  //   /owner/v1/peek     = a PURE read: `relay pending`'s query (pendingMetadata), no seq/epoch stamp, no read mark.
+  //   /owner/v1/liveness = the metadata-only anchor restamp (agent_pid, agent_pid_start; host_id when NULL).
+  // #434 R1 P2-3: the sealed body must hold the LARGEST valid call: a payload field at RELAY_MAX_PAYLOAD_BYTES of
+  // worst-case JSON escaping (a control byte is 6: \u00XX), plus the envelope and its other arguments, then base64
+  // (4/3) for the ciphertext. Still bounded (about 0.5 MiB at the 64 KiB default).
+  const doorBody = express.text({ type: () => true, limit: Math.ceil((payloadMaxBytes() * 6 + 64 * 1024) * (4 / 3)) + 4096 });
+  // Hook PR 3 (as ruled after Codex #418 R2): register / health / liveness run the SAME dispatcher as /mcp, in-process
+  // (an MCP client over the SDK InMemoryTransport), inside a request context that MIRRORS /mcp's: the REAL peer, the
+  // same `authenticated`, the transport http, and the agent token / registration secret carried INSIDE the sealed
+  // request (so the handlers' own checks run unchanged: the mint gate, the token check, recovery, limits, audit).
+  const DOOR_TOOLS: Readonly<Record<string, string>> = {
+    "/owner/v1/register": "register_agent",
+    "/owner/v1/health": "health_check",
+    "/owner/v1/liveness": "report_liveness",
+  };
+  const doorDispatch = async (req: Request, name: string, args: Record<string, unknown>, agentToken: string | undefined, mintSecret: string | undefined) => {
+    const ctx = {
+      sourceIp: extractSourceIp(req, config.trusted_proxies),
+      authenticated: !!config.http_secret,
+      transport: "http" as const,
+      headerAgentToken: agentToken,
+      presentedSecret: mintSecret,
+    };
+    return requestContext.run(ctx, async () => {
+      const server = createServer();
+      const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverSide);
+      const client = new McpClient({ name: "relay-owner-door", version: "1" });
+      await client.connect(clientSide);
+      try {
+        return await client.callTool({ name, arguments: args });
+      } finally {
+        await client.close().catch(() => {});
+      }
+    });
+  };
+  const doorHandler = (doorPath: "/owner/v1/peek" | "/owner/v1/liveness" | "/owner/v1/register" | "/owner/v1/health" | "/owner/v1/session" | "/owner/v1/tool") => async (req: Request, res: Response) => {
+    if (doorDbPath() === null) {
+      res.status(404).json({ error: "this process serves no relay DB" });
+      return;
+    }
+    const v = openDoorRequest(doorPath, req.body);
+    if (!v.ok) {
+      // Before authentication (no ts/nonce to bind a reply to): unsealed. After it: sealed, like every reply.
+      if (v.ts === undefined || v.nonce === undefined) res.status(v.status).type("text/plain").send(JSON.stringify({ ok: false, error: v.error }));
+      else res.status(v.status).type("text/plain").send(sealDoorResponse(doorPath, v.ts, v.nonce, v.status, { ok: false, error: v.error }));
+      return;
+    }
+    const { agent_name, args, ts, nonce } = v.req;
+    const reply = (status: number, payload: unknown) => res.status(status).type("text/plain").send(sealDoorResponse(doorPath, ts, nonce, status, payload));
+    try {
+      if (doorPath === "/owner/v1/peek") {
+        const n = args.with_content;
+        if (Object.keys(args).some((k) => k !== "with_content") || (n !== undefined && (!Number.isInteger(n) || (n as number) < 0 || (n as number) > 50))) {
+          reply(400, { ok: false, error: "peek args: only with_content (an integer 0-50)" });
+          return;
+        }
+        // #423 R1 P2-3 (as ruled): the reply carries the NAMED agent's stored anchor (one indexed read, no write: the peek
+        // stays pure), under the same owner-key authority as its mail. Never another agent's. PostToolUse's wasm
+        // self-heal gates on it (the DB's truth), as the native self-heal gates on its own DB read.
+        const anchorRow = getDb().prepare("SELECT agent_pid, agent_pid_start FROM agents WHERE name = ?").get(agent_name) as
+          | { agent_pid: number | null; agent_pid_start: string | null }
+          | undefined;
+        const anchor = anchorRow ? { agent_pid: anchorRow.agent_pid ?? null, agent_pid_start: anchorRow.agent_pid_start ?? null } : null;
+        reply(200, { ok: true, agent: agent_name, ...pendingMetadata(getDb(), agent_name, { contentFor: (n as number | undefined) ?? 0 }), anchor });
+        return;
+      }
+      if (doorPath === "/owner/v1/session") {
+        // As ruled (PR 3): ONE agent's session_id, only for a token that authenticates THAT agent. The token is
+        // authenticated by the SAME dispatcher as /mcp (whoami: the token names its caller), then the one field is
+        // read. No other field, no other name, no enumeration.
+        const token = args.agent_token;
+        if (Object.keys(args).some((k) => k !== "agent_token") || typeof token !== "string" || token.length === 0) {
+          reply(400, { ok: false, error: "session args: only agent_token (the agent's own token)" });
+          return;
+        }
+        const who = (await doorDispatch(req, "whoami", {}, token, undefined)) as { isError?: boolean; content?: Array<{ text?: string }> };
+        let caller: string | null = null;
+        try {
+          const w = JSON.parse(String(who.content?.[0]?.text ?? "")) as { success?: boolean; agent_name?: string };
+          if (!who.isError && w.success === true && typeof w.agent_name === "string") caller = w.agent_name;
+        } catch {
+          caller = null;
+        }
+        if (caller !== agent_name) {
+          reply(403, { ok: false, error: "the token does not authenticate that agent" });
+          return;
+        }
+        reply(200, { ok: true, session_id: getAgentAuthData(agent_name)?.session_id ?? null });
+        return;
+      }
+      const call = args.rpc as { method?: unknown; params?: { name?: unknown; arguments?: unknown } } | undefined;
+      // PR 4 (as ruled): /owner/v1/tool takes ONE tools/call of a tool on the allowlist; anything else is refused.
+      if (doorPath === "/owner/v1/tool") {
+        const name = call?.params?.name;
+        if (typeof name !== "string" || !OWNER_DOOR_TOOL_ALLOWLIST.has(name)) {
+          reply(403, { ok: false, error: `this tool is not allowed through the owner door (allowed: ${[...OWNER_DOOR_TOOL_ALLOWLIST].join(", ")})` });
+          return;
+        }
+      }
+      const tool = doorPath === "/owner/v1/tool" ? String(call?.params?.name) : DOOR_TOOLS[doorPath]!;
+      const token = args.agent_token;
+      const secret = args.mint_secret;
+      if (
+        Object.keys(args).some((k) => k !== "rpc" && k !== "agent_token" && k !== "mint_secret") ||
+        !call || call.method !== "tools/call" || !call.params || call.params.name !== tool ||
+        call.params.arguments === null || typeof call.params.arguments !== "object" || Array.isArray(call.params.arguments) ||
+        (token !== undefined && typeof token !== "string") || (secret !== undefined && typeof secret !== "string")
+      ) {
+        reply(400, { ok: false, error: `this door path takes one tools/call of ${tool} (args: rpc, agent_token?, mint_secret?)` });
+        return;
+      }
+      const result = await doorDispatch(req, tool, call.params.arguments as Record<string, unknown>, token as string | undefined, secret as string | undefined);
+      reply(200, { ok: true, result });
+    } catch (err) {
+      reply(500, { ok: false, error: `the owner could not answer: ${(err as Error).message}` });
+    }
+  };
+  app.post("/owner/v1/peek", doorBody, doorHandler("/owner/v1/peek"));
+  app.post("/owner/v1/liveness", doorBody, doorHandler("/owner/v1/liveness"));
+  app.post("/owner/v1/register", doorBody, doorHandler("/owner/v1/register"));
+  app.post("/owner/v1/health", doorBody, doorHandler("/owner/v1/health"));
+  app.post("/owner/v1/session", doorBody, doorHandler("/owner/v1/session"));
+  app.post("/owner/v1/tool", doorBody, doorHandler("/owner/v1/tool"));
+
   app.use(authMiddleware);
 
   // ADR-0006 dashboard/operator secret resolution is the SHARED
@@ -1704,9 +1898,11 @@ export function startHttpServer(port: number, host: string): Server {
       log.warn(`[connectors] purge failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     }
   };
-  purgeConnectors();
-  const connectorPurge = setInterval(purgeConnectors, 60 * 60 * 1000);
-  if (typeof connectorPurge.unref === "function") connectorPurge.unref();
+  if (!ownerPeek) {
+    purgeConnectors();
+    const connectorPurge = setInterval(purgeConnectors, 60 * 60 * 1000);
+    if (typeof connectorPurge.unref === "function") connectorPurge.unref();
+  }
 
   // #60 — S2 wake-coverage detector (ADR-0023). HTTP DAEMON ONLY (this is the
   // long-lived shared process; a per-terminal stdio server must NOT run a
@@ -1714,7 +1910,7 @@ export function startHttpServer(port: number, host: string): Server {
   // RELAY_WAKE_DETECTOR=0). The timer is unref'd inside the helper and the process
   // outlives it, so — like the reaper — we do not thread a stop handle through
   // shutdown here.
-  void startWakeCoverageSweep(getDb());
+  if (!ownerPeek) void startWakeCoverageSweep(getDb());
 
   function isInitializeBody(body: unknown): boolean {
     return (
@@ -1969,8 +2165,54 @@ export function startHttpServer(port: number, host: string): Server {
     res.status(204).end();
   });
 
-  const server = app.listen(port, host, () => {
-    log.info(`HTTP server listening on http://${host}:${port}`);
+  const server = app.listen(port, host, (listenErr?: Error) => {
+    // #423 R1 P3-4: Express calls this on a FAILED listen too (with the error, and address() null). Nothing below may
+    // run then: above all, no owner record (it would name the requested port, which another process holds). The
+    // failure is named here; the server's 'error' handler keeps its own behaviour.
+    if (listenErr) {
+      log.error(`[http] could not listen on ${host}:${port} (${(listenErr as NodeJS.ErrnoException).code ?? listenErr.message}): no owner record is written.`);
+      // Express routes the error HERE, so nothing else would act on it. The caller decides (src/index.ts: HTTP-only exits
+      // 1 through the one shutdown, `both` degrades to stdio); with no decider, the MAIN listener's failure ends the
+      // process through the one shutdown (a daemon left with no listener would keep its DB, a wasm owner's lock, from
+      // every successor). The owner-peek listener's failure is logged and its process keeps serving.
+      if (opts.onListenError) opts.onListenError(listenErr);
+      else if (!ownerPeek) void shutdown(1, "listen-failure");
+      return;
+    }
+    const addr = server.address();
+    if (addr === null || typeof addr !== "object") {
+      log.error(`[http] the listener on ${host}:${port} reports no bound address: no owner record is written.`);
+      return;
+    }
+    boundPort = addr.port;
+    log.info(`HTTP server listening on http://${host}:${boundPort}${ownerPeek ? " (the owner-peek listener: the hooks' mail only)" : ""}`);
+    // Hook PR 1 (as ruled, Q9): once listening, a wasm OWNER writes its endpoint record, which ALWAYS names a listener
+    // the hooks reach as 127.0.0.1. Judged on the address actually BOUND and on this listener's own Host check: when
+    // 127.0.0.1 cannot reach it (::1, a LAN address, "::", a "localhost" that resolved to ::1, a Host allowlist without
+    // 127.0.0.1), the owner opens the loopback owner-peek listener and the record names THAT. A record failure is
+    // logged, never fatal (the hooks then skip, by name).
+    const owned = doorDbPath();
+    if (owned !== null) {
+      const reachable =
+        addr !== null && typeof addr === "object" && addressReachesLoopback(addr.address) && checkHostHeader(`127.0.0.1:${boundPort}`, hostAllowlistOverride).ok;
+      if (ownerPeek || reachable) {
+        try {
+          const inst = resolveInstance();
+          const f = writeOwnerEndpoint(owned, boundPort, opts.ownerTransport ?? "http", inst.kind === "instance" ? inst.id : "");
+          log.info(`[owner-endpoint] the owner endpoint record is ${f}`);
+        } catch (err) {
+          log.warn(`[owner-endpoint] could not write the owner endpoint record (${(err as Error).message}): the hooks read no mail from this owner.`);
+        }
+      } else {
+        log.info(`[owner-endpoint] 127.0.0.1 does not reach this listener (${host}): opening the loopback owner-peek listener for the hooks' mail.`);
+        try {
+          const peek = startHttpServer(0, OWNER_PEEK_HOST, { ownerPeek: true, ownerTransport: "http" });
+          server.once("close", () => peek.close());
+        } catch (err) {
+          log.warn(`[owner-endpoint] could not open the owner-peek listener (${(err as Error).message}): the hooks read no mail from this owner.`);
+        }
+      }
+    }
     log.info(`  MCP endpoint: POST http://${host}:${port}/mcp`);
     log.info(`  Health check: GET http://${host}:${port}/health`);
     log.info(`  Dashboard:    GET http://${host}:${port}/`);
@@ -2014,7 +2256,17 @@ export function startHttpServer(port: number, host: string): Server {
   // v2.2.0 Phase 2: attach the dashboard WebSocket server to the running
   // http.Server. Hijacks only /dashboard/ws upgrades; every other upgrade
   // path is left untouched. Auth is checked inside attachDashboardWs.
-  attachDashboardWs(server);
+  if (ownerPeek) {
+    // A listen failure (no loopback: EADDRNOTAVAIL) is an ASYNC 'error' event: unhandled, it would end the process
+    // that owns the DB. The owner keeps serving; no record is written, so the hooks skip, by name.
+    server.on("error", (err) => {
+      log.warn(`[owner-endpoint] the owner-peek listener failed (${err.message}): no owner endpoint record, so the hooks read no mail from this owner.`);
+    });
+    // An upgrade bypasses Express (and so the gate): the owner-peek listener accepts none.
+    server.on("upgrade", (_req, socket) => socket.destroy());
+  } else {
+    attachDashboardWs(server);
+  }
 
   // v2.8 dashboard-state-machine — start the decay broadcaster on the
   // HTTP daemon process. The class itself was added in src/dashboard-
@@ -2033,7 +2285,7 @@ export function startHttpServer(port: number, host: string): Server {
   // than the pending window counts toward the `pending` derivation.
   // Fresh mail is "active, agent is processing"; old mail is "pending,
   // operator should look."
-  if (!isDisabledByEnv()) {
+  if (!ownerPeek && !isDisabledByEnv()) {
     const thresholds = resolveThresholdsFromEnv();
     const broadcaster = new DashboardStateBroadcaster({
       getAgents: () => getDashboardAgentSnapshots(thresholds.pendingWindowMs),
@@ -2057,7 +2309,7 @@ export function startHttpServer(port: number, host: string): Server {
   // The board is a DECISION SURFACE, so a shared secret is REQUIRED: if a URL is
   // set but `dashboard_push_secret` is missing we DISABLE the push (and say why
   // loudly) rather than silently emit unsigned snapshots to a board Maxime trusts.
-  {
+  if (!ownerPeek) {
     const cfg = loadConfig();
     if (cfg.dashboard_push_url && !cfg.dashboard_push_secret) {
       log.warn(

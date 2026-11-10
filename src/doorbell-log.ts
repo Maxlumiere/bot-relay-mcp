@@ -19,6 +19,7 @@
  *     (reading session, message id), so a restart never re-rings the same pair.
  *   - Mode 0600 in a 0700 state dir; an existing file readable by anyone else is refused.
  */
+import { sameFileIdentity } from "./file-identity.js";
 import fs from "fs";
 import path from "path";
 import { AGENT_NAME_PATTERN } from "./types.js";
@@ -443,8 +444,8 @@ export interface LogHandle {
   io: LogIo;
   /** The VERIFIED state dir, held open (no-follow), and its identity (#300 R2 #2). */
   dirFd: number;
-  dirDev: number;
-  dirIno: number;
+  dirDev: bigint;
+  dirIno: bigint;
 }
 
 /**
@@ -456,28 +457,28 @@ export interface LogHandle {
  */
 function verifyDir(h: LogHandle, what: string): void {
   const dir = path.dirname(h.path);
-  let st: fs.Stats;
+  let st: fs.BigIntStats;
   try {
-    st = fs.lstatSync(dir);
+    st = fs.lstatSync(dir, { bigint: true });
   } catch (err) {
     throw new LogWriteError(`the doorbell state dir is gone ${what} (${err instanceof Error ? err.message : String(err)})`);
   }
-  if (st.isSymbolicLink() || !st.isDirectory() || st.dev !== h.dirDev || st.ino !== h.dirIno) {
+  if (st.isSymbolicLink() || !st.isDirectory() || !sameFileIdentity(st, { dev: h.dirDev, ino: h.dirIno })) {
     throw new LogWriteError(`the doorbell state dir ${dir} was replaced ${what}: refusing to write into it`);
   }
 }
 
 /** The state dir must be a REAL directory (not a symlink), private (0700). */
-export function ensurePrivateDir(dir: string): fs.Stats {
-  let st: fs.Stats | null = null;
+export function ensurePrivateDir(dir: string): fs.BigIntStats {
+  let st: fs.BigIntStats | null = null;
   try {
-    st = fs.lstatSync(dir);
+    st = fs.lstatSync(dir, { bigint: true });
   } catch {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    st = fs.lstatSync(dir);
+    st = fs.lstatSync(dir, { bigint: true });
   }
   if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`${dir} is not a real directory (a symlink or another file type): refusing to use it as the doorbell state dir`);
-  const mode = st.mode & 0o777;
+  const mode = Number(st.mode) & 0o777;
   if (mode & 0o077) throw new Error(`${dir} is mode ${mode.toString(8)}: the doorbell state dir must be private (0700)`);
   return st;
 }
@@ -498,9 +499,9 @@ export function openLog(stateDir: string, io: LogIo = realLogIo): { handle: LogH
   // intact, so the temp is discarded (unlink removes a planted symlink itself, never its target).
   for (const name of fs.readdirSync(stateDir)) if (name.startsWith(COMPACT_PREFIX) || name.startsWith(STATE_FILE_TMP_PREFIX)) fs.unlinkSync(path.join(stateDir, name));
   const logPath = path.join(stateDir, LOG_FILENAME);
-  let pre: fs.Stats | null = null;
+  let pre: fs.BigIntStats | null = null;
   try {
-    pre = fs.lstatSync(logPath);
+    pre = fs.lstatSync(logPath, { bigint: true });
   } catch {
     pre = null;
   }
@@ -508,10 +509,10 @@ export function openLog(stateDir: string, io: LogIo = realLogIo): { handle: LogH
   const flags = fs.constants.O_RDWR | fs.constants.O_APPEND | O_NOFOLLOW | (pre ? 0 : fs.constants.O_CREAT | fs.constants.O_EXCL);
   const fd = fs.openSync(logPath, flags, 0o600);
   try {
-    const st = fs.fstatSync(fd);
+    const st = fs.fstatSync(fd, { bigint: true });
     if (!st.isFile()) throw new Error(`${logPath} is not a regular file`);
-    if (pre && (st.dev !== pre.dev || st.ino !== pre.ino)) throw new Error(`${logPath} changed between its check and its open: refusing it`);
-    const mode = st.mode & 0o777;
+    if (pre && !sameFileIdentity(st, pre)) throw new Error(`${logPath} changed between its check and its open: refusing it`);
+    const mode = Number(st.mode) & 0o777;
     if (mode & 0o077) throw new Error(`${logPath} is mode ${mode.toString(8)}: the doorbell log must be private (0600)`);
     const bytes = fs.readFileSync(fd);
     const state = parseLogText(bytes.toString("utf-8"), logPath); // throws before any truncation
@@ -523,8 +524,8 @@ export function openLog(stateDir: string, io: LogIo = realLogIo): { handle: LogH
       state.tornTail = false;
     }
     const dirFd = fs.openSync(stateDir, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | O_NOFOLLOW);
-    const held = fs.fstatSync(dirFd);
-    if (held.dev !== dirSt.dev || held.ino !== dirSt.ino) {
+    const held = fs.fstatSync(dirFd, { bigint: true });
+    if (!sameFileIdentity(held, dirSt)) {
       fs.closeSync(dirFd);
       throw new Error(`${stateDir} changed between its check and its open: refusing it`);
     }
@@ -770,9 +771,9 @@ export function compactLog(
   try {
     verifyDir(h, "before the compaction's temp file was created");
     const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
-    let tmpIno: number;
+    let tmpIno: bigint;
     try {
-      tmpIno = fs.fstatSync(fd).ino;
+      tmpIno = fs.fstatSync(fd, { bigint: true }).ino;
       const buf = Buffer.from(kept.map((r) => JSON.stringify(r) + "\n").join(""), "utf-8");
       let off = 0;
       while (off < buf.length) {
@@ -787,7 +788,7 @@ export function compactLog(
     verifyDir(h, "before the compaction's rename");
     fs.renameSync(tmp, h.path);
     renamed = true;
-    const landed = fs.lstatSync(h.path);
+    const landed = fs.lstatSync(h.path, { bigint: true });
     if (landed.ino !== tmpIno || !landed.isFile()) throw new Error("the compacted log is not the file this compaction wrote");
     h.io.fsyncSync(h.dirFd); // the HELD verified dir, never re-opened by path
   } catch (err) {
@@ -848,7 +849,7 @@ export function selectLedgerKeep(
  */
 export class LogTailer {
   private fd: number | null = null;
-  private ino = 0;
+  private ino = 0n;
   private offset = 0;
   private partial = "";
   private readonly seen = new Set<string>();
@@ -860,7 +861,7 @@ export class LogTailer {
 
   private openCurrent(): void {
     this.fd = fs.openSync(this.logPath, fs.constants.O_RDONLY | O_NOFOLLOW);
-    this.ino = fs.fstatSync(this.fd).ino;
+    this.ino = fs.fstatSync(this.fd, { bigint: true }).ino;
     this.offset = 0;
     this.partial = "";
   }
@@ -891,9 +892,9 @@ export class LogTailer {
     if (this.fd === null) this.openCurrent();
     // #300 R2 #3: DETECT a replacement first, THEN drain the old inode: anything written to
     // it before the replacement was detected is read before it is closed.
-    let pathIno: number | null = null;
+    let pathIno: bigint | null = null;
     try {
-      pathIno = fs.lstatSync(this.logPath).ino;
+      pathIno = fs.lstatSync(this.logPath, { bigint: true }).ino;
     } catch {
       pathIno = null;
     }

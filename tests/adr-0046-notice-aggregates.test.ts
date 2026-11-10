@@ -133,6 +133,8 @@ function runHook(remindSecs?: string, mode: "local" | "remote" = "local"): Promi
     RELAY_HTTP_PORT: String(port),
   };
   if (mode === "local") env.RELAY_DB_PATH = DB_PATH;
+  // Hook PR 3 (as ruled): a relay on loopback with no local DB is a TUNNEL, opted in for its port.
+  else env.RELAY_HTTP_TRUSTED_TUNNEL_PORT = String(port);
   if (remindSecs !== undefined) env.RELAY_HOOK_NOTICE_REMIND_SECS = remindSecs;
   return spawnHook(env);
 }

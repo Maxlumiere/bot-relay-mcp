@@ -29,6 +29,8 @@ import { spawnSync } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
 
+// PR 4: a local send/resolve goes through the owner door; these in-process rows keep their fake daemon via the adapter.
+vi.mock("../src/cli/relay-client.js", async (orig) => (await import("./_helpers/door-via-fetch.js")).doorViaFetch(await orig()));
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY = path.join(REPO_ROOT, "bin", "relay");
 

@@ -92,6 +92,27 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
 
+  // --- PR 4 (as ruled): the ROUTE first (src/cli/relay-client.ts). A LOCAL relay (loopback, any spelling) is
+  // reached only through its owner door; a REMOTE one by a hardened bearer with per-remote credentials; an
+  // unresolved host gets nothing. Host/port: the config, then the environment.
+  let host = "127.0.0.1";
+  let port = 3777;
+  try {
+    const { loadConfig } = await import("../config.js");
+    const cfg = loadConfig();
+    host = cfg.http_host || host;
+    port = cfg.http_port || port;
+  } catch {
+    host = process.env.RELAY_HTTP_HOST || host;
+    port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
+  }
+  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteToken, remoteSecret, envSelects, mcpResultOf } = await import("./relay-client.js");
+  const route = await routeFor(host, port);
+  if (route.kind === "unresolved") {
+    process.stderr.write(`relay resolve: ${unresolvedMessage(route)}\n`);
+    return 2;
+  }
+
   // --- Resolve + LOCALLY VALIDATE the agent's token (never send a bad cred) ---
   // Precedence: $RELAY_AGENT_TOKEN (operator-explicit — trusted as-provided, may
   // target a remote hub) → the per-instance vault, which MUST authenticate against
@@ -100,7 +121,17 @@ export async function run(argv: string[]): Promise<number> {
   // (exit 2, NO POST) — same discipline as `relay send`.
   let token: string | null = null;
   const envToken = process.env.RELAY_AGENT_TOKEN;
-  if (isValidTokenShape(envToken)) {
+  if (route.kind === "remote") {
+    // A REMOTE gets only ITS credential: RELAY_AGENT_TOKEN, or its own vault scope. Never the local vault.
+    token = await remoteToken(route.host, route.port, agent, { envSelected: envSelects(route.host) });
+    if (!token) {
+      process.stderr.write(
+        `relay resolve: no token for "${agent}" on the remote relay ${route.host}:${route.port}: set RELAY_AGENT_TOKEN ` +
+          "(the local vault is never sent to a remote).\n"
+      );
+      return 2;
+    }
+  } else if (isValidTokenShape(envToken)) {
     token = envToken;
   } else {
     // ADR-0048: the ONE strict resolver; a fault is said and ends the verb.
@@ -182,70 +213,39 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   // --- Resolve host/port + the /mcp TRANSPORT secret ---
-  // resolve.ts POSTs to /mcp (the agent transport, authed by http_secret via
-  // authMiddleware) — NOT a dashboard/operator endpoint. So present http_secret,
-  // NOT RELAY_DASHBOARD_SECRET (the operator principal). Preferring the dashboard
-  // secret here was the mirror-image of send.ts's bug — the fifth copy of the
-  // resolver drift, mixing the principals the OPPOSITE way.
-  let host = "127.0.0.1";
-  let port = 3777;
-  let secret: string | null = process.env.RELAY_HTTP_SECRET || null;
+  let status = 0;
+  let envelope: { success?: boolean; error?: string; resolved_ids?: unknown; resolved_count?: unknown; note?: string } | null = null;
   try {
-    const { loadConfig } = await import("../config.js");
-    const cfg = loadConfig();
-    host = cfg.http_host || host;
-    port = cfg.http_port || port;
-    if (!secret) secret = cfg.http_secret || null;
-  } catch {
-    host = process.env.RELAY_HTTP_HOST || host;
-    port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
-  }
-
-  const url = `http://${host}:${port}/mcp`;
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Accept: "application/json, text/event-stream",
-    "X-Agent-Token": token, // agent auth (same as an MCP client)
-  };
-  if (secret) headers["Authorization"] = `Bearer ${secret}`; // transport secret, when configured
-  const body = JSON.stringify({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "tools/call",
-    params: { name: "resolve_messages", arguments: { agent_name: agent, message_ids: args.messageIds } },
-  });
-
-  let res: Response;
-  try {
-    res = await fetch(url, { method: "POST", headers, body });
+    if (route.kind === "remote") {
+      // /mcp is the agent transport: a remote's transport secret is ITS OWN (relay remote set-http-secret) or
+      // RELAY_HTTP_SECRET, never this machine's config.
+      const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Agent-Token": token };
+      const secret = await remoteSecret(route.host, route.port, "http");
+      if (secret) headers["Authorization"] = `Bearer ${secret}`;
+      const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "resolve_messages", arguments: { agent_name: agent, message_ids: args.messageIds } } });
+      const r = await remotePost(route, "/mcp", headers, body);
+      status = r.status;
+      const result = mcpResultOf(r.text);
+      if (!result) {
+        process.stderr.write(`relay resolve: the relay returned an unparseable response (${r.status}) — ${r.text.slice(0, 300)}\n`);
+        return 1;
+      }
+      envelope = toolJson(result);
+    } else {
+      // LOCAL: resolve_messages through the owner door (the token inside the ciphertext; the tool's own auth).
+      const result = await localTool("resolve_messages", { agent_name: agent, message_ids: args.messageIds }, { agentToken: token });
+      status = result.isError ? 400 : 200;
+      envelope = toolJson(result);
+    }
   } catch (err) {
-    process.stderr.write(
-      `relay resolve: could not reach the daemon at ${url} — is it running? (${err instanceof Error ? err.message : String(err)})\n`
-    );
+    process.stderr.write(`relay resolve: could not reach the daemon at ${host}:${port} — is it running? (${err instanceof Error ? err.message : String(err)})\n`);
     return 2;
   }
-
-  // Parse the MCP response — SSE-wrapped (`data: {...}`) or plain JSON. The tool
-  // result envelope is nested at result.content[0].text.
-  const text = await res.text();
-  let envelope: { success?: boolean; error?: string; resolved_ids?: unknown; resolved_count?: unknown; note?: string } | null =
-    null;
-  try {
-    const dataLine = text.split("\n").map((l) => l.trim()).find((l) => l.startsWith("data:"));
-    const rpc = JSON.parse(dataLine ? dataLine.slice(5).trim() : text);
-    if (rpc?.error) {
-      process.stderr.write(
-        `relay resolve: daemon error — ${rpc.error.message ?? JSON.stringify(rpc.error)}\n`
-      );
-      return 1;
-    }
-    envelope = JSON.parse(rpc.result.content[0].text);
-  } catch {
-    process.stderr.write(
-      `relay resolve: daemon returned an unparseable response (${res.status}) — ${text.slice(0, 300)}\n`
-    );
+  if (envelope === null) {
+    process.stderr.write(`relay resolve: the relay returned an unparseable tool result (${status})\n`);
     return 1;
   }
+  const res = { ok: status >= 200 && status < 300, status };
 
   if (!res.ok || envelope?.success === false) {
     process.stderr.write(`relay resolve: ${envelope?.error ?? `daemon returned ${res.status}`}\n`);

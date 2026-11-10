@@ -76,7 +76,7 @@ const LITERALS: Array<[string, RegExp]> = [
   ["python timeout=N", /\btimeout\s*=\s*\d/],
   ["select() with a literal timeout", /select\.select\([^)]*,\s*\d[\d.]*\s*\)/],
   ["sleep N", /(^|[\s;|&(!])sleep\s+['"]?\d/],
-  ["relay_run_* with a literal", /relay_run_(?:pending|bounded|capture)\s+['"]?\d/],
+  ["relay_run_* with a literal", /relay_run_(?:pending|bounded|capture|streamed)\s+['"]?\d/],
 ];
 
 function scan(file: string, src: string): Violation[] {
@@ -95,7 +95,9 @@ function scan(file: string, src: string): Violation[] {
     if (/sqlite3\.connect\(/.test(line) && !/timeout=float\(os\.environ\["RELAY_STEP_SECS"\]\)/.test(line)) {
       v.push({ file, rule: "sqlite3.connect without the budget timeout", line: line.trim() });
     }
-    if (/(^|[\s;|&(!])node\s+"\$[A-Za-z_]+"/.test(line) && !/relay_run_(?:pending|bounded)\s+"\$[A-Za-z0-9_{}]+"/.test(line)) {
+    // relay_run_streamed is the same watchdog (124) with streamed stdio (hook PR 3: a register reply carries a minted
+    // token, so it never goes through a file).
+    if (/(^|[\s;|&(!])node\s+"\$[A-Za-z_]+"/.test(line) && !/relay_run_(?:pending|bounded|streamed)\s+"\$[A-Za-z0-9_{}]+"/.test(line)) {
       v.push({ file, rule: "relay CLI outside the watchdog", line: line.trim() });
     }
   }
@@ -166,6 +168,7 @@ describe("Codex #291 R2 #1 — TRIPWIRE: no literal timeout in any hook; every b
     ["sleep 3", "sleep N"],
     ['X=$(sqlite3 "$DB_PATH" "select 1")', "sqlite3 outside relay_run_capture"],
     ['relay_run_pending 4 "$o" "$e" node "$RELAY_CLI" pending', "relay_run_* with a literal"],
+    ['relay_run_streamed 4 node "$RELAY_CLI" owner tool health_check', "relay_run_* with a literal"],
     ['node "$RELAY_CLI" pending "$AGENT_NAME" --json', "relay CLI outside the watchdog"],
     ["RELAY_STEP_SECS=2", "RELAY_STEP_SECS set outside relay_budget_for"],
     ['if RELAY_STEP_SECS=60; then :; fi', "RELAY_STEP_SECS set outside relay_budget_for"],
@@ -184,6 +187,7 @@ describe("Codex #291 R2 #1 — TRIPWIRE: no literal timeout in any hook; every b
     "why=$(grep -m 1 'PENDING_' \"$errf\")",
     'X=$(relay_run_capture "$RELAY_STEP_SECS" /dev/stdin sqlite3 "$DB_PATH" <<SQL',
     'relay_run_pending "$RELAY_STEP_SECS" "$o" "$e" node "$RELAY_CLI" pending',
+    'relay_run_streamed "$RELAY_STEP_SECS" node "$RELAY_CLI" owner tool health_check --args-json "{}"',
     "# a comment may say sleep 3 or --max-time 4",
     "alarm 0;",
     'RELAY_STEP_SECS="$RELAY_STEP_SECS" perl -e 1',
@@ -332,7 +336,9 @@ function timed(hook: string, tag: string, env: Record<string, string>, input = "
       PATH: `${dir}:${process.env.PATH ?? ""}`,
       HOME,
       RELAY_AGENT_NAME: AGENT,
-      RELAY_HTTP_HOST: "127.0.0.1",
+      // A REMOTE relay (curl is a stub: no connection is made). Hook PR 3 (as ruled): only an explicit non-loopback host
+      // declares one; a loopback host would be refused as an unopted tunnel.
+      RELAY_HTTP_HOST: "203.0.113.10",
       RELAY_HTTP_PORT: "1",
       RELAY_HOOK_NOTICE_REMIND_SECS: "0",
       RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json"),
@@ -361,8 +367,10 @@ function expectEveryCallInsideTheBudget(r: ReturnType<typeof timed>, budget: num
 
 function vaultToken(): string {
   const token = "vaulttok_" + "r".repeat(20);
-  fs.mkdirSync(path.join(RH, "agents"), { recursive: true });
-  fs.writeFileSync(path.join(RH, "agents", `${AGENT}.token`), token + "\n", { mode: 0o600 });
+  // #433 R1 P1-3: a remote's vault entries are its OWN (scoped by destination), never the unscoped vault.
+  const dir = path.join(RH, "agents", "remote-203.0.113.10-1");
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(dir, `${AGENT}.token`), token + "\n", { mode: 0o600 });
   return token;
 }
 
@@ -632,7 +640,7 @@ describe("Codex #291 R2 #2 — a resolution field with NUL or any C0 control is 
     expect(r.stdout, r.stderr).toMatch(/^rc=1 kind=error db=$/m);
   });
 
-  it("`relay where --fields` refuses a resolved path with a C0 control (kind error, exit 1, exactly 7 lines)", () => {
+  it("`relay where --fields` refuses a resolved path with a C0 control (kind error, exit 1, exactly 8 lines since hook PR 1)", () => {
     const r = spawnSync(process.execPath, [path.join(REPO_ROOT, "bin", "relay"), "where", "--fields"], {
       encoding: "utf-8",
       env: { PATH: process.env.PATH ?? "", HOME, RELAY_DB_PATH: path.join(HOME, "a\u001bb", "relay.db") },
@@ -642,7 +650,7 @@ describe("Codex #291 R2 #2 — a resolution field with NUL or any C0 control is 
     expect(f[0]).toBe("error");
     expect(f[1]).toBe("");
     expect(f[3]).toMatch(/control character/);
-    expect(f.length, "exactly 7 lines (line 7: the hooks' DB verdict) + the final newline").toBe(8);
+    expect(f.length, "exactly 8 lines (7: the hooks' DB verdict; 8: the owner endpoint) + the final newline").toBe(9);
   });
 
   it("`relay where --fields`: a control character in the REASON becomes a space (the line stays one clean line)", () => {
