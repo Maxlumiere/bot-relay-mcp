@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
+import type { ResolvedInstance } from "../instance.js";
+
 /**
  * ADR-0048 PR B — how a CLI verb picks its relay DB: through the ONE strict
  * resolver (src/instance.ts resolveInstance), and never by guessing. On success
@@ -17,7 +19,19 @@ export async function pinResolvedDbPath(): Promise<string | null> {
   const r = resolveInstance();
   if (r.kind === "error") return r.reason;
   process.env.RELAY_DB_PATH = r.dbPath;
+  pinned = { dbPath: r.dbPath, resolution: r };
   return null;
+}
+
+/**
+ * The resolution the pin was made from. The pin turns an INSTANCE resolution into an explicit one for the rest of
+ * the verb, and the owner door is bound to the instance: a later door call (relay-client localTool) must present the
+ * instance it resolved, not "" (the explicit kind). Returned only while RELAY_DB_PATH still names exactly the pinned
+ * path; anything else (no pin, a changed or cleared RELAY_DB_PATH) → null, and the caller resolves afresh.
+ */
+let pinned: { dbPath: string; resolution: ResolvedInstance } | null = null;
+export function pinnedResolution(): ResolvedInstance | null {
+  return pinned !== null && process.env.RELAY_DB_PATH === pinned.dbPath ? pinned.resolution : null;
 }
 
 /**

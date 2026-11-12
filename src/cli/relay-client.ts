@@ -72,7 +72,10 @@ export async function localTool(
   const { resolveInstance } = await import("../instance.js");
   const { ownerEndpointVerdict, OWNER_DOOR_TOOL } = await import("../owner-endpoint.js");
   const { doorExchange } = await import("./owner.js");
-  const r = resolveInstance(opts.dbPath ? { dbPath: opts.dbPath } : {});
+  // A verb that pinned RELAY_DB_PATH (the vault branch of send/resolve) resolved an INSTANCE before the pin; the
+  // owner door is bound to it, so present that resolution, not the explicit kind the pin now reads as.
+  const { pinnedResolution } = await import("./_instance-db.js");
+  const r = opts.dbPath ? resolveInstance({ dbPath: opts.dbPath }) : (pinnedResolution() ?? resolveInstance({}));
   if (r.kind === "error") throw new RelayClientError(`no local relay instance (${r.reason})`);
   const instanceId = r.kind === "instance" ? r.id : "";
   const v = ownerEndpointVerdict(r.dbPath, instanceId);
