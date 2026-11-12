@@ -474,7 +474,7 @@ describe("PR 4: a LOCAL relay's CLI credentials go ONLY through its door (every 
     // What every agent's CLI fallback does on a real install. The row above uses an explicit RELAY_DB_PATH daemon and an
     // env token, so it never meets the vault branch, which pins RELAY_DB_PATH before the door call.
     const c = newInstanceCase("cli-inst-vault");
-    const [, peerTok] = seedInstanceVault(c, [AGENT, "pr4-peer"]);
+    const [senderTok, peerTok] = seedInstanceVault(c, [AGENT, "pr4-peer"]);
     for (const n of [AGENT, "pr4-peer"]) expect(fs.existsSync(path.join(c.dir, "agents", `${n}.token`)), `precondition: ${n}'s token is in the instance vault`).toBe(true);
     const d = await startInstanceDaemon(c);
     expect(readRecord({ record: c.record } as Case).instance_id, "precondition: the record is bound to the INSTANCE (not \"\")").toBe(c.id);
@@ -490,8 +490,14 @@ describe("PR 4: a LOCAL relay's CLI credentials go ONLY through its door (every 
     expect(r.stderr, "no bound-elsewhere refusal").not.toContain("bound-elsewhere");
     expect(r.status, `resolve: ${r.stderr}`).toBe(0);
     expect((JSON.parse(r.stdout.trim()) as { resolved_ids?: string[] }).resolved_ids, "the recipient resolved exactly that message").toEqual([id]);
-    expect(spy.bytes(), "no credential to the configured port").not.toContain(peerTok);
+    for (const t of [senderTok, peerTok]) expect(spy.bytes(), "neither token reaches the configured port").not.toContain(t);
     expect(spy.reqs.filter((q) => q.url !== "/health"), "nothing but /health at the configured port").toEqual([]);
+    // #438 R1 P3-2: an allowed probe is a bare GET /health: no body, no credential header.
+    for (const q of spy.reqs) {
+      expect(q.method, "a health probe is a GET").toBe("GET");
+      expect(q.body, "a health probe has no body").toBe("");
+      for (const h of ["authorization", "x-agent-token", "x-relay-secret", "cookie", "proxy-authorization"]) expect(q.headers[h], `a health probe carries no ${h} header`).toBeUndefined();
+    }
     await stopDaemon(d.child);
   }, 120_000);
 
