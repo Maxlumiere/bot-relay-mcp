@@ -495,6 +495,31 @@ describe("PR 4: a LOCAL relay's CLI credentials go ONLY through its door (every 
     await stopDaemon(d.child);
   }, 120_000);
 
+  it("the INSTANCE identity survives a REPEATED pin: pinResolvedDbPath twice in one process, then a door call → not refused (bound-elsewhere)", async () => {
+    // A second pin with the environment unchanged reads the FIRST pin's RELAY_DB_PATH (the explicit kind); it must not
+    // replace the instance the first pin resolved, or the door call presents "" against the instance's record.
+    const c = newInstanceCase("cli-inst-repin");
+    const [tok] = seedInstanceVault(c, [AGENT]);
+    const d = await startInstanceDaemon(c);
+    expect(readRecord({ record: c.record } as Case).instance_id, "precondition: the record is bound to the INSTANCE").toBe(c.id);
+    const pin = pathToFileURL(path.join(REPO, "dist", "cli", "_instance-db.js")).href;
+    const client = pathToFileURL(path.join(REPO, "dist", "cli", "relay-client.js")).href;
+    const script = `const { pinResolvedDbPath } = await import(${JSON.stringify(pin)}); const { localTool } = await import(${JSON.stringify(client)});
+for (const i of [1, 2]) { const fault = await pinResolvedDbPath(); if (fault) { process.stdout.write(JSON.stringify({ pin: i, fault })); process.exit(0); } }
+try { const r = await localTool("health_check", {}, { agentToken: process.env.T }); process.stdout.write(JSON.stringify({ ok: r.isError !== true })); }
+catch (e) { process.stdout.write(JSON.stringify({ error: e.message })); }`;
+    const out = await new Promise<string>((resolve) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], { env: instEnv(c, { T: tok }), stdio: ["ignore", "pipe", "pipe"] });
+      procs.push(child);
+      let so = "";
+      child.stdout!.on("data", (b: Buffer) => (so += b));
+      child.once("close", () => resolve(so.trim()));
+    });
+    expect(out, "a door call after two pins").not.toContain("bound-elsewhere");
+    expect(JSON.parse(out), "the door answered health_check").toEqual({ ok: true });
+    await stopDaemon(d.child);
+  }, 120_000);
+
   it("`relay doctor --remote http://127.0.0.1:<port>` (a LOOPBACK hub): its token check goes through the door, never to that port", async () => {
     const c = newCase("cli-doctor-loop");
     const token = seedNativeDb(c);
