@@ -3,6 +3,11 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE for full terms.
 
+import type { ResolvedInstance } from "../instance.js";
+
+/** The resolution the current pin was made from (see pinnedResolution). */
+let pinned: { dbPath: string; resolution: ResolvedInstance } | null = null;
+
 /**
  * ADR-0048 PR B — how a CLI verb picks its relay DB: through the ONE strict
  * resolver (src/instance.ts resolveInstance), and never by guessing. On success
@@ -16,8 +21,22 @@ export async function pinResolvedDbPath(): Promise<string | null> {
   const { resolveInstance } = await import("../instance.js");
   const r = resolveInstance();
   if (r.kind === "error") return r.reason;
+  // A REPEATED pin (RELAY_DB_PATH still exactly the pin) resolves through the pin itself, as the explicit kind: keep
+  // the resolution the first pin was made from (#438 R1 P3-1). `r` was still resolved and validated afresh above.
+  const repeated = pinned !== null && process.env.RELAY_DB_PATH === pinned.dbPath && r.dbPath === pinned.dbPath;
   process.env.RELAY_DB_PATH = r.dbPath;
+  if (!repeated) pinned = { dbPath: r.dbPath, resolution: r };
   return null;
+}
+
+/**
+ * The resolution the pin was made from. The pin turns an INSTANCE resolution into an explicit one for the rest of
+ * the verb, and the owner door is bound to the instance: a later door call (relay-client localTool) must present the
+ * instance it resolved, not "" (the explicit kind). Returned only while RELAY_DB_PATH still names exactly the pinned
+ * path; anything else (no pin, a changed or cleared RELAY_DB_PATH) → null, and the caller resolves afresh.
+ */
+export function pinnedResolution(): ResolvedInstance | null {
+  return pinned !== null && process.env.RELAY_DB_PATH === pinned.dbPath ? pinned.resolution : null;
 }
 
 /**

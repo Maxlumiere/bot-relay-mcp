@@ -25,6 +25,7 @@ import ts from "typescript-legacy";
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_INDEX = path.join(REPO, "dist", "index.js");
 const DIST_DB = pathToFileURL(path.join(REPO, "dist", "db.js")).href;
+const DIST_TOKEN_STORE = pathToFileURL(path.join(REPO, "dist", "token-store.js")).href;
 const RELAY = path.join(REPO, "bin", "relay");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "clidoor-")));
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
@@ -202,8 +203,11 @@ async function recorder(host = "127.0.0.1", handler?: (req: http.IncomingMessage
   return { port, reqs, bytes: () => reqs.map((q) => `${q.method} ${q.url}\n${JSON.stringify(q.headers)}\n${q.body}`).join("\n") };
 }
 function relayAsync(c: Case, args: string[], extra: Record<string, string> = {}, input = ""): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return relayWithEnv(baseEnv(c, extra), args, input);
+}
+function relayWithEnv(env: NodeJS.ProcessEnv, args: string[], input = ""): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [RELAY, ...args], { env: baseEnv(c, extra), stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [RELAY, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
     procs.push(child);
     let stdout = "";
     let stderr = "";
@@ -216,6 +220,55 @@ function relayAsync(c: Case, args: string[], extra: Record<string, string> = {},
       resolve({ status, stdout, stderr });
     });
   });
+}
+
+/**
+ * An INSTANCE relay, as every real install runs it: HOME/.bot-relay/instances/<id>/ (instance.json, config.json),
+ * selected by RELAY_INSTANCE_ID, with NO RELAY_DB_PATH. Its daemon's owner record carries instance_id = <id> (an
+ * explicit-RELAY_DB_PATH daemon's carries ""), and a verb that pins RELAY_DB_PATH mid-run must still present <id>.
+ */
+interface InstCase { id: string; home: string; dir: string; db: string; record: string }
+function newInstanceCase(tag: string): InstCase {
+  const home = fs.mkdtempSync(path.join(ROOT, `${tag}-`));
+  const id = crypto.randomUUID();
+  const dir = path.join(home, ".bot-relay", "instances", id);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(dir, "instance.json"), JSON.stringify({ instance_id: id, created_at: new Date().toISOString(), hostname: "test", daemon_version_first_seen: "0.0.0", label: null }), { mode: 0o600 });
+  fs.writeFileSync(path.join(dir, "config.json"), "{}", { mode: 0o600 });
+  return { id, home, dir, db: path.join(dir, "relay.db"), record: path.join(dir, ".relay.db.relay-owner.json") };
+}
+const instEnv = (c: InstCase, extra: Record<string, string> = {}): NodeJS.ProcessEnv => {
+  const env = sandboxEnv(c.home);
+  delete env.RELAY_HOME;
+  return { ...env, RELAY_INSTANCE_ID: c.id, RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(c.home, "wc.json"), ...extra };
+};
+/** Register `names` on the instance's DB and write each token to the instance's VAULT (the product's own token store). */
+function seedInstanceVault(c: InstCase, names: string[]): string[] {
+  const r = spawnSync(
+    process.execPath,
+    ["--input-type=module", "-e", `const db = await import(${JSON.stringify(DIST_DB)}); const ts = await import(${JSON.stringify(DIST_TOKEN_STORE)});
+const toks = ${JSON.stringify(names)}.map((n) => db.registerAgent(n, "r", []).plaintext_token); db.closeDb();
+for (const [i, n] of ${JSON.stringify(names)}.entries()) await ts.defaultTokenStore().write(n, toks[i]);
+process.stdout.write(JSON.stringify(toks));`],
+    { encoding: "utf-8", env: instEnv(c) }
+  );
+  expect(r.status, r.stderr).toBe(0);
+  return JSON.parse(r.stdout.trim()) as string[];
+}
+async function startInstanceDaemon(c: InstCase): Promise<{ child: ChildProcess; port: number; stderr: () => string }> {
+  const port = await getFreePort();
+  const child = spawn(process.execPath, [DIST_INDEX], { env: instEnv(c, { RELAY_TRANSPORT: "http", RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(port) }), stdio: ["ignore", "pipe", "pipe"] });
+  procs.push(child);
+  let err = "";
+  child.stderr!.on("data", (d: Buffer) => (err += d));
+  const end = Date.now() + 30_000;
+  while (Date.now() < end) {
+    if (child.exitCode !== null) break;
+    const ok = await fetch(`http://127.0.0.1:${port}/health`).then((r) => r.ok, () => false);
+    if (ok && fs.existsSync(c.record)) return { child, port, stderr: () => err };
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(`the instance daemon did not come up with its record (exit ${child.exitCode}):\n${err}`);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -414,6 +467,62 @@ describe("PR 4: a LOCAL relay's CLI credentials go ONLY through its door (every 
     expect((JSON.parse(r.stdout.trim()) as { resolved_ids?: string[] }).resolved_ids, "the recipient resolved exactly that message").toEqual([id]);
     for (const t of [token, peerTok]) expect(spy.bytes(), "no credential to the configured port").not.toContain(t);
     expect(spy.reqs.filter((q) => q.url !== "/health"), "nothing but /health at the configured port").toEqual([]);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("an INSTANCE daemon + VAULT tokens (no RELAY_AGENT_TOKEN, no RELAY_DB_PATH): `relay send` and `relay resolve` go through the door", async () => {
+    // What every agent's CLI fallback does on a real install. The row above uses an explicit RELAY_DB_PATH daemon and an
+    // env token, so it never meets the vault branch, which pins RELAY_DB_PATH before the door call.
+    const c = newInstanceCase("cli-inst-vault");
+    const [senderTok, peerTok] = seedInstanceVault(c, [AGENT, "pr4-peer"]);
+    for (const n of [AGENT, "pr4-peer"]) expect(fs.existsSync(path.join(c.dir, "agents", `${n}.token`)), `precondition: ${n}'s token is in the instance vault`).toBe(true);
+    const d = await startInstanceDaemon(c);
+    expect(readRecord({ record: c.record } as Case).instance_id, "precondition: the record is bound to the INSTANCE (not \"\")").toBe(c.id);
+    const spy = await recorder();
+    const env = instEnv(c, { RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port) });
+    expect(env.RELAY_AGENT_TOKEN === undefined && env.RELAY_DB_PATH === undefined, "precondition: no env token, no explicit DB").toBe(true);
+    const s = await relayWithEnv(env, ["send", "pr4-peer", "pr4 instance vault hello", "--from", AGENT, "--json"]);
+    expect(s.stderr, "no bound-elsewhere refusal").not.toContain("bound-elsewhere");
+    expect(s.status, `send: ${s.stderr}`).toBe(0);
+    const id = (JSON.parse(s.stdout.trim()) as { message_id?: string }).message_id;
+    expect(typeof id, `the message landed: ${s.stdout}`).toBe("string");
+    const r = await relayWithEnv(env, ["resolve", id!, "--agent", "pr4-peer", "--json"]);
+    expect(r.stderr, "no bound-elsewhere refusal").not.toContain("bound-elsewhere");
+    expect(r.status, `resolve: ${r.stderr}`).toBe(0);
+    expect((JSON.parse(r.stdout.trim()) as { resolved_ids?: string[] }).resolved_ids, "the recipient resolved exactly that message").toEqual([id]);
+    for (const t of [senderTok, peerTok]) expect(spy.bytes(), "neither token reaches the configured port").not.toContain(t);
+    expect(spy.reqs.filter((q) => q.url !== "/health"), "nothing but /health at the configured port").toEqual([]);
+    // #438 R1 P3-2: an allowed probe is a bare GET /health: no body, no credential header.
+    for (const q of spy.reqs) {
+      expect(q.method, "a health probe is a GET").toBe("GET");
+      expect(q.body, "a health probe has no body").toBe("");
+      for (const h of ["authorization", "x-agent-token", "x-relay-secret", "cookie", "proxy-authorization"]) expect(q.headers[h], `a health probe carries no ${h} header`).toBeUndefined();
+    }
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("the INSTANCE identity survives a REPEATED pin: pinResolvedDbPath twice in one process, then a door call → not refused (bound-elsewhere)", async () => {
+    // A second pin with the environment unchanged reads the FIRST pin's RELAY_DB_PATH (the explicit kind); it must not
+    // replace the instance the first pin resolved, or the door call presents "" against the instance's record.
+    const c = newInstanceCase("cli-inst-repin");
+    const [tok] = seedInstanceVault(c, [AGENT]);
+    const d = await startInstanceDaemon(c);
+    expect(readRecord({ record: c.record } as Case).instance_id, "precondition: the record is bound to the INSTANCE").toBe(c.id);
+    const pin = pathToFileURL(path.join(REPO, "dist", "cli", "_instance-db.js")).href;
+    const client = pathToFileURL(path.join(REPO, "dist", "cli", "relay-client.js")).href;
+    const script = `const { pinResolvedDbPath } = await import(${JSON.stringify(pin)}); const { localTool } = await import(${JSON.stringify(client)});
+for (const i of [1, 2]) { const fault = await pinResolvedDbPath(); if (fault) { process.stdout.write(JSON.stringify({ pin: i, fault })); process.exit(0); } }
+try { const r = await localTool("health_check", {}, { agentToken: process.env.T }); process.stdout.write(JSON.stringify({ ok: r.isError !== true })); }
+catch (e) { process.stdout.write(JSON.stringify({ error: e.message })); }`;
+    const out = await new Promise<string>((resolve) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], { env: instEnv(c, { T: tok }), stdio: ["ignore", "pipe", "pipe"] });
+      procs.push(child);
+      let so = "";
+      child.stdout!.on("data", (b: Buffer) => (so += b));
+      child.once("close", () => resolve(so.trim()));
+    });
+    expect(out, "a door call after two pins").not.toContain("bound-elsewhere");
+    expect(JSON.parse(out), "the door answered health_check").toEqual({ ok: true });
     await stopDaemon(d.child);
   }, 120_000);
 
