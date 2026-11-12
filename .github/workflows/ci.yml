@@ -318,7 +318,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Download the shards' reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: vitest-shard-*
           path: .
