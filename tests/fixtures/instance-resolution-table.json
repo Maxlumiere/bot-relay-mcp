@@ -119,6 +119,20 @@
       "expect": { "kind": "error", "reason": "does not exist" }
     },
     {
+      "name": "an explicit RELAY_DB_PATH INSIDE instances/ of an unprovisioned instance is an error (it names that instance)",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay" }],
+      "env": { "RELAY_DB_PATH": "${HOME}/.bot-relay/instances/typo/relay.db" },
+      "expect": { "kind": "error", "reason": "does not exist" }
+    },
+    {
+      "name": "an explicit RELAY_DB_PATH INSIDE instances/ of a PROVISIONED instance is the explicit kind",
+      "platform": "all", "containment": "strict",
+      "layout": [{ "file": ".bot-relay/instances/p/instance.json", "content": "{}" }],
+      "env": { "RELAY_DB_PATH": "${HOME}/.bot-relay/instances/p/relay.db" },
+      "expect": { "kind": "explicit-db", "db": "${HOME}/.bot-relay/instances/p/relay.db", "exists": false }
+    },
+    {
       "name": "an explicit RELAY_DB_PATH under the home",
       "platform": "all", "containment": "strict",
       "layout": [],

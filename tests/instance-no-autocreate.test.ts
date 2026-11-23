@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import { initializeDb, getDb, closeDb } from "../src/db.js";
 import { assertInstanceResolution, createInstance, resolveInstance } from "../src/instance.js";
 import { pinResolvedDbPath } from "../src/cli/_instance-db.js";
+import { defaultTokenStore } from "../src/token-store.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO_ROOT, "bin", "relay");
@@ -400,4 +401,51 @@ describe("a corrupt or non-file instance.json is NOT a provisioning, for every v
       expect(use.stderr).toContain("not found");
     });
   }
+});
+
+/** Codex #442 R2 P2-1 (architect 336cb82e): an EXPLICIT path INSIDE instances/ names an instance: unprovisioned → refused. */
+describe("an explicit DB path INSIDE instances/ of an unprovisioned instance is refused by the resolver (Codex R2 P2-1)", () => {
+  const typoDb = () => path.join(instDir("typo"), "relay.db");
+
+  it("relay remote set-mint-secret with RELAY_DB_PATH=<home>/.bot-relay/instances/typo/relay.db refuses; instances/typo does not exist", () => {
+    realInstanceActive();
+    const r = spawnSync(process.execPath, [RELAY_BIN, "remote", "set-mint-secret", "example.com:3777"], {
+      env: cleanEnv({ RELAY_DB_PATH: typoDb() }),
+      input: `${"s".repeat(40)}\n`,
+      encoding: "utf-8",
+      timeout: 30_000,
+    });
+    expect(r.status, r.stdout + r.stderr).not.toBe(0);
+    expect(r.stderr).toContain(`instance "typo"`);
+    expect(fs.existsSync(instDir("typo"))).toBe(false);
+  });
+
+  it("a token-store write under RELAY_DB_PATH inside instances/typo refuses; instances/typo does not exist", async () => {
+    realInstanceActive();
+    process.env.RELAY_DB_PATH = typoDb();
+    await expect((async () => defaultTokenStore().write("someagent", "abcdefgh12345678"))()).rejects.toThrow(/instance "typo"/);
+    expect(fs.existsSync(instDir("typo"))).toBe(false);
+  });
+
+  it("relay where --json reports the error kind (unprovisioned) for RELAY_DB_PATH AND for --db-path inside instances/typo", () => {
+    realInstanceActive();
+    for (const [args, extra] of [
+      [["where", "--json"], { RELAY_DB_PATH: typoDb() }],
+      [["where", "--json", "--db-path", typoDb()], {}],
+    ] as Array<[string[], Record<string, string>]>) {
+      const r = spawnSync(process.execPath, [RELAY_BIN, ...args], { env: cleanEnv(extra), encoding: "utf-8", timeout: 30_000 });
+      expect(r.status, `${args.join(" ")}: ${r.stdout}${r.stderr}`).not.toBe(0);
+      const res = (JSON.parse(r.stdout) as { resolution: Record<string, unknown> }).resolution;
+      expect(res).toMatchObject({ kind: "error", unprovisioned: true });
+      expect(String(res.reason)).toContain(`instance "typo"`);
+    }
+    expect(fs.existsSync(instDir("typo"))).toBe(false);
+  });
+
+  it("a PROVISIONED instance's explicit path still resolves as the explicit kind (outside behaviour unchanged)", () => {
+    provision("p");
+    process.env.RELAY_DB_PATH = path.join(instDir("p"), "relay.db");
+    expect(resolveInstance()).toMatchObject({ kind: "explicit-db", exists: false, basis: "RELAY_DB_PATH" });
+    expect(resolveInstance({ dbPath: path.join(instDir("p"), "relay.db") })).toMatchObject({ kind: "explicit-db", basis: "--db-path" });
+  });
 });
