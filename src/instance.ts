@@ -46,6 +46,7 @@ import {
   ACTIVE_INSTANCE_MARKER,
   DB_FILENAME,
   isProvisionedInstance,
+  instanceDirOfDbPath as layoutDirOf,
   readInstanceMetadataFile,
   unprovisionedReason,
   type ResolvedInstance,
@@ -136,20 +137,9 @@ function instanceIdFault(id: string): string | null {
   return idFaultUnder(id, instancesRoot());
 }
 
-/**
- * The instance directory a DB path names (`<instances root>/<id>/relay.db`), or null for any other layout. Compared
- * lexically AND on real paths (the instances root may not exist yet, or be reached through a link).
- */
+/** The instance directory a DB path names, or null (the resolver's ONE layout test, for this process's env). */
 export function instanceDirOfDbPath(dbPath: string): string | null {
-  if (path.basename(dbPath) !== DB_FILENAME) return null;
-  const dir = path.dirname(dbPath);
-  const parent = path.dirname(dir);
-  if (path.resolve(parent) === path.resolve(instancesRoot())) return dir;
-  try {
-    return fs.realpathSync(parent) === fs.realpathSync(instancesRoot()) ? dir : null;
-  } catch {
-    return null;
-  }
+  return layoutDirOf(dbPath, instancesRoot());
 }
 
 /**

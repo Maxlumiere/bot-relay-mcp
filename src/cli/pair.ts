@@ -359,7 +359,15 @@ export async function run(argv: string[]): Promise<number> {
       const { resolveInstance } = await import("../instance.js");
       const { ownerEndpointVerdict } = await import("../owner-endpoint.js");
       const r = resolveInstance({});
-      if (r.kind !== "error" && fs.existsSync(r.dbPath)) {
+      // #442 R3: an unresolvable local instance FAILS CLOSED. Skipping the comparison would pair this machine with
+      // its own relay whenever the selection is stale.
+      if (r.kind === "error") {
+        process.stderr.write(
+          `relay pair: cannot tell whether ${url.host} is this machine's own relay: the local relay instance does not resolve (${r.reason}). Fix that first. Nothing is sent.\n`,
+        );
+        return 1;
+      }
+      if (fs.existsSync(r.dbPath)) {
         const v = ownerEndpointVerdict(r.dbPath, r.kind === "instance" ? r.id : "");
         // #434 R2 P2-4: the ADDRESS too: an owner on 127.0.0.1:P and a tunnel on [::1]:P are two listeners.
         const { OWNER_DOOR_HOST } = await import("./owner.js");

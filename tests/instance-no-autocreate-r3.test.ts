@@ -77,7 +77,7 @@ describe("P3: relay init --instance-id NEW while the marker names a STALE instan
     expect(fs.existsSync(instDir("goneinst")), "the stale selection was not created").toBe(false);
   });
 
-  it("a resolver error that is NOT unprovisioned (an EMPTY marker) still fails loud", () => {
+  it("a resolver error that is NOT unprovisioned (an EMPTY marker) still fails loud, BEFORE any write", () => {
     createInstance("realinst", "t");
     fs.writeFileSync(path.join(relayRoot(), "active-instance"), "");
     const r = spawnSync(process.execPath, [RELAY_BIN, "init", "--yes", "--skip-daemon", "--skip-hooks", "--transport", "http", "--instance-id", "newinst"], {
@@ -87,6 +87,7 @@ describe("P3: relay init --instance-id NEW while the marker names a STALE instan
     });
     expect(r.status, r.stdout + r.stderr).not.toBe(0);
     expect(r.stderr).toMatch(/is empty/);
+    expect(fs.existsSync(instDir("newinst")), "the resolution is read before the first write").toBe(false);
   });
 });
 

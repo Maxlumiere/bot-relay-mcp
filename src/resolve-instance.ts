@@ -42,7 +42,7 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "bcc4a6eb3c61";
+export const RESOLVER_REVISION = "2124ee055f67";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";
@@ -135,6 +135,40 @@ export function isProvisionedInstance(instanceDirPath: string, dbExists: boolean
   return dbExists || readInstanceMetadataFile(instanceDirPath) !== null;
 }
 
+/**
+ * The instance directory a DB path names (`<instances root>/<id>/relay.db`), or null for any other layout. Compared
+ * lexically AND on real paths (the instances root may not exist yet, or be reached through a link). The ONE layout
+ * test: the resolver's explicit branches and the open's re-check (src/db.ts via src/instance.ts) both use it.
+ */
+export function instanceDirOfDbPath(dbPath: string, instancesRoot: string): string | null {
+  if (path.basename(dbPath) !== DB_FILENAME) return null;
+  const dir = path.dirname(dbPath);
+  const parent = path.dirname(dir);
+  const root = instancesRoot;
+  if (path.resolve(parent) === path.resolve(root)) return dir; // the fast path
+  // realpathSync.NATIVE: on a case-insensitive file system it returns the on-disk case, where JS realpathSync keeps
+  // the caller's (MEASURED, macOS: ".../INSTANCES" stays upper-case under realpathSync, ".../instances" under
+  // .native), so a wrong-case path into instances/ is recognised. The nearest EXISTING ancestor is resolved and the
+  // missing tail re-appended (the instances root itself may not exist yet).
+  const nearestReal = (q: string): string | null => {
+    let cur = path.resolve(q);
+    const tail: string[] = [];
+    for (;;) {
+      try {
+        return path.join(fs.realpathSync.native(cur), ...tail);
+      } catch {
+        const up = path.dirname(cur);
+        if (up === cur) return null;
+        tail.unshift(path.basename(cur));
+        cur = up;
+      }
+    }
+  };
+  const rp = nearestReal(parent);
+  const rr = nearestReal(root);
+  return rp !== null && rr !== null && rp === rr ? dir : null;
+}
+
 /** The refusal for a selected instance that was never provisioned: the id, what named it, how to create or select one. */
 export function unprovisionedReason(id: string, namedBy: string, instanceDirPath: string, select: string): string {
   return (
@@ -167,11 +201,19 @@ export function resolveInstance(opts: ResolveOptions = {}): ResolvedInstance {
     return c.ok ? make({ abs: c.absPath, exists: c.exists, containment: c.containment }) : failed(c.reason);
   };
 
-  if (opts.dbPath) {
-    return placed(opts.dbPath, (p) => ({ kind: "explicit-db", dbPath: p.abs, exists: p.exists, containment: p.containment, basis: "--db-path" }));
-  }
+  // An explicit path INSIDE instances/ names that instance (Codex #442 R2 P2-1): unprovisioned, it is the same error
+  // as a stale selection. Outside the layout, an explicit path is the operator's file, created as before.
+  const explicit = (raw: string, basis: "RELAY_DB_PATH" | "--db-path", select: string): ResolvedInstance =>
+    placed(raw, (p) => {
+      const inDir = instanceDirOfDbPath(p.abs, instancesRootFor(env));
+      if (inDir !== null && !isProvisionedInstance(inDir, p.exists)) {
+        return { kind: "error", unprovisioned: true, reason: unprovisionedReason(path.basename(inDir), basis, inDir, select) };
+      }
+      return { kind: "explicit-db", dbPath: p.abs, exists: p.exists, containment: p.containment, basis };
+    });
+  if (opts.dbPath) return explicit(opts.dbPath, "--db-path", "pass the --db-path of an existing instance's DB");
   if (!opts.ignoreDbPathEnv && env.RELAY_DB_PATH) {
-    return placed(env.RELAY_DB_PATH, (p) => ({ kind: "explicit-db", dbPath: p.abs, exists: p.exists, containment: p.containment, basis: "RELAY_DB_PATH" }));
+    return explicit(env.RELAY_DB_PATH, "RELAY_DB_PATH", "point RELAY_DB_PATH at an existing instance's DB, or unset it");
   }
   const root = relayRootFor(env);
   const instDir = path.join(root, INSTANCES_DIRNAME);

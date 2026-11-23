@@ -364,18 +364,18 @@ describe("the open re-verifies provisioning: concurrent deletion recreates nothi
   it("an explicit RELAY_DB_PATH INTO the instances layout of an ABSENT instance (another selected) is refused, not created", async () => {
     realInstanceActive();
     process.env.RELAY_DB_PATH = path.join(instDir(BOGUS), "relay.db");
-    // The open's OWN refusal (named by the DB path), not SQLite's "directory does not exist".
-    await expect(initializeDb()).rejects.toThrow(new RegExp(`instance "${BOGUS}" \\(named by the DB path`));
+    // The resolver's explicit-branch refusal (R3: named by RELAY_DB_PATH), not SQLite's "directory does not exist".
+    await expect(initializeDb()).rejects.toThrow(new RegExp(`instance "${BOGUS}" \\(named by RELAY_DB_PATH`));
     expect(fs.existsSync(instDir(BOGUS))).toBe(false);
   });
 
-  it("an explicit RELAY_DB_PATH INTO an existing BARE instance directory (another selected): only the open's check stands between it and a new relay.db", async () => {
+  it("an explicit RELAY_DB_PATH INTO an existing BARE instance directory (another selected) is refused; nothing is written into it", async () => {
     realInstanceActive();
     fs.mkdirSync(instDir("bare"), { mode: 0o700 });
     process.env.RELAY_DB_PATH = path.join(instDir("bare"), "relay.db");
-    await expect(initializeDb()).rejects.toThrow(/instance "bare" \(named by the DB path/);
+    await expect(initializeDb()).rejects.toThrow(/instance "bare" \(named by RELAY_DB_PATH/);
     expect(fs.readdirSync(instDir("bare")), "no relay.db, nothing written").toEqual([]);
-    expect(() => getDb()).toThrow(/instance "bare" \(named by the DB path/);
+    expect(() => getDb()).toThrow(/instance "bare" \(named by RELAY_DB_PATH/);
     expect(fs.readdirSync(instDir("bare"))).toEqual([]);
   });
 });
