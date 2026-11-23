@@ -20,7 +20,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { initializeDb, closeDb, registerAgent, sendMessage } from "../src/db.js";
@@ -197,3 +197,90 @@ function fileVsPipeStatusOnly(args: string[]): number {
   });
   return Number(fs.readFileSync(path.join(out, "status"), "utf-8").trim());
 }
+
+/**
+ * #443 R1 (Codex P2-1/P2-2, architect 90188964): the signal exit of `relay watch` uses the SAME helper, BOUNDED; and a
+ * stdout EPIPE while stderr is still queued neither crashes nor loses stderr or the exit code.
+ */
+describe("the signal exit drains, BOUNDED; EPIPE on stdout with stderr pending (#443 R1)", () => {
+  const DIST_EXIT = path.join(REPO_ROOT, "dist", "exit-after-flush.js");
+  const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  function child(body: string): string {
+    const p = path.join(home, `child-${process.hrtime.bigint()}.mjs`);
+    fs.writeFileSync(p, `import { exitAfterFlush, installSignalExit } from ${JSON.stringify(pathToFileURL(DIST_EXIT).href)};\nsetInterval(() => {}, 1000);\n${body}\n`);
+    return p;
+  }
+
+  it("(a) 300000 bytes queued on stdout, then SIGTERM: a late reader gets every byte; exit 0", () => {
+    const out = fs.mkdtempSync(path.join(home, "sa-"));
+    const c = child(`installSignalExit(() => {});\nprocess.stdout.write("x".repeat(300000));\nprocess.kill(process.pid, "SIGTERM");`);
+    const r = spawnSync("sh", ["-c", `{ ${q(process.execPath)} ${q(c)}; echo $? > ${q(path.join(out, "status"))}; } | { sleep 1; cat > ${q(path.join(out, "piped"))}; }`], { encoding: "utf-8", timeout: 30_000 });
+    expect((r.error as NodeJS.ErrnoException | undefined)?.code).toBeUndefined();
+    expect(fs.statSync(path.join(out, "piped")).size, "every queued byte reached the reader").toBe(300000);
+    expect(fs.readFileSync(path.join(out, "status"), "utf-8").trim()).toBe("0");
+  });
+
+  it("(b) a reader that NEVER reads, then SIGTERM: the process exits within the bound, with one stderr line", () => {
+    const out = fs.mkdtempSync(path.join(home, "sb-"));
+    const c = child(`installSignalExit(() => {}, 500);\nprocess.stdout.write("x".repeat(300000));\nprocess.kill(process.pid, "SIGTERM");`);
+    const t0 = Date.now();
+    const r = spawnSync("sh", ["-c", `{ ${q(process.execPath)} ${q(c)} 2> ${q(path.join(out, "err"))}; echo $? > ${q(path.join(out, "status"))}; } | sleep 4`], { encoding: "utf-8", timeout: 30_000 });
+    expect((r.error as NodeJS.ErrnoException | undefined)?.code).toBeUndefined();
+    // The writer's exit is what is bounded; the pipeline ends when `sleep 4` does. The status file is written as soon as
+    // the writer exits, so its mtime measures the writer.
+    const exitedAfter = fs.statSync(path.join(out, "status")).mtimeMs - t0;
+    expect(exitedAfter, "the writer exited near the 500 ms bound, not when the reader went away").toBeLessThan(3000);
+    expect(fs.readFileSync(path.join(out, "status"), "utf-8").trim()).toBe("0");
+    expect(fs.readFileSync(path.join(out, "err"), "utf-8")).toContain("output still queued after 500 ms");
+  }, 20_000);
+
+  it("the watch's signal bound is short (a hung watch keeps its lock and blocks the next arm)", async () => {
+    const { SIGNAL_DRAIN_BOUND_MS } = await import("../src/exit-after-flush.js");
+    expect(SIGNAL_DRAIN_BOUND_MS).toBeGreaterThan(0);
+    expect(SIGNAL_DRAIN_BOUND_MS).toBeLessThanOrEqual(5000);
+  });
+
+  it("stdout EPIPE (reader gone) while 300000 bytes of STDERR are still queued: stderr is delivered whole, the exit code (3) survives, no crash", () => {
+    const out = fs.mkdtempSync(path.join(home, "se-"));
+    const c = child(`process.stdout.write("o".repeat(300000));\nprocess.stderr.write("e".repeat(300000));\nexitAfterFlush(3);`);
+    const r = spawnSync("bash", ["-c", `{ ${q(process.execPath)} ${q(c)} 2> >(sleep 1; cat > ${q(path.join(out, "err"))}); echo $? > ${q(path.join(out, "status"))}; } | head -c 10 > /dev/null; sleep 2`], { encoding: "utf-8", timeout: 30_000 });
+    expect((r.error as NodeJS.ErrnoException | undefined)?.code).toBeUndefined();
+    expect(fs.readFileSync(path.join(out, "status"), "utf-8").trim(), "the exit code survived the stdout EPIPE").toBe("3");
+    const err = fs.readFileSync(path.join(out, "err"), "utf-8");
+    expect(err).not.toMatch(/Unhandled 'error' event|EPIPE/);
+    expect(err.length, "stderr drained in full after stdout's reader left").toBe(300000);
+  });
+
+  it("WIRING (a source check, not a behaviour row): relay watch's signal path is installSignalExit, with no bare process.exit left in it", () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, "src", "cli", "watch.ts"), "utf-8");
+    expect(src).toContain("installSignalExit(stop)");
+    expect(src).not.toMatch(/const onSignal = \(\): void => \{\s*stop\(\);\s*process\.exit\(0\);/);
+  });
+
+  it("the real relay watch still exits promptly on SIGTERM (0), and its wake line reaches the reader", async () => {
+    const r = await new Promise<{ code: number | null; out: string; ms: number }>((resolve) => {
+      const w = spawn(process.execPath, [RELAY_BIN, "watch", "pipe-to", "--json"], {
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: os.tmpdir(), RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let out = "";
+      let t0 = 0;
+      w.stdout.on("data", (d) => {
+        out += d;
+        if (!t0 && out.includes('"event":"wake"')) {
+          t0 = Date.now();
+          w.kill("SIGTERM");
+        }
+      });
+      const guard = setTimeout(() => w.kill("SIGKILL"), 25_000);
+      w.on("exit", (code) => {
+        clearTimeout(guard);
+        resolve({ code, out, ms: t0 ? Date.now() - t0 : -1 });
+      });
+    });
+    expect(r.out).toContain('"event":"wake"');
+    expect(r.code).toBe(0);
+    expect(r.ms).toBeGreaterThanOrEqual(0);
+    expect(r.ms, "exited within the signal bound").toBeLessThan(5000);
+  }, 30_000);
+});
