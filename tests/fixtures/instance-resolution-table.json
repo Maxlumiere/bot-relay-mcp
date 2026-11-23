@@ -79,23 +79,44 @@
     {
       "name": "the active-instance marker as a SYMLINK",
       "platform": "posix", "containment": "strict",
-      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "symlink": ".bot-relay/active-instance", "to": "a" }],
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "file": ".bot-relay/instances/a/instance.json", "content": "{}" }, { "symlink": ".bot-relay/active-instance", "to": "a" }],
       "env": {},
       "expect": { "kind": "instance", "db": "${HOME}/.bot-relay/instances/a/relay.db", "exists": false }
     },
     {
       "name": "the active-instance marker as a FILE (the Windows form)",
       "platform": "all", "containment": "strict",
-      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "file": ".bot-relay/active-instance", "content": "a\n" }],
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "file": ".bot-relay/instances/a/instance.json", "content": "{}" }, { "file": ".bot-relay/active-instance", "content": "a\n" }],
       "env": {},
       "expect": { "kind": "instance", "db": "${HOME}/.bot-relay/instances/a/relay.db", "exists": false }
     },
     {
       "name": "RELAY_INSTANCE_ID",
       "platform": "all", "containment": "strict",
-      "layout": [{ "mkdir": ".bot-relay" }],
+      "layout": [{ "mkdir": ".bot-relay" }, { "file": ".bot-relay/instances/b/instance.json", "content": "{}" }],
       "env": { "RELAY_INSTANCE_ID": "b" },
       "expect": { "kind": "instance", "db": "${HOME}/.bot-relay/instances/b/relay.db", "exists": false }
+    },
+    {
+      "name": "RELAY_INSTANCE_ID naming an instance that was never provisioned is an error (it would CREATE an empty relay)",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay" }],
+      "env": { "RELAY_INSTANCE_ID": "b" },
+      "expect": { "kind": "error", "reason": "does not exist" }
+    },
+    {
+      "name": "a marker naming a removed instance is an error, never a path to create",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay/instances/a" }, { "file": ".bot-relay/instances/a/instance.json", "content": "{}" }, { "file": ".bot-relay/active-instance", "content": "gone\n" }],
+      "env": {},
+      "expect": { "kind": "error", "reason": "does not exist" }
+    },
+    {
+      "name": "a BARE instance directory (no instance.json, no relay.db) is not a provisioning: an error",
+      "platform": "all", "containment": "n/a",
+      "layout": [{ "mkdir": ".bot-relay/instances/b" }],
+      "env": { "RELAY_INSTANCE_ID": "b" },
+      "expect": { "kind": "error", "reason": "does not exist" }
     },
     {
       "name": "an explicit RELAY_DB_PATH under the home",

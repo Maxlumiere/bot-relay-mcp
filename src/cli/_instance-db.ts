@@ -18,12 +18,9 @@ let pinned: { dbPath: string; resolution: ResolvedInstance } | null = null;
  * default no longer exists, because a fault must never select a different DB.)
  */
 export async function pinResolvedDbPath(): Promise<string | null> {
-  const { resolveInstance, unprovisionedInstanceFault } = await import("../instance.js");
+  const { resolveInstance } = await import("../instance.js");
   const r = resolveInstance();
   if (r.kind === "error") return r.reason;
-  // A pinned path is opened as an explicit DB (which may create), so a non-existent instance is refused BEFORE the pin.
-  const unprovisioned = unprovisionedInstanceFault(r);
-  if (unprovisioned) return unprovisioned;
   // A REPEATED pin (RELAY_DB_PATH still exactly the pin) resolves through the pin itself, as the explicit kind: keep
   // the resolution the first pin was made from (#438 R1 P3-1). `r` was still resolved and validated afresh above.
   const repeated = pinned !== null && process.env.RELAY_DB_PATH === pinned.dbPath && r.dbPath === pinned.dbPath;

@@ -43,6 +43,7 @@ describe("resolveVaultTokenPath — mirrors resolveInstanceDbPath", () => {
 
   it("ADR-0048 PR D: the injected homeDir IS the home (no HOME / RELAY_HOME in the env): the vault is under it", () => {
     fs.mkdirSync(path.join(home, ".bot-relay", "instances", "hi"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".bot-relay", "instances", "hi", "instance.json"), "{}"); // provisioned (instance.json): the resolver refuses an unprovisioned instance
     fs.symlinkSync("hi", path.join(home, ".bot-relay", "active-instance"));
     const r = resolveVaultTokenPath("a1", {}, home);
     expect(r).toEqual({ tokenPath: path.join(home, ".bot-relay", "instances", "hi", "agents", "a1.token") });
@@ -60,6 +61,8 @@ describe("resolveVaultTokenPath — mirrors resolveInstanceDbPath", () => {
   });
 
   it("RELAY_INSTANCE_ID env → per-instance vault", () => {
+    fs.mkdirSync(path.join(home, "instances", "inst-x"), { recursive: true });
+    fs.writeFileSync(path.join(home, "instances", "inst-x", "instance.json"), "{}"); // provisioned (instance.json): the resolver refuses an unprovisioned instance
     const env: EnvRecord = { RELAY_HOME: home, RELAY_INSTANCE_ID: "inst-x" };
     const r = resolveVaultTokenPath("a1", env, home);
     expect(r).toEqual({ tokenPath: path.join(home, "instances", "inst-x", "agents", "a1.token") });
@@ -70,6 +73,7 @@ describe("resolveVaultTokenPath — mirrors resolveInstanceDbPath", () => {
     fs.writeFileSync(path.join(home, "active-instance"), "abc\n");
     // plant BOTH: the correct instance token AND a stale flat token
     plantVault(path.join(home, "instances", "abc", "agents"), "watcher", GOOD);
+    fs.writeFileSync(path.join(home, "instances", "abc", "instance.json"), "{}"); // provisioned (instance.json): the resolver refuses an unprovisioned instance
     plantVault(path.join(home, "agents"), "watcher", STALE);
 
     const env: EnvRecord = { RELAY_HOME: home };
@@ -82,6 +86,7 @@ describe("resolveVaultTokenPath — mirrors resolveInstanceDbPath", () => {
 
   it("active-instance SYMLINK → per-instance vault (mirrors relay lstat-no-follow)", () => {
     fs.mkdirSync(path.join(home, "instances", "sy"), { recursive: true });
+    fs.writeFileSync(path.join(home, "instances", "sy", "instance.json"), "{}"); // provisioned (instance.json): the resolver refuses an unprovisioned instance
     fs.symlinkSync("sy", path.join(home, "active-instance"));
     const r = resolveVaultTokenPath("a1", { RELAY_HOME: home }, home);
     expect(r).toEqual({ tokenPath: path.join(home, "instances", "sy", "agents", "a1.token") });

@@ -40,8 +40,10 @@ beforeEach(() => {
   fs.rmSync(A, { recursive: true, force: true });
   fs.rmSync(B, { recursive: true, force: true });
   fs.mkdirSync(path.join(A, ".bot-relay", "instances", "ia"), { recursive: true });
+  fs.writeFileSync(path.join(A, ".bot-relay", "instances", "ia", "instance.json"), "{}"); // provisioned: a bare dir is refused
   fs.symlinkSync("ia", path.join(A, ".bot-relay", "active-instance"));
   fs.mkdirSync(path.join(B, ".bot-relay", "instances", "ib"), { recursive: true });
+  fs.writeFileSync(path.join(B, ".bot-relay", "instances", "ib", "instance.json"), "{}"); // provisioned: a bare dir is refused
   fs.symlinkSync("ib", path.join(B, ".bot-relay", "active-instance"));
 });
 afterEach(() => {

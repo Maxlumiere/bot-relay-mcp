@@ -44,6 +44,10 @@ import {
   instancesRootFor,
   instanceIdFault as idFaultUnder,
   ACTIVE_INSTANCE_MARKER,
+  DB_FILENAME,
+  isProvisionedInstance,
+  readInstanceMetadataFile,
+  unprovisionedReason,
   type ResolvedInstance,
   type ResolverEnv,
 } from "./resolve-instance.js";
@@ -132,40 +136,42 @@ function instanceIdFault(id: string): string | null {
   return idFaultUnder(id, instancesRoot());
 }
 
-/** The provisioning record `relay init --instance-id` / `--multi-instance` writes (createInstance below). */
-export const INSTANCE_METADATA_FILENAME = "instance.json";
+/**
+ * The instance directory a DB path names (`<instances root>/<id>/relay.db`), or null for any other layout. Compared
+ * lexically AND on real paths (the instances root may not exist yet, or be reached through a link).
+ */
+export function instanceDirOfDbPath(dbPath: string): string | null {
+  if (path.basename(dbPath) !== DB_FILENAME) return null;
+  const dir = path.dirname(dbPath);
+  const parent = path.dirname(dir);
+  if (path.resolve(parent) === path.resolve(instancesRoot())) return dir;
+  try {
+    return fs.realpathSync(parent) === fs.realpathSync(instancesRoot()) ? dir : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
- * Why an INSTANCE-kind resolution names an instance that must NOT be opened, or null.
- *
- * The injury: RELAY_INSTANCE_ID (or the active-instance marker) naming an instance that was never provisioned —
- * a typo, a stale id from another machine, a removed instance — used to CREATE <instances>/<id>/relay.db: an empty
- * relay that starts cleanly, looks connected, and reads an empty mailbox while every peer writes to the real instance.
- *
- * The rule: an instance is opened only when it is PROVISIONED — its directory holds instance.json (the explicit
- * provisioning path writes it) or its relay.db already exists (a legacy instance with data, from before instance.json;
- * opening an existing DB creates nothing). A bare directory is NOT a provisioning: other code creates instance
- * directories as a side effect. Only the instance kind is checked: the flat zero-config layout and an explicit
- * RELAY_DB_PATH / --db-path (the operator named the file) keep creating their DB.
+ * Re-verified AT THE OPEN (Codex #442 R1 P2-2): a DB in the instance layout is opened only while its instance is
+ * provisioned NOW, however it was named (selected, pinned into RELAY_DB_PATH, or an explicit RELAY_DB_PATH into
+ * instances/). The resolution may be stale: the DB or the directory can be removed between it and the open. Returns
+ * the instance directory (whose DB directory the caller must NOT create), or null for any other layout.
  */
-export function unprovisionedInstanceFault(r: ResolvedInstance): string | null {
-  if (r.kind !== "instance" || r.exists) return null;
-  const dir = path.dirname(r.dbPath);
-  if (fs.existsSync(path.join(dir, INSTANCE_METADATA_FILENAME))) return null;
-  const namedBy =
-    r.basis === "RELAY_INSTANCE_ID"
-      ? "RELAY_INSTANCE_ID"
-      : `the active-instance marker ${path.join(botRelayRoot(), ACTIVE_INSTANCE_MARKER)}`;
-  const select =
-    r.basis === "RELAY_INSTANCE_ID"
-      ? "set RELAY_INSTANCE_ID to an existing instance, or unset it"
-      : "switch to an existing instance with `relay use-instance <id>`";
-  return (
-    `instance "${r.id}" (named by ${namedBy}) does not exist: ${dir} holds no ${INSTANCE_METADATA_FILENAME} and no ` +
-    `${path.basename(r.dbPath)}. Opening it would CREATE an empty relay that looks connected while its peers use ` +
-    `another instance, so nothing was created. Create it with \`relay init --instance-id ${r.id}\`, or ${select} ` +
-    "(`relay list-instances` lists them)."
-  );
+export function assertInstanceProvisionedAtOpen(dbPath: string): string | null {
+  const dir = instanceDirOfDbPath(dbPath);
+  if (dir === null) return null;
+  let dbExists = false;
+  try {
+    fs.lstatSync(dbPath);
+    dbExists = true;
+  } catch {
+    /* absent */
+  }
+  if (!isProvisionedInstance(dir, dbExists)) {
+    throw new Error(unprovisionedReason(path.basename(dir), `the DB path ${dbPath}`, dir, "name an existing instance"));
+  }
+  return dir;
 }
 
 /** The DB path, or a thrown Error naming the fault. Never the flat DB by accident. */
@@ -269,13 +275,8 @@ export function createInstance(
 export function readInstance(instanceId: string): InstanceMetadata | null {
   const dir = instanceDir(instanceId);
   if (!dir) return null;
-  try {
-    const metaPath = path.join(dir, "instance.json");
-    if (!fs.existsSync(metaPath)) return null;
-    return JSON.parse(fs.readFileSync(metaPath, "utf-8")) as InstanceMetadata;
-  } catch {
-    return null;
-  }
+  // The ONE reader of instance.json (the resolver's provisioning predicate uses it too): a non-object is not a record.
+  return readInstanceMetadataFile(dir) as InstanceMetadata | null;
 }
 
 /** List all instances. Empty array in single-instance mode. */
@@ -374,12 +375,6 @@ export function assertInstanceResolution(
         "  A relay started on a guessed DB looks healthy and reads the WRONG mailbox.\n" +
         "  Fix the cause above, then start again (`relay doctor` prints this same result).",
     );
-  }
-
-  // A non-existent instance is refused HERE, before the lock, the secrets or the DB open create its directory.
-  const unprovisioned = unprovisionedInstanceFault(r);
-  if (unprovisioned) {
-    throw new Error(`bot-relay: REFUSING TO START — ${unprovisioned}`);
   }
 
   if (res.legacyFallback) {

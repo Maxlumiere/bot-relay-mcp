@@ -42,12 +42,14 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "24c3a313f19f";
+export const RESOLVER_REVISION = "bcc4a6eb3c61";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";
 export const INSTANCES_DIRNAME = "instances";
 export const DB_FILENAME = "relay.db";
+/** The provisioning record `relay init --instance-id` / `--multi-instance` writes (src/instance.ts createInstance). */
+export const INSTANCE_METADATA_FILENAME = "instance.json";
 
 export const INSTANCE_ID_RE = /^[A-Za-z0-9._-]+$/;
 
@@ -107,7 +109,40 @@ export type ResolvedInstance =
   | { kind: "explicit-db"; dbPath: string; exists: boolean; containment: ContainmentModel; basis: "RELAY_DB_PATH" | "--db-path" }
   | { kind: "instance"; id: string; dbPath: string; exists: boolean; containment: ContainmentModel; basis: "RELAY_INSTANCE_ID" | "active-instance" }
   | { kind: "flat"; dbPath: string; exists: boolean; containment: ContainmentModel; warning?: string }
-  | { kind: "error"; reason: string; ambiguous?: boolean; code?: string };
+  | { kind: "error"; reason: string; ambiguous?: boolean; code?: string; unprovisioned?: boolean };
+
+/**
+ * instance.json's content when it parses as a JSON OBJECT, else null (absent, unreadable, a directory, corrupt, or a
+ * non-object). The ONE reader of the provisioning record: src/instance.ts readInstance (`relay use-instance`,
+ * `relay list-instances`) and isProvisionedInstance below both use it, so "this instance exists" has one meaning.
+ */
+export function readInstanceMetadataFile(instanceDirPath: string): Record<string, unknown> | null {
+  try {
+    const v: unknown = JSON.parse(fs.readFileSync(path.join(instanceDirPath, INSTANCE_METADATA_FILENAME), "utf-8"));
+    return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether an instance directory is PROVISIONED: its instance.json is a valid record (readInstanceMetadataFile; the
+ * explicit provisioning path writes it), or its relay.db already exists (a legacy instance with data, from before
+ * instance.json; opening an existing DB creates nothing). A bare directory is NOT a provisioning: other code creates
+ * instance directories as a side effect.
+ */
+export function isProvisionedInstance(instanceDirPath: string, dbExists: boolean): boolean {
+  return dbExists || readInstanceMetadataFile(instanceDirPath) !== null;
+}
+
+/** The refusal for a selected instance that was never provisioned: the id, what named it, how to create or select one. */
+export function unprovisionedReason(id: string, namedBy: string, instanceDirPath: string, select: string): string {
+  return (
+    `instance "${id}" (named by ${namedBy}) does not exist: ${instanceDirPath} holds no ${INSTANCE_METADATA_FILENAME} and no ` +
+    `${DB_FILENAME}. Opening it would CREATE an empty relay that looks connected while its peers use another instance, ` +
+    `so nothing was created. Create it with \`relay init --instance-id ${id}\`, or ${select} (\`relay list-instances\` lists them).`
+  );
+}
 
 export interface ResolveOptions {
   /** An explicit DB path (`--db-path`): wins over everything. */
@@ -141,12 +176,19 @@ export function resolveInstance(opts: ResolveOptions = {}): ResolvedInstance {
   const root = relayRootFor(env);
   const instDir = path.join(root, INSTANCES_DIRNAME);
   const envId = env.RELAY_INSTANCE_ID;
+  // A SELECTED instance (env or marker) must be provisioned: a stale or mistyped id is an error, never a path a
+  // caller would create. Every consumer (open, pin, `relay where`, the hooks, the credential writers, Tether) then
+  // refuses it the way it refuses any other fault.
+  const selected = (id: string, namedBy: string, select: string, basis: "RELAY_INSTANCE_ID" | "active-instance"): ResolvedInstance =>
+    placed(path.join(instDir, id, DB_FILENAME), (p) =>
+      isProvisionedInstance(path.dirname(p.abs), p.exists)
+        ? { kind: "instance", id, dbPath: p.abs, exists: p.exists, containment: p.containment, basis }
+        : { kind: "error", unprovisioned: true, reason: unprovisionedReason(id, namedBy, path.dirname(p.abs), select) },
+    );
   if (envId) {
     const idFault = instanceIdFault(envId, instDir);
     if (idFault) return failed(`RELAY_INSTANCE_ID "${envId}" is invalid: ${idFault}`);
-    return placed(path.join(instDir, envId, DB_FILENAME), (p) => ({
-      kind: "instance", id: envId, dbPath: p.abs, exists: p.exists, containment: p.containment, basis: "RELAY_INSTANCE_ID",
-    }));
+    return selected(envId, "RELAY_INSTANCE_ID", "set RELAY_INSTANCE_ID to an existing instance, or unset it", "RELAY_INSTANCE_ID");
   }
 
   const flat = (warning?: string): ResolvedInstance =>
@@ -184,9 +226,7 @@ export function resolveInstance(opts: ResolveOptions = {}): ResolvedInstance {
     if (!id) return failed(`${marker} is empty`);
     const idFault = instanceIdFault(id, instDir);
     if (idFault) return failed(`${marker} names an invalid instance id "${id}": ${idFault}`);
-    return placed(path.join(instDir, id, DB_FILENAME), (p) => ({
-      kind: "instance", id, dbPath: p.abs, exists: p.exists, containment: p.containment, basis: "active-instance",
-    }));
+    return selected(id, `the active-instance marker ${marker}`, "switch to an existing instance with `relay use-instance <id>`", "active-instance");
   }
 
   // No marker: flat only if no instance directory exists.
@@ -228,7 +268,11 @@ export function resolveInstance(opts: ResolveOptions = {}): ResolvedInstance {
 export function serializeResolution(r: ResolvedInstance): Record<string, unknown> {
   switch (r.kind) {
     case "error":
-      return r.ambiguous ? { kind: r.kind, reason: r.reason, ambiguous: true } : { kind: r.kind, reason: r.reason };
+      return r.ambiguous
+        ? { kind: r.kind, reason: r.reason, ambiguous: true }
+        : r.unprovisioned
+          ? { kind: r.kind, reason: r.reason, unprovisioned: true }
+          : { kind: r.kind, reason: r.reason };
     case "flat":
       return r.warning
         ? { kind: r.kind, db_path: r.dbPath, exists: r.exists, containment: r.containment, warning: r.warning }
