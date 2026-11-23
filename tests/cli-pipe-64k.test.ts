@@ -147,8 +147,8 @@ describe("bin/relay: a PIPED subcommand's stdout is complete (not cut at 64 KiB)
  * The exit helper itself, in a child that keeps a handle OPEN (a timer), as a subcommand may: without the helper's
  * own process.exit the child would never exit, and without its EPIPE branch a reader that left would hang it.
  */
-describe("bin/_exit-after-flush.mjs: drains, then exits with the code, even with an open handle", () => {
-  const HELPER = path.join(REPO_ROOT, "bin", "_exit-after-flush.mjs");
+describe("the exit helper (src/exit-after-flush.ts, loaded from dist/): drains, then exits with the code, even with an open handle", () => {
+  const HELPER = path.join(REPO_ROOT, "dist", "exit-after-flush.js");
   function writer(): string {
     const p = path.join(home, `writer-${process.hrtime.bigint()}.mjs`);
     fs.writeFileSync(
@@ -199,7 +199,7 @@ function fileVsPipeStatusOnly(args: string[]): number {
 }
 
 /**
- * #443 R1 (Codex P2-1/P2-2, architect 90188964): the signal exit of `relay watch` uses the SAME helper, BOUNDED; and a
+ * #443 R1 (Codex P2-1/P2-2, ruling 90188964): the signal exit of `relay watch` uses the SAME helper, BOUNDED; and a
  * stdout EPIPE while stderr is still queued neither crashes nor loses stderr or the exit code.
  */
 describe("the signal exit drains, BOUNDED; EPIPE on stdout with stderr pending (#443 R1)", () => {
@@ -207,7 +207,7 @@ describe("the signal exit drains, BOUNDED; EPIPE on stdout with stderr pending (
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
   function child(body: string): string {
     const p = path.join(home, `child-${process.hrtime.bigint()}.mjs`);
-    fs.writeFileSync(p, `import { exitAfterFlush, installSignalExit } from ${JSON.stringify(pathToFileURL(DIST_EXIT).href)};\nsetInterval(() => {}, 1000);\n${body}\n`);
+    fs.writeFileSync(p, `import { exitAfterFlush, installSignalExit, markTerminatingOnSignals } from ${JSON.stringify(pathToFileURL(DIST_EXIT).href)};\nsetInterval(() => {}, 1000);\n${body}\n`);
     return p;
   }
 
@@ -251,12 +251,6 @@ describe("the signal exit drains, BOUNDED; EPIPE on stdout with stderr pending (
     expect(err.length, "stderr drained in full after stdout's reader left").toBe(300000);
   });
 
-  it("WIRING (a source check, not a behaviour row): relay watch's signal path is installSignalExit, with no bare process.exit left in it", () => {
-    const src = fs.readFileSync(path.join(REPO_ROOT, "src", "cli", "watch.ts"), "utf-8");
-    expect(src).toContain("installSignalExit(stop)");
-    expect(src).not.toMatch(/const onSignal = \(\): void => \{\s*stop\(\);\s*process\.exit\(0\);/);
-  });
-
   it("the real relay watch still exits promptly on SIGTERM (0), and its wake line reaches the reader", async () => {
     const r = await new Promise<{ code: number | null; out: string; ms: number }>((resolve) => {
       const w = spawn(process.execPath, [RELAY_BIN, "watch", "pipe-to", "--json"], {
@@ -283,4 +277,74 @@ describe("the signal exit drains, BOUNDED; EPIPE on stdout with stderr pending (
     expect(r.ms).toBeGreaterThanOrEqual(0);
     expect(r.ms, "exited within the signal bound").toBeLessThan(5000);
   }, 30_000);
+
+  // --- #443 R2 delta (ruling c07c9674) ---
+  // --until-wake's exit, modelled EXACTLY as it runs: the terminating marker, a `once` phase handler that settles, then
+  // bin/relay's UNBOUNDED exitAfterFlush(code) after runUntilWake returns. (The real --until-wake did not reach a
+  // listening phase in a sandbox within 9 s, MEASURED; its setup-time behaviour is the last row below.)
+  const untilWakeModel = `markTerminatingOnSignals();\nprocess.stdout.write("x".repeat(300000));\nprocess.once("SIGTERM", () => setImmediate(() => exitAfterFlush(0)));\nprocess.kill(process.pid, "SIGTERM");`;
+
+  it("P2-a: the --until-wake exit path (marker + phase handler + an UNBOUNDED exitAfterFlush) is bounded once a signal arrived: a never-reading reader cannot hang it", () => {
+    const out = fs.mkdtempSync(path.join(home, "ua-"));
+    const t0 = Date.now();
+    const r = spawnSync("sh", ["-c", `{ ${q(process.execPath)} ${q(child(untilWakeModel))} 2> ${q(path.join(out, "err"))}; echo $? > ${q(path.join(out, "status"))}; } | sleep 6`], { encoding: "utf-8", timeout: 30_000 });
+    expect((r.error as NodeJS.ErrnoException | undefined)?.code).toBeUndefined();
+    const exitedAfter = fs.statSync(path.join(out, "status")).mtimeMs - t0;
+    expect(exitedAfter, "bounded by SIGNAL_DRAIN_BOUND_MS (2000), not by the reader").toBeLessThan(4500);
+    expect(fs.readFileSync(path.join(out, "status"), "utf-8").trim()).toBe("0");
+  }, 20_000);
+
+  it("P2-a: TWO SIGTERMs on that path exit with code 0, not by a signal (the second is absorbed)", () => {
+    const out = fs.mkdtempSync(path.join(home, "ub-"));
+    const twice = untilWakeModel.replace('process.kill(process.pid, "SIGTERM");', 'process.kill(process.pid, "SIGTERM");\nsetTimeout(() => process.kill(process.pid, "SIGTERM"), 50);');
+    const r = spawnSync("sh", ["-c", `{ ${q(process.execPath)} ${q(child(twice))}; echo $? > ${q(path.join(out, "status"))}; } | sleep 4`], { encoding: "utf-8", timeout: 30_000 });
+    expect((r.error as NodeJS.ErrnoException | undefined)?.code).toBeUndefined();
+    expect(fs.readFileSync(path.join(out, "status"), "utf-8").trim(), "exit 0 (143 would be death by SIGTERM)").toBe("0");
+  }, 20_000);
+
+  it("P2-b: a THROWING stop() still exits 0 (one stderr line); a double signal runs stop() ONCE", () => {
+    const out = fs.mkdtempSync(path.join(home, "uc-"));
+    const count = path.join(out, "count");
+    // 300000 bytes queued behind a LATE reader: the drain lasts ~1 s, so the second signal lands DURING it.
+    const body = `import fs from "node:fs";\ninstallSignalExit(() => { fs.appendFileSync(${JSON.stringify(count)}, "x"); throw new Error("boom"); });\nprocess.stdout.write("x".repeat(300000));\nprocess.kill(process.pid, "SIGTERM");\nsetTimeout(() => process.kill(process.pid, "SIGTERM"), 200);`;
+    const r = spawnSync("sh", ["-c", `{ ${q(process.execPath)} ${q(child(body))} 2> ${q(path.join(out, "err"))}; echo $? > ${q(path.join(out, "status"))}; } | { sleep 1; cat > /dev/null; }`], { encoding: "utf-8", timeout: 30_000 });
+    expect((r.error as NodeJS.ErrnoException | undefined)?.code).toBeUndefined();
+    expect(fs.readFileSync(path.join(out, "status"), "utf-8").trim()).toBe("0");
+    expect(fs.readFileSync(count, "utf-8"), "stop() ran exactly once").toBe("x");
+    expect(fs.readFileSync(path.join(out, "err"), "utf-8")).toContain("cleanup failed (boom)");
+  });
+
+  it("REGRESSION GUARD: a SIGTERM while the REAL relay watch --until-wake is still setting up (nothing listening yet) still terminates it by the signal, as on main", async () => {
+    const r = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; ms: number }>((resolve) => {
+      const w = spawn(process.execPath, [RELAY_BIN, "watch", "pipe-to", "--until-wake"], {
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: os.tmpdir(), RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let t0 = 0;
+      setTimeout(() => {
+        t0 = Date.now();
+        w.kill("SIGTERM");
+      }, 1500);
+      const guard = setTimeout(() => w.kill("SIGKILL"), 20_000);
+      w.on("exit", (code, signal) => {
+        clearTimeout(guard);
+        resolve({ code, signal, ms: Date.now() - t0 });
+      });
+    });
+    expect(r.signal, "terminated by SIGTERM (a swallowed signal would leave it running until the SIGKILL guard)").toBe("SIGTERM");
+    expect(r.ms).toBeLessThan(3000);
+  }, 30_000);
+
+  it("P2-c: bin/relay with a missing build says so in one line and exits 1 (nothing written before it)", () => {
+    const tree = fs.mkdtempSync(path.join(home, "nobuild-"));
+    fs.mkdirSync(path.join(tree, "bin"));
+    fs.mkdirSync(path.join(tree, "dist"));
+    fs.copyFileSync(RELAY_BIN, path.join(tree, "bin", "relay"));
+    fs.writeFileSync(path.join(tree, "package.json"), JSON.stringify({ type: "module" }));
+    const r = spawnSync(process.execPath, [path.join(tree, "bin", "relay"), "help"], { encoding: "utf-8", timeout: 30_000 });
+    expect(r.status).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr.trim()).toBe("relay: build missing or out of date (dist/exit-after-flush.js); run npm run build");
+  });
 });
+

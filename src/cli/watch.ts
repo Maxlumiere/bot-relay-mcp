@@ -382,6 +382,10 @@ export async function run(argv: string[]): Promise<number> {
     const { runUntilWake, runLockStatus, runArmCheck } = await import("./watch-until-wake.js");
     if (args.lockStatus) return runLockStatus(agent);
     if (args.armCheck) return runArmCheck(agent);
+    // #443 R2 P2-a: a signal marks the process TERMINATING, so the exit bin/relay makes with the code runUntilWake
+    // returns is BOUNDED; a second signal is absorbed (exit 0, never "killed by signal").
+    const { markTerminatingOnSignals } = await import("../exit-after-flush.js");
+    markTerminatingOnSignals();
     return runUntilWake(agent, { intervalMs: args.intervalMs, ...(args.dormantCheckMs ? { dormantCheckMs: args.dormantCheckMs } : {}), ...(args.anchorUnknownBoundMs ? { anchorUnknownBoundMs: args.anchorUnknownBoundMs } : {}) });
   }
 

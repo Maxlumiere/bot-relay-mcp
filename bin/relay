@@ -63,8 +63,6 @@
  * should switch to the unified entry.
  */
 
-import { exitAfterFlush } from "./_exit-after-flush.mjs";
-
 const SUBCOMMANDS = {
   doctor: "../dist/cli/doctor.js",
   init: "../dist/cli/init.js",
@@ -153,9 +151,20 @@ function printHelp(requested) {
   );
 }
 
-// THE ONE EXIT POINT: every exit below goes through exitAfterFlush (bin/_exit-after-flush.mjs), which drains
-// stdout/stderr before process.exit (a bare process.exit cut piped output at 65,536 bytes). `return` after it.
+// THE ONE EXIT POINT: every exit below goes through exitAfterFlush (src/exit-after-flush.ts, loaded from dist/ at the
+// top of main), which drains stdout/stderr before process.exit (a bare process.exit cut piped output at 65,536 bytes).
+// `return` after it.
+let exitAfterFlush;
 async function main() {
+  // ONE implementation, loaded by DYNAMIC import (ruling c07c9674): a missing or stale build is said in one line.
+  // A bare process.exit is safe HERE: nothing has been written yet.
+  try {
+    ({ exitAfterFlush } = await import("../dist/exit-after-flush.js"));
+    if (typeof exitAfterFlush !== "function") throw new Error("no exitAfterFlush export");
+  } catch {
+    process.stderr.write("relay: build missing or out of date (dist/exit-after-flush.js); run npm run build\n");
+    process.exit(1);
+  }
   const argv = process.argv.slice(2);
   const askedForHelp =
     argv[0] === "help" || argv[0] === "--help" || argv[0] === "-h";
