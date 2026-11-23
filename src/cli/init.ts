@@ -668,10 +668,18 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
   // verify at the FILESYSTEM — the path the daemon reads on its NEXT start — not
   // against the running daemon, which loads config only at boot and would
   // false-alarm on a correct write until it is restarted.
+  // The pre-write check only decides whether to ABORT. After the writes the selection is RE-RESOLVED (ruling a657bee8):
+  // the advised recovery, `relay init --instance-id <the missing one>`, has just provisioned it, so it now resolves and
+  // gets the normal verify. Only a selection STILL missing takes the "not active" path.
+  let stillMissing: string | null = null;
   if (activeMissing !== null) {
+    const again = resolveInstance({ ignoreDbPathEnv: true });
+    stillMissing = again.kind === "error" && again.unprovisioned === true ? again.reason : null;
+  }
+  if (stillMissing !== null) {
     // Configuring a NON-active instance is legitimate (set up now, activate later): the existing "not active" path.
     process.stdout.write(
-      `\n⚠️  Not the ACTIVE instance: the active selection names a missing instance (${activeMissing}). The config ` +
+      `\n⚠️  Not the ACTIVE instance: the active selection names a missing instance (${stillMissing}). The config ` +
         `written here takes effect once you run \`relay use-instance ${effectiveInstanceId}\` and restart the daemon.\n`,
     );
   } else {
