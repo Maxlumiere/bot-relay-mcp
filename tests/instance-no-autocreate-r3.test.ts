@@ -79,6 +79,20 @@ describe("P3: relay init --instance-id NEW while the marker names a STALE instan
     expect(fs.existsSync(instDir("goneinst")), "the stale selection was not created").toBe(false);
   });
 
+  it("the ADVISED recovery: marker names \"gone\" + relay init --instance-id gone → rc 0, a ✓ verified line, NO \"Not the ACTIVE\" line (the selection is re-resolved after the writes)", () => {
+    createInstance("realinst", "t");
+    fs.writeFileSync(path.join(relayRoot(), "active-instance"), "gone\n");
+    const r = spawnSync(process.execPath, [RELAY_BIN, "init", "--yes", "--skip-daemon", "--skip-hooks", "--transport", "http", "--instance-id", "gone"], {
+      env: childEnv(),
+      encoding: "utf-8",
+      timeout: 60_000,
+    });
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout).toMatch(/✓ verified: the daemon resolves this config at /);
+    expect(r.stdout).not.toContain("Not the ACTIVE instance");
+    expect(fs.existsSync(path.join(instDir("gone"), "instance.json"))).toBe(true);
+  });
+
   it("a resolver error that is NOT unprovisioned (an EMPTY marker) still fails loud, BEFORE any write", () => {
     createInstance("realinst", "t");
     fs.writeFileSync(path.join(relayRoot(), "active-instance"), "");
