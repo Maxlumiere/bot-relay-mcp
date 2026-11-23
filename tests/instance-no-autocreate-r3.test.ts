@@ -12,7 +12,9 @@
  * legitimate: it takes the existing "Not the ACTIVE instance" path, and says the active selection is missing.
  *
  * .native: on a case-insensitive file system, a wrong-case RELAY_DB_PATH (<home>/.bot-relay/INSTANCES/<stale>/...)
- * names the same directory, and JS realpathSync keeps the caller's case, so the layout test missed it.
+ * names the same directory, and JS realpathSync keeps the caller's case, so the layout test missed it. The default
+ * macOS file system (APFS) is case-insensitive, so this file is in the macOS PR subset, where the .native row runs;
+ * on Linux CI it skips with a printed reason (detected, never assumed).
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";

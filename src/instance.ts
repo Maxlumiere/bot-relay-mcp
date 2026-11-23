@@ -44,7 +44,6 @@ import {
   instancesRootFor,
   instanceIdFault as idFaultUnder,
   ACTIVE_INSTANCE_MARKER,
-  DB_FILENAME,
   isProvisionedInstance,
   instanceDirOfDbPath as layoutDirOf,
   readInstanceMetadataFile,
