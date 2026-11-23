@@ -21,6 +21,8 @@ import { fileURLToPath, pathToFileURL } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { sandboxEnv } from "./_helpers/sandbox-env.js";
 import ts from "typescript-legacy";
+import type { AddressInfo } from "node:net";
+import { closedIdentity, safeRefusal, transportDiagnostic } from "../src/cli/whoami.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_INDEX = path.join(REPO, "dist", "index.js");
@@ -999,7 +1001,7 @@ describe("queue item 3: `relay whoami` (read-only) through the owner door; whoam
     await stopDaemon(d.child);
   }, 120_000);
 
-  it("a STALE vault token (right shape, wrong value) is refused LOCALLY (exit 2) and never presented (the shared resolve/whoami token path)", async () => {
+  it("a STALE vault token (right shape, wrong value) is refused LOCALLY, before any send (exit 2; the shared resolve/whoami token path)", async () => {
     const c = newInstanceCase("cli-whoami-stale");
     seedInstanceVault(c, [AGENT]);
     fs.writeFileSync(path.join(c.dir, "agents", `${AGENT}.token`), "stale-token-0123456789abcdef", { mode: 0o600 });
@@ -1008,6 +1010,86 @@ describe("queue item 3: `relay whoami` (read-only) through the owner door; whoam
     expect(r.status, r.stderr).toBe(2);
     expect(r.stdout).toBe("");
     expect(r.stderr).toContain("does not authenticate against the DB");
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("ruling c4454ae5 (2), the name contract ENFORCED: A's token + RELAY_AGENT_NAME=B (no --agent) → exit 1 naming both sources; an --agent match WINS over the env name (rc 0)", async () => {
+    const c = newInstanceCase("cli-whoami-envname");
+    const [tokA] = seedInstanceVault(c, [AGENT, "pr4-peer"]);
+    const d = await startInstanceDaemon(c);
+    const mis = await relayWithEnv(instEnv(c, { RELAY_AGENT_TOKEN: tokA, RELAY_AGENT_NAME: "pr4-peer" }), ["whoami"]);
+    expect(mis.status, mis.stderr).toBe(1);
+    expect(mis.stdout).toBe("");
+    expect(mis.stderr).toContain(`belongs to "${AGENT}", not "pr4-peer"`);
+    expect(mis.stderr).toContain("token from RELAY_AGENT_TOKEN; expected name from RELAY_AGENT_NAME");
+    expect(mis.stderr, "never the token").not.toContain(tokA);
+    const win = await relayWithEnv(instEnv(c, { RELAY_AGENT_TOKEN: tokA, RELAY_AGENT_NAME: "pr4-peer" }), ["whoami", "--agent", AGENT]);
+    expect(win.status, win.stderr).toBe(0);
+    expect(win.stdout).toBe(`${AGENT}\n`);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("Codex #444 R1 P1: TOKEN ONLY (no agent name) + a REMOTE relay not selected by RELAY_HTTP_HOST → the inherited local token is NOT sent: exit 2", async () => {
+    const c = newCase("cli-whoami-remote-iso");
+    seedNativeDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ http_host: "203.0.113.10", http_port: 3777 }), { mode: 0o600 });
+    const t0 = Date.now();
+    const r = await relayWithEnv(baseEnv(c, { RELAY_AGENT_TOKEN: "pr4-a-local-launcher-token-aaaaaa" }), ["whoami"]);
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/RELAY_AGENT_TOKEN is not selected for the remote relay 203\.0\.113\.10:\d+/); // the sandbox env pins RELAY_HTTP_PORT
+    expect(Date.now() - t0, "refused before any connection attempt").toBeLessThan(10_000);
+  }, 60_000);
+
+  it("Codex #444 R1 P2-1: the printed envelope is the CLOSED identity, field by field: a token, operator secrets and extra fields (nested too) are dropped", () => {
+    const hostile = {
+      success: true, agent_name: "A", role: "r", capabilities: ["x", 7, { t: "tok" }], instance_id: "i", db_path: "/d", host_id: null, edge_id: "e",
+      token: "LEAKED-TOKEN", http_secret: "LEAKED-HTTP", dashboard_secret: "LEAKED-DASH", agent_token: "LEAKED-AT",
+      build: { build_id: "b", commit: null, dirty: false, built_at: null, deps_id: null, deps_state: "known", node: "v22", secret: "LEAKED-NESTED", nested: { token: "LEAKED-DEEP" } },
+    };
+    const out = closedIdentity(hostile);
+    expect(out).toEqual({
+      success: true, agent_name: "A", role: "r", capabilities: ["x"], instance_id: "i", db_path: "/d", host_id: null, edge_id: "e",
+      build: { build_id: "b", commit: null, dirty: false, built_at: null, deps_id: null, deps_state: "known", node: "v22" },
+    });
+    expect(JSON.stringify(out)).not.toMatch(/LEAKED/);
+    expect(closedIdentity({ success: false, agent_name: "A" })).toBeNull();
+    expect(closedIdentity({ success: true })).toBeNull();
+  });
+
+  it("Codex #444 R1 P2-2: diagnostics are content-safe: a refusal shows only an error CODE; a remote transport failure never echoes its exception (a redirect's Location can carry the token)", () => {
+    const echoed = { success: false, error: "bad token LEAKED-TOKEN-123", error_code: "AUTH_FAILED" };
+    expect(safeRefusal(echoed)).toBe("the relay refused (AUTH_FAILED)");
+    expect(safeRefusal({ success: false, error: "LEAKED", error_code: "not a code LEAKED" })).toBe("the relay refused");
+    expect(safeRefusal(null)).toBe("the relay refused");
+    const redirect = new Error("redirect refused: Location: https://evil.example/?token=LEAKED-TOKEN-456");
+    const line = transportDiagnostic({ kind: "remote" }, "203.0.113.10", 3777, redirect);
+    expect(line).not.toMatch(/LEAKED|evil|Location/);
+    expect(line).toContain("203.0.113.10:3777");
+  });
+
+  it("a REVOKED agent's vault token: refused locally (exit 2, 'revoked'), nothing on stdout", async () => {
+    const c = newInstanceCase("cli-whoami-revoked");
+    seedInstanceVault(c, [AGENT]);
+    const rv = spawnSync(process.execPath, ["--input-type=module", "-e", `const db = await import(${JSON.stringify(DIST_DB)}); db.revokeAgentToken(${JSON.stringify(AGENT)}); db.closeDb();`], { encoding: "utf-8", env: instEnv(c) });
+    expect(rv.status, rv.stderr).toBe(0);
+    const d = await startInstanceDaemon(c);
+    const r = await relayWithEnv(instEnv(c), ["whoami", "--agent", AGENT]);
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/revoked/);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("direct-door NAME SPOOFING: a sealed whoami naming ANOTHER agent with A's token answers A (the token is the identity, never the claimed name)", async () => {
+    const c = newInstanceCase("cli-whoami-spoof");
+    const [tokA] = seedInstanceVault(c, [AGENT, "pr4-peer"]);
+    const d = await startInstanceDaemon(c);
+    const rec = readRecord({ record: c.record } as Case);
+    const res = await door(rec, "/owner/v1/tool", { rpc: rpc("whoami", {}), agent_token: tokA }, { agent: "pr4-peer" });
+    expect(res.status, res.raw).toBe(200);
+    const text = String(((res.opened as { result?: { content?: Array<{ text?: string }> } } | null)?.result?.content ?? [])[0]?.text ?? "");
+    expect((JSON.parse(text) as { agent_name?: string }).agent_name).toBe(AGENT);
     await stopDaemon(d.child);
   }, 120_000);
 
@@ -1025,3 +1107,119 @@ describe("queue item 3: `relay whoami` (read-only) through the owner door; whoam
     await stopDaemon(d.child);
   }, 120_000);
 });
+
+/** A non-loopback interface address of this machine: it routes as REMOTE (classifyHost), so a fake relay on it is a real remote route. */
+const REMOTE_IP = Object.values(os.networkInterfaces()).flat().find((i) => i && i.family === "IPv4" && !i.internal)?.address ?? null;
+if (!REMOTE_IP) process.stderr.write("[cli-door-clients] fake-remote whoami rows SKIPPED: no non-loopback IPv4 interface on this host\n");
+
+describe.skipIf(!REMOTE_IP)("#444 R1, black box against a FAKE REMOTE relay (security review's twins; MEASURED: the remote's own log)", () => {
+  /** A fake remote /mcp that records every request and answers with `reply`. */
+  async function fakeRemote(reply: (res: http.ServerResponse) => void) {
+    const reqs: Array<{ url?: string; headers: http.IncomingHttpHeaders; body: string }> = [];
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        reqs.push({ url: req.url, headers: req.headers, body });
+        reply(res);
+      });
+    });
+    const port = await new Promise<number>((resolve) => server.listen(0, "0.0.0.0", () => resolve((server.address() as AddressInfo).port)));
+    return { port, reqs, close: () => new Promise<void>((r) => server.close(() => r())) };
+  }
+  const mcpReply = (envelope: unknown) => (res: http.ServerResponse) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify(envelope) }] } }));
+  };
+  const LOCAL_TOKEN = "pr444-local-launcher-token-aaaaaaaa";
+  function remoteCase(tag: string, port: number): Case {
+    const c = newCase(tag);
+    seedNativeDb(c);
+    fs.writeFileSync(c.cfg, JSON.stringify({ http_host: REMOTE_IP, http_port: port }), { mode: 0o600 });
+    return c;
+  }
+
+  it("TWIN 1: token only (no RELAY_AGENT_NAME, no RELAY_HTTP_HOST) → exit 2, the remote receives NOTHING", async () => {
+    const f = await fakeRemote(mcpReply({ success: true, agent_name: "x" }));
+    const c = remoteCase("whoami-twin1", f.port);
+    const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN }), ["whoami"]);
+    expect(r.status, r.stderr).toBe(2);
+    expect(f.reqs.filter((q) => q.url !== "/health"), "the remote received no tool call").toEqual([]);
+    expect(f.reqs.map((q) => JSON.stringify(q)).join(""), "the local token never reached the remote").not.toContain(LOCAL_TOKEN);
+    await f.close();
+  }, 60_000);
+
+  it("TWIN 2: + RELAY_AGENT_NAME (no vault entry for that remote) → exit 2, the remote receives NOTHING", async () => {
+    const f = await fakeRemote(mcpReply({ success: true, agent_name: "x" }));
+    const c = remoteCase("whoami-twin2", f.port);
+    const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN, RELAY_AGENT_NAME: AGENT }), ["whoami"]);
+    expect(r.status, r.stderr).toBe(2);
+    expect(f.reqs.map((q) => JSON.stringify(q)).join("")).not.toContain(LOCAL_TOKEN);
+    await f.close();
+  }, 60_000);
+
+  it("TWIN 3: + RELAY_HTTP_HOST=<that remote> (the environment selected it) → the token IS sent (legitimate), and a HOSTILE reply prints only the closed identity", async () => {
+    const f = await fakeRemote(mcpReply({ success: true, agent_name: "remote-a", role: "r", capabilities: [], instance_id: null, db_path: "/d", host_id: null, edge_id: "e", token: "LEAK-T", http_secret: "LEAK-H", dashboard_secret: "LEAK-D", build: { build_id: "b", secret: "LEAK-N" } }));
+    const c = remoteCase("whoami-twin3", f.port);
+    const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN, RELAY_HTTP_HOST: REMOTE_IP! }), ["whoami", "--json"]);
+    expect(r.status, r.stderr).toBe(0);
+    expect(f.reqs.some((q) => q.headers["x-agent-token"] === LOCAL_TOKEN), "selected → the env token is presented").toBe(true);
+    const out = JSON.parse(r.stdout.trim()) as Record<string, unknown>;
+    expect(out.agent_name).toBe("remote-a");
+    expect(r.stdout + r.stderr).not.toMatch(/LEAK-/);
+    await f.close();
+  }, 60_000);
+
+  for (const [label, reply] of [
+    ["an error body ECHOING the presented token", mcpReply({ success: false, error: `bad token ${LOCAL_TOKEN}`, error_code: "AUTH_FAILED" })],
+    ["a 302 whose Location carries the token", (res: http.ServerResponse) => { res.writeHead(302, { Location: `http://evil.example/?t=${LOCAL_TOKEN}` }); res.end(); }],
+    ["a 500 whose body carries the token", (res: http.ServerResponse) => { res.writeHead(500, { "Content-Type": "text/plain" }); res.end(`oops ${LOCAL_TOKEN}`); }],
+  ] as Array<[string, (res: http.ServerResponse) => void]>) {
+    it(`a remote reply with ${label}: the token never reaches stdout or stderr; non-zero exit`, async () => {
+      const f = await fakeRemote(reply);
+      const c = remoteCase("whoami-hostile", f.port);
+      const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN, RELAY_HTTP_HOST: REMOTE_IP! }), ["whoami"]);
+      expect(r.status).not.toBe(0);
+      expect(r.stdout + r.stderr, r.stderr).not.toContain(LOCAL_TOKEN);
+      await f.close();
+    }, 60_000);
+  }
+
+  // Ruling c4454ae5 (1): the SHARED redirect/error echo. A Location carrying the sent token and user:pass@, and an error
+  // body echoing it, through whoami AND send AND resolve: the token (and the userinfo) reach neither stdout nor stderr.
+  const evilLocation = () => `http://user:pass@evil.example:8443/cb?token=${LOCAL_TOKEN}#frag`;
+  const verbs: Array<[string, string[]]> = [
+    ["whoami", ["whoami"]],
+    ["send", ["send", "pr4-peer", "hi", "--from", AGENT]],
+    ["resolve", ["resolve", "m-1", "--agent", AGENT]],
+  ];
+  for (const [verb, argv] of verbs) {
+    it(`relay ${verb}: a 302 whose Location carries the sent token and user:pass@ → only its ORIGIN is printed; the token and userinfo never reach stdout or stderr`, async () => {
+      const f = await fakeRemote((res) => { res.writeHead(302, { Location: evilLocation() }); res.end(); });
+      const c = remoteCase(`redirect-${verb}`, f.port);
+      const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN, RELAY_HTTP_HOST: REMOTE_IP! }), argv);
+      expect(r.status).not.toBe(0);
+      const all = r.stdout + r.stderr;
+      expect(f.reqs.length, "the request did reach the fake remote (so the redirect path ran)").toBeGreaterThan(0);
+      expect(all, r.stderr).not.toContain(LOCAL_TOKEN);
+      expect(all).not.toMatch(/user:pass|\/cb|frag/);
+      expect(all).toContain("http://evil.example:8443");
+      await f.close();
+    }, 60_000);
+  }
+  for (const [verb, argv] of verbs.filter(([v]) => v !== "whoami")) {
+    it(`relay ${verb}: a remote error body ECHOING the sent token → status and code only; the token never reaches stdout or stderr`, async () => {
+      const echo = { success: false, error: `bad token ${LOCAL_TOKEN}`, error_code: "AUTH_FAILED" };
+      const f = await fakeRemote((res) => {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(verb === "send" ? JSON.stringify(echo) : JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify(echo) }], isError: true } }));
+      });
+      const c = remoteCase(`echo-${verb}`, f.port);
+      const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN, RELAY_HTTP_HOST: REMOTE_IP! }), argv);
+      expect(r.status).not.toBe(0);
+      expect(r.stdout + r.stderr, r.stderr).not.toContain(LOCAL_TOKEN);
+      await f.close();
+    }, 60_000);
+  }
+});
+
