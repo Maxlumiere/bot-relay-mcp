@@ -380,8 +380,8 @@ describe("the open re-verifies provisioning: concurrent deletion recreates nothi
   });
 });
 
-/** the-fixer #442 P3: ONE predicate. An instance.json that `use-instance` / `list-instances` reject is not a provisioning. */
-describe("a corrupt or non-file instance.json is NOT a provisioning, for every verb alike (the-fixer #442 P3)", () => {
+/** The security review, #442 P3: ONE predicate. An instance.json that `use-instance` / `list-instances` reject is not a provisioning. */
+describe("a corrupt or non-file instance.json is NOT a provisioning, for every verb alike (#442 security review P3)", () => {
   const cases: Array<[string, (dir: string) => void]> = [
     ["corrupt ('{')", (dir) => fs.writeFileSync(path.join(dir, "instance.json"), "{")],
     ["a directory", (dir) => fs.mkdirSync(path.join(dir, "instance.json"))],
