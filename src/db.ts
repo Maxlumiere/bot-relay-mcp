@@ -68,7 +68,7 @@ import {
 import { stampNativeHeader } from "./db-header.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile, privacyFaults, restrictToOwnerWindows } from "./fs-perms.js";
-import { resolveInstance } from "./instance.js";
+import { resolveInstance, unprovisionedInstanceFault } from "./instance.js";
 import { checkContainment } from "./approved-roots.js";
 import { emitInboxChanged } from "./inbox-events.js";
 import { VERSION } from "./version.js";
@@ -86,6 +86,9 @@ const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "relay.db");
 export function getDbPath(): string {
   const r = resolveInstance();
   if (r.kind === "error") throw new Error(r.reason);
+  // Every DB open passes here: an instance that was never provisioned is refused, never created.
+  const unprovisioned = unprovisionedInstanceFault(r);
+  if (unprovisioned) throw new Error(unprovisioned);
   return r.dbPath;
 }
 

@@ -12,7 +12,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { resolveInstance, configPathFor } from "../instance.js";
+import { resolveInstance, configPathFor, unprovisionedInstanceFault } from "../instance.js";
 import { withDeadline } from "../http-deadline.js";
 
 type Status = "PASS" | "WARN" | "FAIL";
@@ -610,8 +610,10 @@ export async function run(argv: string[]): Promise<number> {
   // skip the checks that need a DB path (they would only guess or crash); the
   // daemon refuses to start on this same result.
   const resolution = resolveInstance();
-  if (resolution.kind === "error") {
-    results.push({ name: "instance resolution", status: "FAIL", detail: resolution.reason });
+  // A non-existent instance is a FAIL like a fault: every relay entry point refuses it.
+  const unprovisioned = unprovisionedInstanceFault(resolution);
+  if (resolution.kind === "error" || unprovisioned !== null) {
+    results.push({ name: "instance resolution", status: "FAIL", detail: resolution.kind === "error" ? resolution.reason : (unprovisioned as string) });
   } else {
     const who =
       resolution.kind === "instance"

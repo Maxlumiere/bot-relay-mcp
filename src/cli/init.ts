@@ -40,7 +40,7 @@ import { withDeadline } from "../http-deadline.js";
 import { execSystem } from "../system-binary.js"; // SEC-22: launchctl by its trusted path, never by name
 import readline from "readline/promises";
 import { ensureSecureDir, ensureSecureFile } from "../fs-perms.js";
-import { createInstance, generateInstanceId, resolveActiveInstanceId, instanceDir, instanceDirNames, configPathForInstance, flatConfigPath } from "../instance.js";
+import { createInstance, generateInstanceId, resolveActiveInstanceId, resolveInstance, unprovisionedInstanceFault, instanceDir, instanceDirNames, configPathForInstance, flatConfigPath } from "../instance.js";
 import { getConfigPath, configPathOverride } from "../config.js";
 import {
   readJsonSafe,
@@ -440,6 +440,10 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     try {
       configPath = getConfigPath();
       effectiveInstanceId = resolveActiveInstanceId();
+      // A selected instance that was never provisioned (a stale marker or RELAY_INSTANCE_ID) is refused HERE, before
+      // any write: plain init never scaffolds an instance it did not name. --instance-id is the explicit path.
+      const unprovisioned = unprovisionedInstanceFault(resolveInstance({ ignoreDbPathEnv: true }));
+      if (unprovisioned) throw new Error(unprovisioned);
     } catch (err) {
       process.stderr.write(
         `relay init: instance resolution failed: ${err instanceof Error ? err.message : String(err)}\n` +
