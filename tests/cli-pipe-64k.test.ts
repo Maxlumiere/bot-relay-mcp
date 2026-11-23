@@ -97,13 +97,23 @@ describe("bin/relay: a PIPED subcommand's stdout is complete (not cut at 64 KiB)
     expect((JSON.parse(r.piped.toString("utf-8")) as { instances: unknown[] }).instances.length).toBe(1200);
   });
 
-  it("relay pending AGENT --json (DB source): piped bytes == file bytes, and both exceed the pipe buffer", () => {
+  it("relay pending AGENT --json (DB source): the piped answer is complete (1500 messages, equal to the file run once age_seconds is pinned), past two pipe buffers", () => {
     const r = fileVsPipe(["pending", "pipe-to", "--json"], { RELAY_DB_PATH: dbPath });
     expect(r.file.length, "the fixture must exceed one pipe buffer, or the row proves nothing").toBeGreaterThan(2 * PIPE_BUFFER);
     expect(r.status, r.stderr).toBe(0);
-    expect(r.piped.length, "piped output was cut").toBe(r.file.length);
-    expect(r.piped.equals(r.file)).toBe(true);
-    JSON.parse(r.piped.toString("utf-8"));
+    expect(r.piped.length, "piped output was cut").toBeGreaterThan(2 * PIPE_BUFFER);
+    // Not byte equality: each message carries age_seconds, which moves between the two runs (CI measured it: equal
+    // lengths, different bytes). Both answers parse, and are equal once the clock field is pinned.
+    type Pending = { count: number; messages: Array<{ age_seconds: number }> };
+    const pin = (b: Buffer): Pending => {
+      const j = JSON.parse(b.toString("utf-8")) as Pending;
+      for (const m of j.messages) m.age_seconds = 0;
+      return j;
+    };
+    const piped = pin(r.piped);
+    expect(piped.count).toBe(1500);
+    expect(piped.messages.length, "every message reached the reader").toBe(1500);
+    expect(piped).toEqual(pin(r.file));
   });
 
   it("relay help through a pipe: exit 0, the usage on stdout, NOTHING on stderr (an exit path that falls through would add an error)", () => {
