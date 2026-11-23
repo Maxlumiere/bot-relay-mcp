@@ -117,11 +117,27 @@ export type ResolvedInstance =
  * `relay list-instances`) and isProvisionedInstance below both use it, so "this instance exists" has one meaning.
  */
 export function readInstanceMetadataFile(instanceDirPath: string): Record<string, unknown> | null {
+  const file = path.join(instanceDirPath, INSTANCE_METADATA_FILENAME);
+  let fd: number | null = null;
   try {
-    const v: unknown = JSON.parse(fs.readFileSync(path.join(instanceDirPath, INSTANCE_METADATA_FILENAME), "utf-8"));
+    // Never through a link (item 0b): O_NOFOLLOW where the platform has it; elsewhere (Windows) a link is refused
+    // by lstat first. A link at the record's name is not a provisioning record.
+    const noFollow = fs.constants.O_NOFOLLOW;
+    if (noFollow === undefined && fs.lstatSync(file).isSymbolicLink()) return null;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (noFollow ?? 0));
+    if (!fs.fstatSync(fd).isFile()) return null;
+    const v: unknown = JSON.parse(fs.readFileSync(fd, "utf-8"));
     return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
   } catch {
     return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* a close failure leaves nothing to undo */
+      }
+    }
   }
 }
 

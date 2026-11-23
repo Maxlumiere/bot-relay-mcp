@@ -47,6 +47,8 @@ import {
   isProvisionedInstance,
   instanceDirOfDbPath as layoutDirOf,
   readInstanceMetadataFile,
+  INSTANCE_METADATA_FILENAME,
+  INSTANCES_DIRNAME,
   unprovisionedReason,
   type ResolvedInstance,
   type ResolverEnv,
@@ -229,25 +231,82 @@ export function generateInstanceId(): string {
 }
 
 /**
+ * Item 0b (Codex #442 R1 P2-3): explicit provisioning never follows a link below the relay home.
+ *
+ * The trust boundary is the relay home ROOT, resolved ONCE with realpath (it MAY be a link: an operator can keep
+ * ~/.bot-relay elsewhere). Every component BELOW it (instances/, instances/<id>/) must be a real directory: lstat'd,
+ * created one component at a time (never `recursive: true` over an unchecked path), and narrowed to 0700 through a
+ * no-follow descriptor. A link or a non-directory is refused with a content-free line naming its ROLE (no link
+ * target is read or printed).
+ */
+function relayHomeRealRoot(): string {
+  const root = botRelayRoot();
+  // Above the trust boundary is the operator's own home: creating the root's missing ancestors there is not a
+  // descent through anything this code must distrust.
+  if (!lstatOrNull(root)) fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  return fs.realpathSync(root);
+}
+
+function lstatOrNull(p: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(p);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/** One directory component below the trust root: created when absent, refused unless it is a REAL directory. */
+function realDirComponent(p: string, role: string): void {
+  let st = lstatOrNull(p);
+  if (!st) {
+    try {
+      fs.mkdirSync(p, { mode: 0o700 });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    st = lstatOrNull(p);
+  }
+  if (!st || st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error(`refusing to provision the instance: the ${role} is not a real directory (a symbolic link, or not a directory)`);
+  }
+  if (process.platform === "win32") return;
+  // Narrow an existing directory through a descriptor that cannot follow a link swapped in after the lstat.
+  const fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  try {
+    fs.fchmodSync(fd, 0o700);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** The instance directory, every component below the relay home real (created one at a time). */
+export function provisionInstanceDir(instanceId: string): string {
+  const idFault = instanceIdFault(instanceId);
+  if (idFault) throw new Error(`invalid instance_id "${instanceId}": ${idFault}`);
+  const instances = path.join(relayHomeRealRoot(), INSTANCES_DIRNAME);
+  realDirComponent(instances, "instances directory");
+  const dir = path.join(instances, instanceId);
+  realDirComponent(dir, "instance directory");
+  return dir;
+}
+
+/**
  * Create a per-instance directory + write instance.json metadata.
  * Idempotent: re-creating an existing instance refreshes the
  * `daemon_version_first_seen` but leaves `created_at` intact.
+ * Item 0b: no link is followed. The directories come from provisionInstanceDir; the record is read with O_NOFOLLOW
+ * (readInstanceMetadataFile) and written to a fresh temp file (O_CREAT|O_EXCL|O_NOFOLLOW, 0600) renamed over the
+ * name, so a link at instance.json is REPLACED and its target never written.
  */
 export function createInstance(
   instanceId: string,
   version: string,
   label?: string | null,
 ): InstanceMetadata {
-  const dir = instanceDir(instanceId);
-  if (!dir) throw new Error("createInstance requires non-null instance_id");
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const metaPath = path.join(dir, "instance.json");
-  let existing: InstanceMetadata | null = null;
-  try {
-    if (fs.existsSync(metaPath)) {
-      existing = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as InstanceMetadata;
-    }
-  } catch { /* treat corrupt as absent */ }
+  const dir = provisionInstanceDir(instanceId);
+  const metaPath = path.join(dir, INSTANCE_METADATA_FILENAME);
+  const existing = readInstanceMetadataFile(dir) as InstanceMetadata | null;
   const now = new Date().toISOString();
   const meta: InstanceMetadata = {
     instance_id: instanceId,
@@ -256,7 +315,18 @@ export function createInstance(
     daemon_version_first_seen: existing?.daemon_version_first_seen ?? version,
     label: label ?? existing?.label ?? null,
   };
-  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), { mode: 0o600 });
+  const tmp = path.join(dir, `.${INSTANCE_METADATA_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
+  const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify(meta, null, 2));
+    fs.fsyncSync(fd);
+  } catch (err) {
+    fs.closeSync(fd);
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
+  fs.closeSync(fd);
+  fs.renameSync(tmp, metaPath);
   return meta;
 }
 
