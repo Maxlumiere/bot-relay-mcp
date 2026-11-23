@@ -955,6 +955,61 @@ describe("#442 R3: the self-pair guard FAILS CLOSED when the local instance cann
     expect(r.stderr).toMatch(new RegExp(`cannot tell whether 127\\.0\\.0\\.1:${P} is this machine's own relay`));
     expect(fs.existsSync(path.join(c.home, "p.json")), "no client config was emitted").toBe(false);
     expect(fs.existsSync(path.dirname(typo)), "the unprovisioned instance was not created").toBe(false);
+
+describe("queue item 3: `relay whoami` (read-only) through the owner door; whoami on the door allowlist", () => {
+  it("an INSTANCE daemon + a VAULT token: `relay whoami --agent A --json` answers A's identity through the door; no token reaches the configured port", async () => {
+    const c = newInstanceCase("cli-whoami");
+    const [tok] = seedInstanceVault(c, [AGENT]);
+    const d = await startInstanceDaemon(c);
+    const spy = await recorder();
+    const env = instEnv(c, { RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port) });
+    const r = await relayWithEnv(env, ["whoami", "--agent", AGENT, "--json"]);
+    expect(r.status, r.stderr).toBe(0);
+    const w = JSON.parse(r.stdout.trim()) as Record<string, unknown>;
+    expect(w).toMatchObject({ success: true, agent_name: AGENT, instance_id: c.id });
+    expect(Object.keys(w).some((k) => /token|secret/i.test(k)), "the closed identity surface carries no credential").toBe(false);
+    expect(spy.bytes(), "the token never reaches the configured port").not.toContain(tok);
+    expect(spy.reqs.filter((q) => q.url !== "/health")).toEqual([]);
+    // Plain mode: stdout is ONLY the agent name (a clean capture); the human line goes to stderr.
+    const p = await relayWithEnv(env, ["whoami", "--agent", AGENT]);
+    expect(p.status, p.stderr).toBe(0);
+    expect(p.stdout).toBe(`${AGENT}\n`);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("--agent NAME that the token does NOT belong to: exit 1, nothing on stdout (the token IS the identity)", async () => {
+    const c = newInstanceCase("cli-whoami-mismatch");
+    const [tok] = seedInstanceVault(c, [AGENT, "pr4-peer"]);
+    const d = await startInstanceDaemon(c);
+    const env = instEnv(c, { RELAY_AGENT_TOKEN: tok });
+    const r = await relayWithEnv(env, ["whoami", "--agent", "pr4-peer"]);
+    expect(r.status, r.stderr).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain(`belongs to "${AGENT}", not "pr4-peer"`);
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("no token for the agent (not in the vault, no RELAY_AGENT_TOKEN): exit 2, a local refusal, nothing on stdout", async () => {
+    const c = newInstanceCase("cli-whoami-notoken");
+    seedInstanceVault(c, [AGENT]);
+    const d = await startInstanceDaemon(c);
+    const r = await relayWithEnv(instEnv(c), ["whoami", "--agent", "nobody-here"]);
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.stdout).toBe("");
+    await stopDaemon(d.child);
+  }, 120_000);
+
+  it("the door allowlist carries whoami (a direct sealed call answers it) and still refuses a tool outside it", async () => {
+    const c = newInstanceCase("cli-whoami-door");
+    const [tok] = seedInstanceVault(c, [AGENT]);
+    const d = await startInstanceDaemon(c);
+    const rec = readRecord({ record: c.record } as Case);
+    const ok = await door(rec, "/owner/v1/tool", { rpc: rpc("whoami", {}), agent_token: tok }, { agent: AGENT });
+    expect(ok.status, ok.raw).toBe(200);
+    expect(shapeOf((ok.opened as { result?: unknown } | null)?.result).outcome, toolText(ok.opened)).toBe("success");
+    const refused = await door(rec, "/owner/v1/tool", { rpc: rpc("unregister_agent", { name: AGENT }), agent_token: tok }, { agent: AGENT });
+    expect(refused.status).toBe(403);
+    expect(JSON.stringify(refused.opened)).toContain("not allowed through the owner door");
     await stopDaemon(d.child);
   }, 120_000);
 });
