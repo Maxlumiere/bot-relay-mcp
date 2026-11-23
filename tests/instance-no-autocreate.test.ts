@@ -22,11 +22,12 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { initializeDb, getDb, closeDb } from "../src/db.js";
-import { assertInstanceResolution, createInstance } from "../src/instance.js";
+import { assertInstanceResolution, createInstance, resolveInstance } from "../src/instance.js";
 import { pinResolvedDbPath } from "../src/cli/_instance-db.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -128,12 +129,15 @@ describe("the provisioning channels that MUST still create", () => {
   });
 
   it("a legacy instance with a relay.db but no instance.json still opens", async () => {
-    process.env.RELAY_INSTANCE_ID = "legacy";
-    // Create its DB the way a pre-instance.json relay did: through an explicit path.
-    process.env.RELAY_DB_PATH = path.join(instDir("legacy"), "relay.db");
+    // A real relay DB, built elsewhere, then placed as a pre-instance.json instance's relay.db.
+    const built = path.join(home, "elsewhere", "relay.db");
+    process.env.RELAY_DB_PATH = built;
     await initializeDb();
     closeDb();
     delete process.env.RELAY_DB_PATH;
+    fs.mkdirSync(instDir("legacy"), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(built, path.join(instDir("legacy"), "relay.db"));
+    process.env.RELAY_INSTANCE_ID = "legacy";
     expect(fs.existsSync(path.join(instDir("legacy"), "instance.json"))).toBe(false);
     await expect(initializeDb()).resolves.toBeUndefined();
   });
@@ -235,4 +239,165 @@ describe("black box: the CLI verbs and the server refuse, and leave no directory
     expect(r.stdout).toMatch(/FAIL\s+instance resolution:.*does not exist/);
     expect(fs.existsSync(instDir(BOGUS))).toBe(false);
   });
+});
+
+/** Codex #442 R1 P2-1: EVERY resolver consumer refuses (the resolver classifies the instance as an error), with no artifact. */
+describe("every resolver consumer refuses an unprovisioned instance, leaving no artifact (Codex #442 R1 P2-1)", () => {
+  it("resolveInstance() answers the ERROR kind (unprovisioned: true) for a stale RELAY_INSTANCE_ID and a removed marker; a provisioned instance with no DB yet is still the instance kind", () => {
+    realInstanceActive();
+    process.env.RELAY_INSTANCE_ID = BOGUS;
+    const stale = resolveInstance();
+    expect(stale.kind).toBe("error");
+    expect(stale.kind === "error" && stale.unprovisioned).toBe(true);
+    delete process.env.RELAY_INSTANCE_ID;
+    fs.writeFileSync(path.join(relayRoot(), "active-instance"), "goneinst\n");
+    const gone = resolveInstance();
+    expect(gone.kind === "error" && gone.unprovisioned).toBe(true);
+    fs.writeFileSync(path.join(relayRoot(), "active-instance"), "realinst\n");
+    const fresh = resolveInstance();
+    expect(fresh.kind).toBe("instance");
+    expect(fresh.kind === "instance" && fresh.exists).toBe(false);
+  });
+
+  it("relay where --json reports the failure (exit non-zero, kind error, unprovisioned): the hooks get no path", () => {
+    realInstanceActive();
+    const r = spawnSync(process.execPath, [RELAY_BIN, "where", "--json"], { env: cleanEnv({ RELAY_INSTANCE_ID: BOGUS }), encoding: "utf-8", timeout: 30_000 });
+    expect(r.status).not.toBe(0);
+    const res = (JSON.parse(r.stdout) as { resolution: Record<string, unknown> }).resolution;
+    expect(res.kind).toBe("error");
+    expect(res.unprovisioned).toBe(true);
+    expect(fs.existsSync(instDir(BOGUS))).toBe(false);
+  });
+
+  it("the hooks' vault and spawn-manifest writers refuse and create nothing under the instance", () => {
+    realInstanceActive();
+    const helper = path.join(REPO_ROOT, "hooks", "_vault-helpers.sh");
+    const script = `set -u\n. '${helper}'\nwrite_relay_token_to_vault someagent abcdefgh12345678; a=$?\nwrite_relay_spawn_manifest someagent somerole; b=$?\necho "$a $b"\n`;
+    const r = spawnSync("bash", ["-c", script], { env: cleanEnv({ RELAY_INSTANCE_ID: BOGUS }), encoding: "utf-8", timeout: 60_000 });
+    expect(r.stdout.trim(), r.stderr).toBe("1 1");
+    expect(r.stderr).toContain("does not exist");
+    expect(fs.existsSync(instDir(BOGUS)), "no instance directory, no agents/ under it").toBe(false);
+  });
+
+  it("relay remote set-mint-secret refuses and creates no credential directory", () => {
+    realInstanceActive();
+    const r = spawnSync(process.execPath, [RELAY_BIN, "remote", "set-mint-secret", "example.com:3777"], {
+      env: cleanEnv({ RELAY_INSTANCE_ID: BOGUS }),
+      input: `${"s".repeat(40)}\n`,
+      encoding: "utf-8",
+      timeout: 30_000,
+    });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain(`instance "${BOGUS}"`);
+    expect(fs.existsSync(instDir(BOGUS))).toBe(false);
+  });
+
+  it("relay pending refuses with the remediation (how to create or select an instance), creates nothing", () => {
+    realInstanceActive();
+    const r = spawnSync(process.execPath, [RELAY_BIN, "pending", "someagent", "--json"], { env: cleanEnv({ RELAY_INSTANCE_ID: BOGUS }), encoding: "utf-8", timeout: 30_000 });
+    expect(r.status).not.toBe(0);
+    expect(`${r.stdout}${r.stderr}`).toContain(`relay init --instance-id ${BOGUS}`);
+    expect(fs.existsSync(instDir(BOGUS))).toBe(false);
+  });
+
+  it("the HTTP daemon refuses to start, creates nothing (no DB, no secrets, no owner record)", async () => {
+    realInstanceActive();
+    // A real free port: an invalid one would end the daemon on a config error, a refusal for the wrong reason.
+    const port = await new Promise<number>((res) => {
+      const s = net.createServer().listen(0, "127.0.0.1", () => {
+        const p = (s.address() as net.AddressInfo).port;
+        s.close(() => res(p));
+      });
+    });
+    const child = spawn(process.execPath, [SERVER], { env: cleanEnv({ RELAY_INSTANCE_ID: BOGUS, RELAY_TRANSPORT: "http", RELAY_HTTP_PORT: String(port) }), stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d));
+    const code = await new Promise<number | null>((resolve) => {
+      const t = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve(null);
+      }, 20_000);
+      child.on("exit", (c) => {
+        clearTimeout(t);
+        resolve(c);
+      });
+    });
+    expect(code, `it exited by itself; stderr: ${stderr}`).not.toBeNull();
+    expect(code).not.toBe(0);
+    expect(stderr).toContain(`instance "${BOGUS}"`);
+    expect(fs.existsSync(instDir(BOGUS))).toBe(false);
+  }, 30_000);
+});
+
+/** Codex #442 R1 P2-2: the open re-verifies; a stale resolution or pin cannot recreate a removed instance. */
+describe("the open re-verifies provisioning: concurrent deletion recreates nothing (Codex #442 R1 P2-2)", () => {
+  /** A pre-instance.json instance: a real relay DB (built elsewhere) as its relay.db, and no instance.json. */
+  async function legacyInstance(id: string): Promise<void> {
+    const built = path.join(home, `built-${id}`, "relay.db");
+    process.env.RELAY_DB_PATH = built;
+    await initializeDb();
+    closeDb();
+    delete process.env.RELAY_DB_PATH;
+    fs.mkdirSync(instDir(id), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(built, path.join(instDir(id), "relay.db"));
+  }
+
+  it("pinned, then the instance directory is removed before the open: initializeDb refuses and leaves no directory", async () => {
+    await legacyInstance("legacy");
+    process.env.RELAY_INSTANCE_ID = "legacy";
+    expect(await pinResolvedDbPath()).toBeNull();
+    fs.rmSync(instDir("legacy"), { recursive: true, force: true });
+    await expect(initializeDb()).rejects.toThrow(/instance "legacy".*does not exist: .*holds no instance\.json/);
+    expect(fs.existsSync(instDir("legacy"))).toBe(false);
+  });
+
+  it("pinned, then only the legacy DB is removed (no instance.json): getDb refuses and writes nothing into the directory", async () => {
+    await legacyInstance("legacy2");
+    process.env.RELAY_INSTANCE_ID = "legacy2";
+    expect(await pinResolvedDbPath()).toBeNull();
+    fs.rmSync(path.join(instDir("legacy2"), "relay.db"));
+    expect(() => getDb()).toThrow(/instance "legacy2".*does not exist: .*holds no instance\.json/);
+    expect(fs.readdirSync(instDir("legacy2"))).toEqual([]);
+  });
+
+  it("an explicit RELAY_DB_PATH INTO the instances layout of an ABSENT instance (another selected) is refused, not created", async () => {
+    realInstanceActive();
+    process.env.RELAY_DB_PATH = path.join(instDir(BOGUS), "relay.db");
+    // The open's OWN refusal (named by the DB path), not SQLite's "directory does not exist".
+    await expect(initializeDb()).rejects.toThrow(new RegExp(`instance "${BOGUS}" \\(named by the DB path`));
+    expect(fs.existsSync(instDir(BOGUS))).toBe(false);
+  });
+
+  it("an explicit RELAY_DB_PATH INTO an existing BARE instance directory (another selected): only the open's check stands between it and a new relay.db", async () => {
+    realInstanceActive();
+    fs.mkdirSync(instDir("bare"), { mode: 0o700 });
+    process.env.RELAY_DB_PATH = path.join(instDir("bare"), "relay.db");
+    await expect(initializeDb()).rejects.toThrow(/instance "bare" \(named by the DB path/);
+    expect(fs.readdirSync(instDir("bare")), "no relay.db, nothing written").toEqual([]);
+    expect(() => getDb()).toThrow(/instance "bare" \(named by the DB path/);
+    expect(fs.readdirSync(instDir("bare"))).toEqual([]);
+  });
+});
+
+/** the-fixer #442 P3: ONE predicate. An instance.json that `use-instance` / `list-instances` reject is not a provisioning. */
+describe("a corrupt or non-file instance.json is NOT a provisioning, for every verb alike (the-fixer #442 P3)", () => {
+  const cases: Array<[string, (dir: string) => void]> = [
+    ["corrupt ('{')", (dir) => fs.writeFileSync(path.join(dir, "instance.json"), "{")],
+    ["a directory", (dir) => fs.mkdirSync(path.join(dir, "instance.json"))],
+    ["a JSON non-object (3)", (dir) => fs.writeFileSync(path.join(dir, "instance.json"), "3")],
+  ];
+  for (const [label, plant] of cases) {
+    it(`instance.json ${label}: relay purge-agents refuses and creates no relay.db; relay use-instance agrees it is not found`, () => {
+      realInstanceActive();
+      fs.mkdirSync(instDir("bad"), { mode: 0o700 });
+      plant(instDir("bad"));
+      const purge = spawnSync(process.execPath, [RELAY_BIN, "purge-agents"], { env: cleanEnv({ RELAY_INSTANCE_ID: "bad" }), encoding: "utf-8", timeout: 30_000 });
+      expect(purge.status, purge.stdout + purge.stderr).not.toBe(0);
+      expect(`${purge.stdout}${purge.stderr}`).toContain(`instance "bad"`);
+      expect(fs.existsSync(path.join(instDir("bad"), "relay.db")), "no relay.db was created").toBe(false);
+      const use = spawnSync(process.execPath, [RELAY_BIN, "use-instance", "bad"], { env: cleanEnv({}), encoding: "utf-8", timeout: 30_000 });
+      expect(use.status).not.toBe(0);
+      expect(use.stderr).toContain("not found");
+    });
+  }
 });
