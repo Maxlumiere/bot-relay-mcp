@@ -135,7 +135,7 @@ export async function run(argv: string[]): Promise<number> {
     host = process.env.RELAY_HTTP_HOST || host;
     port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
   }
-  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteToken, remoteSecret, envSelects, RelayClientError } = await import("./relay-client.js");
+  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteToken, remoteSecret, envSelects, RelayClientError, remoteRefusal } = await import("./relay-client.js");
   const route = await routeFor(host, port);
   if (route.kind === "unresolved") {
     process.stderr.write(`relay send: ${unresolvedMessage(route)}\n`);
@@ -293,7 +293,9 @@ export async function run(argv: string[]): Promise<number> {
 
   if (status < 200 || status >= 300 || (parsed && parsed.success === false)) {
     process.stderr.write(
-      `relay send: daemon returned ${status} — ${parsed?.error ?? text.slice(0, 300)}\n`
+      route.kind === "remote"
+        ? `relay send: ${remoteRefusal(status, parsed)}\n`
+        : `relay send: daemon returned ${status} — ${parsed?.error ?? text.slice(0, 300)}\n`
     );
     return 1;
   }
@@ -315,7 +317,7 @@ export async function run(argv: string[]): Promise<number> {
   if (!id) {
     process.stderr.write(
       `relay send: daemon returned success but no usable message_id — refusing to emit an empty capture. ` +
-        `Response: ${text.slice(0, 300)}\n`
+        (route.kind === "remote" ? "(the remote's reply text is withheld: it can carry credentials)\n" : `Response: ${text.slice(0, 300)}\n`)
     );
     return 1;
   }

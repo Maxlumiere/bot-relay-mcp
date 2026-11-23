@@ -13,6 +13,56 @@
  * tool's closed type); otherwise stdout is ONLY the agent name, the human line on stderr. --agent NAME that the token
  * does not belong to exits 1 with nothing on stdout. Never registers, never mints.
  */
+import { RelayClientError } from "./relay-client.js";
+
+/** The CLOSED identity surface (src/types.ts WhoamiResult), field by field: nothing else from a response is printed. */
+const IDENTITY_STRINGS = ["agent_name", "role", "instance_id", "db_path", "host_id", "edge_id"] as const;
+const BUILD_FIELDS = ["build_id", "commit", "dirty", "built_at", "deps_id", "deps_state", "node"] as const;
+
+/**
+ * The permitted envelope, built FIELD BY FIELD (nested `build` included) from an untrusted response: a token, an
+ * operator secret or any other extra field a relay (or a man in the middle) adds is dropped, never passed through.
+ * Null when the response is not a successful identity.
+ */
+export function closedIdentity(e: Record<string, unknown>): Record<string, unknown> | null {
+  if (e.success !== true || typeof e.agent_name !== "string") return null;
+  const out: Record<string, unknown> = { success: true };
+  for (const k of IDENTITY_STRINGS) {
+    const v = e[k];
+    if (typeof v === "string" || v === null) out[k] = v;
+  }
+  if (Array.isArray(e.capabilities)) out.capabilities = e.capabilities.filter((c): c is string => typeof c === "string");
+  if (e.build !== null && typeof e.build === "object" && !Array.isArray(e.build)) {
+    const b = e.build as Record<string, unknown>;
+    const build: Record<string, unknown> = {};
+    for (const k of BUILD_FIELDS) {
+      const v = b[k];
+      if (typeof v === "string" || typeof v === "number" || typeof v === "boolean" || v === null) build[k] = v;
+    }
+    out.build = build;
+  }
+  return out;
+}
+
+/** A refusal said WITHOUT the relay's own text (it may echo the token): only a well-formed error code. */
+export function safeRefusal(e: Record<string, unknown> | null): string {
+  const code = e?.error_code;
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{1,40}$/.test(code) ? `the relay refused (${code})` : "the relay refused";
+}
+
+/**
+ * A transport failure. For a REMOTE, only the client's OWN message (RelayClientError: constructed in relay-client.ts,
+ * a redirect shown by its origin only); any other exception text is withheld (it can carry a Location, a token).
+ */
+export function transportDiagnostic(route: { kind: string }, host: string, port: number, err: unknown): string {
+  if (route.kind === "remote") {
+    return err instanceof RelayClientError
+      ? `could not reach the relay at ${host}:${port} (${err.message})`
+      : `could not reach the relay at ${host}:${port} (transport error; details withheld: they can carry credentials)`;
+  }
+  return `could not reach the daemon at ${host}:${port} — is it running? (${err instanceof Error ? err.message : String(err)})`;
+}
+
 interface Args {
   agent: string | null;
   json: boolean;
@@ -85,8 +135,29 @@ export async function run(argv: string[]): Promise<number> {
     return 2;
   }
   const { resolveCliAgentToken } = await import("./agent-token.js");
-  // With only RELAY_AGENT_TOKEN set (no name), the token alone is presented; the vault is never read without a name.
-  const resolved = agent ? await resolveCliAgentToken("whoami", agent, route) : { token: process.env.RELAY_AGENT_TOKEN as string };
+  let resolved: { token: string } | { code: number };
+  // Where the presented token came from (named in a mismatch line; the token itself never is).
+  const envToken = process.env.RELAY_AGENT_TOKEN;
+  const { isValidTokenShape } = await import("../spawn/validation.js");
+  const { envSelects: selects } = await import("./relay-client.js");
+  const tokenSource =
+    !agent || (route.kind !== "remote" && isValidTokenShape(envToken)) || (route.kind === "remote" && selects(route.host) && isValidTokenShape(envToken))
+      ? "RELAY_AGENT_TOKEN"
+      : "the vault";
+  if (agent) {
+    resolved = await resolveCliAgentToken("whoami", agent, route);
+  } else {
+    // TOKEN ONLY (no name): the SAME credential policy as the shared resolver. A REMOTE gets RELAY_AGENT_TOKEN only when
+    // the environment selected that remote (RELAY_HTTP_HOST); an inherited local token is never sent elsewhere.
+    const { envSelects } = await import("./relay-client.js");
+    if (route.kind === "remote" && !envSelects(route.host)) {
+      process.stderr.write(
+        `relay whoami: RELAY_AGENT_TOKEN is not selected for the remote relay ${route.host}:${route.port} (set RELAY_HTTP_HOST=${route.host}, or pass --agent NAME for its own vault entry); nothing is sent.\n`,
+      );
+      return 2;
+    }
+    resolved = { token: process.env.RELAY_AGENT_TOKEN as string };
+  }
   if ("code" in resolved) return resolved.code;
 
   let envelope: Record<string, unknown> | null;
@@ -102,26 +173,37 @@ export async function run(argv: string[]): Promise<number> {
       envelope = toolJson(await localTool("whoami", {}, { agentToken: resolved.token }, agent ? { agentName: agent } : {}));
     }
   } catch (err) {
-    process.stderr.write(`relay whoami: could not reach the daemon at ${host}:${port} — is it running? (${err instanceof Error ? err.message : String(err)})\n`);
+    process.stderr.write(`relay whoami: ${transportDiagnostic(route, host, port, err)}\n`);
     return 2;
   }
   if (envelope === null) {
     process.stderr.write("relay whoami: the relay returned an unparseable tool result\n");
     return 1;
   }
-  if (envelope.success !== true || typeof envelope.agent_name !== "string") {
-    process.stderr.write(`relay whoami: ${typeof envelope.error === "string" ? envelope.error : "the relay refused"}\n`);
+  const identity = closedIdentity(envelope);
+  if (identity === null) {
+    process.stderr.write(`relay whoami: ${safeRefusal(envelope)}\n`);
     return 1;
   }
-  if (args.agent && envelope.agent_name !== args.agent) {
-    process.stderr.write(`relay whoami: the token belongs to "${envelope.agent_name}", not "${args.agent}"\n`);
+  const name = identity.agent_name as string;
+  // The name is printed, so it must be a NAME (the relay's agent-name rule), never arbitrary response text.
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(name)) {
+    process.stderr.write("relay whoami: the relay returned a malformed agent name\n");
+    return 1;
+  }
+  // The contract, ENFORCED (ruling c4454ae5): whenever an expected name exists (--agent, else RELAY_AGENT_NAME), the
+  // token must belong to it. --agent wins over the environment's name. The line names both sources, never the token.
+  const expected = args.agent ?? (process.env.RELAY_AGENT_NAME || null);
+  if (expected && name !== expected) {
+    const expectedFrom = args.agent ? "--agent" : "RELAY_AGENT_NAME";
+    process.stderr.write(`relay whoami: the token belongs to "${name}", not "${expected}" (token from ${tokenSource}; expected name from ${expectedFrom})\n`);
     return 1;
   }
   if (args.json) {
-    process.stdout.write(JSON.stringify(envelope) + "\n");
+    process.stdout.write(JSON.stringify(identity) + "\n");
     return 0;
   }
-  process.stderr.write(`✓ this token is agent "${envelope.agent_name}" (instance ${String(envelope.instance_id ?? "-")})\n`);
-  process.stdout.write(`${envelope.agent_name}\n`);
+  process.stderr.write(`✓ this token is agent "${name}"\n`);
+  process.stdout.write(`${name}\n`);
   return 0;
 }

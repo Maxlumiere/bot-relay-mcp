@@ -116,6 +116,26 @@ export function toolJson(result: { content?: Array<{ text?: string }> }): Record
   }
 }
 
+/** A redirect target's ORIGIN only (no userinfo, path, query or fragment), or "(unparseable target)". */
+function locationOrigin(location: string, r: PinnedTarget): string {
+  try {
+    const u = new URL(location, `${r.secure ? "https" : "http"}://${hostHeader(r)}`);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return "(unparseable target)";
+  }
+}
+
+/**
+ * A REMOTE relay's refusal, said WITHOUT its own text (an error body can echo the request's secrets): the status and a
+ * well-formed error code only (#444 R1 ruling c4454ae5).
+ */
+export function remoteRefusal(status: number, parsed: unknown): string {
+  const code = parsed !== null && typeof parsed === "object" ? (parsed as Record<string, unknown>).error_code : undefined;
+  const shown = typeof code === "string" && /^[A-Z][A-Z0-9_]{1,40}$/.test(code) ? `, ${code}` : "";
+  return `the remote relay refused (status ${status}${shown}; its reply text is withheld: it can carry credentials)`;
+}
+
 /** Host header for a pinned target: an IPv6 literal is bracketed (RFC 7230 §5.4). */
 const hostHeader = (r: PinnedTarget): string => `${r.host.includes(":") ? `[${r.host}]` : r.host}:${r.port}`;
 /**
@@ -169,7 +189,9 @@ function pinnedRequest(
       res = m;
       const status = m.statusCode ?? 0;
       if (refuseRedirect && status >= 300 && status < 400) {
-        finish(new RelayClientError(`the relay answered with a redirect (${status}${m.headers.location ? ` to ${String(m.headers.location).slice(0, 120)}` : ""}): not followed`));
+        // Only the target's ORIGIN (scheme://host[:port]): a Location's userinfo, path, query or fragment can carry the
+        // request's secrets (#444 R1 ruling c4454ae5), so they are never printed.
+        finish(new RelayClientError(`the relay answered with a redirect (${status}${m.headers.location ? ` to ${locationOrigin(String(m.headers.location), r)}` : ""}): not followed`));
         return;
       }
       const chunks: Buffer[] = [];

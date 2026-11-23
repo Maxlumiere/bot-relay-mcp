@@ -105,7 +105,7 @@ export async function run(argv: string[]): Promise<number> {
     host = process.env.RELAY_HTTP_HOST || host;
     port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
   }
-  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteSecret, mcpResultOf } = await import("./relay-client.js");
+  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteSecret, mcpResultOf, remoteRefusal } = await import("./relay-client.js");
   const route = await routeFor(host, port);
   if (route.kind === "unresolved") {
     process.stderr.write(`relay resolve: ${unresolvedMessage(route)}\n`);
@@ -143,7 +143,7 @@ export async function run(argv: string[]): Promise<number> {
       status = r.status;
       const result = mcpResultOf(r.text);
       if (!result) {
-        process.stderr.write(`relay resolve: the relay returned an unparseable response (${r.status}) — ${r.text.slice(0, 300)}\n`);
+        process.stderr.write(`relay resolve: the remote relay returned an unparseable response (status ${r.status}; its text is withheld: it can carry credentials)\n`);
         return 1;
       }
       envelope = toolJson(result);
@@ -164,7 +164,7 @@ export async function run(argv: string[]): Promise<number> {
   const res = { ok: status >= 200 && status < 300, status };
 
   if (!res.ok || envelope?.success === false) {
-    process.stderr.write(`relay resolve: ${envelope?.error ?? `daemon returned ${res.status}`}\n`);
+    process.stderr.write(route.kind === "remote" ? `relay resolve: ${remoteRefusal(res.status, envelope)}\n` : `relay resolve: ${envelope?.error ?? `daemon returned ${res.status}`}\n`);
     return 1;
   }
 
