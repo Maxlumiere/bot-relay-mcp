@@ -999,6 +999,18 @@ describe("queue item 3: `relay whoami` (read-only) through the owner door; whoam
     await stopDaemon(d.child);
   }, 120_000);
 
+  it("a STALE vault token (right shape, wrong value) is refused LOCALLY (exit 2) and never presented (the shared resolve/whoami token path)", async () => {
+    const c = newInstanceCase("cli-whoami-stale");
+    seedInstanceVault(c, [AGENT]);
+    fs.writeFileSync(path.join(c.dir, "agents", `${AGENT}.token`), "stale-token-0123456789abcdef", { mode: 0o600 });
+    const d = await startInstanceDaemon(c);
+    const r = await relayWithEnv(instEnv(c), ["whoami", "--agent", AGENT]);
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("does not authenticate against the DB");
+    await stopDaemon(d.child);
+  }, 120_000);
+
   it("the door allowlist carries whoami (a direct sealed call answers it) and still refuses a tool outside it", async () => {
     const c = newInstanceCase("cli-whoami-door");
     const [tok] = seedInstanceVault(c, [AGENT]);
