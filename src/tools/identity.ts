@@ -26,7 +26,8 @@ import {
   setObservedCliProfile,
   normalizeCliProfile,
 } from "../db.js";
-import { getOwnDetectedAgent, getOwnHostId, probeAgentProfile } from "../liveness.js";
+import { getOwnHostId, isStdioObserver, probeAgentProfile, probeOwnAncestryProfile } from "../liveness.js";
+import { randomUUID } from "crypto";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "../transport/websocket.js";
 import { log } from "../logger.js";
@@ -106,36 +107,36 @@ function suffixMintRefusal(requestedName: string) {
 }
 
 /**
- * Doorbell PR 8b: derive cli_profile_observed for a registration. A stdio server that observed its own agent process
- * (the NEAREST agent above it) uses that, synchronously. Otherwise the column is set to NULL now and, for a pid on THIS
- * host, a bounded ASYNC probe of the caller-named process fills it in later (compare-and-swap on the observation time,
- * so a late probe never overwrites a newer registration). The caller's own cli_profile stays informational; when both
- * are known and differ, one log line says so. Never throws into the registration.
+ * Doorbell PR 8b: derive cli_profile_observed for a registration (ruling cc9f2199; Codex #448 R1). The column is set to
+ * NULL now with a fresh GENERATION, then a bounded ASYNC probe fills it in, written only while that generation is
+ * still the row's (a late probe never overwrites a newer registration). The TRANSPORT selects the probe:
+ *   - a stdio server: a FRESH walk of its OWN ancestry (the nearest agent above it); a caller-named pid is ignored;
+ *   - otherwise (the HTTP daemon): the caller-named pid on THIS host, one coherent ps snapshot, its start checked.
+ * The caller's own cli_profile stays informational; when both are known and differ, one log line says so. Never
+ * throws into the registration.
  */
 export function deriveObservedCliProfile(name: string, input: RegisterAgentInput): void {
-  const at = new Date().toISOString();
+  const gen = randomUUID();
   const supplied = normalizeCliProfile(input.cli_profile);
-  const disagree = (observed: string | null | undefined): void => {
-    if (supplied && observed && supplied !== observed) log.warn(`[register] ${name}: cli_profile supplied "${supplied}" but the relay observed "${observed}" (the observed profile decides wake coverage)`);
-  };
-  const own = getOwnDetectedAgent();
-  if (own && (typeof input.agent_pid !== "number" || input.agent_pid === own.pid)) {
-    setObservedCliProfile(name, own.profile ?? null, at);
-    disagree(own.profile);
-    return;
-  }
-  setObservedCliProfile(name, null, at);
-  const ownHost = getOwnHostId();
-  if (typeof input.agent_pid !== "number") return;
-  if (input.host_id && (!ownHost || input.host_id !== ownHost)) return; // another host's process cannot be probed here
-  void probeAgentProfile(input.agent_pid, input.agent_pid_start ?? null).then((r) => {
+  setObservedCliProfile(name, null, new Date().toISOString(), { gen });
+  const land = (r: { profile: string | null; why?: string }): void => {
     if (r.why) log.warn(`[register] ${name}: the CLI profile was not observed (${r.why}): it stays NULL`);
     try {
-      if (setObservedCliProfile(name, r.profile, new Date().toISOString(), at)) disagree(r.profile);
+      const written = setObservedCliProfile(name, r.profile, new Date().toISOString(), { expectGen: gen });
+      if (written && supplied && r.profile && supplied !== r.profile) log.warn(`[register] ${name}: cli_profile supplied "${supplied}" but the relay observed "${r.profile}" (the observed profile decides wake coverage)`);
     } catch {
       /* the row may be gone: nothing to record */
     }
-  });
+  };
+  // Per REQUEST (a relay serving both transports picks per request): a stdio request on a stdio server.
+  if (isStdioObserver() && currentContext().transport === "stdio") {
+    void probeOwnAncestryProfile().then(land);
+    return;
+  }
+  const ownHost = getOwnHostId();
+  if (typeof input.agent_pid !== "number") return;
+  if (input.host_id && (!ownHost || input.host_id !== ownHost)) return; // another host's process cannot be probed here
+  void probeAgentProfile(input.agent_pid, input.agent_pid_start ?? null).then(land);
 }
 
 export function handleRegisterAgent(input: RegisterAgentInput) {

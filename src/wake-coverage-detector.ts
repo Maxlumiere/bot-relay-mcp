@@ -479,14 +479,16 @@ export function watchClassForDaemon(db: CompatDatabase, dbPath: string): (agent:
   const own = getOwnHostId();
   let bindings: ReturnType<typeof listAgentBindings> | null = null;
   return (agent) => {
+    // P1-c (+ Codex #448 R1): the bindings are read for EVERY agent, first: a read ERROR is UNCOVERED on every path,
+    // decided before the profile.
+    try {
+      bindings ??= listAgentBindings(db);
+    } catch {
+      return "armed";
+    }
     if (watchableName(agent) && fs.existsSync(watchAgentDir(dbPath, agent))) {
-      try {
-        bindings ??= listAgentBindings(db);
-        const mine = bindings.filter((b) => b.agent_name === agent);
-        if (oneLiveWindow(mine, own, (b) => bindingLiveness(b, own)).kind === "ambiguous") return "two_windows";
-      } catch {
-        return "armed"; // P1-c: a bindings-read ERROR is UNCOVERED, decided BEFORE the profile
-      }
+      const mine = bindings.filter((b) => b.agent_name === agent);
+      if (oneLiveWindow(mine, own, (b) => bindingLiveness(b, own)).kind === "ambiguous") return "two_windows";
     }
     try {
       // The profile the RELAY observed (ruling cc9f2199), never the caller-supplied cli_profile.

@@ -2134,6 +2134,8 @@ function migrateSchemaToV2_27(db: CompatDatabase): void {
   const cols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === "cli_profile_observed")) db.exec("ALTER TABLE agents ADD COLUMN cli_profile_observed TEXT");
   if (!cols.some((c) => c.name === "cli_profile_observed_at")) db.exec("ALTER TABLE agents ADD COLUMN cli_profile_observed_at TEXT");
+  // The registration GENERATION (a uuid per registration): the compare-and-swap token a late probe must match.
+  if (!cols.some((c) => c.name === "cli_profile_observed_gen")) db.exec("ALTER TABLE agents ADD COLUMN cli_profile_observed_gen TEXT");
 }
 
 function migrateSchemaToV2_26(db: CompatDatabase): void {
@@ -2493,17 +2495,19 @@ export function profileOwesVerdict(cliProfile: string | null | undefined): boole
  * registry does not know becomes NULL (= UNKNOWN), never a default.
  */
 /**
- * Doorbell PR 8b: record the CLI profile the relay OBSERVED for `name` (canonical id, or NULL) and when. `expectAt`
- * makes it a compare-and-swap on the observation time: a late probe never overwrites a newer registration's value.
+ * Doorbell PR 8b: record the CLI profile the relay OBSERVED for `name` (canonical id, or NULL) and when.
+ *   - { gen }: a NEW registration: writes the value and its generation (a uuid) unconditionally.
+ *   - { expectGen }: a probe's late answer: written only while the row still carries THAT registration's generation
+ *     (Codex #448 R1 P2: a unique token, never a millisecond timestamp two registrations can share).
  * Returns whether the row was written.
  */
-export function setObservedCliProfile(name: string, profile: string | null, at: string, expectAt?: string): boolean {
+export function setObservedCliProfile(name: string, profile: string | null, at: string, key: { gen: string } | { expectGen: string }): boolean {
   const canon = profile ? (getAgentCliProfile(profile)?.id ?? null) : null;
   const db = getDb();
   const r =
-    expectAt === undefined
-      ? db.prepare("UPDATE agents SET cli_profile_observed = ?, cli_profile_observed_at = ? WHERE name = ?").run(canon, at, name)
-      : db.prepare("UPDATE agents SET cli_profile_observed = ?, cli_profile_observed_at = ? WHERE name = ? AND cli_profile_observed_at IS ?").run(canon, at, name, expectAt);
+    "gen" in key
+      ? db.prepare("UPDATE agents SET cli_profile_observed = ?, cli_profile_observed_at = ?, cli_profile_observed_gen = ? WHERE name = ?").run(canon, at, key.gen, name)
+      : db.prepare("UPDATE agents SET cli_profile_observed = ?, cli_profile_observed_at = ? WHERE name = ? AND cli_profile_observed_gen IS ?").run(canon, at, name, key.expectGen);
   return r.changes > 0;
 }
 

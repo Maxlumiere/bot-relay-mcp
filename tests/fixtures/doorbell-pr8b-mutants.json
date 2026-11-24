@@ -93,36 +93,64 @@
  {
   "name": "bindings-error-no-claim",
   "file": "src/wake-coverage-detector.ts",
-  "find": "        return \"armed\"; // P1-c: a bindings-read ERROR is UNCOVERED, decided BEFORE the profile",
-  "replace": "        /* no two_windows claim */",
+  "find": "    try {\n      bindings ??= listAgentBindings(db);\n    } catch {\n      return \"armed\";\n    }",
+  "replace": "    try {\n      bindings ??= listAgentBindings(db);\n    } catch {\n      bindings = [];\n    }",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
  },
  {
   "name": "register-takes-supplied",
   "file": "src/tools/identity.ts",
-  "find": "    setObservedCliProfile(name, own.profile ?? null, at);",
-  "replace": "    setObservedCliProfile(name, supplied, at);",
+  "find": "      const written = setObservedCliProfile(name, r.profile, new Date().toISOString(), { expectGen: gen });",
+  "replace": "      const written = setObservedCliProfile(name, supplied ?? r.profile, new Date().toISOString(), { expectGen: gen });",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
  },
  {
   "name": "no-cas",
   "file": "src/db.ts",
-  "find": "      : db.prepare(\"UPDATE agents SET cli_profile_observed = ?, cli_profile_observed_at = ? WHERE name = ? AND cli_profile_observed_at IS ?\").run(canon, at, name, expectAt);",
-  "replace": "      : db.prepare(\"UPDATE agents SET cli_profile_observed = ?, cli_profile_observed_at = ? WHERE name = ?\").run(canon, at, name);",
+  "find": "WHERE name = ? AND cli_profile_observed_gen IS ?\").run(canon, at, name, key.expectGen);",
+  "replace": "WHERE name = ? AND ? IS NOT NULL\").run(canon, at, name, key.expectGen);",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
  },
  {
   "name": "probe-no-start-guard",
   "file": "src/liveness.ts",
-  "find": "    if (raw + START_TOKEN_UTC_SUFFIX !== claimedStart) return { profile: null, why: \"the agent pid is another process now (start token differs)\" };\n",
-  "replace": "",
+  "find": "      if (m[2]! + START_TOKEN_UTC_SUFFIX !== claimedStart) return",
+  "replace": "      if (m[2]! + START_TOKEN_UTC_SUFFIX === \"\\u0000never\") return",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
  },
  {
   "name": "no-rederive",
   "file": "src/tools/identity.ts",
-  "find": "  setObservedCliProfile(name, null, at);\n  const ownHost = getOwnHostId();",
-  "replace": "  const ownHost = getOwnHostId();",
+  "find": "  setObservedCliProfile(name, null, new Date().toISOString(), { gen });",
+  "replace": "  if (false) setObservedCliProfile(name, null, new Date().toISOString(), { gen });",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "r1-stdio-honours-caller-pid",
+  "file": "src/tools/identity.ts",
+  "find": "  if (isStdioObserver() && currentContext().transport === \"stdio\") {",
+  "replace": "  if (isStdioObserver() && currentContext().transport === \"stdio\" && typeof input.agent_pid !== \"number\") {",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "r1-stdio-startup-cache",
+  "file": "src/liveness.ts",
+  "find": "      const agent = findAgentProcess(opts.selfPid ?? process.pid, table);",
+  "replace": "      const agent = ownDetectedAgent ?? findAgentProcess(opts.selfPid ?? process.pid, table);",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "r1-cas-by-time",
+  "file": "src/db.ts",
+  "find": "WHERE name = ? AND cli_profile_observed_gen IS ?\").run(canon, at, name, key.expectGen);",
+  "replace": "WHERE name = ? AND cli_profile_observed_at IS ?\").run(canon, at, name, at);",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "r1-transport-process-wide",
+  "file": "src/tools/identity.ts",
+  "find": "  if (isStdioObserver() && currentContext().transport === \"stdio\") {",
+  "replace": "  if (isStdioObserver()) {",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
  }
 ]

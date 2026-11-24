@@ -682,13 +682,28 @@ export function observedProfileOf(command: string, comm: string | undefined): st
   return hits.length === 1 ? hits[0]!.id : null;
 }
 
-/** The agent process THIS stdio server observed above itself at startup (transport/stdio.ts), or null. */
+/**
+ * Whether THIS process is a stdio server (transport/stdio.ts marks it at startup). The TRANSPORT selects how a
+ * registration's profile is observed (Codex #448 R1 P1): a stdio server always walks its OWN ancestry; a caller-named
+ * pid never selects that path.
+ */
+let stdioObserver = false;
+/** The agent process this stdio server observed above itself at startup (for liveness; never reused as the profile). */
 let ownDetectedAgent: AgentProcess | null = null;
 export function setOwnDetectedAgent(p: AgentProcess | null): void {
+  stdioObserver = true;
   ownDetectedAgent = p;
 }
 export function getOwnDetectedAgent(): AgentProcess | null {
   return ownDetectedAgent;
+}
+export function isStdioObserver(): boolean {
+  return stdioObserver;
+}
+/** TESTS ONLY. */
+export function _resetStdioObserverForTests(): void {
+  stdioObserver = false;
+  ownDetectedAgent = null;
 }
 
 /** An ASYNC, time-bounded `ps` (never blocks the event loop); injectable for tests. */
@@ -701,15 +716,32 @@ export function _setAsyncPsRunnerForTests(r: AsyncPsRunner | null): void {
   asyncPs = r ?? defaultAsyncPs;
 }
 
-/** The register path's bound on the probe (ruling 9d0bb9e6): past it, the profile is NULL and registration goes on. */
+/** The register path's bound on a profile probe (ruling 9d0bb9e6): past it, the profile is NULL and registration goes on. */
 export const PROFILE_PROBE_TIMEOUT_MS = 1000;
 
+/** `work`, bounded by `timeoutMs` overall: a timeout or any error → { profile: null, why }. Never throws. */
+async function bounded(work: Promise<{ profile: string | null; why?: string }>, timeoutMs: number): Promise<{ profile: string | null; why?: string }> {
+  let t: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        t = setTimeout(() => reject(new Error(`the profile probe timed out after ${timeoutMs} ms`)), timeoutMs);
+      }),
+    ]);
+  } catch (err) {
+    return { profile: null, why: err instanceof Error ? err.message : String(err) };
+  } finally {
+    if (t) clearTimeout(t);
+  }
+}
+
 /**
- * Doorbell PR 8b: OBSERVE the CLI profile of a caller-named agent process on THIS host (the HTTP register path). The
- * pid must still be the process the caller named (its start token equals the claimed one: the reuse guard); then its
- * identity is judged by observedProfileOf. Any doubt (no or bad pid, no claimed start, a different start, a timeout,
- * any error) → profile null with the reason. Never throws; bounded by `timeoutMs` overall.
- * RESIDUAL (stated, ADR-0036): the caller names the pid, so a same-user process can name another's CLI.
+ * Doorbell PR 8b, the HTTP register path: OBSERVE the CLI profile of a caller-named agent process on THIS host, from
+ * ONE coherent `ps` snapshot of that pid (its start and its command in the same read, Codex #448 R1 P2): the start must
+ * equal the claimed one (the reuse guard), then its identity is judged by observedProfileOf. Any doubt → NULL with the
+ * reason. Never throws; bounded overall.
+ * RESIDUAL (stated, ADR-0036): on this path the caller names the pid.
  */
 export async function probeAgentProfile(
   pid: number | undefined | null,
@@ -720,26 +752,33 @@ export async function probeAgentProfile(
   if (!claimedStart) return { profile: null, why: "no agent start token (the reuse guard needs one)" };
   const run = opts.run ?? asyncPs;
   const timeoutMs = opts.timeoutMs ?? PROFILE_PROBE_TIMEOUT_MS;
-  const p = String(pid);
-  let bound: NodeJS.Timeout | undefined;
-  try {
-    const all = Promise.all([
-      run(["-o", "lstart=", "-p", p], { startTokenForm: "utc", timeoutMs }),
-      run(["-o", "comm=", "-p", p], { startTokenForm: "utc", timeoutMs }),
-      run(["-o", "command=", "-p", p], { startTokenForm: "utc", timeoutMs }),
-    ]);
-    const timeout = new Promise<never>((_, reject) => {
-      bound = setTimeout(() => reject(new Error(`the profile probe timed out after ${timeoutMs} ms`)), timeoutMs);
-    });
-    const [lstart, comm, command] = await Promise.race([all, timeout]);
-    const raw = lstart.trim();
-    if (!RAW_START_TOKEN_RE.test(raw)) return { profile: null, why: "no start time for the agent pid" };
-    if (raw + START_TOKEN_UTC_SUFFIX !== claimedStart) return { profile: null, why: "the agent pid is another process now (start token differs)" };
-    return { profile: observedProfileOf(command.trim(), comm.trim() || undefined) };
-  } catch (err) {
-    return { profile: null, why: err instanceof Error ? err.message : String(err) };
-  } finally {
-    if (bound) clearTimeout(bound);
-  }
+  return bounded(
+    (async () => {
+      const out = (await run(["-o", "pid=,lstart=,command=", "-p", String(pid)], { startTokenForm: "utc", timeoutMs })).trim();
+      const m = out.match(/^(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
+      if (!m || Number(m[1]) !== pid || !RAW_START_TOKEN_RE.test(m[2]!)) return { profile: null, why: "no coherent process record for the agent pid" };
+      if (m[2]! + START_TOKEN_UTC_SUFFIX !== claimedStart) return { profile: null, why: "the agent pid is another process now (start token differs)" };
+      return { profile: observedProfileOf(m[3]!.trim(), undefined) };
+    })(),
+    timeoutMs,
+  );
+}
+
+/**
+ * Doorbell PR 8b, the stdio register path (Codex #448 R1 P1 + P2): a FRESH, bounded walk of THIS process's own
+ * ancestry at every registration, from ONE `ps` table snapshot: the NEAREST agent-identity process above it decides
+ * (findAgentProcess). Never the startup cache, never a caller-named pid. None found, a timeout or an error → NULL.
+ */
+export async function probeOwnAncestryProfile(opts: { run?: AsyncPsRunner; timeoutMs?: number; selfPid?: number } = {}): Promise<{ profile: string | null; why?: string }> {
+  const run = opts.run ?? asyncPs;
+  const timeoutMs = opts.timeoutMs ?? PROFILE_PROBE_TIMEOUT_MS;
+  return bounded(
+    (async () => {
+      const table = parseProcessTable(await run(["-axo", "pid=,ppid=,lstart=,command="], { startTokenForm: "utc", timeoutMs }));
+      const agent = findAgentProcess(opts.selfPid ?? process.pid, table);
+      return agent ? { profile: agent.profile ?? null } : { profile: null, why: "no agent process above this relay" };
+    })(),
+    timeoutMs,
+  );
 }
 
