@@ -469,11 +469,11 @@ describe("Codex #447 R2 P1-b: the identity is the file the HANDLE opened, taken 
       for (const w of writers) w.close();
     }
   });
-  it("the path swapped DURING the open → the handle is closed and nothing is recorded (null: the watch opens again), never B's identity for A's handle", async () => {
+  it("the path swapped BETWEEN the identity and the driver's open → no handle is kept and nothing is recorded (null: the watch opens again), never A's identity on B's handle", async () => {
     const { openRelayDbBound } = await import("../src/cli/watch-until-wake.js");
     const { B, link, writers } = await twoInstances();
     try {
-      const h = await openRelayDbBound(path.join(link, "relay.db"), () => swap(link, B));
+      const h = await openRelayDbBound(path.join(link, "relay.db"), undefined, () => swap(link, B));
       expect(h).toBeNull();
     } finally {
       for (const w of writers) w.close();

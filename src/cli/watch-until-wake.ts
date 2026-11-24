@@ -167,7 +167,7 @@ export async function agentWatchStatus(db: Handle, dbPath: string, agent: string
  * driver opens the path, and the path must still name it AFTER the open; a path that changed during the open closes
  * the handle (null: try again). Never an identity read from the pathname after the fact.
  */
-export async function openRelayDbBound(dbPath: string, duringOpen?: () => void): Promise<{ db: Handle; identity: string } | null> {
+export async function openRelayDbBound(dbPath: string, duringOpen?: () => void, beforeOpen?: () => void): Promise<{ db: Handle; identity: string } | null> {
   const { openRelayDbIfWritten } = await import("../doorbell-run.js");
   const { fileIdentityKey } = await import("../file-identity.js");
   let pre: string;
@@ -176,6 +176,7 @@ export async function openRelayDbBound(dbPath: string, duringOpen?: () => void):
   } catch {
     return null;
   }
+  beforeOpen?.(); // a TEST seam: a path swapped between the identity and the driver's open (the window the re-check closes)
   const r = await openRelayDbIfWritten(dbPath, duringOpen);
   if ("waiting" in r) return null;
   let post: string | null = null;
