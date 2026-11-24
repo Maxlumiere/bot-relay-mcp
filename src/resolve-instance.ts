@@ -42,7 +42,7 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "df958454f1b1";
+export const RESOLVER_REVISION = "65137158f9f5";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";
@@ -164,7 +164,8 @@ export function isProvisionedInstance(instanceDirPath: string, dbExists: boolean
 /**
  * The instance directory a DB path names (`<instances root>/<id>/relay.db`), or null for any other layout. Compared
  * lexically AND on real paths (the instances root may not exist yet, or be reached through a link). The ONE layout
- * test: the resolver's explicit branches and the open's re-check (src/db.ts via src/instance.ts) both use it.
+ * test: the resolver's explicit branches and the open's re-check (src/db.ts via src/instance.ts) both use it. The
+ * directory it returns is always spelled under the instances root.
  */
 export function instanceDirOfDbPath(dbPath: string, instancesRoot: string, opts: { caseInsensitive?: boolean } = {}): string | null {
   const dir = path.dirname(dbPath);
@@ -197,7 +198,10 @@ export function instanceDirOfDbPath(dbPath: string, instancesRoot: string, opts:
   if (!same(path.basename(dbPath), DB_FILENAME)) return null;
   const pa = rp.split(path.sep);
   const pb = rr.split(path.sep);
-  return pa.length === pb.length && pa.every((c, i) => same(c, pb[i]!)) ? dir : null;
+  // Matched through real paths: the directory is returned spelled UNDER THE INSTANCES ROOT (<root>/instances/<id>), never
+  // in the caller's spelling, so every check below the trust root (ruling 3fc05540: no link there) examines the root's
+  // own components. A link OUTSIDE the root that named the DB (an alias) is an access path, not a component below it.
+  return pa.length === pb.length && pa.every((c, i) => same(c, pb[i]!)) ? path.join(path.resolve(instancesRoot), path.basename(dir)) : null;
 }
 
 /** The fold for a case-insensitive file system's names (APFS / NTFS: Unicode case-insensitive). */

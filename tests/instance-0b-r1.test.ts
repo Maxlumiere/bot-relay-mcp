@@ -201,6 +201,23 @@ describe.skipIf(!POSIX)("ruling 3fc05540: a link BELOW the relay home is never a
     expect(r.kind).toBe("explicit-db");
     expect(assertInstanceProvisionedAtOpen(path.join(alias, "ok", "relay.db")), "the instance dir, spelled under the root").toBe(path.join(instances(), "ok"));
   });
+  it("the same ALIAS when the real instances/<id> IS a link → refused with the line naming instances/<id> (the component that is the link), never the alias", async () => {
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r1-storage-"));
+    fs.writeFileSync(path.join(storage, "instance.json"), "{}");
+    fs.writeFileSync(path.join(storage, "relay.db"), "");
+    fs.mkdirSync(instances(), { recursive: true });
+    fs.symlinkSync(storage, path.join(instances(), "lnk"));
+    const alias = path.join(home, "alias-instances");
+    fs.symlinkSync(instances(), alias);
+    process.env.RELAY_DB_PATH = path.join(alias, "lnk", "relay.db");
+    const { resolveInstance } = await import("../src/instance.js");
+    const r = resolveInstance() as { kind: string; reason?: string };
+    expect(r.kind).toBe("error");
+    expect(r.reason).toContain("the instance directory instances/lnk is a symbolic link");
+    expect(r.reason, "never names the alias").not.toContain("alias-instances");
+    expect(fs.readdirSync(storage).sort()).toEqual(["instance.json", "relay.db"]);
+    fs.rmSync(storage, { recursive: true, force: true });
+  });
   it("the CONTROL: a linked relay HOME (the trust root) with real children still resolves the instance", async () => {
     const realHome = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r1-realhome-"));
     const linkedHome = path.join(home, "linked-relay-home");
@@ -217,7 +234,7 @@ describe.skipIf(!POSIX)("ruling 3fc05540: a link BELOW the relay home is never a
 describe("the mutation fixture (tests/fixtures/instance-0b-mutants.json; run: node scripts/mutation-sweep.mjs <fixture>)", () => {
   it("every mutant still applies: its find text occurs exactly once in its file; names are unique", () => {
     const M = JSON.parse(fs.readFileSync(path.join(REPO, "tests", "fixtures", "instance-0b-mutants.json"), "utf-8")) as Array<{ name: string; file: string; find: string }>;
-    expect(M.length).toBeGreaterThanOrEqual(12);
+    expect(M.length).toBeGreaterThanOrEqual(13);
     for (const m of M) expect(fs.readFileSync(path.join(REPO, m.file), "utf-8").split(m.find).length - 1, m.name).toBe(1);
     expect(new Set(M.map((m) => m.name)).size).toBe(M.length);
   });

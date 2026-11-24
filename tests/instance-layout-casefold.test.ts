@@ -52,7 +52,9 @@ describe("the layout test, pure (the case-insensitivity seam): component by comp
     fs.mkdirSync(relayRoot(), { recursive: true }); // instances/ absent
     const ci = { caseInsensitive: true };
     expect(instanceDirOfDbPath(path.join(instancesRoot(), "stale", "RELAY.DB"), instancesRoot(), ci)).toBe(path.join(instancesRoot(), "stale"));
-    expect(instanceDirOfDbPath(path.join(relayRoot(), "INSTANCES", "stale", "relay.db"), instancesRoot(), ci)).toBe(path.join(relayRoot(), "INSTANCES", "stale"));
+    // Spelled under the instances ROOT, never the caller's spelling (so the link checks below the root examine the
+    // root's own components).
+    expect(instanceDirOfDbPath(path.join(relayRoot(), "INSTANCES", "stale", "relay.db"), instancesRoot(), ci)).toBe(path.join(instancesRoot(), "stale"));
     expect(instanceDirOfDbPath(path.join(relayRoot(), "Instances", "stale", "Relay.Db"), instancesRoot(), ci)).not.toBeNull();
   });
   it("case-SENSITIVE: the same wrong-case paths are NOT the layout (they name other files there); the exact path is", () => {
