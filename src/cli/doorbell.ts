@@ -128,6 +128,15 @@ export interface DoorbellStatus {
   dormant_watches: Record<string, number>;
   /** INV-LIVE-01: DORMANT watches whose process cannot be judged now (start unreadable or never recorded), per agent (only agents with any). Neither alive nor gone. */
   dormant_watches_unknown: Record<string, number>;
+  /**
+   * PR 8b (ruling 7eb82f49): the wake-coverage findings from the detector's durable sink, on this SAME surface as the
+   * doorbell's own alarms: UNCOVERED is class "alarm", NEEDS_HUMAN class "report" (mail waits for a person; never
+   * hidden), UNOBSERVABLE "unjudged". `generated_at` lets a reader judge staleness; an absent or invalid sink is
+   * state "unknown", never an empty healthy list.
+   */
+  wake_coverage:
+    | { state: "read"; generated_at: string; findings: Array<{ agent: string; verdict: string; class: "alarm" | "report" | "unjudged"; pending_count: number | null; oldest_age_seconds: number | null; reason?: string }> }
+    | { state: "unknown" };
   /** PR 6: the agents the job's LAST cycle could not evaluate (a hold is never silent); null when it planned no cycle. */
   not_evaluated: { count: number; names: string[] } | null;
   /** Who last took the instance lock, from its NON-authoritative sidecar (display only; the lock itself is kernel-held). */
@@ -182,6 +191,29 @@ async function liveCounts(dbPath: string, agents: string[]): Promise<{ ok: true;
   } finally {
     opened.db.close();
   }
+}
+
+/** PR 8b: the wake-coverage sink's findings, classed (read-only; an absent or invalid sink is "unknown"). */
+async function readWakeCoverage(): Promise<DoorbellStatus["wake_coverage"]> {
+  const { readWakeCoverageStatus } = await import("../wake-coverage-status.js");
+  const st = readWakeCoverageStatus();
+  if (st === null) return { state: "unknown" };
+  const cls = (v: string): "alarm" | "report" | "unjudged" => (v === "uncovered" ? "alarm" : v === "needs_human" ? "report" : "unjudged");
+  return {
+    state: "read",
+    generated_at: st.generatedAt,
+    findings: st.findings.map((f) => {
+      const x = f as unknown as { agent: string; verdict: string; pendingCount?: unknown; oldestAgeMs?: unknown; reason?: unknown };
+      return {
+        agent: x.agent,
+        verdict: x.verdict,
+        class: cls(x.verdict),
+        pending_count: typeof x.pendingCount === "number" ? x.pendingCount : null,
+        oldest_age_seconds: typeof x.oldestAgeMs === "number" ? Math.round(x.oldestAgeMs / 1000) : null,
+        ...(typeof x.reason === "string" ? { reason: x.reason } : {}),
+      };
+    }),
+  };
 }
 
 /** Read the status for a resolved DB path. Throws on anything unreadable (the caller exits 1). */
@@ -262,9 +294,10 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
     .sort((a, b) => (a.since < b.since ? -1 : a.since > b.since ? 1 : a.agent_name < b.agent_name ? -1 : 1));
   const openBoardCasesLive: DoorbellStatus["open_board_cases_live"] = live.ok ? { ok: true } : { ok: false, why: live.why };
   const dormantWatches = await countDormantWatches(dbPath);
+  const wakeCoverage = await readWakeCoverage();
 
   if (hb.kind === "absent") {
-    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, open_board_cases: openBoardCases, open_board_cases_live: openBoardCasesLive, dormant_watches: dormantWatches.live, dormant_watches_unknown: dormantWatches.unknown, not_evaluated: null, holder, state_dir: stateDir, db_path: dbPath, resolution };
+    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, open_board_cases: openBoardCases, open_board_cases_live: openBoardCasesLive, dormant_watches: dormantWatches.live, dormant_watches_unknown: dormantWatches.unknown, wake_coverage: wakeCoverage, not_evaluated: null, holder, state_dir: stateDir, db_path: dbPath, resolution };
   }
   const h = hb.heartbeat;
   const judged = judgeHeartbeat(h, nowWall);
@@ -301,6 +334,7 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
     open_board_cases_live: openBoardCasesLive,
     dormant_watches: dormantWatches.live,
     dormant_watches_unknown: dormantWatches.unknown,
+    wake_coverage: wakeCoverage,
     not_evaluated: h.not_evaluated,
     holder,
     state_dir: stateDir,
@@ -346,7 +380,7 @@ export async function run(argv: string[]): Promise<number> {
     const lines = hookLines(st);
     if (lines.length > 0) process.stdout.write(lines.join("\n") + "\n");
   } else {
-    process.stdout.write(`[RELAY] doorbell: ${st.state} (${st.why})${st.build ? `, build ${st.build.verdict}` : ""}${st.condition ? `, ${st.condition}` : ""}, ${st.escalations.open} open escalation(s), ${st.open_board_cases.length} open board case(s)${Object.keys(st.dormant_watches).length ? `, dormant watches: ${Object.entries(st.dormant_watches).map(([a, n]) => `${a}=${n}`).join(" ")}` : ""}${Object.keys(st.dormant_watches_unknown).length ? `, dormant watches that cannot be judged now: ${Object.entries(st.dormant_watches_unknown).map(([a, n]) => `${a}=${n}`).join(" ")}` : ""}\n`);
+    process.stdout.write(`[RELAY] doorbell: ${st.state} (${st.why})${st.build ? `, build ${st.build.verdict}` : ""}${st.condition ? `, ${st.condition}` : ""}, ${st.escalations.open} open escalation(s), ${st.open_board_cases.length} open board case(s)${Object.keys(st.dormant_watches).length ? `, dormant watches: ${Object.entries(st.dormant_watches).map(([a, n]) => `${a}=${n}`).join(" ")}` : ""}${Object.keys(st.dormant_watches_unknown).length ? `, dormant watches that cannot be judged now: ${Object.entries(st.dormant_watches_unknown).map(([a, n]) => `${a}=${n}`).join(" ")}` : ""}${st.wake_coverage.state === "read" && st.wake_coverage.findings.length ? `, wake-coverage: ${st.wake_coverage.findings.map((f) => `${f.agent}=${f.verdict}${f.reason ? `(${f.reason})` : ""}`).join(" ")}` : ""}\n`);
   }
   return 0;
 }

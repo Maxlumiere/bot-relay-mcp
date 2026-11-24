@@ -350,6 +350,8 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
   const dbPath = process.env.RELAY_DB_PATH as string;
   // EXEMPT from a record: this name cannot be a directory (watchableName), so there is no dir to write in.
   if (!W.watchableName(agent)) return dormant("not_watchable", birth, null);
+  // PR 8b (ruling 1cd77de6): record "a watch ran for this agent" once (best-effort; a fault is one stderr line).
+  (await import("../watch-seen.js")).noteWatchSeen(dbPath, agent);
   const { currentWakePolicy } = await import("../wake-policy.js");
   const { acquireInstanceLock, lockStillOurs, releaseInstanceLock } = await import("../doorbell-lock.js");
   const { ensurePrivateDir } = await import("../doorbell-log.js");

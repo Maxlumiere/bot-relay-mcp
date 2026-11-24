@@ -132,13 +132,19 @@
  * the marker guarantees correctness GOING FORWARD, which is what the rule requires.
  */
 import type { CompatDatabase } from "./sqlite-compat.js";
-import { pendingGlobalClause } from "./db.js";
+import { pendingGlobalClause, getDbPath, listAgentBindings } from "./db.js";
+import fs from "fs";
 import { log } from "./logger.js";
 // ADR-0026 item 1 — the durable status sink's pure I/O + staleness-enforcing reader live in a
 // db-free module (wake-coverage-status.ts) so the SessionStart hook can import them WITHOUT
 // pulling this file's native-sqlite graph (db.js) in. This file remains the single WRITER
 // (runWakeCoverageSweep) and re-exports the rest so existing importers are unchanged.
 import { writeWakeCoverageStatus, resolveWakeCoverageStatusPath } from "./wake-coverage-status.js";
+import { ensureWatchSeenStore, readWatchSeen } from "./watch-seen.js";
+import { watchAgentDir, watchableName } from "./watch-wake.js";
+import { oneLiveWindow } from "./doorbell-core.js";
+import { bindingLiveness } from "./doorbell-run.js";
+import { getOwnHostId } from "./liveness.js";
 export {
   defaultWakeCoverageStatusPath,
   readWakeCoverageStatus,
@@ -147,7 +153,20 @@ export {
 export { writeWakeCoverageStatus, resolveWakeCoverageStatusPath };
 export type { WakeCoverageStatus } from "./wake-coverage-status.js";
 
-export type WakeVerdict = "covered" | "uncovered" | "unobservable";
+/**
+ * PR 8b (gate brief §6; rulings 7eb82f49, 1cd77de6): UNCOVERED is SPLIT by the agent's watch history, DERIVED from
+ * the relay's own record, never declared (no name list, no flag):
+ *   - needs_human: NO watch of any kind ever ran for this agent (no watch-seen marker), past the grace. Mail waits for
+ *     a person. REPORTED on the same surfaces as the alarms, never as one, never hidden.
+ *   - uncovered:   a watch existed and the agent stopped draining (its watcher died, a hook went dead): the alarm.
+ *                  With reason two_windows when two live windows are bound to it (its --until-wake watch refuses,
+ *                  by design: no wake until one closes).
+ */
+export type WakeVerdict = "covered" | "uncovered" | "unobservable" | "needs_human";
+/** The agent's watch history, for the split (see watchClassForDaemon). */
+export type WatchClass = "never" | "two_windows" | "armed";
+/** The closed set of reasons an UNCOVERED finding may carry. */
+export type UncoveredReason = "two_windows";
 
 export interface WakeCoverageFinding {
   readonly agent: string;
@@ -165,9 +184,16 @@ export interface WakeCoverageFinding {
    * (finding 2; same class as the grace-log report-what-was-used fix).
    */
   readonly thresholdMs: number;
+  /** PR 8b: why an UNCOVERED finding is uncovered, when the relay knows (closed set). Absent otherwise. */
+  readonly reason?: UncoveredReason;
 }
 
 export interface WakeCoverageOptions {
+  /**
+   * PR 8b: the agent's watch history (the daemon passes watchClassForDaemon). ABSENT → every uncovered agent stays
+   * UNCOVERED, exactly as before 8b.
+   */
+  readonly watchClass?: (agent: string) => WatchClass;
   /** Evaluation "now" in epoch ms. Injected for testability. */
   readonly nowMs: number;
   /**
@@ -253,10 +279,18 @@ export function classifyWakeCoverage(
     // has not drained since — see line ~205), so the operator line states what is KNOWN
     // and offers the causes rather than asserting a behaviour (finding 3).
     // Else UNCOVERED — drained before but not since the stuck mail: the S2 regression.
-    const verdict: WakeVerdict = lastDrainAt !== null ? "uncovered" : "unobservable";
+    let verdict: WakeVerdict = lastDrainAt !== null ? "uncovered" : "unobservable";
+    let reason: UncoveredReason | undefined;
+    if (verdict === "uncovered" && opts.watchClass) {
+      // PR 8b: split UNCOVERED by the watch history. ONLY "never" leaves the alarm.
+      const cls = opts.watchClass(row.agent);
+      if (cls === "never") verdict = "needs_human";
+      else if (cls === "two_windows") reason = "two_windows";
+    }
     findings.push({
       agent: row.agent,
       verdict,
+      ...(reason ? { reason } : {}),
       pendingCount: row.pending_count,
       oldestCreatedAt: row.oldest_created_at,
       oldestAgeMs: nowMs - new Date(row.oldest_created_at).getTime(),
@@ -283,6 +317,12 @@ export function formatWakeCoverageFindings(findings: readonly WakeCoverageFindin
     // Report the EFFECTIVE threshold that actually fired (bound + margin), never the
     // bare word "bound" — that names 24h while 48h is what was applied (finding 2).
     const threshold = fmtHours(f.thresholdMs);
+    if (f.verdict === "needs_human") {
+      return `[wake-coverage] NEEDS_HUMAN — ${f.agent}: queued: no automatic wake exists for this agent; mail waits for a person (${f.pendingCount} message(s), oldest ${age}).`;
+    }
+    if (f.verdict === "uncovered" && f.reason === "two_windows") {
+      return `[wake-coverage] UNCOVERED — ${f.agent}: two windows are bound to ${f.agent}; close one (no wake until then) (${f.pendingCount} pending, oldest ${age}).`;
+    }
     if (f.verdict === "uncovered") {
       return (
         `[wake-coverage] UNCOVERED — ${f.agent}: ${f.pendingCount} message(s) pending ` +
@@ -402,18 +442,28 @@ export function wakeConfigFromEnv(): WakeDetectorConfig {
  */
 export function startWakeCoverageSweep(
   db: CompatDatabase,
-  deps: { scheduler?: WakeSweepScheduler; now?: () => number } = {},
+  deps: { scheduler?: WakeSweepScheduler; now?: () => number; dbPath?: string } = {},
 ): WakeSweepHandle {
   const cfg = wakeConfigFromEnv();
   if (!cfg.enabled) return { stop: () => {} };
   const now = deps.now ?? (() => Date.now());
   const scheduler = deps.scheduler ?? realWakeScheduler();
+  const dbPath = deps.dbPath ?? getDbPath();
+  // PR 8b: the watch-seen store exists from the daemon's first sweep, so the GRACE starts at deploy even in a relay
+  // where no watch has run yet (best-effort: a fault leaves the split off, never on).
+  try {
+    ensureWatchSeenStore(dbPath, new Date(now()));
+  } catch (err) {
+    log.warn("[wake-coverage] the watch-seen store could not be created (the NEEDS_HUMAN split stays off): " + String(err));
+  }
   const tick = (): void => {
     try {
+      const nowMs = now();
       runWakeCoverageSweep(db, {
-        nowMs: now(),
+        nowMs,
         boundMs: cfg.boundMs,
         antiFlapMarginMs: cfg.antiFlapMarginMs,
+        watchClass: watchClassForDaemon(db, dbPath, nowMs),
       });
     } catch (err) {
       log.debug("[wake-coverage] sweep failed (non-fatal): " + String(err));
@@ -421,4 +471,32 @@ export function startWakeCoverageSweep(
   };
   tick(); // fire once at startup
   return scheduler.setInterval(tick, cfg.intervalMs);
+}
+
+/**
+ * PR 8b: the agent's watch history, DERIVED from the relay's own record (read-only):
+ *   - "two_windows": its --until-wake agent dir exists (it armed that watch) AND two or more live windows are bound
+ *     to it (the same judge the watch uses: oneLiveWindow over listAgentBindings, bindingLiveness). Still UNCOVERED.
+ *   - "never": past the watch-seen GRACE, and no watch of ANY kind ever ran for it (no watch-seen marker). NOT the
+ *     --until-wake dir: a streaming agent never creates that one.
+ *   - else "armed".
+ * Within the grace (or with an unreadable store) nothing is "never": the split is off.
+ */
+export function watchClassForDaemon(db: CompatDatabase, dbPath: string, nowMs: number): (agent: string) => WatchClass {
+  const seen = readWatchSeen(dbPath, nowMs);
+  const own = getOwnHostId();
+  let bindings: ReturnType<typeof listAgentBindings> | null = null;
+  return (agent) => {
+    if (watchableName(agent) && fs.existsSync(watchAgentDir(dbPath, agent))) {
+      try {
+        bindings ??= listAgentBindings(db);
+        const mine = bindings.filter((b) => b.agent_name === agent);
+        if (oneLiveWindow(mine, own, (b) => bindingLiveness(b, own)).kind === "ambiguous") return "two_windows";
+      } catch {
+        /* the bindings cannot be read: no two_windows claim */
+      }
+    }
+    if (seen.graceOver && !seen.seen(agent)) return "never";
+    return "armed";
+  };
 }

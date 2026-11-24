@@ -70,7 +70,7 @@ function stampAgo(ms: number): void {
   const dir = SEEN.ensureWatchSeenStore(DB);
   fs.writeFileSync(path.join(dir, SEEN.WATCH_SEEN_STAMP), new Date(NOW - ms).toISOString());
 }
-const env = (): Record<string, string> => ({ PATH: process.env.PATH ?? "", HOME: path.join(ROOT, "home"), RELAY_DB_PATH: DB, RELAY_FILESYSTEM_MARKERS: "0", RELAY_HTTP_PORT: "1" });
+const env = (): Record<string, string> => ({ PATH: process.env.PATH ?? "", HOME: path.join(ROOT, "home"), RELAY_DB_PATH: DB, RELAY_FILESYSTEM_MARKERS: "0", RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: SINK });
 
 describe("the watch-seen store: write-once, no-follow, private", () => {
   beforeEach(() => reset());
@@ -92,7 +92,7 @@ describe("the watch-seen store: write-once, no-follow, private", () => {
     fs.symlinkSync(target, SEEN.watchSeenDir(DB));
     expect(() => SEEN.recordWatchSeen(DB, "s-bob")).toThrow(/not a real directory/);
     expect(fs.readdirSync(target)).toEqual([]);
-    fs.rmSync(SEEN.watchSeenDir(DB));
+    fs.unlinkSync(SEEN.watchSeenDir(DB)); // the link itself, never its target
     SEEN.ensureWatchSeenStore(DB);
     const victim = path.join(ROOT, "victim");
     fs.writeFileSync(victim, "keep");
@@ -213,7 +213,18 @@ describe("the daemon's sweep: the store exists from its first sweep; NEEDS_HUMAN
     expect(lines).toContain("[wake-coverage] UNCOVERED — s-bob");
     const sink = ST.readWakeCoverageStatus(SINK);
     expect(sink?.findings.map((f) => [f.agent, f.verdict]).sort()).toEqual([["s-bob", "uncovered"], ["s-codex", "needs_human"]]);
-  });
+    // the SAME surface as the alarms: relay doorbell status (the board's JSON), NEEDS_HUMAN classed "report"
+    const j = JSON.parse(spawnSync("node", [RELAY_BIN, "doorbell", "status", "--json"], { env: env(), encoding: "utf-8" }).stdout) as { wake_coverage: { state: string; findings: Array<Record<string, unknown>> } };
+    expect(j.wake_coverage.state).toBe("read");
+    const by = Object.fromEntries(j.wake_coverage.findings.map((x) => [x.agent, x]));
+    expect(by["s-codex"]).toMatchObject({ verdict: "needs_human", class: "report", pending_count: 1 });
+    expect(by["s-bob"]).toMatchObject({ verdict: "uncovered", class: "alarm", pending_count: 1 });
+    expect(spawnSync("node", [RELAY_BIN, "doorbell", "status"], { env: env(), encoding: "utf-8" }).stdout).toContain("s-codex=needs_human");
+  }, 30_000);
+  it("no sink → doorbell status says wake_coverage unknown (never an empty, healthy list)", () => {
+    const j = JSON.parse(spawnSync("node", [RELAY_BIN, "doorbell", "status", "--json"], { env: env(), encoding: "utf-8" }).stdout) as { wake_coverage: unknown };
+    expect(j.wake_coverage).toEqual({ state: "unknown" });
+  }, 30_000);
 });
 
 describe("the status sink and the SessionStart line: NEEDS_HUMAN is REPORTED, never an alarm, never hidden", () => {
@@ -225,13 +236,13 @@ describe("the status sink and the SessionStart line: NEEDS_HUMAN is REPORTED, ne
     expect(ST.isValidWakeCoverageStatus(rec([f("a", "uncovered", { reason: "something_else" })]))).toBe(false);
   });
   it("only NEEDS_HUMAN → a report line (no *** alarm), naming the agent, its count and oldest age", () => {
-    const line = ST.formatWakeCoverageStatusLine(rec([f("s-codex", "needs_human")]) as never, NOW);
+    const line = ST.formatWakeCoverageStatusLine(rec([f("s-codex", "needs_human")]) as never, NOW, 3 * HOUR);
     expect(line).not.toContain("***");
     expect(line).toContain("NEEDS_HUMAN");
     expect(line).toContain("s-codex (2 message(s), oldest 2d)");
   });
   it("UNCOVERED + NEEDS_HUMAN → the alarm, with the queued agents appended (never dropped); two_windows is named", () => {
-    const line = ST.formatWakeCoverageStatusLine(rec([f("s-bob", "uncovered", { reason: "two_windows" }), f("s-codex", "needs_human")]) as never, NOW);
+    const line = ST.formatWakeCoverageStatusLine(rec([f("s-bob", "uncovered", { reason: "two_windows" }), f("s-codex", "needs_human")]) as never, NOW, 3 * HOUR);
     expect(line).toContain("*** wake-coverage: 1 agent(s) UNCOVERED");
     expect(line).toContain("s-bob (two windows bound: close one)");
     expect(line).toContain("Queued for a person");
