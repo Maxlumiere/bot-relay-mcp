@@ -705,7 +705,9 @@ write_relay_spawn_manifest() {
   manifest_path=$(resolve_relay_spawn_manifest_path "$name") || return 1
   local dir
   dir=$(dirname "$manifest_path")
-  mkdir -p "$dir" 2>/dev/null || true
+  local manifest_db_path
+  manifest_db_path=$(resolve_relay_db_path) || return 1
+  relay_ensure_instance_subdir "$manifest_db_path" "$dir" || return 1
   chmod 0700 "$dir" 2>/dev/null || true
   local now
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -862,6 +864,54 @@ delete_relay_spawn_manifest() {
   return 0
 }
 
+# relay_ensure_instance_subdir <db_path> <dir> — RE-VERIFIED AT WRITE TIME (#442 review P2-2): the path was
+# resolved earlier, and the instance may be gone now. For an instance in the layout (<...>/instances/<id>/relay.db)
+# the instance must still be provisioned (a real instance.json or relay.db, never a link), and only the components
+# BELOW it are created, one at a time, never through a link: never `mkdir -p` from above the instance. Outside the
+# layout (the legacy flat home) it creates the dir as before. Returns 0, or 1 with one stderr line.
+relay_ensure_instance_subdir() {
+  local db_path="$1"
+  local dir="$2"
+  local inst
+  inst=$(dirname "$db_path")
+  if [ "$(basename "$(dirname "$inst")")" != "instances" ]; then
+    mkdir -p "$dir" 2>/dev/null || true
+    return 0
+  fi
+  if { [ -f "$inst/instance.json" ] && [ ! -L "$inst/instance.json" ]; } || { [ -f "$db_path" ] && [ ! -L "$db_path" ]; }; then
+    :
+  else
+    echo "[bot-relay hook] the relay instance \"$(basename "$inst")\" is not provisioned (removed or never created): nothing written" >&2
+    return 1
+  fi
+  case "$dir" in
+    "$inst"/*) ;;
+    *) echo "[bot-relay hook] refusing to write outside the instance directory" >&2; return 1 ;;
+  esac
+  local rel="${dir#"$inst"/}"
+  local cur="$inst"
+  local part
+  local old_ifs="$IFS"
+  IFS='/'
+  for part in $rel; do
+    IFS="$old_ifs"
+    cur="$cur/$part"
+    if [ -L "$cur" ]; then
+      echo "[bot-relay hook] refusing to write through a link in the instance directory ($part)" >&2
+      return 1
+    fi
+    if [ ! -d "$cur" ]; then
+      mkdir "$cur" 2>/dev/null || { echo "[bot-relay hook] could not create $part under the instance" >&2; return 1; }
+    fi
+    if [ -L "$cur" ] || [ ! -d "$cur" ]; then
+      echo "[bot-relay hook] refusing to write through a link in the instance directory ($part)" >&2
+      return 1
+    fi
+  done
+  IFS="$old_ifs"
+  return 0
+}
+
 # write_relay_token_to_vault <name> <token> — atomic tmp+rename, chmod
 # 0o600. Returns 0 on success; on bad shape / IO failure, stderr + return 1.
 write_relay_token_to_vault() {
@@ -875,7 +925,9 @@ write_relay_token_to_vault() {
   token_path=$(resolve_relay_token_path "$name") || return 1
   local dir
   dir=$(dirname "$token_path")
-  mkdir -p "$dir" 2>/dev/null || true
+  local vault_db_path
+  vault_db_path=$(resolve_relay_db_path) || return 1
+  relay_ensure_instance_subdir "$vault_db_path" "$dir" || return 1
   chmod 0700 "$dir" 2>/dev/null || true   # POSIX; no-op on Windows
   # Atomic write: tmp file in same dir, chmod, rename.
   local tmp="${token_path}.tmp.$$"

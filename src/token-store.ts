@@ -47,7 +47,8 @@
 import fs from "fs";
 import path from "path";
 import { randomBytes } from "crypto";
-import { resolveInstanceDbPath } from "./instance.js";
+import { resolveInstanceDbPath, assertInstanceProvisionedAtOpen } from "./instance.js";
+import { DB_FILENAME } from "./resolve-instance.js";
 
 /** Pluggable credential vault interface. v2.9+ may add Keychain / Vault impls. */
 export interface TokenStore {
@@ -173,7 +174,21 @@ export class FileTokenStore implements TokenStore {
     }
     const target = this.pathFor(agentName);
     const dir = path.dirname(target);
-    await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+    // RE-VERIFIED AT WRITE TIME (#442 review P2-2): the vault dir was resolved when this store was built; the instance
+    // may be gone now. An instance in the layout must be provisioned NOW (it throws otherwise), and then only the
+    // agents/ directory BELOW it is created, one component, never through a link: never `mkdir -p` from above.
+    const instanceDir = assertInstanceProvisionedAtOpen(path.join(path.dirname(dir), DB_FILENAME));
+    if (instanceDir !== null) {
+      try {
+        await fs.promises.mkdir(dir, { mode: 0o700 });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      }
+      const st = await fs.promises.lstat(dir);
+      if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`the agent vault ${dir} is not a real directory (a link or another type): refusing to write through it`);
+    } else {
+      await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 }); // outside the instance layout (legacy, a test vault)
+    }
     // Best-effort chmod after mkdir — handles the case where the dir already
     // existed at a looser mode (e.g. legacy ~/.bot-relay created at 0o755
     // pre-v2.1 Phase 4c.4). On Windows, this is a no-op.
