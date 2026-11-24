@@ -321,3 +321,32 @@ describe("TRIPWIRES: one reader, no remover", () => {
     expect(namers).toEqual([]);
   });
 });
+
+describe("A1 §A2 (the doorbell stays unreachable from the server): the daemon's sweep reaches NO doorbell or watch module", () => {
+  /** The TRANSITIVE closure of relative imports (static and dynamic) from a src/ module. */
+  function closure(entry: string): string[] {
+    const seen = new Set<string>();
+    const visit = (abs: string) => {
+      if (seen.has(abs)) return;
+      seen.add(abs);
+      const text = fs.readFileSync(abs, "utf-8");
+      for (const m of text.matchAll(/(?:from\s+|import\(\s*)["'](\.{1,2}\/[^"']+)["']/g)) {
+        const target = path.resolve(path.dirname(abs), m[1]!.replace(/\.js$/, ".ts"));
+        if (fs.existsSync(target)) visit(target);
+      }
+    };
+    visit(path.join(REPO, entry));
+    return [...seen].map((p) => path.relative(REPO, p)).sort();
+  }
+  it("src/wake-coverage-detector.ts (what the HTTP daemon starts) never reaches doorbell-* / watch-wake / watch-owner / watch-until-wake", () => {
+    const reach = closure("src/wake-coverage-detector.ts");
+    expect(reach.length).toBeGreaterThan(5); // non-vacuous: it followed the imports
+    expect(reach).toContain("src/window-judge.ts");
+    expect(reach.filter((f) => /\/doorbell[-.]|\/watch-wake\.ts$|\/watch-owner\.ts$|\/watch-until-wake\.ts$/.test(f))).toEqual([]);
+  });
+  it("and neither does the HTTP transport as a whole", () => {
+    const reach = closure("src/transport/http.ts");
+    expect(reach).toContain("src/wake-coverage-detector.ts");
+    expect(reach.filter((f) => /\/doorbell[-.]|\/watch-wake\.ts$|\/watch-owner\.ts$|\/watch-until-wake\.ts$/.test(f))).toEqual([]);
+  });
+});

@@ -32,7 +32,9 @@ import { probeLockHeld, readHolderInfo, type HolderInfo } from "./doorbell-lock.
 import { AGENT_NAME_PATTERN } from "./types.js";
 
 /** An agent name that can name a watch dir: a valid agent name that is not all dots. */
-export const watchableName = (agent: string): boolean => AGENT_NAME_PATTERN.test(agent) && !/^\.+$/.test(agent);
+// PR 8b: the name and path rules live in src/watch-paths.ts (pure; shared with the daemon's sweep); re-exported.
+export { watchableName, watchAgentDir } from "./watch-paths.js";
+import { watchableName, watchAgentDir } from "./watch-paths.js";
 
 import { ALLOW_ALL, DEFAULT_PAIR_WAKES_PER_HOUR, PAIR_WINDOW_MS, pairKey, type StandingCheck, type WakeMeta } from "./wake-policy.js";
 export { ALLOW_ALL, DEFAULT_PAIR_WAKES_PER_HOUR, PAIR_WINDOW_MS, pairKey, type StandingCheck, type WakeMeta };
@@ -139,10 +141,6 @@ export const HEARTBEAT_STALE_MS = 5 * 60_000;
  * one (`.` and `..` ARE valid agent names, but as a path segment they would name the watch dir's
  * parent or itself): such an agent simply has no watch.
  */
-export function watchAgentDir(dbPath: string, agent: string): string {
-  if (!watchableName(agent)) throw new Error(`no watch for this agent name: ${JSON.stringify(agent)}`);
-  return path.join(path.dirname(dbPath), "watch", agent);
-}
 /** A window's key: its pid and a digest of its start token (the token may hold spaces and colons). */
 export function windowKey(pid: number, start: string): string {
   if (!Number.isInteger(pid) || pid <= 0) throw new Error(`not a window pid: ${pid}`);

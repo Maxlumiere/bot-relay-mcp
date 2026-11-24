@@ -141,9 +141,8 @@ import { log } from "./logger.js";
 // (runWakeCoverageSweep) and re-exports the rest so existing importers are unchanged.
 import { writeWakeCoverageStatus, resolveWakeCoverageStatusPath } from "./wake-coverage-status.js";
 import { ensureWatchSeenStore, readWatchSeen } from "./watch-seen.js";
-import { watchAgentDir, watchableName } from "./watch-wake.js";
-import { oneLiveWindow } from "./doorbell-core.js";
-import { bindingLiveness } from "./doorbell-run.js";
+import { watchAgentDir, watchableName } from "./watch-paths.js";
+import { oneLiveWindow, bindingLiveness } from "./window-judge.js";
 import { getOwnHostId } from "./liveness.js";
 export {
   defaultWakeCoverageStatusPath,

@@ -22,7 +22,7 @@
  */
 import fs from "fs";
 import path from "path";
-import { watchableName } from "./watch-wake.js";
+import { watchableName } from "./watch-paths.js";
 
 export const WATCH_SEEN_DIR = "watch-seen";
 /** The store's creation stamp (a dot name: never an agent marker, since an all-dot name is not watchable). */
