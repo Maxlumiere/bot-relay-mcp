@@ -941,3 +941,20 @@ describe.skipIf(!V6_LOOPBACK)("#434 R2 P2-4: the self-pair guard compares the ch
     await stopDaemon(d.child);
   }, 120_000);
 });
+
+describe("#442 R3: the self-pair guard FAILS CLOSED when the local instance cannot be resolved", () => {
+  it("an owner on 127.0.0.1:P + a trusted tunnel on P + RELAY_DB_PATH inside an UNPROVISIONED instance → pair refuses (it cannot tell whether P is this machine's own relay)", async () => {
+    const c = newCase("pair-self-unresolved");
+    seedNativeDb(c);
+    const d = await startDaemon(c);
+    const P = readRecord(c).port;
+    const typo = path.join(c.home, ".bot-relay", "instances", "typo", "relay.db");
+    const env = { RELAY_HTTP_TRUSTED_TUNNEL_PORT: String(P), RELAY_DB_PATH: typo };
+    const r = await relayAsync(c, ["pair", `http://127.0.0.1:${P}`, "--name", "pr442-self", "--yes", "--output", path.join(c.home, "p.json"), "--secret-stdin"], env, "pr442-hub-secret-cccccccccccccccccccccccccccc\n");
+    expect(r.status, r.stderr).not.toBe(0);
+    expect(r.stderr).toMatch(new RegExp(`cannot tell whether 127\\.0\\.0\\.1:${P} is this machine's own relay`));
+    expect(fs.existsSync(path.join(c.home, "p.json")), "no client config was emitted").toBe(false);
+    expect(fs.existsSync(path.dirname(typo)), "the unprovisioned instance was not created").toBe(false);
+    await stopDaemon(d.child);
+  }, 120_000);
+});

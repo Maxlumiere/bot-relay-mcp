@@ -167,6 +167,7 @@ describe("v2.4.5 — bash hook resolvers mirror src/instance.ts (parameterized o
       it(`(Q2) ${label}: follows the active-instance symlink to the per-instance DB`, () => {
         const id = "test-instance-q2";
         fs.mkdirSync(path.join(root, "instances", id), { recursive: true });
+        fs.writeFileSync(path.join(root, "instances", id, "instance.json"), "{}"); // provisioned: a bare dir is refused
         fs.symlinkSync(id, path.join(root, "active-instance"));
         const r = runHookResolver(hookPath, { HOME });
         expect(r.status).toBe(0);
@@ -175,6 +176,8 @@ describe("v2.4.5 — bash hook resolvers mirror src/instance.ts (parameterized o
 
       it(`(Q3) ${label}: honours RELAY_INSTANCE_ID env override`, () => {
         const id = "test-instance-q3";
+        fs.mkdirSync(path.join(root, "instances", id), { recursive: true });
+        fs.writeFileSync(path.join(root, "instances", id, "instance.json"), "{}"); // provisioned: an unprovisioned id is refused
         const r = runHookResolver(hookPath, { HOME, RELAY_INSTANCE_ID: id });
         expect(r.status).toBe(0);
         expect(r.stdout).toBe(path.join(root, "instances", id, "relay.db"));

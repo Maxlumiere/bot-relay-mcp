@@ -277,6 +277,8 @@ describe("INV-DB-01 slice 1: the driver is an instance property", () => {
     const instances = path.join(caseDir, ".bot-relay", "instances");
     writeConfig(path.join(instances, "a", "config.json"), { sqlite_driver: "wasm" });
     fs.mkdirSync(path.join(instances, "b"), { recursive: true });
+    // Both PROVISIONED (instance.json): an unprovisioned instance is refused before any open.
+    for (const id of ["a", "b"]) fs.writeFileSync(path.join(instances, id, "instance.json"), "{}");
     process.env.RELAY_INSTANCE_ID = "a";
     await compat.initializeDb(path.join(instances, "a", "relay.db"));
     expect(compat.getActiveDriver()).toBe("wasm");

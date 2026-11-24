@@ -89,6 +89,12 @@ function fault(fn: "lstatSync" | "readlinkSync" | "readFileSync" | "readdirSync"
 
 const flatDb = () => path.join(RH, "relay.db");
 const instDb = (id: string) => path.join(RH, "instances", id, "relay.db");
+/** A provisioned instance as `relay init --instance-id` leaves it: instance.json, no DB yet. */
+const provision = (id: string) => {
+  const p = path.join(RH, "instances", id, "instance.json");
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, "{}");
+};
 
 describe("ADR-0048 — the state table: positive rows", () => {
   it("RELAY_DB_PATH, file present → explicit-db, exists", () => {
@@ -122,8 +128,13 @@ describe("ADR-0048 — the state table: positive rows", () => {
     touch(instDb("work"));
     process.env.RELAY_INSTANCE_ID = "work";
     expect(inst.resolveInstance()).toEqual({ kind: "instance", id: "work", dbPath: instDb("work"), exists: true, basis: "RELAY_INSTANCE_ID", containment: "strict" });
+    // A PROVISIONED instance with no DB yet (instance.json, as `relay init --instance-id` leaves it): instance, not exists.
+    provision("other");
     process.env.RELAY_INSTANCE_ID = "other";
     expect(inst.resolveInstance()).toEqual({ kind: "instance", id: "other", dbPath: instDb("other"), exists: false, basis: "RELAY_INSTANCE_ID", containment: "strict" });
+    // An id that was never provisioned is an ERROR, never a path to create (tests/instance-no-autocreate.test.ts).
+    process.env.RELAY_INSTANCE_ID = "never";
+    expect(inst.resolveInstance()).toMatchObject({ kind: "error", unprovisioned: true });
   });
 
   it("marker symlink → instance (active-instance)", () => {
@@ -134,6 +145,7 @@ describe("ADR-0048 — the state table: positive rows", () => {
 
   it("marker FILE with an id → instance", () => {
     fs.mkdirSync(RH, { recursive: true });
+    provision("b");
     fs.writeFileSync(path.join(RH, "active-instance"), "b\n");
     expect(inst.resolveInstance()).toEqual({ kind: "instance", id: "b", dbPath: instDb("b"), exists: false, basis: "active-instance", containment: "strict" });
   });
@@ -306,6 +318,7 @@ describe("ADR-0048 — consumers are strict: no fault reaches the flat DB throug
   });
   it("the config path follows the same strict resolution", () => {
     fs.mkdirSync(RH, { recursive: true });
+    provision("a");
     fs.symlinkSync("a", path.join(RH, "active-instance"));
     expect(inst.resolveInstanceConfigPath()).toBe(path.join(RH, "instances", "a", "config.json"));
     fault("readlinkSync", (p) => p.endsWith("active-instance"), "EIO");

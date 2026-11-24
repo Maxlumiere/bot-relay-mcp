@@ -583,6 +583,9 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     const root = path.join(caseDir, ".bot-relay", "instances");
     fs.mkdirSync(path.join(root, "a"), { recursive: true });
     fs.mkdirSync(path.join(root, "b"), { recursive: true });
+    // Both are PROVISIONED instances (instance.json): a bare directory is a non-existent instance, refused before any
+    // open (tests/instance-no-autocreate.test.ts); these rows are about the driver declaration of real instances.
+    for (const id of ["a", "b"]) fs.writeFileSync(path.join(root, id, "instance.json"), "{}");
     const aCfg = path.join(root, "a", "config.json");
     if (declA !== null) fs.writeFileSync(aCfg, declA, { mode: 0o600 });
     fs.writeFileSync(path.join(root, "b", "config.json"), JSON.stringify({ sqlite_driver: "native" }), { mode: 0o600 });
@@ -822,8 +825,10 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     const root = path.join(caseDir, ".bot-relay", "instances");
     fs.mkdirSync(path.join(root, "b"), { recursive: true });
     fs.writeFileSync(path.join(root, "b", "config.json"), JSON.stringify({ sqlite_driver: "native" }), { mode: 0o600 });
+    fs.writeFileSync(path.join(root, "b", "instance.json"), "{}"); // provisioned (see twoInstances)
     const storage = path.join(caseDir, "storage", "a");
     fs.mkdirSync(storage, { recursive: true });
+    fs.writeFileSync(path.join(storage, "instance.json"), "{}"); // provisioned, through the link
     fs.writeFileSync(path.join(storage, "config.json"), WASM_DECL, { mode: 0o600 });
     fs.symlinkSync(storage, path.join(root, "a"));
     delete process.env.RELAY_CONFIG_PATH;

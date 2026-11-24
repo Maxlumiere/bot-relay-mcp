@@ -40,7 +40,7 @@ import { withDeadline } from "../http-deadline.js";
 import { execSystem } from "../system-binary.js"; // SEC-22: launchctl by its trusted path, never by name
 import readline from "readline/promises";
 import { ensureSecureDir, ensureSecureFile } from "../fs-perms.js";
-import { createInstance, generateInstanceId, resolveActiveInstanceId, instanceDir, instanceDirNames, configPathForInstance, flatConfigPath } from "../instance.js";
+import { createInstance, generateInstanceId, resolveActiveInstanceId, resolveInstance, instanceDir, instanceDirNames, configPathForInstance, flatConfigPath } from "../instance.js";
 import { getConfigPath, configPathOverride } from "../config.js";
 import {
   readJsonSafe,
@@ -515,6 +515,22 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
     return 1;
   }
 
+  // #442 R3 P3: the ACTIVE selection, read BEFORE any write. For an explicit --instance-id / --multi-instance, an
+  // active selection naming a MISSING (unprovisioned) instance only means the instance configured here is not the
+  // active one (the structured flag, never the reason text). Any other resolver fault fails loud, here, before a write.
+  let activeMissing: string | null = null;
+  if (args.instanceId || args.multiInstance) {
+    const active = resolveInstance({ ignoreDbPathEnv: true });
+    if (active.kind === "error") {
+      if (active.unprovisioned === true) {
+        activeMissing = active.reason;
+      } else {
+        process.stderr.write(`relay init: instance resolution failed: ${active.reason}\n`);
+        return 1;
+      }
+    }
+  }
+
   // ---- 1. config.json (reconcile) ------------------------------------------
   ensureSecureDir(defaultBotRelayDir(), 0o700);
   if (effectiveInstanceId && perInstanceDir) {
@@ -652,40 +668,56 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
   // verify at the FILESYSTEM — the path the daemon reads on its NEXT start — not
   // against the running daemon, which loads config only at boot and would
   // false-alarm on a correct write until it is restarted.
-  const daemonResolvedPath = getConfigPath();
-  const sameAsDaemon = path.resolve(daemonResolvedPath) === path.resolve(configPath);
-  if (httpEnabled) {
-    const readback = readJsonSafe(daemonResolvedPath) as Record<string, unknown> | null;
-    const secretReadable =
-      sameAsDaemon &&
-      readback !== null &&
-      typeof readback.dashboard_secret === "string" &&
-      (readback.dashboard_secret as string).length >= 32;
-    if (!secretReadable) {
-      if (!explicitInstance) {
-        // The common `relay init`: configPath IS getConfigPath() by construction,
-        // so a miss here means the write genuinely did not land — never a benign
-        // "different instance". Fail loud; do NOT let the success line stand.
-        process.stderr.write(
-          `\n✗ VERIFY FAILED: wrote ${configPath}, but the daemon's dashboard_secret is not readable at ` +
-            `its resolved path ${daemonResolvedPath}. Operator actions would 401. The write did not land as ` +
-            `expected — do NOT trust the success line above.\n`,
-        );
-        return 1;
-      }
-      // Explicit --instance-id / --multi-instance: configuring a NON-active
-      // instance is legitimate (set up now, activate later). Not fatal — but say
-      // plainly the running daemon will not read it until it is made active.
-      process.stdout.write(
-        `\n⚠️  Not the ACTIVE instance: the daemon resolves ${daemonResolvedPath}, not ${configPath}. ` +
-          `The dashboard_secret set here will NOT take effect until you run ` +
-          `\`relay use-instance ${effectiveInstanceId}\` and restart the daemon.\n`,
-      );
-    } else {
-      process.stdout.write(`✓ verified: the daemon resolves this config at ${daemonResolvedPath}\n`);
-    }
+  // The pre-write check only decides whether to ABORT. After the writes the selection is RE-RESOLVED (ruling a657bee8):
+  // the advised recovery, `relay init --instance-id <the missing one>`, has just provisioned it, so it now resolves and
+  // gets the normal verify. Only a selection STILL missing takes the "not active" path.
+  let stillMissing: string | null = null;
+  if (activeMissing !== null) {
+    const again = resolveInstance({ ignoreDbPathEnv: true });
+    stillMissing = again.kind === "error" && again.unprovisioned === true ? again.reason : null;
   }
+  if (stillMissing !== null) {
+    // Configuring a NON-active instance is legitimate (set up now, activate later): the existing "not active" path.
+    process.stdout.write(
+      `\n⚠️  Not the ACTIVE instance: the active selection names a missing instance (${stillMissing}). The config ` +
+        `written here takes effect once you run \`relay use-instance ${effectiveInstanceId}\` and restart the daemon.\n`,
+    );
+  } else {
+    const daemonResolvedPath = getConfigPath();
+    const sameAsDaemon = path.resolve(daemonResolvedPath) === path.resolve(configPath);
+    if (httpEnabled) {
+      const readback = readJsonSafe(daemonResolvedPath) as Record<string, unknown> | null;
+      const secretReadable =
+        sameAsDaemon &&
+        readback !== null &&
+        typeof readback.dashboard_secret === "string" &&
+        (readback.dashboard_secret as string).length >= 32;
+      if (!secretReadable) {
+        if (!explicitInstance) {
+          // The common `relay init`: configPath IS getConfigPath() by construction,
+          // so a miss here means the write genuinely did not land — never a benign
+          // "different instance". Fail loud; do NOT let the success line stand.
+          process.stderr.write(
+            `\n✗ VERIFY FAILED: wrote ${configPath}, but the daemon's dashboard_secret is not readable at ` +
+              `its resolved path ${daemonResolvedPath}. Operator actions would 401. The write did not land as ` +
+              `expected — do NOT trust the success line above.\n`,
+          );
+          return 1;
+        }
+        // Explicit --instance-id / --multi-instance: configuring a NON-active
+        // instance is legitimate (set up now, activate later). Not fatal — but say
+        // plainly the running daemon will not read it until it is made active.
+        process.stdout.write(
+          `\n⚠️  Not the ACTIVE instance: the daemon resolves ${daemonResolvedPath}, not ${configPath}. ` +
+            `The dashboard_secret set here will NOT take effect until you run ` +
+            `\`relay use-instance ${effectiveInstanceId}\` and restart the daemon.\n`,
+        );
+      } else {
+        process.stdout.write(`✓ verified: the daemon resolves this config at ${daemonResolvedPath}\n`);
+      }
+    }
 
+  }
   if (args.configOnly) {
     process.stdout.write(`\nDone (config only). Your HTTP secret is in ${configPath}.\n`);
     return 0;
