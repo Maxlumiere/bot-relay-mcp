@@ -18,6 +18,8 @@ export async function withOffCpuWatch<T>(
 ): Promise<T> {
   const env = deps.env ?? process.env;
   if (env.RELAY_TIMING_OFFCPU !== "1") return bar();
+  // ASSUMED NOT TO THROW: `log` is called inside the catches below (console.log does not throw). A logger that can throw
+  // must be wrapped before it is passed here, or its throw would escape the boundary.
   const log = deps.log ?? ((line: string) => console.log(line));
   const why = (err: unknown) => (err instanceof Error ? err.message : String(err));
   let mod: WatchModule | null = null;
