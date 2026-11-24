@@ -78,7 +78,7 @@ jobs:
               echo "### run $i (vitest exit $rc)"
               if [ "$completed" = 0 ]; then
                 echo "INCOMPLETE run / no diagnostic output (vitest exit $rc): no DIAG A/A TERMINAL marker"
-                [ -n "$lines" ] && { echo '```'; echo "$lines"; echo '```'; }
+                if [ -n "$lines" ]; then echo '```'; echo "$lines"; echo '```'; fi
               elif printf '%s\n' "$lines" | grep -q '^BREACH '; then
                 echo '```'; echo "$lines"; echo '```'
               else
@@ -86,6 +86,7 @@ jobs:
               fi
               # Every run's BAR line (its medians: the neutrality comparison, flag on vs off) and any OFFCPU line.
               barlines=$(printf '%s\n' "$clean" | grep -E '^(BAR A/A|OFFCPU) ' || true)
-              [ -n "$barlines" ] && { echo '```'; echo "$barlines"; echo '```'; }
+              # An if, never `[ … ] && …`: under bash -e an empty list would end the collection.
+              if [ -n "$barlines" ]; then echo '```'; echo "$barlines"; echo '```'; fi
             } >> "$GITHUB_STEP_SUMMARY"
           done

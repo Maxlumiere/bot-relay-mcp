@@ -30,8 +30,10 @@ export interface ThreadSample {
   syscall: string;
   /** For a call whose first argument is a file descriptor: what that descriptor names (readlink), else absent. */
   fdTarget?: string;
-  /** The process's child pids and commands at the moment, when any (a nested-loop sync call has one). */
+  /** The process's child pids and commands at the moment, when any (a nested-loop sync call has one), or ["unavailable"]. */
   children?: string[];
+  /** The main thread recovered while this sample's reads ran: it may describe the recovered thread, never evidence. */
+  inconclusive?: boolean;
 }
 export interface StallRecord {
   startedAtMs: number;
@@ -87,48 +89,67 @@ export function parseProcSyscall(line: string, arch: string = process.arch): { s
 const WORKER_SOURCE = String.raw`
 const { workerData, parentPort } = require("node:worker_threads");
 const fs = require("node:fs");
-const { sab, tid, thresholdMs, sampleEveryMs, names, fdFirst } = workerData;
+const { sab, tid, thresholdMs, sampleEveryMs, names, fdFirst, procRoot, sampleDelayMs } = workerData;
 const beat = new BigInt64Array(sab);
 const now = () => performance.timeOrigin + performance.now();
+const base = procRoot + "/self/task/" + tid + "/";
+// A per-field read: the value, or null when the file could not be read (labelled "unavailable", never silently empty).
 const read = (p) => { try { return fs.readFileSync(p, "utf8"); } catch { return null; } };
-const stateOf = (s) => { if (!s) return "?"; const c = s.lastIndexOf(")"); const f = s.slice(c + 1).trim().split(/\s+/)[0]; return /^[A-Za-z]$/.test(f || "") ? f : "?"; };
+const stateOf = (s) => { if (s === null) return "unavailable"; const c = s.lastIndexOf(")"); const f = s.slice(c + 1).trim().split(/\s+/)[0]; return /^[A-Za-z]$/.test(f || "") ? f : "?"; };
+// Probed ONCE, up front: without a readable stat for the main thread, nothing here can be read (never "no stall").
+if (read(base + "stat") === null) { parentPort.postMessage({ unavailable: "the main thread's " + base + "stat is not readable" }); }
+else {
 const children = () => {
+  const list = read(base + "children");
+  if (list === null) return "unavailable";
   const out = [];
-  const list = read("/proc/self/task/" + tid + "/children");
-  for (const pid of (list || "").trim().split(/\s+/).filter(Boolean)) {
-    const cmd = (read("/proc/" + pid + "/cmdline") || "").split("\0").filter(Boolean).join(" ").slice(0, 120);
-    out.push(pid + " " + cmd);
+  for (const pid of list.trim().split(/\s+/).filter(Boolean)) {
+    const raw = read(procRoot + "/" + pid + "/cmdline");
+    out.push(pid + " " + (raw === null ? "(command unavailable)" : raw.split("\0").filter(Boolean).join(" ").slice(0, 120)));
   }
   return out;
 };
 const sample = (startedAt) => {
-  const base = "/proc/self/task/" + tid + "/";
-  const s = { atMs: Math.round(now() - startedAt), state: stateOf(read(base + "stat")), wchan: (read(base + "wchan") || "").trim(), syscall: "?" };
-  const line = (read(base + "syscall") || "").trim();
-  if (line === "running") s.syscall = "running";
+  const s = { atMs: Math.round(now() - startedAt), state: stateOf(read(base + "stat")), wchan: "", syscall: "?" };
+  const w = read(base + "wchan");
+  s.wchan = w === null ? "unavailable" : w.trim();
+  const raw = read(base + "syscall");
+  const line = raw === null ? null : raw.trim();
+  if (line === null) s.syscall = "unavailable";
+  else if (line === "running") s.syscall = "running";
   else if (line) {
     const parts = line.split(/\s+/);
     const nr = Number(parts[0]);
     if (Number.isInteger(nr)) {
       s.syscall = nr < 0 ? "none" : (names[nr] || ("nr" + nr));
       if (fdFirst.includes(s.syscall) && parts[1] !== undefined) {
-        try { s.fdTarget = fs.readlinkSync("/proc/self/fd/" + parseInt(parts[1], 16)); } catch { s.fdTarget = "(unreadable)"; }
+        try { s.fdTarget = fs.readlinkSync(procRoot + "/self/fd/" + parseInt(parts[1], 16)); } catch { s.fdTarget = "unavailable"; }
       }
     }
   }
   const kids = children();
-  if (kids.length > 0) s.children = kids;
+  if (kids === "unavailable") s.children = ["unavailable"];
+  else if (kids.length > 0) s.children = kids;
   return s;
 };
 const records = [];
 let stall = null;
 let lastSample = 0;
 const timer = setInterval(() => {
-  const last = Number(Atomics.load(beat, 0)) / 1000;
+  const before = Atomics.load(beat, 0);
+  const last = Number(before) / 1000;
   const t = now();
   if (t - last >= thresholdMs) {
     if (!stall) stall = { startedAtMs: last, samples: [] };
-    if (t - lastSample >= sampleEveryMs) { stall.samples.push(sample(stall.startedAtMs)); lastSample = t; }
+    if (t - lastSample >= sampleEveryMs) {
+      const s = sample(stall.startedAtMs);
+      if (sampleDelayMs > 0) { const until = now() + sampleDelayMs; while (now() < until) {} } // TESTS ONLY
+      // The heartbeat RE-CHECKED after the reads: if the main thread recovered while they ran, the sample may describe
+      // the recovered thread (an idle epoll_wait, an unrelated child), so it is marked inconclusive, never evidence.
+      if (Atomics.load(beat, 0) !== before) s.inconclusive = true;
+      stall.samples.push(s);
+      lastSample = t;
+    }
   } else if (stall) {
     stall.durationMs = Math.round(last - stall.startedAtMs);
     records.push(stall);
@@ -139,17 +160,37 @@ parentPort.on("message", (m) => {
   if (m === "drain") {
     clearInterval(timer);
     if (stall) { stall.durationMs = Math.round(now() - stall.startedAtMs); records.push(stall); }
-    parentPort.postMessage(records);
+    parentPort.postMessage({ records });
   }
 });
+}
 `;
 
+/** How long stop() waits for the worker's records before it reports the reading unavailable (never a hang). */
+export const DRAIN_DEADLINE_MS = 2000;
+
+/** A worker for the watch (a seam: the rows pass one that throws, exits early or never answers). */
+export type WorkerFactory = (source: string, workerData: unknown) => Worker;
+const defaultFactory: WorkerFactory = (source, workerData) => new Worker(source, { eval: true, workerData });
+
 /**
- * Start the watch: null without RELAY_TIMING_OFFCPU=1 (nothing is created); not supported off Linux. `env` and
- * `platform` are seams for the rows.
+ * Start the watch: null without RELAY_TIMING_OFFCPU=1 (nothing is created); not supported off Linux or off the main
+ * thread. It NEVER throws and its stop() NEVER rejects or hangs: any failure of the instrument (the worker cannot start,
+ * errors, exits before answering, or does not answer within DRAIN_DEADLINE_MS; /proc unreadable) is a labelled
+ * "unavailable" reading, so a bar's verdict can never depend on it. `env`, `platform`, `workerFactory`, `procRoot`
+ * and `sampleDelayMs` are seams for the rows.
  */
 export function startOffCpuWatch(
-  opts: { thresholdMs?: number; sampleEveryMs?: number; env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform } = {},
+  opts: {
+    thresholdMs?: number;
+    sampleEveryMs?: number;
+    env?: NodeJS.ProcessEnv;
+    platform?: NodeJS.Platform;
+    workerFactory?: WorkerFactory;
+    procRoot?: string;
+    sampleDelayMs?: number;
+    drainDeadlineMs?: number;
+  } = {},
 ): OffCpuWatch | null {
   const env = opts.env ?? process.env;
   if (env.RELAY_TIMING_OFFCPU !== "1") return null;
@@ -161,40 +202,71 @@ export function startOffCpuWatch(
   const stamp = () => Atomics.store(beat, 0, BigInt(Math.round((performance.timeOrigin + performance.now()) * 1000)));
   stamp();
   const heartbeat = setInterval(stamp, 10);
-  const worker = new Worker(WORKER_SOURCE, {
-    eval: true,
-    workerData: {
+  heartbeat.unref();
+  let worker: Worker;
+  try {
+    worker = (opts.workerFactory ?? defaultFactory)(WORKER_SOURCE, {
       sab,
       tid: process.pid,
       thresholdMs: opts.thresholdMs ?? 150,
       sampleEveryMs: opts.sampleEveryMs ?? 25,
-      names: SYSCALL_NAMES[process.arch] ?? {},
+      names: SYSTEM_NAMES_FOR_ARCH(),
       fdFirst: [...FD_FIRST],
-    },
-  });
+      procRoot: opts.procRoot ?? "/proc",
+      sampleDelayMs: opts.sampleDelayMs ?? 0,
+    });
+  } catch (err) {
+    clearInterval(heartbeat);
+    return { supported: false, why: `unavailable: the watch's worker could not start (${err instanceof Error ? err.message : String(err)})`, stop: async () => [] };
+  }
   worker.unref();
-  return {
+  // The worker's own answer, captured from the start: an early "unavailable" (no /proc), records, an error, an exit.
+  let settled: { records?: StallRecord[]; unavailable?: string } | null = null;
+  const waiters: Array<() => void> = [];
+  const settle = (v: { records?: StallRecord[]; unavailable?: string }) => {
+    if (settled === null) settled = v;
+    for (const w of waiters.splice(0)) w();
+  };
+  worker.on("message", (m: { records?: StallRecord[]; unavailable?: string }) => settle(m));
+  worker.on("error", (err: Error) => settle({ unavailable: `the watch's worker failed (${err.message})` }));
+  worker.on("exit", (code: number) => settle({ unavailable: `the watch's worker exited (code ${code}) before answering` }));
+  const watch: OffCpuWatch = {
     supported: true,
     stop: () =>
       new Promise<StallRecord[]>((resolve) => {
         clearInterval(heartbeat);
         stamp();
-        worker.once("message", (records: StallRecord[]) => {
-          void worker.terminate();
-          resolve(records);
-        });
-        worker.postMessage("drain");
+        const finish = () => {
+          clearTimeout(deadline);
+          const v = settled ?? { unavailable: `the watch's worker did not answer within ${opts.drainDeadlineMs ?? DRAIN_DEADLINE_MS} ms` };
+          if (v.unavailable !== undefined) {
+            watch.supported = false;
+            watch.why = `unavailable: ${v.unavailable}`;
+          }
+          void worker.terminate().catch(() => undefined);
+          resolve(v.records ?? []);
+        };
+        const deadline = setTimeout(finish, opts.drainDeadlineMs ?? DRAIN_DEADLINE_MS);
+        if (settled !== null) return finish();
+        waiters.push(finish);
+        try {
+          worker.postMessage("drain");
+        } catch {
+          finish();
+        }
       }),
   };
+  return watch;
 }
+const SYSTEM_NAMES_FOR_ARCH = (): Record<number, string> => SYSCALL_NAMES[process.arch] ?? {};
 
-/** One report line per stall (report-only), or the "not supported" line. */
+/** One report line per stall (report-only), the "unavailable" or "not supported" line, or a no-stall line. */
 export function offCpuLines(label: string, watch: OffCpuWatch | null, records: StallRecord[]): string[] {
   if (watch === null) return [];
   if (!watch.supported) return [`OFFCPU ${label} | ${watch.why ?? "not supported"}: no reading`];
   if (records.length === 0) return [`OFFCPU ${label} | no main-thread stall of the threshold or more`];
   return records.map((r) => {
-    const seen = r.samples.map((s) => `${s.atMs}ms ${s.state} ${s.syscall}${s.fdTarget ? ` fd→${s.fdTarget}` : ""}${s.wchan && s.wchan !== "0" ? ` wchan=${s.wchan}` : ""}${s.children ? ` children=[${s.children.join("; ")}]` : ""}`);
+    const seen = r.samples.map((s) => `${s.atMs}ms ${s.state} ${s.syscall}${s.fdTarget ? ` fd→${s.fdTarget}` : ""}${s.wchan && s.wchan !== "0" ? ` wchan=${s.wchan}` : ""}${s.children ? ` children=[${s.children.join("; ")}]` : ""}${s.inconclusive ? " (inconclusive: the thread recovered during this sample)" : ""}`);
     return `OFFCPU ${label} | stall ${r.durationMs} ms | ${seen.join(" | ") || "no sample taken"}`;
   });
 }

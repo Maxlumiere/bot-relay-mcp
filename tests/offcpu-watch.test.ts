@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { createRequire } from "node:module";
+import { Worker } from "node:worker_threads";
 import { startOffCpuWatch, offCpuLines, parseProcStat, parseProcSyscall, type StallRecord } from "./_helpers/offcpu-watch.js";
 
 const LINUX = process.platform === "linux";
@@ -102,6 +103,8 @@ describe.skipIf(!LINUX)("planted main-thread waits are NAMED as predicted (Linux
     console.log(offCpuLines("P3", w, rs).join("\n"));
     expect(stalls(rs).length, JSON.stringify(rs)).toBeGreaterThanOrEqual(1);
     expect(syscalls(stalls(rs)).some((s) => s === "clock_nanosleep" || s === "nanosleep"), JSON.stringify(rs)).toBe(true);
+    // Corroborated: the lock holder (a child of this process) is named in the samples.
+    expect(stalls(rs).flatMap((r) => r.samples.flatMap((x) => x.children ?? [])).some((c) => c.startsWith(`${holder.pid} `)), JSON.stringify(rs)).toBe(true);
   });
   it("P4: a FIFO read released by a child after 300 ms → read, and its fd names the FIFO", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "offcpu-fifo-"));
@@ -149,3 +152,90 @@ describe.skipIf(!LINUX)("negative controls (Linux)", () => {
     expect(stalls(rs), JSON.stringify(rs)).toEqual([]);
   });
 });
+
+/** A fake /proc root holding only the main thread's stat (so a stall is sampled with every other field missing). */
+function fakeProc(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "offcpu-fakeproc-"));
+  const task = path.join(root, "self", "task", String(process.pid));
+  fs.mkdirSync(task, { recursive: true });
+  fs.writeFileSync(path.join(task, "stat"), `${process.pid} (node) S 1 1 1 0 -1`);
+  return root;
+}
+const LINUX_SEAM = { env: ON, platform: "linux" as NodeJS.Platform };
+
+describe("R1: the instrument can never fail or hang the bar (every OS, through the seams)", () => {
+  it("the worker cannot START → 'unavailable', the heartbeat cleared, stop() resolves", async () => {
+    const w = startOffCpuWatch({ ...LINUX_SEAM, workerFactory: () => { throw new Error("no worker today"); } })!;
+    expect(w.supported).toBe(false);
+    expect(w.why).toMatch(/unavailable: the watch's worker could not start \(no worker today\)/);
+    expect(await w.stop()).toEqual([]);
+    expect(offCpuLines("x", w, [])[0]).toMatch(/^OFFCPU x \| unavailable: .*no reading$/);
+  });
+  it("the worker EXITS before answering → stop() resolves at once with 'unavailable … exited'", async () => {
+    const w = startOffCpuWatch({ ...LINUX_SEAM, workerFactory: () => new Worker("process.exit(3)", { eval: true }) })!;
+    await wait(200);
+    const t0 = Date.now();
+    expect(await w.stop()).toEqual([]);
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(w.why).toMatch(/unavailable: the watch's worker exited \(code 3\) before answering/);
+  });
+  it("the worker THROWS → 'unavailable … failed'", async () => {
+    const w = startOffCpuWatch({ ...LINUX_SEAM, workerFactory: () => new Worker("throw new Error('boom')", { eval: true }) })!;
+    await wait(200);
+    await w.stop();
+    expect(w.why).toMatch(/unavailable: the watch's worker failed \(boom\)/);
+  });
+  it("the worker NEVER answers → stop() resolves at its deadline with 'unavailable … did not answer', never a hang", async () => {
+    const w = startOffCpuWatch({ ...LINUX_SEAM, drainDeadlineMs: 300, workerFactory: () => new Worker("setInterval(() => {}, 1000)", { eval: true }) })!;
+    const t0 = Date.now();
+    expect(await w.stop()).toEqual([]);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(280);
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(w.why).toMatch(/did not answer within 300 ms/);
+  });
+});
+
+describe("R1: unavailable evidence is LABELLED, never silently collapsed (every OS, a fake /proc)", () => {
+  it("/proc unreadable → 'unavailable … stat is not readable', NEVER 'no main-thread stall'", async () => {
+    const w = startOffCpuWatch({ ...LINUX_SEAM, procRoot: path.join(os.tmpdir(), "offcpu-no-such-proc-" + process.pid) })!;
+    await wait(200);
+    await w.stop();
+    const lines = offCpuLines("x", w, []);
+    expect(lines[0]).toMatch(/unavailable: .*stat is not readable/);
+    expect(lines.join("\n")).not.toMatch(/no main-thread stall/);
+  });
+  it("a stall sampled with wchan, syscall and children unreadable → each field labelled 'unavailable'", async () => {
+    const root = fakeProc();
+    const w = startOffCpuWatch({ ...LINUX_SEAM, procRoot: root })!;
+    await wait(50);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+    await wait(50);
+    const rs = await w.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+    const samples = stalls(rs).flatMap((r) => r.samples);
+    expect(samples.length, JSON.stringify(rs)).toBeGreaterThanOrEqual(1);
+    for (const x of samples) {
+      expect(x.state).toBe("S"); // the fake stat
+      expect(x.wchan).toBe("unavailable");
+      expect(x.syscall).toBe("unavailable");
+      expect(x.children).toEqual(["unavailable"]);
+    }
+  });
+});
+
+describe("R1: a sample that overlaps the recovery is INCONCLUSIVE (every OS, a fake /proc, a slowed sample)", () => {
+  it("a 200 ms stall, its first sample's reads stretched by 150 ms past the recovery → that sample is marked inconclusive", async () => {
+    const root = fakeProc();
+    const w = startOffCpuWatch({ ...LINUX_SEAM, procRoot: root, sampleDelayMs: 150 })!;
+    await wait(50);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    await wait(300);
+    const rs = await w.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+    const samples = rs.flatMap((r) => r.samples);
+    expect(samples.length, JSON.stringify(rs)).toBeGreaterThanOrEqual(1);
+    expect(samples.some((x) => x.inconclusive === true), JSON.stringify(rs)).toBe(true);
+    expect(offCpuLines("x", w, rs).join("\n")).toMatch(/inconclusive: the thread recovered during this sample/);
+  });
+});
+
