@@ -193,6 +193,18 @@ export async function runArmCheck(agent: string): Promise<number> {
     emitLine(`no-mail: refused (not_watchable): ${JSON.stringify(agent)} cannot have a watch`);
     return 2;
   }
+  // PR 8a: the WAKE POLICY, before anything else is decided. No valid policy means no wakes: refuse loudly, never
+  // arm a watch that can wake nobody. An agent the policy does not opt in is refused the same way.
+  const { readWakePolicy } = await import("../wake-policy.js");
+  const policy = readWakePolicy(path.dirname(dbPath));
+  if (!policy.ok) {
+    emitLine(`no-mail: wake policy unreadable (${policy.why}). Do not start a watch for ${agent}.`);
+    return 2;
+  }
+  if (!policy.file.optIn.includes(agent)) {
+    emitLine(`no-mail: refused (not_opted_in): ${agent} is not opted in to wakes by this relay's doorbell policy. Do not start a watch for ${agent}.`);
+    return 2;
+  }
   const { openRelayDbIfWritten } = await import("../doorbell-run.js");
   const r = await openRelayDbIfWritten(dbPath);
   if ("waiting" in r) {
@@ -353,7 +365,7 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
   const { currentWakePolicy } = await import("../wake-policy.js");
   const { acquireInstanceLock, lockStillOurs, releaseInstanceLock } = await import("../doorbell-lock.js");
   const { ensurePrivateDir } = await import("../doorbell-log.js");
-  const { pendingMetadata } = await import("../db.js");
+  const { pendingMetadata, agentRegistered } = await import("../db.js");
   const O = await import("../watch-owner.js");
   const ownHost = me.host_id;
   const ownerDeps = await realOwnerDeps(ownHost);
@@ -526,7 +538,9 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
         const meta = new Map(m.messages.map((x) => [x.id, { from: x.from, lane: "direct" as const }]));
         const read = { registered: true, reading_session: m.reading_session, ids: m.messages.map((x) => x.id), meta };
         const woken = W.readWoken(dir);
-        const d = W.decideWake(read, agent, woken, t, currentWakePolicy());
+        // PR 8a: the instance's policy, re-read at every check (a file made invalid while the watch runs wakes nobody).
+        const reader = db; // the handle this check read with (the closure below must not see a later reassignment)
+        const d = W.decideWake(read, agent, woken, t, currentWakePolicy(dbPath, (name) => agentRegistered(reader, name)));
         if (d.wake.length === 0) return; // nothing new to wake for (or a NULL session: keep waiting)
         const senders = d.wake.flatMap((id) => (meta.get(id)?.from ? [meta.get(id)!.from as string] : []));
         if (!rightful()) return;

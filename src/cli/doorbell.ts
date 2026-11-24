@@ -40,15 +40,22 @@ interface Args {
   hook: boolean;
   dbPath: string | null;
   help: boolean;
+  /** PR 8a: `relay doorbell policy --check` (read-only) instead of `status`. */
+  policyCheck: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const a: Args = { json: false, hook: false, dbPath: null, help: false };
+  const a: Args = { json: false, hook: false, dbPath: null, help: false, policyCheck: false };
   const [sub, ...rest] = argv;
   if (sub === "--help" || sub === "-h" || sub === "help") return { ...a, help: true };
-  if (sub !== "status") throw new Error(sub ? `unknown subcommand ${JSON.stringify(sub)} (only: status)` : "a subcommand is required (status)");
+  if (sub !== "status" && sub !== "policy") throw new Error(sub ? `unknown subcommand ${JSON.stringify(sub)} (only: status, policy --check)` : "a subcommand is required (status, policy --check)");
+  if (sub === "policy") {
+    a.policyCheck = true;
+    if (!rest.includes("--check")) throw new Error("policy needs --check (it only reads the file; the writer is not part of this command)");
+  }
   for (let i = 0; i < rest.length; i++) {
     const t = rest[i];
+    if (t === "--check" && a.policyCheck) continue;
     if (t === "--json") a.json = true;
     else if (t === "--hook") a.hook = true;
     else if (t === "--db-path") {
@@ -64,13 +71,17 @@ function parseArgs(argv: string[]): Args {
 
 function usage(requested = false): void {
   const text =
-    "Usage: relay doorbell status [--json | --hook] [--db-path P]\n\n" +
+    "Usage: relay doorbell status [--json | --hook] [--db-path P]\n" +
+    "       relay doorbell policy --check [--db-path P]\n\n" +
     "Is the doorbell job alive (healthy / stale / not-installed / disabled), on which build\n" +
     "(CURRENT / STALE / UNKNOWN / INSTALL INCONSISTENT), in what condition (ok /\n" +
     "waiting-for-writer / log-full / failing), and with which OPEN escalations (metadata\n" +
     "only). Read-only.\n\n" +
     "  --json   Emit JSON.\n" +
     "  --hook   Print exactly what the SessionStart hook shows (nothing when all is well).\n\n" +
+    "policy --check: read the wake policy (<instance dir>/doorbell-policy.json) and print whether it is\n" +
+    "valid, with its counts, or policy_invalid and why (no agent can be woken then). Writes nothing.\n" +
+    "Exit 0 = valid, 1 = invalid or unreadable.\n\n" +
     "Exit: 0 = read OK · 1 = unreadable (stdout empty) · 2 = usage · 3 = no local relay instance.\n";
   if (requested) process.stdout.write(text);
   else process.stderr.write(text);
@@ -137,6 +148,14 @@ export interface DoorbellStatus {
   wake_coverage:
     | { state: "read"; generated_at: string; findings: Array<{ agent: string; verdict: string; class: "alarm" | "report" | "unjudged"; pending_count: number | null; oldest_age_seconds: number | null; reason?: string }> }
     | { state: "unknown" };
+  /** PR 8a: the wake policy's state: valid, or policy_invalid with a content-free why (no agent can be woken then). */
+  policy: { state: "valid" } | { state: "policy_invalid"; why: string };
+  /**
+   * PR 8a: mail HELD by the policy, per agent, never silent: for an OPTED-IN agent, its pending mail from senders
+   * without standing (no_standing); while the policy is invalid, the pending mail of every agent with a LIVE watch
+   * (policy_invalid). Counts and the oldest age only.
+   */
+  held: Record<string, { reason: "no_standing" | "policy_invalid"; count: number; oldest_age_seconds: number }>;
   /** PR 6: the agents the job's LAST cycle could not evaluate (a hold is never silent); null when it planned no cycle. */
   not_evaluated: { count: number; names: string[] } | null;
   /** Who last took the instance lock, from its NON-authoritative sidecar (display only; the lock itself is kernel-held). */
@@ -151,7 +170,27 @@ export interface DoorbellStatus {
  * F1 (ruling b556c011): waiting-for-writer is silent only WITHIN its grace (waitingGraceMs); beyond
  * it, it is ONE line naming the likely cause, since no relay process holds the DB.
  */
+/**
+ * PR 8a: the policy lines. QUIET before the rollout (no file and no live watch): a missing file is the state of
+ * every relay until a policy is installed. LOUD when a file exists but is invalid, or when any live watch cannot
+ * wake because of it, and for held mail.
+ */
+export function policyLines(st: DoorbellStatus): string[] {
+  const lines: string[] = [];
+  const stuck = Object.entries(st.held).filter(([, h]) => h.reason === "policy_invalid");
+  if (st.policy.state === "policy_invalid" && (st.policy.why !== "missing" || stuck.length > 0)) {
+    lines.push(`[RELAY] doorbell policy: policy_invalid (${st.policy.why}): no agent can be woken${stuck.length ? `; live watches that cannot wake: ${stuck.map(([a, h]) => `${a} (${h.count} pending, oldest ${shortAge(h.oldest_age_seconds)})`).join(", ")}` : ""}`);
+  }
+  const noStanding = Object.entries(st.held).filter(([, h]) => h.reason === "no_standing");
+  if (noStanding.length) lines.push(`[RELAY] doorbell policy: mail held (no standing to wake): ${noStanding.map(([a, h]) => `${a} ${h.count}, oldest ${shortAge(h.oldest_age_seconds)}`).join("; ")}`);
+  return lines;
+}
+
 export function hookLines(st: DoorbellStatus): string[] {
+  return [...policyLines(st), ...supervisorLines(st)];
+}
+
+function supervisorLines(st: DoorbellStatus): string[] {
   if (st.state === "not-installed") return [];
   const hb = st.heartbeat;
   const waitingTooLong = st.condition === "waiting-for-writer" && !!hb && hb.condition_age_ms > waitingGraceMs(hb.interval_ms);
@@ -214,6 +253,69 @@ async function readWakeCoverage(): Promise<DoorbellStatus["wake_coverage"]> {
       };
     }),
   };
+}
+
+/**
+ * PR 8a: the policy's state and the HELD mail (read-only; the job's own no-sidecar open). Valid: each opted-in
+ * agent's pending mail from senders without standing. Invalid: the pending mail of each agent whose watch is LIVE
+ * (it is armed and cannot wake). An unopenable DB holds nothing back: held is then empty, the policy state stands.
+ */
+async function readPolicyAndHeld(dbPath: string): Promise<{ policy: DoorbellStatus["policy"]; held: DoorbellStatus["held"] }> {
+  const { readWakePolicy, policyStanding } = await import("../wake-policy.js");
+  const read = readWakePolicy(path.dirname(dbPath));
+  const policy: DoorbellStatus["policy"] = read.ok ? { state: "valid" } : { state: "policy_invalid", why: read.why };
+  const held: DoorbellStatus["held"] = {};
+  const { openRelayDbIfWritten } = await import("../doorbell-run.js");
+  const { pendingMetadata, agentRegistered } = await import("../db.js");
+  let opened: Awaited<ReturnType<typeof openRelayDbIfWritten>>;
+  try {
+    opened = await openRelayDbIfWritten(dbPath);
+  } catch {
+    return { policy, held };
+  }
+  if ("waiting" in opened) return { policy, held };
+  const db = opened.db;
+  try {
+    if (read.ok) {
+      const standing = policyStanding(read.file, (n) => agentRegistered(db, n));
+      for (const agent of [...new Set(read.file.optIn)].sort()) {
+        const refused = pendingMetadata(db, agent).messages.filter((m) => standing({ sender: m.from, recipient: agent, kind: "direct", id: m.id }) !== "allowed");
+        if (refused.length) held[agent] = { reason: "no_standing", count: refused.length, oldest_age_seconds: Math.max(...refused.map((m) => m.age_seconds)) };
+      }
+    } else {
+      const { agentWatchStatus } = await import("./watch-until-wake.js");
+      const W = await import("../watch-wake.js");
+      const root = path.join(path.dirname(dbPath), "watch");
+      let names: string[] = [];
+      try {
+        names = fs.readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory() && W.watchableName(e.name)).map((e) => e.name).sort();
+      } catch {
+        /* no watch dir: no watch was ever armed here */
+      }
+      for (const agent of names) {
+        if ((await agentWatchStatus(db, dbPath, agent)) !== "live") continue;
+        const msgs = pendingMetadata(db, agent).messages;
+        if (msgs.length) held[agent] = { reason: "policy_invalid", count: msgs.length, oldest_age_seconds: Math.max(...msgs.map((m) => m.age_seconds)) };
+      }
+    }
+  } catch {
+    /* a read fault holds nothing back here; the policy state stands */
+  } finally {
+    db.close();
+  }
+  return { policy, held };
+}
+
+/** `relay doorbell policy --check`: read the policy, print its verdict. Writes nothing. */
+async function runPolicyCheck(dbPath: string): Promise<number> {
+  const { readWakePolicy } = await import("../wake-policy.js");
+  const r = readWakePolicy(path.dirname(dbPath));
+  if (!r.ok) {
+    process.stdout.write(`[RELAY] doorbell policy: policy_invalid (${r.why}): no agent can be woken\n`);
+    return 1;
+  }
+  process.stdout.write(`[RELAY] doorbell policy: valid (${r.file.optIn.length} agent(s) opted in, ${r.file.wake.length} wake pair(s), ${r.file.pairWakesPerHour} wake(s) per pair per hour)\n`);
+  return 0;
 }
 
 /** Read the status for a resolved DB path. Throws on anything unreadable (the caller exits 1). */
@@ -295,9 +397,10 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
   const openBoardCasesLive: DoorbellStatus["open_board_cases_live"] = live.ok ? { ok: true } : { ok: false, why: live.why };
   const dormantWatches = await countDormantWatches(dbPath);
   const wakeCoverage = await readWakeCoverage();
+  const { policy, held } = await readPolicyAndHeld(dbPath);
 
   if (hb.kind === "absent") {
-    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, open_board_cases: openBoardCases, open_board_cases_live: openBoardCasesLive, dormant_watches: dormantWatches.live, dormant_watches_unknown: dormantWatches.unknown, wake_coverage: wakeCoverage, not_evaluated: null, holder, state_dir: stateDir, db_path: dbPath, resolution };
+    return { ok: true, state: "not-installed", why: `no heartbeat in ${stateDir}`, build: null, condition: null, heartbeat: null, escalations: { open: items.length, items }, open_board_cases: openBoardCases, open_board_cases_live: openBoardCasesLive, dormant_watches: dormantWatches.live, dormant_watches_unknown: dormantWatches.unknown, wake_coverage: wakeCoverage, policy, held, not_evaluated: null, holder, state_dir: stateDir, db_path: dbPath, resolution };
   }
   const h = hb.heartbeat;
   const judged = judgeHeartbeat(h, nowWall);
@@ -335,6 +438,8 @@ export async function readDoorbellStatus(dbPath: string, resolution: Record<stri
     dormant_watches: dormantWatches.live,
     dormant_watches_unknown: dormantWatches.unknown,
     wake_coverage: wakeCoverage,
+    policy,
+    held,
     not_evaluated: h.not_evaluated,
     holder,
     state_dir: stateDir,
@@ -368,6 +473,7 @@ export async function run(argv: string[]): Promise<number> {
     return EXIT_NO_LOCAL;
   }
   if (source.kind === "ambiguous" || source.kind === "unreadable") return failed(source.reason);
+  if (args.policyCheck) return await runPolicyCheck(source.dbPath);
   let st: DoorbellStatus;
   try {
     const { serializeResolution } = await import("../instance.js");
@@ -380,7 +486,7 @@ export async function run(argv: string[]): Promise<number> {
     const lines = hookLines(st);
     if (lines.length > 0) process.stdout.write(lines.join("\n") + "\n");
   } else {
-    process.stdout.write(`[RELAY] doorbell: ${st.state} (${st.why})${st.build ? `, build ${st.build.verdict}` : ""}${st.condition ? `, ${st.condition}` : ""}, ${st.escalations.open} open escalation(s), ${st.open_board_cases.length} open board case(s)${Object.keys(st.dormant_watches).length ? `, dormant watches: ${Object.entries(st.dormant_watches).map(([a, n]) => `${a}=${n}`).join(" ")}` : ""}${Object.keys(st.dormant_watches_unknown).length ? `, dormant watches that cannot be judged now: ${Object.entries(st.dormant_watches_unknown).map(([a, n]) => `${a}=${n}`).join(" ")}` : ""}${st.wake_coverage.state === "read" && st.wake_coverage.findings.length ? `, wake-coverage: ${st.wake_coverage.findings.map((f) => `${f.agent}=${f.verdict}${f.reason ? `(${f.reason})` : ""}`).join(" ")}` : ""}\n`);
+    process.stdout.write(`[RELAY] doorbell: ${st.state} (${st.why})${st.build ? `, build ${st.build.verdict}` : ""}${st.condition ? `, ${st.condition}` : ""}, ${st.escalations.open} open escalation(s), ${st.open_board_cases.length} open board case(s)${Object.keys(st.dormant_watches).length ? `, dormant watches: ${Object.entries(st.dormant_watches).map(([a, n]) => `${a}=${n}`).join(" ")}` : ""}${Object.keys(st.dormant_watches_unknown).length ? `, dormant watches that cannot be judged now: ${Object.entries(st.dormant_watches_unknown).map(([a, n]) => `${a}=${n}`).join(" ")}` : ""}${st.wake_coverage.state === "read" && st.wake_coverage.findings.length ? `, wake-coverage: ${st.wake_coverage.findings.map((f) => `${f.agent}=${f.verdict}${f.reason ? `(${f.reason})` : ""}`).join(" ")}` : ""}, policy ${st.policy.state === "valid" ? "valid" : `policy_invalid (${st.policy.why})`}${Object.keys(st.held).length ? `, held: ${Object.entries(st.held).map(([a, h]) => `${a}=${h.count} (${h.reason})`).join(" ")}` : ""}\n`);
   }
   return 0;
 }

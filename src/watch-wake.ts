@@ -36,8 +36,8 @@ import { AGENT_NAME_PATTERN } from "./types.js";
 export { watchableName, watchAgentDir } from "./watch-paths.js";
 import { watchAgentDir } from "./watch-paths.js";
 
-import { ALLOW_ALL, DEFAULT_PAIR_WAKES_PER_HOUR, PAIR_WINDOW_MS, pairKey, type StandingCheck, type WakeMeta } from "./wake-policy.js";
-export { ALLOW_ALL, DEFAULT_PAIR_WAKES_PER_HOUR, PAIR_WINDOW_MS, pairKey, type StandingCheck, type WakeMeta };
+import { DEFAULT_PAIR_WAKES_PER_HOUR, PAIR_WINDOW_MS, pairKey, type StandingCheck, type WakeMeta } from "./wake-policy.js";
+export { DEFAULT_PAIR_WAKES_PER_HOUR, PAIR_WINDOW_MS, pairKey, type StandingCheck, type WakeMeta };
 
 /** The persisted state for ONE agent's watch: what it already woke for, in which session, and recent wakes. */
 export interface WokenState {
@@ -73,15 +73,16 @@ export function decideWake(
   recipient: string,
   woken: WokenState | null,
   now: number,
-  policy: { standing?: StandingCheck; pairWakesPerHour?: number } = {},
+  // REQUIRED (PR 8a): the caller names its policy; there is no default (no implicit allow-all).
+  policy: { standing: StandingCheck; pairWakesPerHour: number },
 ): WakeDecision {
   const out: WakeDecision = { wake: [], refused: {}, pairCapped: 0, hold: false };
   if (!read.registered) return out;
   if (read.reading_session === null) return { ...out, hold: true }; // V4: no wake YET, keep waiting
   const prior = woken && woken.reading_session === read.reading_session ? woken : null;
   const already = new Set(prior?.ids ?? []);
-  const standing = policy.standing ?? ALLOW_ALL;
-  const budget = policy.pairWakesPerHour ?? DEFAULT_PAIR_WAKES_PER_HOUR;
+  const standing = policy.standing;
+  const budget = policy.pairWakesPerHour;
   const inHour = new Map<string, number>();
   for (const w of prior?.wakes ?? []) {
     if (now - w.at >= PAIR_WINDOW_MS) continue;

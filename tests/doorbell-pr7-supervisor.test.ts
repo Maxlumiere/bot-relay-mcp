@@ -20,6 +20,7 @@ import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { openWindow, within, type TestWindow } from "./helpers/watch-window.js";
 import { startToken } from "./helpers/start-token.js";
+import { installOpenPolicy } from "./_helpers/wake-policy-file.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO, "bin", "relay");
@@ -79,6 +80,7 @@ describe.skipIf(!OWN)("PR 7: the doorbell supervises the watch (the real job, a 
     db.getDb();
     db.registerAgent("s7-sender", "s", []);
     db.registerAgent("s7-alice", "r", []);
+    installOpenPolicy(path.join(ROOT, "inst"), ["s7-alice", "s7-sender"]); // PR 8a: no policy means no wakes
     win = openWindow(path.join(ROOT, `win-${Date.now()}`), env());
     windows.push(win);
     bindWindow("s7-alice", win.pid);

@@ -322,3 +322,25 @@ describe.skipIf(!OWN)("the --until-wake watch honours the policy (real windows)"
     expect(j.held["p-bob"]).toMatchObject({ reason: "policy_invalid", count: 1 });
   }, 40_000);
 });
+
+describe("the SessionStart lines (policyLines): QUIET before the rollout, LOUD after", () => {
+  const st = (policy: object, held: object) => ({ policy, held }) as unknown as import("../src/cli/doorbell.js").DoorbellStatus;
+  it("no file and no live watch (every relay before the rollout) → silent", async () => {
+    const S = await import("../src/cli/doorbell.js");
+    expect(S.policyLines(st({ state: "policy_invalid", why: "missing" }, {}))).toEqual([]);
+  });
+  it("a file that EXISTS but is invalid → one line, even with no watch", async () => {
+    const S = await import("../src/cli/doorbell.js");
+    expect(S.policyLines(st({ state: "policy_invalid", why: "schema: unexpected field" }, {}))).toEqual(["[RELAY] doorbell policy: policy_invalid (schema: unexpected field): no agent can be woken"]);
+  });
+  it("missing BUT a live watch cannot wake → one line naming it, with its count and oldest age", async () => {
+    const S = await import("../src/cli/doorbell.js");
+    expect(S.policyLines(st({ state: "policy_invalid", why: "missing" }, { "p-bob": { reason: "policy_invalid", count: 2, oldest_age_seconds: 90 } }))).toEqual([
+      "[RELAY] doorbell policy: policy_invalid (missing): no agent can be woken; live watches that cannot wake: p-bob (2 pending, oldest 90s)",
+    ]);
+  });
+  it("held mail with no standing (valid policy) → one line", async () => {
+    const S = await import("../src/cli/doorbell.js");
+    expect(S.policyLines(st({ state: "valid" }, { "p-bob": { reason: "no_standing", count: 1, oldest_age_seconds: 30 } }))).toEqual(["[RELAY] doorbell policy: mail held (no standing to wake): p-bob 1, oldest 30s"]);
+  });
+});

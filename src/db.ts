@@ -6973,6 +6973,11 @@ export function agentsWithPendingMail(db: CompatDatabase): string[] {
  * `contentFor: N` (OPT-IN, SessionStart delivery only) adds the decrypted body to
  * the first N messages in drain order, from the same statement.
  */
+/** PR 8a: is `name` a registered agent in THIS relay DB (read-only; for the wake policy's one wildcard)? */
+export function agentRegistered(db: CompatDatabase, name: string): boolean {
+  return db.prepare("SELECT 1 FROM agents WHERE name = ?").get(name) !== undefined;
+}
+
 export function pendingMetadata(
   db: CompatDatabase,
   agentName: string,
