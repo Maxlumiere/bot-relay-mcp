@@ -166,16 +166,25 @@ HOOK_INPUT=""
 _line=""
 _capped=0
 _ended=0
+_cut=0
 if relay_budget_for "the hook payload read" 2 margin; then
+  _cut=1 # until the payload ENDS (EOF) or reaches the cap, the read was cut by its deadline
   _stdin_end=$(( SECONDS + RELAY_STEP_SECS ))
   while [ "$SECONDS" -lt "$_stdin_end" ]; do
     if IFS= read -r -t "$(( _stdin_end - SECONDS ))" _line 2>/dev/null; then
       HOOK_INPUT="${HOOK_INPUT}${_line}"
       if [ ${#HOOK_INPUT} -ge 262144 ]; then
         _capped=1
+        _cut=0
         break
       fi
     else
+      # read's own TIMEOUT is the deadline, so still a cut; otherwise EOF: the payload is whole. bash >= 4 reports a
+      # timeout as rc > 128; bash 3.2 (macOS) reports rc 1, as for EOF, so the deadline itself decides there:
+      # SECONDS counts whole wall-clock seconds, so after a timeout of N seconds it is at least _stdin_end. (An EOF
+      # landing in the deadline's very second is named a cut too: the stop is not blocked either way.)
+      _rc=$?
+      [ "$_rc" -gt 128 ] || [ "$SECONDS" -ge "$_stdin_end" ] || _cut=0
       _ended=1
       break
     fi
@@ -190,6 +199,16 @@ if [ "$_ended" -eq 1 ]; then
   HOOK_INPUT="${HOOK_INPUT}${_line}"
 fi
 HOOK_INPUT="${HOOK_INPUT:0:262144}"
+# A read cut by its deadline is NAMED, as PostToolUse names it: an incomplete payload cannot be judged, so the stop is
+# never blocked and the mail stays pending (the fail-safe below would give the same outcome, but silently).
+# The name is not validated yet: it goes into the verdict line only when it passes the same allowlist used below
+# (a newline in it must never forge a second verdict line).
+if [ "$_cut" -eq 1 ]; then
+  _cut_agent=""
+  [[ "${RELAY_AGENT_NAME:-}" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] && _cut_agent=" agent=\"${RELAY_AGENT_NAME}\""
+  command -v relay_verdict_set >/dev/null 2>&1 && relay_verdict_set "CANNOT-JUDGE" "hook stdin not complete within its time budget: stop check skipped (mail left pending)" "$_cut_agent"
+  exit 0
+fi
 # Guard modes, decided by what the payload PROVES (fail-safe in every branch —
 # suppression always leaves mail PENDING for the floor; nothing here writes):
 #   active   → this stop is already our forced continuation: one wake per
