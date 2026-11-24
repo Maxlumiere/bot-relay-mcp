@@ -689,6 +689,9 @@ describe("#286 P-a — no time budget left: the read is skipped, LOUD, never flo
   // by the relay_pending_deadline row above and the SessionStart row.)
   // REAL CLOCK ONLY: the cut is the payload's REAL arrival time (a writer that dribbles for ~2.6 s), which a fixed clock
   // cannot see. So it runs through runHookRealBudgetAsync, which asserts the cut it prints.
+  // MUTATION NOTE: raising the payload read's own cap from 2 to 3 s is an EQUIVALENT mutant on the production budget
+  // (the share is min(3, 5 - 3) = 2 s): this row stays green under it, correctly; do not re-add it as a RED. The
+  // production-visible mutant is the payload read losing its deadline (it then waits for EOF): that turns this row red.
   it("PostToolUse: a slow hook stdin is CUT at its budget share → CANNOT-JUDGE 'not complete within its time budget', inside 5s, the mail read never started", async () => {
     await runHookRealBudgetAsync({
       label: "PostToolUse slow stdin",
