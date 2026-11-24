@@ -67,6 +67,8 @@ describe("the layout test, pure (the case-insensitivity seam): component by comp
       expect(instanceDirOfDbPath(path.join(instancesRoot(), "stale", "other.db"), instancesRoot(), { caseInsensitive })).toBeNull();
       expect(instanceDirOfDbPath(path.join(instancesRoot(), "stale", "deeper", "relay.db"), instancesRoot(), { caseInsensitive })).toBeNull();
       expect(instanceDirOfDbPath(path.join(relayRoot(), "instances-old", "stale", "relay.db"), instancesRoot(), { caseInsensitive })).toBeNull();
+      // a parent SHORTER than the root (the relay home itself, a prefix of instances/) is not the layout either
+      expect(instanceDirOfDbPath(path.join(relayRoot(), "stale", "relay.db"), instancesRoot(), { caseInsensitive })).toBeNull();
     }
   });
 });
