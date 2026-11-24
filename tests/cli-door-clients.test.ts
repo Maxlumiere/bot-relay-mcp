@@ -1114,14 +1114,14 @@ if (!REMOTE_IP) process.stderr.write("[cli-door-clients] fake-remote whoami rows
 
 describe.skipIf(!REMOTE_IP)("#444 R1, black box against a FAKE REMOTE relay (security review's twins; MEASURED: the remote's own log)", () => {
   /** A fake remote /mcp that records every request and answers with `reply`. */
-  async function fakeRemote(reply: (res: http.ServerResponse) => void) {
+  async function fakeRemote(reply: (res: http.ServerResponse, req: { url?: string; method?: string }) => void) {
     const reqs: Array<{ url?: string; headers: http.IncomingHttpHeaders; body: string }> = [];
     const server = http.createServer((req, res) => {
       let body = "";
       req.on("data", (d) => (body += d));
       req.on("end", () => {
         reqs.push({ url: req.url, headers: req.headers, body });
-        reply(res);
+        reply(res, { url: req.url, method: req.method });
       });
     });
     const port = await new Promise<number>((resolve) => server.listen(0, "0.0.0.0", () => resolve((server.address() as AddressInfo).port)));
@@ -1144,8 +1144,8 @@ describe.skipIf(!REMOTE_IP)("#444 R1, black box against a FAKE REMOTE relay (sec
     const c = remoteCase("whoami-twin1", f.port);
     const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN }), ["whoami"]);
     expect(r.status, r.stderr).toBe(2);
-    expect(f.reqs.filter((q) => q.url !== "/health"), "the remote received no tool call").toEqual([]);
-    expect(f.reqs.map((q) => JSON.stringify(q)).join(""), "the local token never reached the remote").not.toContain(LOCAL_TOKEN);
+    expect(f.reqs, "ZERO requests reached the remote (a token-less /health counts)").toEqual([]);
+    expect(r.stdout + r.stderr, "the token is in neither stream").not.toContain(LOCAL_TOKEN);
     await f.close();
   }, 60_000);
 
@@ -1154,7 +1154,8 @@ describe.skipIf(!REMOTE_IP)("#444 R1, black box against a FAKE REMOTE relay (sec
     const c = remoteCase("whoami-twin2", f.port);
     const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN, RELAY_AGENT_NAME: AGENT }), ["whoami"]);
     expect(r.status, r.stderr).toBe(2);
-    expect(f.reqs.map((q) => JSON.stringify(q)).join("")).not.toContain(LOCAL_TOKEN);
+    expect(f.reqs, "ZERO requests reached the remote").toEqual([]);
+    expect(r.stdout + r.stderr).not.toContain(LOCAL_TOKEN);
     await f.close();
   }, 60_000);
 
@@ -1181,6 +1182,9 @@ describe.skipIf(!REMOTE_IP)("#444 R1, black box against a FAKE REMOTE relay (sec
       const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN, RELAY_HTTP_HOST: REMOTE_IP! }), ["whoami"]);
       expect(r.status).not.toBe(0);
       expect(r.stdout + r.stderr, r.stderr).not.toContain(LOCAL_TOKEN);
+      // A TOOL refusal reads through the closed-set helper; a transport failure (the 302) reads as "could not reach".
+      if (label.startsWith("an error body")) expect(r.stderr).toContain("the remote relay refused (HTTP 200, auth_error");
+      if (label.startsWith("a 302")) expect(r.stderr).toContain("could not reach the relay");
       await f.close();
     }, 60_000);
   }
@@ -1221,5 +1225,70 @@ describe.skipIf(!REMOTE_IP)("#444 R1, black box against a FAKE REMOTE relay (sec
       await f.close();
     }, 60_000);
   }
+
+  // #444 R2 (rulings c195b57f, 9533449d, d559d33f)
+  const healthOk = (version = "0.0.0-fake") => (res: http.ServerResponse) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ status: "ok", version, protocol_version: "2.4.0" })); };
+
+  it("doctor --remote: the env token is bound to <ip>:<another port> → the hub at <ip>:<port> is refused BEFORE ANY REQUEST (zero at the fake, not even /health); the token is in neither stream", async () => {
+    const f = await fakeRemote(healthOk());
+    const c = newCase("doctor-port-bind");
+    seedNativeDb(c);
+    const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_HOST: REMOTE_IP!, RELAY_HTTP_PORT: String(f.port + 1), RELAY_AGENT_TOKEN: LOCAL_TOKEN }), ["doctor", "--remote", `http://${REMOTE_IP}:${f.port}`]);
+    expect(r.status, r.stderr).toBe(2);
+    expect(f.reqs, "ZERO requests at the fake").toEqual([]);
+    expect(r.stdout + r.stderr).not.toContain(LOCAL_TOKEN);
+    expect(r.stderr).toContain("refusing before any request");
+    await f.close();
+  }, 60_000);
+
+  it("doctor --remote to the RESOLVED endpoint itself (the env's host and port) is ACCEPTED: it connects and presents the env token", async () => {
+    const f = await fakeRemote((res, req) => {
+      if (req.url === "/health") return healthOk()(res);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify({ status: "ok", agent_name: "hub-agent", auth_state: "active" }) }] } }));
+    });
+    const c = newCase("doctor-port-ok");
+    seedNativeDb(c);
+    const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_HOST: REMOTE_IP!, RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN }), ["doctor", "--remote", `http://${REMOTE_IP}:${f.port}`]);
+    expect(f.reqs.some((q) => q.headers["x-agent-token"] === LOCAL_TOKEN), `the bound endpoint got the token\n${r.stdout}${r.stderr}`).toBe(true);
+    expect(r.stdout).toMatch(/PASS\s+token auth: accepted \(agent=hub-agent, auth_state=active\)/);
+    await f.close();
+  }, 60_000);
+
+  it("doctor --remote: an auth_error body ECHOING the token and a hostile /health version → status + closed-set code only; the token is in neither stream", async () => {
+    const f = await fakeRemote((res, req) => {
+      if (req.url === "/health") return healthOk(`1.0 ${LOCAL_TOKEN}`)(res);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify({ auth_error: true, error: `bad token ${LOCAL_TOKEN}` }) }] } }));
+    });
+    const c = newCase("doctor-echo");
+    seedNativeDb(c);
+    const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_HOST: REMOTE_IP!, RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN }), ["doctor", "--remote", `http://${REMOTE_IP}:${f.port}`]);
+    expect(r.stdout + r.stderr, r.stdout).not.toContain(LOCAL_TOKEN);
+    expect(r.stdout).toMatch(/token auth: RELAY_AGENT_TOKEN rejected by hub: the remote relay refused \(HTTP 200, auth_error;/);
+    expect(r.stdout).toContain("version=(unrecognised)");
+    await f.close();
+  }, 60_000);
+
+  it("relay send: a remote success:false reply renders through the closed-set helper (not 'no usable message_id'); the token is in neither stream", async () => {
+    const f = await fakeRemote((res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ success: false, error: `bad token ${LOCAL_TOKEN}` })); });
+    const c = remoteCase("send-success-false", f.port);
+    const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN, RELAY_HTTP_HOST: REMOTE_IP! }), ["send", "pr4-peer", "hi", "--from", AGENT]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("the remote relay refused (HTTP 200");
+    expect(r.stderr).not.toContain("no usable message_id");
+    expect(r.stdout + r.stderr).not.toContain(LOCAL_TOKEN);
+    await f.close();
+  }, 60_000);
+
+  it("relay send: a remote 200 reply WITHOUT success:true (an empty object) also renders through the helper, never 'no usable message_id'", async () => {
+    const f = await fakeRemote((res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end("{}"); });
+    const c = remoteCase("send-no-success", f.port);
+    const r = await relayWithEnv(baseEnv(c, { RELAY_HTTP_PORT: String(f.port), RELAY_AGENT_TOKEN: LOCAL_TOKEN, RELAY_HTTP_HOST: REMOTE_IP! }), ["send", "pr4-peer", "hi", "--from", AGENT]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("the remote relay refused (HTTP 200");
+    expect(r.stderr).not.toContain("no usable message_id");
+    await f.close();
+  }, 60_000);
 });
 
