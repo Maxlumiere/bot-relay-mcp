@@ -69,7 +69,7 @@ import type { AnchorVerdict } from "./liveness.js";
 // The window judgement lives in src/window-judge.ts (PR 8b: the daemon's sweep shares it without reaching the
 // doorbell); re-exported here unchanged.
 export { judgeWindows, oneLiveWindow, type CandidateBinding } from "./window-judge.js";
-import { judgeWindows, oneLiveWindow, type CandidateBinding } from "./window-judge.js";
+import { judgeWindows, type CandidateBinding } from "./window-judge.js";
 
 /** What the planner needs from one pending read (pendingMetadata). */
 export interface PendingRead {
