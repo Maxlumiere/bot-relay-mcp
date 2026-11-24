@@ -36,6 +36,8 @@ import path from "path";
  * `$HOOKS_DIR/../dist/wake-coverage-status.js` and silently skips the wake-coverage line without it, so a copy
  * without dist/ (as before this) differed from the real hooks on that line.
  */
+/** The marker file a budgetTree copy carries in its hooks directory (the tripwire's test for "seamed"). */
+export const BUDGET_TREE_MARKER = ".relay-budget-tree";
 export const BUDGET_CLOCK_READ = "${SECONDS:-0}";
 export const BUDGET_CLOCK_SEAMED = "${RELAY_TEST_CLOCK:-${SECONDS:-0}}";
 export const BUDGET_FUNCTIONS = ["relay_margin_secs", "relay_pending_deadline"] as const;
@@ -114,6 +116,9 @@ export function budgetTree(dir: string, hooksDir: string, binDir: string, opts: 
     const distDir = path.join(path.dirname(binDir), "dist");
     if (fs.existsSync(distDir)) fs.symlinkSync(distDir, path.join(base, "dist"), "junction");
     const copy = path.join(base, "hooks");
+    // The seam's MARKER (tests/_setup/hook-budget-tripwire.ts reads it): a hook spawned from a directory without it runs
+    // on the real clock and budget. A file, not a line in a helper, so a row that corrupts the helpers keeps it.
+    fs.writeFileSync(path.join(copy, BUDGET_TREE_MARKER), "a budgetTree copy: the test clock seam is installed\n");
     for (const [hook, secs] of Object.entries(opts.declaredBudget ?? {})) {
       const p = path.join(copy, hook);
       fs.writeFileSync(p, rewriteDeclaredBudget(fs.readFileSync(p, "utf-8"), secs));

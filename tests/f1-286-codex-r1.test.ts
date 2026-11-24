@@ -27,6 +27,7 @@ import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders, mintSecretFor } from "./_helpers/mint.js";
 import { ownRecordedPid, signalOwnedPid, type OwnedPid } from "./_helpers/recorded-pid.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { runHookRealBudget, runHookRealBudgetAsync, REAL_BUDGET_OPTIN } from "./_helpers/hook-real-budget.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK = path.join(REPO_ROOT, "hooks", "check-relay.sh");
@@ -41,7 +42,8 @@ const STOP_HOOK = path.join(REPO_ROOT, "hooks", "stop-check.sh");
 // read RELAY_TEST_CLOCK (tests/_helpers/hook-budget-tree.ts), which baseEnv fixes at 0: bash SECONDS ticks on whole
 // wall-clock seconds, so on a slow runner a step could be skipped for budget and the row read the skip (or, where a
 // skip prints the same "relay unreadable", pass without the read it claims). Rows that measure the deadline or the
-// budget run the live hooks, which never read RELAY_TEST_CLOCK: they stay on the real clock.
+// budget run the SAME seamed copy (its real 5 s budget) through runHookRealBudget, on the real clock and, where they
+// can, a starved fixed clock: that helper asserts the cut each one prints (the hook budget tripwire refuses the live hooks).
 const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "f1286-seamed-"));
 const SEAMED_HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
 const SEAMED_DIR = path.dirname(SEAMED_HOOK);
@@ -98,8 +100,9 @@ function seedDb(dbPath: string, agent: string, withTask = false): void {
   expect(r.status, r.stderr).toBe(0);
 }
 
-function baseEnv(home: string, over: Record<string, string>): Record<string, string> {
-  return {
+/** `clockFrom`: runHookRealBudget's env. Its real-clock opt-in drops the fixed clock (a starved clock is in `over`). */
+function baseEnv(home: string, over: Record<string, string>, clockFrom: Record<string, string> = {}): Record<string, string> {
+  const env: Record<string, string> = {
     HOME: home,
     RELAY_HOME: home,
     PATH: `${SHIM_DIR}:${process.env.PATH ?? ""}`,
@@ -111,6 +114,8 @@ function baseEnv(home: string, over: Record<string, string>): Record<string, str
     RELAY_TEST_CLOCK: "0", // read only by the seamed copy; the live hooks ignore it
     ...over,
   };
+  if (clockFrom[REAL_BUDGET_OPTIN] === "1") delete env.RELAY_TEST_CLOCK;
+  return env;
 }
 
 async function waitForHealth(port: number, ms: number): Promise<void> {
@@ -528,7 +533,7 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
     // One run cannot pin both halves on a slow runner: the real clock can spend the 2s before the read (then the
     // read is skipped, loudly), and a fixed clock keeps the read's deadline at 2s however late it starts. So each
     // half is its own row, and NEITHER overrides the deadline (RELAY_PENDING_TIMEOUT_SECS stays unset).
-    const stalledRun = (tag: string, script: string) => {
+    const stalledRun = (tag: string, script: string, extra: Record<string, string> = {}) => {
       const home = path.join(ROOT, `home-d1-${label}-${tag}`);
       fs.mkdirSync(home, { recursive: true });
       const dbPath = path.join(home, "relay.db");
@@ -539,8 +544,9 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
         RELAY_AGENT_NAME: `d1${label.toLowerCase()}`, RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1",
         SHIM_MODE: "stall", SHIM_MARKER: marker,
         RELAY_HOOK_NOTICE_REMIND_SECS: "0", RELAY_STOP_WAKE_DAMPER_SECS: "0",
-      }) });
-      return { r, took: Date.now() - t0, readStarted: fs.existsSync(marker) };
+        ...extra,
+      }, extra) });
+      return { r, took: Date.now() - t0, readStarted: fs.existsSync(marker), out: `${r.stdout ?? ""}\n${r.stderr ?? ""}` };
     };
     it(`${label}: a stalled read is ENDED by its deadline, LOUD (DEGRADED timed out), with NO override (fixed clock: the read always starts)`, () => {
       const { r, took, readStarted } = stalledRun("seamed", path.join(SEAMED_DIR, path.basename(hook)));
@@ -548,11 +554,20 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
       expect(took, "the deadline, not the 20s stalled child, ends the read").toBeLessThan(9_000);
       expect(r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*timed out/);
     }, 45_000);
-    it(`${label}: on the REAL clock the hook ends INSIDE its installed 5s budget, LOUD either way (the read timed out, or no budget was left for it)`, () => {
-      const { r, took } = stalledRun("real", hook);
-      expect(took, `${label} must finish inside its 5s installed budget`).toBeLessThan(5_000);
-      expect(r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*(timed out|no time budget left)/);
-    }, 45_000);
+    // The REAL budget (a seamed copy at the installed 5 s), through the opt-in: on the REAL clock, and under a STARVED
+    // fixed clock (2 s spent: the read is skipped on any machine). Either way the hook prints its cut and ends inside 5 s.
+    for (const clock of ["real", { starvedSeconds: 2 }] as const) {
+      it(`${label}: the REAL 5s budget (${clock === "real" ? "real clock" : "starved clock"}): the hook ends INSIDE it, LOUD either way (the read timed out, or no budget was left for it)`, () => {
+        const { took } = runHookRealBudget({
+          label: `${label} stalled read`,
+          env: {},
+          clock,
+          assertsCut: clock === "real" ? /VERDICT=DEGRADED reason="relay unreadable: [^"]*(timed out|no time budget left)/ : /no time budget left/,
+          run: (e) => stalledRun(clock === "real" ? "real" : "starved", path.join(SEAMED_DIR, path.basename(hook)), e),
+        });
+        expect(took, `${label} must finish inside its 5s installed budget`).toBeLessThan(5_000);
+      }, 45_000);
+    }
   }
 
   it("BUDGET INVARIANT: each hook's budget constant IS the installed timeout in src/agent-cli-profiles.ts, and deadline + margin stays under it", () => {
@@ -670,13 +685,24 @@ describe("#286 P-a — no time budget left: the read is skipped, LOUD, never flo
   // so a slow stdin can no longer spend the mail read's time: it is CUT at its
   // share and said so, and the hook ends inside its 5s. (The no-floor skip is held
   // by the relay_pending_deadline row above and the SessionStart row.)
+  // REAL CLOCK ONLY: the cut is the payload's REAL arrival time (a writer that dribbles for ~2.6 s), which a fixed clock
+  // cannot see. So it runs through runHookRealBudgetAsync, which asserts the cut it prints.
   it("PostToolUse: a slow hook stdin is CUT at its budget share → CANNOT-JUDGE 'not complete within its time budget', inside 5s, the mail read never started", async () => {
+    await runHookRealBudgetAsync({
+      label: "PostToolUse slow stdin",
+      env: {},
+      clock: "real",
+      assertsCut: /VERDICT=CANNOT-JUDGE reason="hook stdin not complete within its time budget: mail check skipped/,
+      run: async (extra) => ({ out: await slowStdin(extra) }),
+    });
+  }, 30_000);
+  const slowStdin = async (extra: Record<string, string>): Promise<string> => {
     const home = path.join(ROOT, "home-pa2");
     fs.mkdirSync(home, { recursive: true });
     const dbPath = path.join(home, "relay.db");
     seedDb(dbPath, "pa2");
     const t0 = Date.now();
-    const child = spawn("bash", [PTU_HOOK], { env: baseEnv(home, { RELAY_AGENT_NAME: "pa2", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_HOOK_NOTICE_REMIND_SECS: "0" }) });
+    const child = spawn("bash", [path.join(SEAMED_DIR, "post-tool-use-check.sh")], { env: baseEnv(home, { RELAY_AGENT_NAME: "pa2", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_HOOK_NOTICE_REMIND_SECS: "0", ...extra }, extra) });
     let stderr = "";
     child.stderr.on("data", (d) => (stderr += d.toString()));
     child.stdin.on("error", () => {}); // the hook may have ended (EPIPE): expected
@@ -691,6 +717,6 @@ describe("#286 P-a — no time budget left: the read is skipped, LOUD, never flo
     child.stdin.end();
     await done;
     expect((Date.now() - t0) / 1000, stderr).toBeLessThan(5);
-    expect(stderr).toMatch(/VERDICT=CANNOT-JUDGE reason="hook stdin not complete within its time budget: mail check skipped/);
-  }, 30_000);
+    return stderr;
+  };
 });

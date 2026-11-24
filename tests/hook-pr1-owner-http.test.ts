@@ -35,10 +35,18 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_INDEX = path.join(REPO, "dist", "index.js");
 const DIST_DB = pathToFileURL(path.join(REPO, "dist", "db.js")).href;
 const RELAY = path.join(REPO, "bin", "relay");
-const HOOKS = path.join(REPO, "hooks");
+/** The REAL hooks: only ever a copy source or a text read (tests/_setup/hook-budget-tripwire.ts refuses spawning them). */
+const REAL_HOOKS_SRC = path.join(REPO, "hooks");
 /** The bash hooks do not run on native Windows (src/cli/generate-hooks.ts; WSL runs them as Linux). */
 const WIN_NO_BASH_HOOKS = process.platform === "win32";
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "hookpr1-")));
+/**
+ * The hook-runners' DEFAULT: a budgetTree copy with a RAISED declared budget (and the fixed clock every run passes), so a
+ * behaviour row never depends on the runner's speed: on the real 5 s budget a step that starts after 2 s is skipped.
+ */
+const HOOKS = budgetTree(path.join(ROOT, "hooks-seamed"), REAL_HOOKS_SRC, path.join(REPO, "bin"), {
+  declaredBudget: { "post-tool-use-check.sh": 30, "stop-check.sh": 30 }, // SessionStart keeps its own (a timing row bounds it)
+});
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 const AGENT = "pr1-agent";
 const KEY_RE = /^[0-9a-f]{32}$/;
@@ -417,7 +425,7 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
   it("the closed verdict set is pinned EXACTLY (TS), and the hooks' gate names each", async () => {
     const { HOOK_DB_VERDICTS } = (await import("../src/hook-db-verdict.js")) as { HOOK_DB_VERDICTS: readonly string[] };
     expect([...HOOK_DB_VERDICTS]).toEqual(["sqlite3", "skip-declared-wasm", "skip-rlyw", "skip-unreadable", "skip-owner-locked", "skip-no-endpoint", "http"]);
-    const src = fs.readFileSync(path.join(HOOKS, "_vault-helpers.sh"), "utf-8");
+    const src = fs.readFileSync(path.join(REAL_HOOKS_SRC, "_vault-helpers.sh"), "utf-8");
     for (const v of HOOK_DB_VERDICTS) expect(src, `the hooks know ${v}`).toMatch(new RegExp(`\\b${v.replace(/-/g, "\\-")}\\)`));
   });
 });
@@ -1231,7 +1239,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     const token = seedWasmDb(c, "pr1 ps budget mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const tree = budgetTree(path.join(c.home, "tree"), HOOKS, path.join(REPO, "bin"));
+    const tree = budgetTree(path.join(c.home, "tree"), REAL_HOOKS_SRC, path.join(REPO, "bin"));
     const count = path.join(c.home, "starve.count");
     const r = await runHook(
       c,
@@ -1535,6 +1543,7 @@ function pinnedRemoteHooks(): string {
   if (PINNED_HOOKS) return PINNED_HOOKS;
   const root = path.join(ROOT, "pinned-remote");
   fs.rmSync(root, { recursive: true, force: true }); // a failed earlier build leaves nothing half-made behind
+  // From the SEAMED copy (its fixed clock, raised budget and marker), never the real hooks.
   fs.cpSync(HOOKS, path.join(root, "hooks"), { recursive: true });
   // A REAL bin dir (a symlinked one would send `bin/../hooks` to the REAL hooks): the launcher copied, `relay` linked
   // (node follows the link to the real dist).
@@ -1621,7 +1630,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the de
       fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
       const e = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_TEST_CLOCK: "0", RELAY_CODEX_LAUNCHER: stub, ...env });
       delete e.RELAY_AGENT_NAME;
-      const binDir = hooksDir === HOOKS ? path.join(REPO, "bin") : path.join(path.dirname(hooksDir), "bin");
+      const binDir = path.join(path.dirname(hooksDir), "bin"); // a budgetTree copy carries bin/ beside it
       // ASYNC: the spies live in THIS process; spawnSync would starve them (the request never recorded).
       return await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
         const child = spawn("bash", [path.join(binDir, "codex-relay"), AGENT], { env: e, stdio: ["ignore", "pipe", "pipe"] });

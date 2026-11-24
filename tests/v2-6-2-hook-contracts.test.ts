@@ -99,10 +99,9 @@ const REAL_HELPER_BYTES = fs.readFileSync(REAL_HELPER);
  * hook's path inside the copy.
  */
 function hookCopy(root: string): { helper: string; hooks: string[] } {
-  const base = path.join(root, "copy", "bot-relay-mcp");
-  const dir = path.join(base, "hooks");
-  fs.cpSync(path.join(REPO_ROOT, "hooks"), dir, { recursive: true });
-  fs.symlinkSync(path.join(REPO_ROOT, "bin"), path.join(base, "bin"));
+  // A budgetTree copy (the same layout: copy/bot-relay-mcp/{hooks,bin}): its fixed clock keeps the rows off the
+  // runner's speed, and the hook budget tripwire refuses spawning from a plain copy.
+  const dir = budgetTree(path.join(root, "copy"), path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin"));
   return {
     helper: path.join(dir, "_verdict.sh"),
     hooks: ALL_HOOKS.map((h) => path.join(dir, path.relative(path.join(REPO_ROOT, "hooks"), h))),
