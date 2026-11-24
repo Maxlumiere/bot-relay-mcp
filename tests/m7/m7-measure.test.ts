@@ -55,6 +55,7 @@ const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "m7-seamed-"));
 const STOP_HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO, "hooks"), path.join(REPO, "bin"), { declaredBudget: "real" }), "stop-check.sh");
 assertProductionBudget(path.dirname(STOP_HOOK), "m7");
 
+import { installOpenPolicy } from "../_helpers/wake-policy-file.js";
 const W = await import("../../src/watch-wake.js");
 const db = await import("../../src/db.js");
 const { getOwnHostId } = await import("../../src/liveness.js");
@@ -211,6 +212,9 @@ describe.skipIf(!OWN)(`M7 (doorbell PR 8 gate brief §4) on ${SHA}`, () => {
     db.getDb();
     db.registerAgent("m7-alice", "s", []);
     db.registerAgent(AGENT, "r", []);
+    // Doorbell PR 8a: no wake policy means no wakes (default-deny). The harness measures the doorbell's mechanics, so
+    // it opts its agent in, wakeable by any registered sender at the PR 7 rate (the behaviour it measured before 8a).
+    installOpenPolicy(path.join(ROOT, "inst"), [AGENT]);
     win = openWin();
   });
 
