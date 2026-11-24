@@ -367,11 +367,13 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 2: the hooks read a stdio owner's ma
     expect((await anchorOf(c, AGENT)).agent_pid, "the anchor is the hook's agent pid (this test process)").toBe(process.pid);
   }, 150_000);
 
-  it("THE BUDGET-SKIP PATH (the REAL 5 s hook, the restamp starved by the budget seam): the skip line is printed and ZERO liveness calls are made", async () => {
+  it("THE BUDGET-SKIP PATH (the REAL 5 s hook, the RULED condition: 2 s of 5 s spent when the restamp budgets, its normal own cap): the skip line is printed and ZERO liveness calls are made", async () => {
     const c = newCase("budget-skip");
     const { token } = seedWasmDb(c, "pr2 skip mail");
     const o = await startStdioOwner(c);
-    const r = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token, RELAY_TEST_STARVE: "the liveness restamp" }, PTU, HOOKS_REAL_BUDGET);
+    // Only the restamp's budget call sees 2 s elapsed (the clock seam, per step); it keeps its own cap, so the hook's
+    // REAL subtraction (5 - 2 - the 3 s margin = 0) is what skips it. Breaking that subtraction turns this row red.
+    const r = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token, RELAY_TEST_ELAPSED_AT: "the liveness restamp", RELAY_TEST_ELAPSED: "2" }, PTU, HOOKS_REAL_BUDGET);
     expect(r.peekCalls, `precondition: the mail was read through the door\n${r.out}`).toBeGreaterThanOrEqual(1);
     expect(r.out).toMatch(/no time budget left for the liveness restamp \(\d+s of 5s spent\): skipped\./);
     expect(r.livenessCalls, `skipped: zero liveness calls\n${r.out}`).toBe(0);
