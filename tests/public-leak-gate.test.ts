@@ -176,10 +176,10 @@ describe("the scan step honours the scanner's caller contract (PASS = exit 0 AND
   });
 
   /** The Scan step with a SUBSTITUTE scanner (in a temp tree): exit code + output chosen by the row. */
-  function withScanner(body: string): { status: number | null; out: string } {
+  function withScanner(body: string | null): { status: number | null; out: string } {
     const tree = fs.mkdtempSync(path.join(os.tmpdir(), "leakgate-tree-"));
     fs.mkdirSync(path.join(tree, "tools", "public-leak-scan"), { recursive: true });
-    fs.writeFileSync(path.join(tree, "tools", "public-leak-scan", "scan.mjs"), body);
+    if (body !== null) fs.writeFileSync(path.join(tree, "tools", "public-leak-scan", "scan.mjs"), body); // null: NO scanner at the base
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "leakgate-"));
     fs.mkdirSync(path.join(tmp, "leak-meta"));
     for (const k of ["pr-title", "pr-body", "branch", "commit-msg"]) fs.writeFileSync(path.join(tmp, "leak-meta", k), "clean");
@@ -196,6 +196,14 @@ describe("the scan step honours the scanner's caller contract (PASS = exit 0 AND
     expect(r.status).toBe(1);
     expect(r.out).toContain("could not run");
     expect(r.out).not.toContain("A denylisted term");
+    expect(r.out, "never the irreversible-task text for a non-hit").not.toContain("tell the maintainer");
+  });
+  it("NO scanner at the base (node MODULE_NOT_FOUND, exit 1) → 'could not run', never a term and never the maintainer task", () => {
+    const r = withScanner(null);
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("could not run");
+    expect(r.out).not.toContain("A denylisted term");
+    expect(r.out).not.toContain("tell the maintainer");
   });
   it("a scanner exiting 3 → 'could not run'", () => {
     const r = withScanner("process.exit(3);\n");
