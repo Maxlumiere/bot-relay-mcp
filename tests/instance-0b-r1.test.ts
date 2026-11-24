@@ -206,7 +206,7 @@ describe.skipIf(!POSIX)("ruling 3fc05540: a link BELOW the relay home is never a
 describe("the mutation fixture (tests/fixtures/instance-0b-mutants.json; run: node scripts/mutation-sweep.mjs <fixture>)", () => {
   it("every mutant still applies: its find text occurs exactly once in its file; names are unique", () => {
     const M = JSON.parse(fs.readFileSync(path.join(REPO, "tests", "fixtures", "instance-0b-mutants.json"), "utf-8")) as Array<{ name: string; file: string; find: string }>;
-    expect(M.length).toBeGreaterThanOrEqual(11);
+    expect(M.length).toBeGreaterThanOrEqual(12);
     for (const m of M) expect(fs.readFileSync(path.join(REPO, m.file), "utf-8").split(m.find).length - 1, m.name).toBe(1);
     expect(new Set(M.map((m) => m.name)).size).toBe(M.length);
   });

@@ -75,5 +75,12 @@
   "find": "  const linked = linkedInstanceComponent(instanceDirPath);\n  if (linked !== null) {",
   "replace": "  const linked = linkedInstanceComponent(instanceDirPath);\n  if (linked !== null && false) {",
   "test": "tests/instance-0b-r1.test.ts"
+ },
+ {
+  "name": "r1-db-behind-link-provisions",
+  "file": "src/resolve-instance.ts",
+  "find": "  if (linkedInstanceComponent(instanceDirPath) !== null) return false;\n  return dbExists",
+  "replace": "  return dbExists",
+  "test": "tests/instance-0b-r1.test.ts"
  }
 ]

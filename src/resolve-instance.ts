@@ -42,7 +42,7 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "101f07906f45";
+export const RESOLVER_REVISION = "df958454f1b1";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";
@@ -156,6 +156,8 @@ export function readInstanceMetadataFile(instanceDirPath: string): Record<string
  * instance directories as a side effect.
  */
 export function isProvisionedInstance(instanceDirPath: string, dbExists: boolean): boolean {
+  // Ruling 3fc05540: a linked instances/ or instances/<id> is never an instance, whatever it holds (a DB too).
+  if (linkedInstanceComponent(instanceDirPath) !== null) return false;
   return dbExists || readInstanceMetadataFile(instanceDirPath) !== null;
 }
 
