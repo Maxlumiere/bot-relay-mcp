@@ -16,7 +16,8 @@
  * by real path): a one-environment check. The full pre-restart check, which also
  * proves WHICH environment and WHICH open DB, is `relay deploy-gate`.
  *
- * --fields prints the same answer for a SHELL (the hooks): exactly eight lines,
+ * --fields prints the same answer for a SHELL (the hooks): exactly nine lines (line 8, the owner endpoint, and line 9,
+ * the instance directory the layout test finds for the DB, "" outside the layout, are described where they are built),
  * kind, db_path, exists, reason, warning, vault_dir (empty lines where a field
  * does not apply) and hook_db (INV-DB-01 slice 3: whether the hooks may read the
  * DB with sqlite3, one token of src/hook-db-verdict.ts HOOK_DB_VERDICTS;
@@ -69,7 +70,7 @@ function usage(requested = false): void {
     "Which relay DB this environment resolves to (the one strict resolver, ADR-0048).\n" +
     "Read-only. --expect-db PATH exits 1 unless the resolution names that DB (for\n" +
     "the full pre-restart check, see relay deploy-gate).\n" +
-    "--fields prints eight lines for a shell: kind, db_path, exists, reason, warning, vault_dir, hook_db, owner_endpoint.\n" +
+    "--fields prints nine lines for a shell: kind, db_path, exists, reason, warning, vault_dir, hook_db, owner_endpoint, instance_dir.\n" +
     "--env-keys lists the environment variables the resolver reads.\n\n" +
     "Exit: 0 = resolved (and matched) · 1 = a resolver fault, or no match · 2 = usage.\n";
   if (requested) process.stdout.write(text);
@@ -99,7 +100,7 @@ export async function run(argv: string[]): Promise<number> {
     usage(true);
     return 0;
   }
-  const { resolveInstance, serializeResolution, RESOLVER_ENV_KEYS, RESOLVER_REVISION } = await import("../instance.js");
+  const { resolveInstance, serializeResolution, RESOLVER_ENV_KEYS, RESOLVER_REVISION, instanceDirOfDbPath } = await import("../instance.js");
   if (args.envKeys) {
     process.stdout.write(args.json ? JSON.stringify(RESOLVER_ENV_KEYS) + "\n" : RESOLVER_ENV_KEYS.join("\n") + "\n");
     return 0;
@@ -120,10 +121,17 @@ export async function run(argv: string[]): Promise<number> {
     // is NOT printed: it stays in the owner's 0600 record, which `relay owner` opens under the trust model.
     const { hookDbAnswer } = await import("../hook-db-verdict.js");
     const a = r.kind === "error" ? null : hookDbAnswer(r.dbPath);
+    // Line 9 (APPENDED): the instance directory the resolver's ONE layout test finds for this DB (real paths, case-folded
+    // on a case-insensitive file system), or "" outside the layout. The hooks' writers create their directories under
+    // it and re-check it at write time: they never re-derive the layout in bash.
+    const inDir = r.kind === "error" ? null : instanceDirOfDbPath(r.dbPath);
+    if (inDir !== null && /[\x00-\x1f\x7f]/.test(inDir)) {
+      r = { kind: "error", reason: "the instance directory contains a control character, which a shell must never be handed as a path: refused" };
+    }
     const lines =
       r.kind === "error" || a === null
-        ? ["error", "", "", oneLine(r.kind === "error" ? r.reason : ""), "", "", "skip-unreadable", ""]
-        : [r.kind, r.dbPath, String(r.exists), "", r.kind === "flat" ? oneLine(r.warning) : "", vaultDir ?? "", a.verdict, a.endpoint];
+        ? ["error", "", "", oneLine(r.kind === "error" ? r.reason : ""), "", "", "skip-unreadable", "", ""]
+        : [r.kind, r.dbPath, String(r.exists), "", r.kind === "flat" ? oneLine(r.warning) : "", vaultDir ?? "", a.verdict, a.endpoint, inDir ?? ""];
     process.stdout.write(lines.join("\n") + "\n");
   } else if (args.json) {
     // ADR-0047: loaded only here, for --json (it hashes the installed

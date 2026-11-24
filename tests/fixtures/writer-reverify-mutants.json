@@ -1,0 +1,86 @@
+[
+ {
+  "name": "store-no-reverify",
+  "file": "src/token-store.ts",
+  "find": "const instanceDir = assertInstanceProvisionedAtOpen(path.join(path.dirname(dir), DB_FILENAME));",
+  "replace": "const instanceDir = null as string | null; void assertInstanceProvisionedAtOpen;",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "store-agents-link-unchecked",
+  "file": "src/token-store.ts",
+  "find": "if (st.isSymbolicLink() || !st.isDirectory()) throw",
+  "replace": "if (st.isSymbolicLink() && false) throw",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "hook-provision-bypassed",
+  "file": "hooks/_vault-helpers.sh",
+  "find": "    if [ ! -d \"$instances_dir\" ] || [ ! -d \"$inst\" ] || ! {",
+  "replace": "    if false && ! {",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "hook-component-link-checks-off",
+  "file": "hooks/_vault-helpers.sh",
+  "find": "    cur=\"$cur/$part\"\n    if [ -L \"$cur\" ]; then\n      echo \"[bot-relay hook] refusing to write through a link in the instance directory ($part)\" >&2\n      return 1\n    fi\n    made=\"\"\n    if [ ! -d \"$cur\" ]; then\n      ( umask 077 && mkdir \"$cur\" ) 2>/dev/null || { echo \"[bot-relay hook] could not create $part under the instance\" >&2; return 1; }\n      made=1\n    fi\n    if [ -L \"$cur\" ] || [ ! -d \"$cur\" ]; then",
+  "replace": "    cur=\"$cur/$part\"\n    if false; then\n      echo \"[bot-relay hook] refusing to write through a link in the instance directory ($part)\" >&2\n      return 1\n    fi\n    made=\"\"\n    if [ ! -d \"$cur\" ]; then\n      ( umask 077 && mkdir \"$cur\" ) 2>/dev/null || { echo \"[bot-relay hook] could not create $part under the instance\" >&2; return 1; }\n      made=1\n    fi\n    if false; then",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "hook-layout-ignored",
+  "file": "hooks/_vault-helpers.sh",
+  "find": "  inst=\"${RELAY_RES_INSTANCE_DIR:-}\"",
+  "replace": "  inst=\"\"",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "hook-skew-writes",
+  "file": "hooks/_vault-helpers.sh",
+  "find": "  if [ \"${RELAY_RES_LAYOUT_KNOWN:-}\" != 1 ]; then",
+  "replace": "  if false; then",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "hook-instances-link-unchecked",
+  "file": "hooks/_vault-helpers.sh",
+  "find": "    if [ -L \"$instances_dir\" ]; then",
+  "replace": "    if false; then",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "hook-id-link-unchecked",
+  "file": "hooks/_vault-helpers.sh",
+  "find": "    if [ -L \"$inst\" ]; then",
+  "replace": "    if false; then",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "hook-temp-predictable",
+  "file": "hooks/_vault-helpers.sh",
+  "find": "  tmp=$(mktemp \"$dir/.${file}.XXXXXXXX\" 2>/dev/null) || {",
+  "replace": "  tmp=\"$dir/${file}.tmp.$$\"; true || {",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "where-no-line-9",
+  "file": "src/cli/where.ts",
+  "find": ", a.verdict, a.endpoint, inDir ?? \"\"];",
+  "replace": ", a.verdict, a.endpoint];",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "where-caller-spelling",
+  "file": "src/cli/where.ts",
+  "find": "const inDir = r.kind === \"error\" ? null : instanceDirOfDbPath(r.dbPath);",
+  "replace": "const inDir = r.kind === \"error\" ? null : instanceDirOfDbPath(r.dbPath) === null ? null : path.dirname(r.dbPath);",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "hook-token-writer-loads-only-in-subshell",
+  "file": "hooks/_vault-helpers.sh",
+  "find": "  # Load the resolver HERE, in this shell (see write_relay_spawn_manifest).\n  [ \"${RELAY_RES_LOADED:-}\" = 1 ] || relay_where_load || true",
+  "replace": "  # Load the resolver HERE, in this shell (see write_relay_spawn_manifest).",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ }
+]

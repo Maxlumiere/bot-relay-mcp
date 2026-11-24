@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### The hooks' credential writers re-check the instance at write time
+
+- **Changed:** `relay where --fields` prints a 9th line: the instance directory the resolver's layout test finds for the DB, spelled under the instances root, or an empty line outside the layout. A script that checks for exactly 8 lines must accept 9.
+- **Changed (behaviour):** the hooks' token and spawn-manifest writers take the instance directory from that line, never from the path's spelling. At write time they re-check that `instances/` and `instances/<id>` are real directories (a link gets the message above) and that the instance still holds its record or DB. They then create only the missing directories below it, one at a time, mode 0700, never through a link. The file is written through an exclusively created private temp file. Outside the layout they no longer create the DB's directory: it must exist. With an older relay CLI (an 8-line answer) they write nothing and say the relay CLI is older than the hooks.
+- **Changed:** the token store re-checks its instance at write time the same way, and creates only `agents/` below it.
+
 ### A linked directory below the relay home is no longer an instance
 
 - **Changed (behaviour):** below the relay home, every directory must be a real directory, for reads as well as writes. An `instances/` directory, or an `instances/<id>` directory, that is a symbolic link is no longer treated as an instance. Opening it, selecting it or provisioning into it is refused with its own message, non-zero, and nothing is created at the link's target: `relay: the instance directory instances/<id> is a symbolic link, which is not allowed below the relay home. To keep the relay on other storage, move or link the WHOLE relay home (RELAY_HOME / ~/.bot-relay) instead.` Migration: if you kept an instance directory on other storage through a link, link or move the whole relay home instead. The relay home itself may still be a link.

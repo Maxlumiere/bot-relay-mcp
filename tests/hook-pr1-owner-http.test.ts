@@ -374,14 +374,14 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     await stopDaemon(d.child);
   }, 90_000);
 
-  it("`relay where --fields`: a valid record → 8 lines, line 7 `http`, line 8 the URL ONLY (the key is never in where's answer); every OS (the pid is not part of validity, as ruled)", async () => {
+  it("`relay where --fields`: a valid record → 9 lines, line 7 `http`, line 8 the URL ONLY (the key is never in where's answer); every OS (the pid is not part of validity, as ruled)", async () => {
     const c = newCase("where-http");
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
     const { key } = readRecord(c);
     const w = whereFields(c);
-    expect(w.lines.length, w.raw).toBe(8);
+    expect(w.lines.length, w.raw).toBe(9); // line 9: the instance directory
     expect(w.lines[6]).toBe("http");
     expect(w.lines[7]).toBe(`http://127.0.0.1:${d.port}`);
     expect(w.raw + w.stderr, "the key is in no part of where's answer").not.toContain(key);
@@ -396,7 +396,7 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     await stopDaemon(d.child);
     expect(fs.existsSync(c.record), "precondition: the record is left behind").toBe(true);
     const w = whereFields(c);
-    expect(w.lines.length, w.raw).toBe(8);
+    expect(w.lines.length, w.raw).toBe(9); // line 9: the instance directory
     expect(w.lines[6]).not.toBe("http");
     expect(w.lines[7]).toBe("");
     const { ownerEndpointVerdict } = (await import("../src/owner-endpoint.js")) as { ownerEndpointVerdict: (db: string) => { ok: boolean; reason?: string } };
@@ -416,11 +416,11 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     await stopDaemon(d.child);
   }, 90_000);
 
-  it("twin: a NATIVE instance → 8 lines, line 7 `sqlite3`, line 8 empty (unchanged reads)", () => {
+  it("twin: a NATIVE instance → 9 lines, line 7 `sqlite3`, line 8 empty (unchanged reads)", () => {
     const c = newCase("where-native");
     seedNativeDb(c);
     const w = whereFields(c);
-    expect(w.lines.length, w.raw).toBe(8);
+    expect(w.lines.length, w.raw).toBe(9); // line 9: the instance directory
     expect(w.lines[6]).toBe("sqlite3");
     expect(w.lines[7]).toBe("");
   }, 60_000);
@@ -1025,7 +1025,9 @@ async function runHook(c: Case, hook: string, extra: Record<string, string>, inp
 }
 function fakeWhere(c: Case, line7: string, line8: string | null): string {
   const f = path.join(c.home, `where-${crypto.randomBytes(4).toString("hex")}.txt`);
-  const lines = ["explicit-db", c.db, "true", "", "", path.join(c.dir, "agents"), line7, ...(line8 === null ? [] : [line8])];
+  // A current CLI's 9 lines (line 9, the instance directory, is empty: an explicit DB outside the layout); line8 null → an
+  // older CLI's 7-line answer.
+  const lines = ["explicit-db", c.db, "true", "", "", path.join(c.dir, "agents"), line7, ...(line8 === null ? [] : [line8, ""])];
   fs.writeFileSync(f, lines.join("\n") + "\n");
   return f;
 }
