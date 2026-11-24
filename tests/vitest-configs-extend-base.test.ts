@@ -29,6 +29,7 @@ import desktopFixtureConfig from "./fixtures/desktop-tripwire/vitest.config.ts";
 import fullSuiteFixtureConfig from "./fixtures/full-suite/vitest.config.ts";
 import releaseConfig from "../vitest.release.config.ts";
 import serialConfig from "../vitest.serial.config.ts";
+import m7Config from "../vitest.m7.config.ts";
 
 /** Every vitest config in the repo, by its path from the repo root. A new one is added HERE. */
 const IMPORTED: Record<string, unknown> = {
@@ -40,6 +41,7 @@ const IMPORTED: Record<string, unknown> = {
   "tests/fixtures/full-suite/vitest.config.ts": fullSuiteFixtureConfig,
   "vitest.release.config.ts": releaseConfig,
   "vitest.serial.config.ts": serialConfig,
+  "vitest.m7.config.ts": m7Config,
 };
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
