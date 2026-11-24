@@ -297,7 +297,11 @@ const routeArgs = (args: string[]) => args.map(seamedPath);
 function stdinErrorTolerated(code: string | undefined, childExited: boolean): boolean {
   return code === "EPIPE" || (code === "ENOTCONN" && childExited);
 }
-/** How long an ENOTCONN waits for the child's exit (libuv may report the error just before the exit event). */
+/**
+ * How long an ENOTCONN waits for the child's exit (libuv may report the error just before the exit event). This grace
+ * proves the child EVENTUALLY exited, not that its exit preceded the write: accepted for a harness (ordering them would
+ * need instrumentation of libuv's internals).
+ */
 const ENOTCONN_EXIT_WAIT_MS = 2000;
 
 function run(args: string[], env: Record<string, string>, stdin = "", fd5?: string): Promise<RunResult> {
