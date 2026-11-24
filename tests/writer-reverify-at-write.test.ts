@@ -17,7 +17,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { createInstance } from "../src/instance.js";
-import { FileTokenStore } from "../src/token-store.js";
+import { FileTokenStore, _setTokenTempNameForTests } from "../src/token-store.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENV_KEYS = ["HOME", "RELAY_HOME", "RELAY_INSTANCE_ID", "RELAY_DB_PATH", "RELAY_CONFIG_PATH", "RELAY_CLAUDE_HOME"] as const;
@@ -47,6 +47,25 @@ describe("the token store re-verifies its instance at write time", () => {
     await store.write("w-bob", "abcdefgh12345678");
     expect(fs.readFileSync(path.join(instDir("live"), "agents", "w-bob.token"), "utf-8")).toBe("abcdefgh12345678\n");
     expect(fs.statSync(path.join(instDir("live"), "agents")).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(path.join(instDir("live"), "agents", "w-bob.token")).mode & 0o777, "the token FILE is 0600").toBe(0o600);
+  });
+  it("R2 P2-b: a symlink PLANTED at the temp name → the exclusive create refuses; nothing written through it; no token", async () => {
+    createInstance("live", "t");
+    process.env.RELAY_INSTANCE_ID = "live";
+    const target = path.join(home, "elsewhere");
+    fs.mkdirSync(target);
+    const agents = path.join(instDir("live"), "agents");
+    fs.mkdirSync(agents, { recursive: true });
+    fs.symlinkSync(path.join(target, "stolen"), path.join(agents, ".w-bob.token.tmp.fixed"));
+    _setTokenTempNameForTests(() => ".w-bob.token.tmp.fixed");
+    try {
+      await expect(new FileTokenStore().write("w-bob", "abcdefgh12345678")).rejects.toThrow(/EEXIST|ELOOP/);
+    } finally {
+      _setTokenTempNameForTests(null);
+    }
+    expect(fs.existsSync(path.join(target, "stolen")), "nothing written through the planted link").toBe(false);
+    expect(fs.existsSync(path.join(agents, "w-bob.token"))).toBe(false);
+    expect(fs.lstatSync(path.join(agents, ".w-bob.token.tmp.fixed")).isSymbolicLink(), "the planted name is not ours: left alone").toBe(true);
   });
   it("the instance REMOVED after the store resolved its path → the write refuses, and nothing is re-created", async () => {
     createInstance("gone", "t");
@@ -89,7 +108,7 @@ const POSIX = process.platform !== "win32";
 describe("the mutation fixture (tests/fixtures/writer-reverify-mutants.json, run by scripts/mutation-sweep.mjs)", () => {
   it("every mutant still applies: its find text occurs exactly once in its file; names are unique", () => {
     const M = JSON.parse(fs.readFileSync(path.join(REPO, "tests", "fixtures", "writer-reverify-mutants.json"), "utf-8")) as Array<{ name: string; file: string; find: string }>;
-    expect(M.length).toBeGreaterThanOrEqual(11);
+    expect(M.length).toBeGreaterThanOrEqual(15);
     expect(new Set(M.map((m) => m.name)).size).toBe(M.length);
     for (const m of M) expect(fs.readFileSync(path.join(REPO, m.file), "utf-8").split(m.find).length - 1, m.name).toBe(1);
   });
@@ -220,16 +239,50 @@ describe.skipIf(!POSIX)("the hooks' writers: the RESOLVER's layout (relay where 
     expect(last(r.stdout), r.stderr).toBe("0 0");
     expect(fs.readFileSync(path.join(instDir("ok"), "agents", "w-bob.token"), "utf-8")).toBe("abcdefgh12345678\n");
   });
-  it("the temp file is created EXCLUSIVELY (mktemp): a symlink planted at the old predictable name (<token>.tmp.<pid>) is never followed", () => {
+  it("R2 P2-b: a symlink PLANTED at the EXACT temp name (bash's RANDOM seeded to predict it) → the token writer refuses; nothing written through it", () => {
     createInstance("live", "t");
     const target = path.join(home, "elsewhere");
     fs.mkdirSync(target);
     const agents = path.join(instDir("live"), "agents");
     fs.mkdirSync(agents, { recursive: true });
-    const r = run({ RELAY_INSTANCE_ID: "live" }, `ln -s '${path.join(target, "stolen")}' '${agents}/w-bob.token.tmp.'$$`);
-    expect(last(r.stdout), r.stderr).toBe("0 0");
+    // Seeding RANDOM makes the writer's next two $RANDOM values the ones computed here.
+    const plant = `RANDOM=4242; n="$RANDOM$RANDOM"; RANDOM=4242; ln -s '${path.join(target, "stolen")}' "${agents}/.w-bob.token.$$.$n"`;
+    const r = run({ RELAY_INSTANCE_ID: "live" }, plant);
+    expect(last(r.stdout), r.stderr).toMatch(/^1 /);
+    expect(r.stderr).toContain("something already exists at the temp name");
     expect(fs.existsSync(path.join(target, "stolen")), "nothing written through the planted link").toBe(false);
-    expect(fs.lstatSync(path.join(agents, "w-bob.token")).isSymbolicLink(), "the token is a regular file").toBe(false);
+    expect(fs.existsSync(path.join(agents, "w-bob.token"))).toBe(false);
+  });
+  it("R2 P2-a: an INHERITED resolution cache (DB A + dir B, exported by a parent) is discarded: the writers re-resolve, and nothing lands under B", () => {
+    createInstance("live", "t");
+    createInstance("b", "t");
+    const script = `set -u\n. '${helper}'\nwrite_relay_token_to_vault w-bob abcdefgh12345678; a=$?\nwrite_relay_spawn_manifest w-bob somerole; b=$?\necho "$a $b"\n`;
+    const inherited = { RELAY_RES_LOADED: "1", RELAY_RES_KIND: "explicit-db", RELAY_RES_DB_PATH: path.join(home, "a-db", "relay.db"), RELAY_RES_EXISTS: "true", RELAY_RES_INSTANCE_DIR: instDir("b"), RELAY_RES_LAYOUT_KNOWN: "1" };
+    const r = spawnSync("bash", ["-c", script], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: os.tmpdir(), RELAY_INSTANCE_ID: "live", ...inherited }, encoding: "utf-8", timeout: 60_000 });
+    expect(last(r.stdout), r.stderr).toBe("0 0");
+    expect(fs.existsSync(path.join(instDir("live"), "agents", "w-bob.token")), "re-resolved: the instance the environment names").toBe(true);
+    expect(fs.existsSync(path.join(instDir("b"), "agents", "w-bob.token")), "nothing under B").toBe(false);
+  });
+  it("R2 P2-a: an inherited cache with NO mismatch (instance X) is still discarded: the environment's instance (Y) is the one written", () => {
+    createInstance("x", "t");
+    createInstance("y", "t");
+    const script = `set -u\n. '${helper}'\nwrite_relay_token_to_vault w-bob abcdefgh12345678; echo "rc=$?"\n`;
+    const inherited = { RELAY_RES_LOADED: "1", RELAY_RES_KIND: "instance", RELAY_RES_DB_PATH: path.join(instDir("x"), "relay.db"), RELAY_RES_EXISTS: "true", RELAY_RES_INSTANCE_DIR: instDir("x"), RELAY_RES_LAYOUT_KNOWN: "1" };
+    const r = spawnSync("bash", ["-c", script], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: os.tmpdir(), RELAY_INSTANCE_ID: "y", ...inherited }, encoding: "utf-8", timeout: 60_000 });
+    expect(r.stdout, r.stderr).toContain("rc=0");
+    expect(fs.existsSync(path.join(instDir("y"), "agents", "w-bob.token"))).toBe(true);
+    expect(fs.existsSync(path.join(instDir("x"), "agents", "w-bob.token"))).toBe(false);
+  });
+  it("R2 P2-a: BOUND at write time: this process's own cache naming DB A with directory B (set after the helpers load) → refused, nothing under B", () => {
+    createInstance("a", "t");
+    createInstance("b", "t");
+    const set = `RELAY_RES_LOADED=1 RELAY_RES_KIND=instance RELAY_RES_DB_PATH='${path.join(instDir("a"), "relay.db")}' RELAY_RES_EXISTS=true RELAY_RES_INSTANCE_DIR='${instDir("b")}' RELAY_RES_LAYOUT_KNOWN=1; export RELAY_RES_LOADED RELAY_RES_KIND RELAY_RES_DB_PATH RELAY_RES_EXISTS RELAY_RES_INSTANCE_DIR RELAY_RES_LAYOUT_KNOWN`;
+    const script = `set -u\n. '${helper}'\n${set}\nwrite_relay_token_to_vault w-bob abcdefgh12345678; a=$?\nwrite_relay_spawn_manifest w-bob somerole; b=$?\necho "$a $b"\n`;
+    const r = spawnSync("bash", ["-c", script], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: os.tmpdir() }, encoding: "utf-8", timeout: 60_000 });
+    expect(last(r.stdout), r.stderr).toBe("1 1");
+    expect(r.stderr).toContain("does not belong to the resolved instance directory");
+    expect(fs.existsSync(path.join(instDir("b"), "agents", "w-bob.token"))).toBe(false);
+    expect(fs.existsSync(path.join(instDir("a"), "agents", "w-bob.token"))).toBe(false);
   });
   it("a WRONG-CASE explicit RELAY_DB_PATH (case-insensitive file system) + the instance removed after the resolution → refused, nothing re-created", (ctx) => {
     createInstance("gone", "t");

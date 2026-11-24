@@ -9,8 +9,8 @@
  {
   "name": "store-agents-link-unchecked",
   "file": "src/token-store.ts",
-  "find": "if (st.isSymbolicLink() || !st.isDirectory()) throw",
-  "replace": "if (st.isSymbolicLink() && false) throw",
+  "find": "if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`the agent vault ${dir} is not",
+  "replace": "if (st.isSymbolicLink() && false) throw new Error(`the agent vault ${dir} is not",
   "test": "tests/writer-reverify-at-write.test.ts"
  },
  {
@@ -56,10 +56,10 @@
   "test": "tests/writer-reverify-at-write.test.ts"
  },
  {
-  "name": "hook-temp-predictable",
+  "name": "hook-temp-exclusive-off",
   "file": "hooks/_vault-helpers.sh",
-  "find": "  tmp=$(mktemp \"$dir/.${file}.XXXXXXXX\" 2>/dev/null) || {",
-  "replace": "  tmp=\"$dir/${file}.tmp.$$\"; true || {",
+  "find": "  tmp=\"$dir/.${file}.$$.${RANDOM}${RANDOM}\"\n  if [ -e \"$tmp\" ] || [ -L \"$tmp\" ]; then\n    echo \"[bot-relay hook] refusing: something already exists at the temp name for $file\" >&2\n    return 1\n  fi\n  if ! ( set -C; umask 077; printf '%s' \"$content\" > \"$tmp\" ) 2>/dev/null; then",
+  "replace": "  tmp=\"$dir/.${file}.$$.${RANDOM}${RANDOM}\"\n  if false; then\n    echo \"[bot-relay hook] refusing: something already exists at the temp name for $file\" >&2\n    return 1\n  fi\n  if ! ( umask 077; printf '%s' \"$content\" > \"$tmp\" ) 2>/dev/null; then",
   "test": "tests/writer-reverify-at-write.test.ts"
  },
  {
@@ -81,6 +81,27 @@
   "file": "hooks/_vault-helpers.sh",
   "find": "  # Load the resolver HERE, in this shell (see write_relay_spawn_manifest).\n  [ \"${RELAY_RES_LOADED:-}\" = 1 ] || relay_where_load || true",
   "replace": "  # Load the resolver HERE, in this shell (see write_relay_spawn_manifest).",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "hook-cache-inherited",
+  "file": "hooks/_vault-helpers.sh",
+  "find": "if [ \"${RELAY_RES_OWNER_PID:-}\" != \"$$\" ]; then",
+  "replace": "if false; then",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "hook-write-unbound",
+  "file": "hooks/_vault-helpers.sh",
+  "find": "    if [ -z \"$base_real\" ] || [ \"$base_real\" != \"$inst_real\" ]; then",
+  "replace": "    if false; then",
+  "test": "tests/writer-reverify-at-write.test.ts"
+ },
+ {
+  "name": "store-temp-not-exclusive",
+  "file": "src/token-store.ts",
+  "find": "fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | nofollow, 0o600);",
+  "replace": "fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC, 0o600);",
   "test": "tests/writer-reverify-at-write.test.ts"
  }
 ]

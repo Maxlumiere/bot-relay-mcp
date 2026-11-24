@@ -50,6 +50,43 @@ import { randomBytes } from "crypto";
 import { resolveInstanceDbPath, assertInstanceProvisionedAtOpen } from "./instance.js";
 import { DB_FILENAME } from "./resolve-instance.js";
 
+/** The temp file's name for a token write (random); TESTS ONLY can fix it (to plant something at it). */
+let tempNameForTests: ((agentName: string) => string) | null = null;
+export function _setTokenTempNameForTests(fn: ((agentName: string) => string) | null): void {
+  tempNameForTests = fn;
+}
+const tokenTempName = (agentName: string): string => tempNameForTests?.(agentName) ?? `.${agentName}.token.tmp.${randomBytes(8).toString("hex")}`;
+
+/** Create `dir`'s missing components one at a time from its nearest existing ancestor, each a REAL directory. */
+async function mkdirOneAtATime(dir: string): Promise<void> {
+  const missing: string[] = [];
+  let cur = path.resolve(dir);
+  for (;;) {
+    try {
+      const st = await fs.promises.lstat(cur);
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        if (missing.length === 0 && cur === path.resolve(dir)) throw new Error(`the agent vault ${dir} is not a real directory (a link or another type): refusing to write through it`);
+      }
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      const up = path.dirname(cur);
+      if (up === cur) break;
+      missing.unshift(cur);
+      cur = up;
+    }
+  }
+  for (const p of missing) {
+    try {
+      await fs.promises.mkdir(p, { mode: 0o700 });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    const st = await fs.promises.lstat(p);
+    if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`the agent vault component ${path.basename(p)} is not a real directory (a link or another type): refusing to write through it`);
+  }
+}
+
 /** Pluggable credential vault interface. v2.9+ may add Keychain / Vault impls. */
 export interface TokenStore {
   read(agentName: string): Promise<string | null>;
@@ -187,20 +224,35 @@ export class FileTokenStore implements TokenStore {
       const st = await fs.promises.lstat(dir);
       if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`the agent vault ${dir} is not a real directory (a link or another type): refusing to write through it`);
     } else {
-      await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 }); // outside the instance layout (legacy, a test vault)
+      // Outside the instance layout (the legacy flat home, a test vault): the missing components are created ONE AT A
+      // TIME from the nearest existing ancestor, each a real directory (never a recursive mkdir, never through a link).
+      await mkdirOneAtATime(dir);
     }
     // Best-effort chmod after mkdir — handles the case where the dir already
     // existed at a looser mode (e.g. legacy ~/.bot-relay created at 0o755
     // pre-v2.1 Phase 4c.4). On Windows, this is a no-op.
     try { await fs.promises.chmod(dir, 0o700); } catch { /* Windows / EPERM */ }
-    const tmp = path.join(dir, `.${agentName}.token.tmp.${randomBytes(4).toString("hex")}`);
+    // The temp file is CREATED AND WRITTEN through ONE exclusive open (O_CREAT|O_EXCL|O_NOFOLLOW, 0600): a file or link
+    // planted at its name fails the create, and nothing is written through it. A failed fchmod is an ERROR.
+    const tmp = path.join(dir, tokenTempName(agentName));
+    const nofollow = (fs.constants as Record<string, number>).O_NOFOLLOW ?? 0;
+    let created = false;
     try {
-      await fs.promises.writeFile(tmp, token + "\n", { mode: 0o600 });
-      try { await fs.promises.chmod(tmp, 0o600); } catch { /* Windows */ }
+      const fh = await fs.promises.open(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | nofollow, 0o600);
+      created = true;
+      try {
+        await fh.writeFile(token + "\n");
+        await fh.chmod(0o600);
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
       await fs.promises.rename(tmp, target);
     } catch (err) {
-      // Best-effort cleanup of tmp on failure.
-      try { await fs.promises.unlink(tmp); } catch { /* ignore */ }
+      // Our own temp file only: never a name we did not create.
+      if (created) {
+        try { await fs.promises.unlink(tmp); } catch { /* ignore */ }
+      }
       throw err;
     }
   }

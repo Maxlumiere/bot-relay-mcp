@@ -33,6 +33,16 @@
 # whole string.
 relay_whole_match() { [[ "$1" =~ $2 ]]; }
 
+# The resolution cache (RELAY_RES_*, exported so this process's $( ) subshells reuse it) is THIS process's own: one
+# inherited from a parent (another hook, another shell) is discarded when the helpers are first sourced here, and
+# re-resolved on demand. The marker is NOT exported, so a child process discards an inherited cache too; a second
+# source in this same process keeps this process's own resolution.
+if [ "${RELAY_RES_OWNER_PID:-}" != "$$" ]; then
+  unset RELAY_RES_LOADED RELAY_RES_KIND RELAY_RES_DB_PATH RELAY_RES_EXISTS RELAY_RES_REASON RELAY_RES_WARNING \
+    RELAY_RES_HOOK_DB RELAY_RES_OWNER_ENDPOINT RELAY_RES_INSTANCE_DIR RELAY_RES_LAYOUT_KNOWN
+  RELAY_RES_OWNER_PID=$$
+fi
+
 # relay_helpers_cli — the relay CLI beside these hooks (hooks/../bin/relay). A
 # function, not a top-level assignment: this file runs no top-level commands.
 # Inside a function, BASH_SOURCE[0] is the file that defines it (this one).
@@ -907,6 +917,15 @@ relay_ensure_instance_subdir() {
       echo "[bot-relay hook] the relay instance \"$id\" is not provisioned (removed or never created): nothing written" >&2
       return 1
     fi
+    # BOUND to the resolution: the DB path's directory must BE the cached instance directory (both canonicalised the
+    # same way, through the real file system), so a cache naming one DB and another directory writes nothing.
+    local base_real inst_real
+    base_real=$(cd "$base" 2>/dev/null && pwd -P) || base_real=""
+    inst_real=$(cd "$inst" 2>/dev/null && pwd -P) || inst_real=""
+    if [ -z "$base_real" ] || [ "$base_real" != "$inst_real" ]; then
+      echo "[bot-relay hook] the resolved relay DB does not belong to the resolved instance directory: nothing written" >&2
+      return 1
+    fi
     root="$inst"
   else
     # Outside the layout (the legacy flat home, an explicit DB elsewhere): no instance to re-create, but still no
@@ -948,15 +967,25 @@ RELAY_PARTS
   return 0
 }
 
-# relay_write_private_file <dir> <file> <content> — write <content> to <dir>/<file> atomically: a temp file CREATED
-# EXCLUSIVELY in <dir> by mktemp (mode 0600, an unpredictable name, never following a link), filled, made 0600
-# (checked), then renamed over the target. 0, or 1 with one stderr line and no temp file left.
+# relay_write_private_file <dir> <file> <content> — write <content> to <dir>/<file> atomically: a temp name is
+# generated, then CREATED AND WRITTEN in ONE redirection under `set -C` (noclobber: O_CREAT|O_EXCL, so a file or a
+# link planted at that name fails the create; any existing name is refused first), umask 077, inside the directory
+# already verified private; then a checked chmod 0600 and the rename over the target. 0, or 1 with one stderr line and
+# no temp file left. Residual (ADR-0036): a same-user process can still replace the file between the steps.
 relay_write_private_file() {
   local dir="$1" file="$2" content="$3" tmp
-  tmp=$(mktemp "$dir/.${file}.XXXXXXXX" 2>/dev/null) || { echo "[bot-relay hook] could not create a private temp file for $file" >&2; return 1; }
-  if ! { printf '%s' "$content" > "$tmp" && chmod 0600 "$tmp"; } 2>/dev/null; then
+  tmp="$dir/.${file}.$$.${RANDOM}${RANDOM}"
+  if [ -e "$tmp" ] || [ -L "$tmp" ]; then
+    echo "[bot-relay hook] refusing: something already exists at the temp name for $file" >&2
+    return 1
+  fi
+  if ! ( set -C; umask 077; printf '%s' "$content" > "$tmp" ) 2>/dev/null; then
+    echo "[bot-relay hook] could not create a private temp file for $file (refused an existing name)" >&2
+    return 1
+  fi
+  if ! chmod 0600 "$tmp" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null
-    echo "[bot-relay hook] could not write $file privately" >&2
+    echo "[bot-relay hook] could not make the temp file for $file private (mode 0600)" >&2
     return 1
   fi
   mv -f "$tmp" "$dir/$file" 2>/dev/null || {
