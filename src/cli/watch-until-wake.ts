@@ -161,12 +161,41 @@ export async function agentWatchStatus(db: Handle, dbPath: string, agent: string
 }
 
 /** Open the relay DB read-only, waiting while no writer has created its WAL sidecars (never creating one). */
-async function openDbWaiting(dbPath: string, intervalMs: number, say: (l: string) => void, agent: string): Promise<Handle> {
+/**
+ * Open the relay DB read-only and take the identity of the file THIS HANDLE opened (Codex #447 R2 P1-b). The driver
+ * exposes no descriptor, so it is the codebase's lock pattern (doorbell-lock.ts): the identity is taken BEFORE the
+ * driver opens the path, and the path must still name it AFTER the open; a path that changed during the open closes
+ * the handle (null: try again). Never an identity read from the pathname after the fact.
+ */
+export async function openRelayDbBound(dbPath: string, duringOpen?: () => void): Promise<{ db: Handle; identity: string } | null> {
   const { openRelayDbIfWritten } = await import("../doorbell-run.js");
+  const { fileIdentityKey } = await import("../file-identity.js");
+  let pre: string;
+  try {
+    pre = fileIdentityKey(fs.statSync(dbPath, { bigint: true }));
+  } catch {
+    return null;
+  }
+  const r = await openRelayDbIfWritten(dbPath, duringOpen);
+  if ("waiting" in r) return null;
+  let post: string | null = null;
+  try {
+    post = fileIdentityKey(fs.statSync(dbPath, { bigint: true }));
+  } catch {
+    /* gone: not the file opened */
+  }
+  if (post !== pre) {
+    r.db.close();
+    return null;
+  }
+  return { db: r.db, identity: pre };
+}
+
+async function openDbWaiting(dbPath: string, intervalMs: number, say: (l: string) => void, agent: string): Promise<{ db: Handle; identity: string }> {
   for (;;) {
     try {
-      const r = await openRelayDbIfWritten(dbPath);
-      if (!("waiting" in r)) return r.db;
+      const r = await openRelayDbBound(dbPath);
+      if (r) return r;
     } catch (err) {
       say(`[sentinel] DEGRADED: the watch for ${agent} cannot open its relay DB yet (${err instanceof Error ? err.message : String(err)}): retrying`);
     }
@@ -382,10 +411,11 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
   };
 
   // PHASE 1 (no lock held): a readable relay DB, then OWNERSHIP (D1). It never creates a sidecar.
-  let db: Handle | null = await openDbWaiting(dbPath, intervalMs, say, agent);
-  // Codex #447 R1 P1: the identity of the DB this watch OPENED; every policy read is bound to it (re-recorded on reopen).
-  const { dbIdentity } = await import("../wake-policy.js");
-  let openedDb = dbIdentity(dbPath);
+  // Codex #447 R1 P1 / R2 P1-b: the identity of the DB file this handle OPENED (taken around the open, never from
+  // the pathname afterwards); every policy read is bound to it, and it is re-taken with every reopen.
+  const first = await openDbWaiting(dbPath, intervalMs, say, agent);
+  let db: Handle | null = first.db;
+  let openedDb: string | null = first.identity;
   const closeDb = () => {
     try {
       db?.close();
@@ -508,8 +538,9 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
       const t = now();
       try {
         if (!db) {
-          db = await openDbWaiting(dbPath, intervalMs, say, agent);
-          openedDb = dbIdentity(dbPath);
+          const again = await openDbWaiting(dbPath, intervalMs, say, agent);
+          db = again.db;
+          openedDb = again.identity;
         }
         // D1 (iii): the agent's ONE live window must still be this one (by pid + the kernel's start).
         const own = O.stillOwner(window, await agentBindings(db, agent), ownHost, ownerDeps, deadCache);

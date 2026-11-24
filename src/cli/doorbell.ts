@@ -261,7 +261,7 @@ async function readWakeCoverage(): Promise<DoorbellStatus["wake_coverage"]> {
  * (it is armed and cannot wake). An unopenable DB holds nothing back: held is then empty, the policy state stands.
  */
 async function readPolicyAndHeld(dbPath: string): Promise<{ policy: DoorbellStatus["policy"]; held: DoorbellStatus["held"] }> {
-  const { readWakePolicy, policyStanding, dbIdentity } = await import("../wake-policy.js");
+  const { readWakePolicy, policyStanding } = await import("../wake-policy.js");
   // A NULL-PROTOTYPE dictionary (Codex #447 R1 P2): "__proto__" is a valid agent name, and a plain {} would turn its
   // record into a prototype change that vanishes from the JSON (its held mail silent).
   const held = Object.create(null) as DoorbellStatus["held"];
@@ -269,18 +269,18 @@ async function readPolicyAndHeld(dbPath: string): Promise<{ policy: DoorbellStat
     const r = readWakePolicy(path.dirname(dbPath));
     return { policy: r.ok ? { state: "valid" } : { state: "policy_invalid", why: r.why }, held };
   };
-  const { openRelayDbIfWritten } = await import("../doorbell-run.js");
+  const { openRelayDbBound } = await import("./watch-until-wake.js");
   const { pendingMetadata, agentRegistered } = await import("../db.js");
-  let opened: Awaited<ReturnType<typeof openRelayDbIfWritten>>;
+  let opened: Awaited<ReturnType<typeof openRelayDbBound>>;
   try {
-    opened = await openRelayDbIfWritten(dbPath);
+    opened = await openRelayDbBound(dbPath);
   } catch {
     return unbound();
   }
-  if ("waiting" in opened) return unbound();
+  if (!opened) return unbound();
   const db = opened.db;
-  // The policy read is BOUND to the DB just opened (Codex #447 R1 P1), as the watch binds its own.
-  const read = readWakePolicy(path.dirname(dbPath), { bound: { dbPath, identity: dbIdentity(dbPath) } });
+  // The policy read is BOUND to the file this handle opened (Codex #447 R1 P1 / R2 P1-b), as the watch binds its own.
+  const read = readWakePolicy(path.dirname(dbPath), { bound: { dbPath, identity: opened.identity } });
   const policy: DoorbellStatus["policy"] = read.ok ? { state: "valid" } : { state: "policy_invalid", why: read.why };
   try {
     if (read.ok) {

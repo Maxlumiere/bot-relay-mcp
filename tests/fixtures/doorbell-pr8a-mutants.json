@@ -138,5 +138,12 @@
   "find": "fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK : 0)",
   "replace": "fs.constants.O_NOFOLLOW : 0)",
   "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "r2-no-post-open-check",
+  "file": "src/cli/watch-until-wake.ts",
+  "find": "  if (post !== pre) {\n    r.db.close();\n    return null;\n  }\n",
+  "replace": "",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
  }
 ]

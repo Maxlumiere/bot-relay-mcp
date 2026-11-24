@@ -416,9 +416,68 @@ describe("Codex #447 R1: the policy is bound to the OPEN relay's instance; read 
 describe("the mutation fixture (tests/fixtures/doorbell-pr8a-mutants.json; run: node scripts/mutation-sweep.mjs <fixture>)", () => {
   it("every mutant still applies: its find text occurs exactly once in its file; names are unique", () => {
     const M = JSON.parse(fs.readFileSync(path.join(REPO, "tests", "fixtures", "doorbell-pr8a-mutants.json"), "utf-8")) as Array<{ name: string; file: string; find: string }>;
-    expect(M.length).toBeGreaterThanOrEqual(20);
+    expect(M.length).toBeGreaterThanOrEqual(21);
     for (const m of M) expect(fs.readFileSync(path.join(REPO, m.file), "utf-8").split(m.find).length - 1, m.name).toBe(1);
     expect(new Set(M.map((m) => m.name)).size).toBe(M.length);
+  });
+});
+
+describe("Codex #447 R2 P1-b: the identity is the file the HANDLE opened, taken around the open (never the pathname afterwards)", () => {
+  /** Two real relay-shaped DBs (WAL, a writer held open so the sidecars exist), A permissive-free and B permissive. */
+  async function twoInstances() {
+    const Database = (await import("better-sqlite3")).default;
+    const mk = (d: string) => {
+      fs.rmSync(d, { recursive: true, force: true });
+      fs.mkdirSync(d, { recursive: true });
+      // A REAL relay DB, made by the product's own initializer in a child (never a copy of this process's open DB).
+      const init = spawnSync(process.execPath, ["-e", `import(require("url").pathToFileURL(process.argv[1]).href).then((m) => m.initializeDb())`, path.join(REPO, "dist", "db.js")], { env: { ...env(), RELAY_DB_PATH: path.join(d, "relay.db") }, encoding: "utf-8", timeout: 30_000 });
+      expect(init.status, init.stderr).toBe(0);
+      const w = new Database(path.join(d, "relay.db")); // a writer held open: the WAL sidecars exist
+      w.pragma("journal_mode = WAL");
+      w.prepare("SELECT COUNT(*) FROM messages").get();
+      return w;
+    };
+    const A = path.join(ROOT, "bind-A");
+    const B = path.join(ROOT, "bind-B");
+    const writers = [mk(A), mk(B)];
+    fs.writeFileSync(path.join(B, "doorbell-policy.json"), JSON.stringify({ ...GOOD, wake: [{ from: "*", to: "p-bob" }] }), { mode: 0o600 });
+    fs.chmodSync(path.join(B, "doorbell-policy.json"), 0o600);
+    const link = path.join(ROOT, "bind-link");
+    try {
+      fs.unlinkSync(link);
+    } catch {
+      /* absent */
+    }
+    fs.symlinkSync(A, link);
+    return { A, B, link, writers };
+  }
+  const swap = (link: string, to: string) => {
+    fs.unlinkSync(link);
+    fs.symlinkSync(to, link);
+  };
+  it("opened A, then the path swapped to B → the recorded identity is still A's, and B's permissive policy is REFUSED", async () => {
+    const { openRelayDbBound } = await import("../src/cli/watch-until-wake.js");
+    const { A, B, link, writers } = await twoInstances();
+    try {
+      const h = await openRelayDbBound(path.join(link, "relay.db"));
+      expect(h).not.toBeNull();
+      expect(h!.identity).toBe(P.dbIdentity(path.join(A, "relay.db")));
+      swap(link, B);
+      expect(P.currentWakePolicy(path.join(link, "relay.db"), () => true, h!.identity).read).toEqual({ ok: false, why: "not the open relay's instance" });
+      h!.db.close();
+    } finally {
+      for (const w of writers) w.close();
+    }
+  });
+  it("the path swapped DURING the open → the handle is closed and nothing is recorded (null: the watch opens again), never B's identity for A's handle", async () => {
+    const { openRelayDbBound } = await import("../src/cli/watch-until-wake.js");
+    const { B, link, writers } = await twoInstances();
+    try {
+      const h = await openRelayDbBound(path.join(link, "relay.db"), () => swap(link, B));
+      expect(h).toBeNull();
+    } finally {
+      for (const w of writers) w.close();
+    }
   });
 });
 
