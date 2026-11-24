@@ -234,6 +234,7 @@ describe("the CLI: --arm-check reads the policy first (loud); doorbell status an
   it("`relay doorbell status`: policy state + why in JSON and text; held mail for an opted-in agent, with its reason, count and oldest age", () => {
     writePolicy(GOOD);
     db.sendMessage("p-carol", "p-bob", "x", "normal"); // carol has no standing → held
+    db.sendMessage("p-alice", "p-bob", "x", "normal"); // alice HAS standing → pending, but never counted as held
     db.sendMessage("p-alice", "p-carol", "x", "normal"); // carol is not opted in → never counted (noise)
     const j = JSON.parse(relay(["doorbell", "status", "--json"]).stdout) as { policy: unknown; held: Record<string, { reason: string; count: number; oldest_age_seconds: number }> };
     expect(j.policy).toEqual({ state: "valid" });
