@@ -1,5 +1,5 @@
 # Dependencies + build output
-# no trailing slash: bin/new-worktree links node_modules (a symlink is not a directory)
+# no trailing slash: a linked node_modules (a symlink) is not a directory
 node_modules
 dist/
 

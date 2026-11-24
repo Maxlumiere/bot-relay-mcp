@@ -6,7 +6,8 @@
 /**
  * Doorbell PR 8, M7: MEASURE the shipped doorbell on the current main before any PR 8 code. A report, not a gate:
  * each check records PASS, FAIL or NOT_DRIVEN with its evidence (exit codes, the exact lines, elapsed times), and
- * the commit, into $M7_REPORT (JSON). Run by tests/m7/run-m7.sh, never by the default suite.
+ * the commit, into $M7_REPORT (JSON). Never part of the default suite.
+ * Run only through tests/m7/run-m7.sh.
  *
  * Real processes: each window is a real shell (tests/helpers/watch-window.ts), bound to a test agent in a SANDBOXED
  * relay DB under a temp dir; every relay command is the real CLI (bin/relay → dist). Nothing here reads or writes a
