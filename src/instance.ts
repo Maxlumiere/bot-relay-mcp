@@ -256,8 +256,26 @@ function lstatOrNull(p: string): fs.Stats | null {
   }
 }
 
+/** A validated component's identity (#449 R1 P1): re-checked after the last write step. */
+interface ComponentIdentity {
+  role: string;
+  path: string;
+  dev: bigint;
+  ino: bigint;
+}
+const identityOf = (p: string, role: string): ComponentIdentity => {
+  const st = fs.lstatSync(p, { bigint: true });
+  return { role, path: p, dev: st.dev, ino: st.ino };
+};
+
+/** TESTS ONLY: runs between the validation of the chain and the writes (a swap injected in the window). */
+let provisionSeam: (() => void) | null = null;
+export function _setProvisionSeamForTests(fn: (() => void) | null): void {
+  provisionSeam = fn;
+}
+
 /** One directory component below the trust root: created when absent, refused unless it is a REAL directory. */
-function realDirComponent(p: string, role: string): void {
+function realDirComponent(p: string, role: string): ComponentIdentity {
   let st = lstatOrNull(p);
   if (!st) {
     try {
@@ -270,25 +288,60 @@ function realDirComponent(p: string, role: string): void {
   if (!st || st.isSymbolicLink() || !st.isDirectory()) {
     throw new Error(`refusing to provision the instance: the ${role} is not a real directory (a symbolic link, or not a directory)`);
   }
-  if (process.platform === "win32") return;
-  // Narrow an existing directory through a descriptor that cannot follow a link swapped in after the lstat.
-  const fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  if (process.platform === "win32") return identityOf(p, role);
+  // Narrow an existing directory through a descriptor that cannot follow a link swapped in after the lstat. A native
+  // failure (a swap between the lstat and the open) names the path: it is mapped to the ROLE (#449 R1 P3).
+  let fd: number;
+  try {
+    fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  } catch {
+    throw new Error(`refusing to provision the instance: the ${role} changed while it was being checked (a symbolic link, or not a directory)`);
+  }
   try {
     fs.fchmodSync(fd, 0o700);
   } finally {
     fs.closeSync(fd);
   }
+  return identityOf(p, role);
 }
 
 /** The instance directory, every component below the relay home real (created one at a time). */
 export function provisionInstanceDir(instanceId: string): string {
+  return provisionInstanceChain(instanceId).dir;
+}
+
+/** provisionInstanceDir, plus each component's identity from the trust root down (for the post-write re-check). */
+function provisionInstanceChain(instanceId: string): { dir: string; chain: ComponentIdentity[] } {
   const idFault = instanceIdFault(instanceId);
   if (idFault) throw new Error(`invalid instance_id "${instanceId}": ${idFault}`);
-  const instances = path.join(relayHomeRealRoot(), INSTANCES_DIRNAME);
-  realDirComponent(instances, "instances directory");
+  const root = relayHomeRealRoot();
+  const chain = [identityOf(root, "relay home")];
+  const instances = path.join(root, INSTANCES_DIRNAME);
+  chain.push(realDirComponent(instances, "instances directory"));
   const dir = path.join(instances, instanceId);
-  realDirComponent(dir, "instance directory");
-  return dir;
+  chain.push(realDirComponent(dir, "instance directory"));
+  return { dir, chain };
+}
+
+/**
+ * #449 R1 P1 (ruling af911583): after the LAST write step, every component must still be the one validated. Node has
+ * no openat, so a component swapped for a link inside the window cannot be PREVENTED; it is DETECTED here and refused
+ * loudly, by ROLE (never the path). Nothing is undone: undoing through a swapped path could delete or chmod at the
+ * other end; a person decides.
+ */
+function assertChainUnchanged(chain: ComponentIdentity[]): void {
+  for (const c of chain) {
+    let same = false;
+    try {
+      const st = fs.lstatSync(c.path, { bigint: true });
+      same = !st.isSymbolicLink() && st.dev === c.dev && st.ino === c.ino;
+    } catch {
+      same = false;
+    }
+    if (!same) {
+      throw new Error(`refusing: the ${c.role} changed while the instance was being provisioned; the operation may have been redirected. Nothing was undone: check it before using this instance.`);
+    }
+  }
 }
 
 /**
@@ -304,7 +357,8 @@ export function createInstance(
   version: string,
   label?: string | null,
 ): InstanceMetadata {
-  const dir = provisionInstanceDir(instanceId);
+  const { dir, chain } = provisionInstanceChain(instanceId);
+  provisionSeam?.();
   const metaPath = path.join(dir, INSTANCE_METADATA_FILENAME);
   const existing = readInstanceMetadataFile(dir) as InstanceMetadata | null;
   const now = new Date().toISOString();
@@ -316,17 +370,34 @@ export function createInstance(
     label: label ?? existing?.label ?? null,
   };
   const tmp = path.join(dir, `.${INSTANCE_METADATA_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
-  const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+  // Every failure here is phrased by ROLE (never the path) and leaves no temp file behind.
+  let fd: number;
+  try {
+    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+  } catch {
+    throw new Error("refusing to provision the instance: its metadata record could not be created in the instance directory");
+  }
   try {
     fs.writeSync(fd, JSON.stringify(meta, null, 2));
     fs.fsyncSync(fd);
-  } catch (err) {
+  } catch {
     fs.closeSync(fd);
     fs.rmSync(tmp, { force: true });
-    throw err;
+    throw new Error("refusing to provision the instance: its metadata record could not be written");
   }
   fs.closeSync(fd);
-  fs.renameSync(tmp, metaPath);
+  try {
+    fs.renameSync(tmp, metaPath);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    const code = (err as NodeJS.ErrnoException).code;
+    throw new Error(
+      code === "EISDIR" || code === "ENOTEMPTY" || code === "EEXIST"
+        ? "refusing to provision the instance: its metadata record (instance.json) is not a regular file"
+        : "refusing to provision the instance: its metadata record could not be put in place",
+    );
+  }
+  assertChainUnchanged(chain);
   return meta;
 }
 

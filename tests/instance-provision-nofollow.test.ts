@@ -32,7 +32,8 @@ const relayRoot = () => path.join(home, ".bot-relay");
 
 /** Every entry under `dir`, recursively, with file contents: the "target untouched" fingerprint. */
 function fingerprint(dir: string): string {
-  const out: string[] = [];
+  // The TARGET DIR's own mode first (a chmod of the target itself through the link must show; #449 R1).
+  const out: string[] = [`. ${(fs.statSync(dir).mode & 0o777).toString(8)}`];
   const walk = (d: string) => {
     for (const e of fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const p = path.join(d, e.name);

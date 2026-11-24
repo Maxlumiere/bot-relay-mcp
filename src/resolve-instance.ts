@@ -42,7 +42,7 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "a9d948119621";
+export const RESOLVER_REVISION = "ebb616a399f9";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";
@@ -124,7 +124,15 @@ export function readInstanceMetadataFile(instanceDirPath: string): Record<string
     // by lstat first. A link at the record's name is not a provisioning record.
     const noFollow = fs.constants.O_NOFOLLOW;
     if (noFollow === undefined && fs.lstatSync(file).isSymbolicLink()) return null;
-    fd = fs.openSync(file, fs.constants.O_RDONLY | (noFollow ?? 0));
+    // #449 R1 P2: the record's ANCESTORS are real directories too (the instance dir and its parent, instances/): a
+    // STATIC link there (instances/<id> → elsewhere) would otherwise lend another tree's record. No race is needed
+    // for that one, so it is refused outright.
+    for (const d of [instanceDirPath, path.dirname(instanceDirPath)]) {
+      const st = fs.lstatSync(d);
+      if (st.isSymbolicLink() || !st.isDirectory()) return null;
+    }
+    // O_NONBLOCK: a FIFO at the record's name would otherwise block the open before the isFile check refuses it.
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (noFollow ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
     if (!fs.fstatSync(fd).isFile()) return null;
     const v: unknown = JSON.parse(fs.readFileSync(fd, "utf-8"));
     return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
@@ -199,7 +207,7 @@ const caseFold = (s: string): string => s.normalize("NFC").toUpperCase().toLower
  * another file means sensitive. No cased component anywhere (undetectable) reads as insensitive (fail closed: the
  * layout test then refuses more, never less).
  */
-export function fsIsCaseInsensitiveAt(p: string): boolean {
+export function fsIsCaseInsensitiveAt(p: string, lstat: (q: string) => { dev: bigint; ino: bigint } = (q) => fs.lstatSync(q, { bigint: true })): boolean {
   let cur = path.resolve(p);
   for (;;) {
     try {
@@ -218,6 +226,14 @@ export function fsIsCaseInsensitiveAt(p: string): boolean {
       return cur;
     }
   })();
+  // #449 R1 P2: only a component on the TARGET's own file system says anything about it (a mount root, or a climb
+  // across a mount boundary, would measure the parent's): another device is skipped; none left → undetectable → fold.
+  let targetDev: bigint;
+  try {
+    targetDev = lstat(real).dev;
+  } catch {
+    return true;
+  }
   const parts = real.split(path.sep);
   for (let i = parts.length - 1; i >= 0; i--) {
     const c = parts[i]!;
@@ -226,8 +242,9 @@ export function fsIsCaseInsensitiveAt(p: string): boolean {
     const here = parts.slice(0, i + 1).join(path.sep);
     const altHere = [...parts.slice(0, i), swapped].join(path.sep);
     try {
-      const a = fs.lstatSync(here, { bigint: true });
-      const b = fs.lstatSync(altHere, { bigint: true });
+      const a = lstat(here);
+      if (a.dev !== targetDev) continue; // another file system: says nothing about the target's
+      const b = lstat(altHere);
       return a.dev === b.dev && a.ino === b.ino;
     } catch {
       return false; // the swapped spelling does not exist: case-sensitive

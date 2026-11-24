@@ -1,0 +1,72 @@
+[
+ {
+  "name": "fold-never",
+  "file": "src/resolve-instance.ts",
+  "find": "  const fold = opts.caseInsensitive ?? fsIsCaseInsensitiveAt(instancesRoot);",
+  "replace": "  const fold = opts.caseInsensitive ?? false;",
+  "test": "tests/instance-layout-casefold.test.ts"
+ },
+ {
+  "name": "basename-exact-only",
+  "file": "src/resolve-instance.ts",
+  "find": "  if (!same(path.basename(dbPath), DB_FILENAME)) return null;",
+  "replace": "  if (path.basename(dbPath) !== DB_FILENAME) return null;",
+  "test": "tests/instance-layout-casefold.test.ts"
+ },
+ {
+  "name": "detection-always-sensitive",
+  "file": "src/resolve-instance.ts",
+  "find": "      return a.dev === b.dev && a.ino === b.ino;",
+  "replace": "      return a.dev === b.dev && a.ino === b.ino && false;",
+  "test": "tests/instance-layout-casefold.test.ts"
+ },
+ {
+  "name": "component-count-unchecked",
+  "file": "src/resolve-instance.ts",
+  "find": "  return pa.length === pb.length && pa.every((c, i) => same(c, pb[i]!)) ? dir : null;",
+  "replace": "  return pa.every((c, i) => pb[i] !== undefined && same(c, pb[i]!)) ? dir : null;",
+  "test": "tests/instance-layout-casefold.test.ts"
+ },
+ {
+  "name": "r1-no-post-write-check",
+  "file": "src/instance.ts",
+  "find": "  assertChainUnchanged(chain);\n  return meta;",
+  "replace": "  return meta;",
+  "test": "tests/instance-0b-r1.test.ts"
+ },
+ {
+  "name": "r1-reader-follows-ancestors",
+  "file": "src/resolve-instance.ts",
+  "find": "      if (st.isSymbolicLink() || !st.isDirectory()) return null;\n    }\n    // O_NONBLOCK",
+  "replace": "      void st;\n    }\n    // O_NONBLOCK",
+  "test": "tests/instance-0b-r1.test.ts"
+ },
+ {
+  "name": "r1-reader-blocks-on-fifo",
+  "file": "src/resolve-instance.ts",
+  "find": " | (noFollow ?? 0) | (fs.constants.O_NONBLOCK ?? 0));",
+  "replace": " | (noFollow ?? 0));",
+  "test": "tests/instance-0b-r1.test.ts"
+ },
+ {
+  "name": "r1-detector-any-device",
+  "file": "src/resolve-instance.ts",
+  "find": "      if (a.dev !== targetDev) continue; // another file system: says nothing about the target's\n",
+  "replace": "",
+  "test": "tests/instance-0b-r1.test.ts"
+ },
+ {
+  "name": "r1-native-error-leaks-path",
+  "file": "src/instance.ts",
+  "find": "  } catch {\n    throw new Error(`refusing to provision the instance: the ${role} changed while it was being checked (a symbolic link, or not a directory)`);\n  }",
+  "replace": "  } catch (err) {\n    throw err;\n  }",
+  "test": "tests/instance-0b-r1.test.ts"
+ },
+ {
+  "name": "r1-temp-left-behind",
+  "file": "src/instance.ts",
+  "find": "    fs.renameSync(tmp, metaPath);\n  } catch (err) {\n    fs.rmSync(tmp, { force: true });",
+  "replace": "    fs.renameSync(tmp, metaPath);\n  } catch (err) {\n    void tmp;",
+  "test": "tests/instance-0b-r1.test.ts"
+ }
+]
