@@ -39,7 +39,6 @@ const { getOwnHostId } = await import("../src/liveness.js");
 const OWN = getOwnHostId();
 
 const HOUR = 3_600_000;
-const DAY = 24 * HOUR;
 const NOW = Date.now();
 const OPTS = { nowMs: NOW, boundMs: 24 * HOUR, antiFlapMarginMs: 24 * HOUR };
 const windows: TestWindow[] = [];
