@@ -5,10 +5,11 @@
 
 /**
  * Doorbell PR 8b (gate brief §6; rulings 7eb82f49, 9ac81564): an HONEST state for an agent with no automatic wake.
- * The wake-coverage detector's UNCOVERED is split by POSITIVE evidence from the relay's own registration record: an
- * agent whose registered CLI profile is known and has autoWake false reads NEEDS_HUMAN (a report on the same
- * surfaces, never an alarm). A NULL or unknown profile and any read error stay UNCOVERED (the alarm); two live
- * windows bound to an agent that armed --until-wake stay UNCOVERED with reason two_windows.
+ * The wake-coverage detector's UNCOVERED is split by POSITIVE evidence the RELAY OBSERVES (ruling cc9f2199): the CLI
+ * profile of the agent's own nearest agent process, re-derived at every registration (agents.cli_profile_observed),
+ * never the caller-supplied cli_profile. Known with autoWake false → NEEDS_HUMAN (a report on the same surfaces,
+ * never an alarm). NULL and any read error stay UNCOVERED (the alarm); two live windows bound to an agent that armed
+ * --until-wake stay UNCOVERED with reason two_windows.
  */
 import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
 import fs from "fs";
@@ -56,8 +57,10 @@ function reset(): void {
   db.getDb();
 }
 /** An agent that drained before, then went dark with mail stuck past the 48 h threshold: today's UNCOVERED. */
-function regressed(agent: string, cli_profile: string | null = null): void {
-  db.registerAgent(agent, "r", [], { cli_profile });
+/** `observed`: the profile the relay observed (what the verdict reads); `supplied`: the caller's (informational). */
+function regressed(agent: string, observed: string | null = null, supplied: string | null = null): void {
+  db.registerAgent(agent, "r", [], { cli_profile: supplied });
+  db.setObservedCliProfile(agent, observed, new Date(NOW - 80 * HOUR).toISOString());
   db.getDb().prepare("UPDATE agents SET last_drain_at = ? WHERE name = ?").run(new Date(NOW - 72 * HOUR).toISOString(), agent);
   db.getDb()
     .prepare("INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, 'x', ?, 'm', 'normal', 'pending', ?)")
@@ -111,12 +114,25 @@ describe("the daemon's derivation (watchClassForDaemon): the REGISTERED CLI prof
     regressed("s-claude", "claude");
     expect(D.classifyWakeCoverage(db.getDb(), { ...OPTS, watchClass: D.watchClassForDaemon(db.getDb(), DB) })[0]).toMatchObject({ verdict: "uncovered" });
   });
-  it("a NULL profile → UNCOVERED; an UNKNOWN profile string is normalised to NULL at registration → UNCOVERED", () => {
+  it("a NULL observed profile → UNCOVERED; an unknown id is stored as NULL → UNCOVERED", () => {
     regressed("s-none", null);
     regressed("s-other", "some-future-cli");
-    expect(db.getDb().prepare("SELECT cli_profile FROM agents WHERE name = 's-other'").get()).toEqual({ cli_profile: null });
+    expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-other'").get()).toEqual({ cli_profile_observed: null });
     const cls = D.watchClassForDaemon(db.getDb(), DB);
     expect([cls("s-none"), cls("s-other")]).toEqual(["armed", "armed"]);
+  });
+  it("the CALLER's cli_profile is never read: supplied codex, observed NULL → UNCOVERED; supplied claude, observed codex → NEEDS_HUMAN", () => {
+    regressed("s-claims", null, "codex");
+    regressed("s-real", "codex", "claude");
+    const cls = D.watchClassForDaemon(db.getDb(), DB);
+    expect([cls("s-claims"), cls("s-real")]).toEqual(["armed", "never"]);
+  });
+  it("P1-c: a BINDINGS read error → UNCOVERED, decided BEFORE the profile (even an observed codex)", () => {
+    regressed("s-codex", "codex");
+    fs.mkdirSync(W.watchAgentDir(DB, "s-codex") as string, { recursive: true });
+    const real = db.getDb();
+    const failingBindings = { prepare: (sql: string) => (/agent_bindings/i.test(sql) ? (() => { throw new Error("SQLITE_IOERR"); })() : real.prepare(sql)) } as unknown as Parameters<typeof D.watchClassForDaemon>[0];
+    expect(D.watchClassForDaemon(failingBindings, DB)("s-codex")).toBe("armed");
   });
   it("ANY read error → UNCOVERED (a read error never silences the alarm)", () => {
     regressed("s-codex", "codex");
@@ -232,9 +248,97 @@ describe("A1 §A2 (the doorbell stays unreachable from the server): the daemon's
 describe("the mutation fixture (tests/fixtures/doorbell-pr8b-mutants.json)", () => {
   it("every mutant still applies: its find text occurs exactly once in its file; names are unique", () => {
     const M = JSON.parse(fs.readFileSync(path.join(REPO, "tests", "fixtures", "doorbell-pr8b-mutants.json"), "utf-8")) as Array<{ name: string; file: string; find: string }>;
-    expect(M.length).toBeGreaterThanOrEqual(12);
+    expect(M.length).toBeGreaterThanOrEqual(18);
     for (const m of M) expect(fs.readFileSync(path.join(REPO, m.file), "utf-8").split(m.find).length - 1, m.name).toBe(1);
     expect(new Set(M.map((m) => m.name)).size).toBe(M.length);
+  });
+});
+
+describe("the relay OBSERVES the profile (ruling cc9f2199; 9d0bb9e6: the nearest agent decides; a bounded probe)", () => {
+  beforeEach(() => reset());
+  const L = () => import("../src/liveness.js");
+  it("observedProfileOf: one process's identity → exactly one profile, else null", async () => {
+    const { observedProfileOf } = await L();
+    expect(observedProfileOf("/usr/local/bin/codex --foo", "codex")).toBe("codex");
+    expect(observedProfileOf("/opt/claude/claude", "claude")).toBe("claude");
+    expect(observedProfileOf("/usr/bin/node /x/bin/codex", "node")).toBe("codex");
+    expect(observedProfileOf("/usr/bin/vim", "vim")).toBeNull();
+    expect(observedProfileOf("/home/u/claude-tools/bin/zsh", "zsh")).toBeNull(); // a name in a PATH never matches
+  });
+  it("the NEAREST agent decides: a codex process under a claude ancestor → codex; a claude process alone → claude", async () => {
+    const { findAgentProcess, parseProcessTable } = await L();
+    const row = (pid: number, ppid: number, cmd: string) => `${pid} ${ppid} Mon Nov 24 10:00:00 2026 ${cmd}`;
+    const nested = parseProcessTable([row(10, 1, "/opt/claude/claude"), row(20, 10, "/usr/local/bin/codex"), row(30, 20, "node /r/dist/index.js")].join("\n"));
+    expect(findAgentProcess(30, nested)?.profile).toBe("codex");
+    const alone = parseProcessTable([row(10, 1, "/opt/claude/claude"), row(30, 10, "node /r/dist/index.js")].join("\n"));
+    expect(findAgentProcess(30, alone)?.profile).toBe("claude");
+  });
+  it("probeAgentProfile: the same process (start token equal) → its profile; another process now, a timeout, an error, no pid, no start → NULL with a why", async () => {
+    const { probeAgentProfile } = await L();
+    const START = "Mon Nov 24 10:00:00 2026";
+    const fake = (comm: string, lstart = START) => async (args: string[]) => (args[1] === "lstart=" ? lstart : args[1] === "comm=" ? comm : `/usr/local/bin/${comm}`);
+    expect(await probeAgentProfile(4242, `${START} UTC`, { run: fake("codex") })).toEqual({ profile: "codex" });
+    expect((await probeAgentProfile(4242, `${START} UTC`, { run: fake("codex", "Tue Nov 25 10:00:00 2026") })).profile).toBeNull();
+    const hang = () => new Promise<string>(() => {});
+    const t0 = Date.now();
+    const timed = await probeAgentProfile(4242, `${START} UTC`, { run: hang, timeoutMs: 80 });
+    expect(timed.profile).toBeNull();
+    expect(timed.why).toMatch(/timed out/);
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect((await probeAgentProfile(4242, `${START} UTC`, { run: async () => { throw new Error("ps failed"); } })).profile).toBeNull();
+    expect((await probeAgentProfile(undefined, `${START} UTC`)).why).toBe("no agent pid");
+    expect((await probeAgentProfile(4242, null)).why).toMatch(/no agent start token/);
+  });
+  it("a stdio server's own observation decides at registration (synchronously); a supplied profile that disagrees writes ONE log line", async () => {
+    const { setOwnDetectedAgent } = await L();
+    const { handleRegisterAgent } = await import("../src/tools/identity.js");
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    setOwnDetectedAgent({ pid: 999_991, startedAt: "Mon Nov 24 10:00:00 2026 UTC", profile: "codex" });
+    try {
+      handleRegisterAgent({ name: "s-obs", role: "r", capabilities: [], cli_profile: "claude" } as never);
+      expect(db.getDb().prepare("SELECT cli_profile, cli_profile_observed FROM agents WHERE name = 's-obs'").get()).toEqual({ cli_profile: "claude", cli_profile_observed: "codex" });
+      expect(warn.mock.calls.flat().map(String).filter((l) => l.includes("cli_profile supplied")).length).toBe(1);
+    } finally {
+      setOwnDetectedAgent(null);
+      warn.mockRestore();
+    }
+  });
+  it("RE-DERIVED at every registration (no COALESCE): a later registration with no observation replaces codex with NULL", async () => {
+    const { deriveObservedCliProfile } = await import("../src/tools/identity.js");
+    regressed("s-again", "codex");
+    deriveObservedCliProfile("s-again", { name: "s-again", role: "r", capabilities: [] } as never);
+    expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-again'").get()).toEqual({ cli_profile_observed: null });
+  });
+  it("the HTTP path with a HANGING ps: registration succeeds at once, the observed profile is NULL, and stays NULL after the probe's bound (one log line)", async () => {
+    const { _setAsyncPsRunnerForTests, PROFILE_PROBE_TIMEOUT_MS } = await L();
+    const { handleRegisterAgent } = await import("../src/tools/identity.js");
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    _setAsyncPsRunnerForTests(() => new Promise<string>(() => {}));
+    try {
+      const t0 = Date.now();
+      const r = handleRegisterAgent({ name: "s-http", role: "r", capabilities: [], agent_pid: process.pid, agent_pid_start: "Mon Nov 24 10:00:00 2026 UTC" } as never) as { isError?: boolean };
+      expect(r.isError).toBeFalsy();
+      expect(Date.now() - t0, "registration never waits on the probe").toBeLessThan(500);
+      expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-http'").get()).toEqual({ cli_profile_observed: null });
+      await new Promise((res) => setTimeout(res, PROFILE_PROBE_TIMEOUT_MS + 300));
+      expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-http'").get()).toEqual({ cli_profile_observed: null });
+      expect(warn.mock.calls.flat().map(String).filter((l) => l.includes("was not observed") && l.includes("timed out")).length).toBe(1);
+    } finally {
+      _setAsyncPsRunnerForTests(null);
+      warn.mockRestore();
+    }
+  }, 15_000);
+  it("a late probe never overwrites a NEWER registration's value (compare-and-swap on the observation time)", () => {
+    regressed("s-cas", null);
+    db.setObservedCliProfile("s-cas", null, "2026-11-24T10:00:00.000Z");
+    db.setObservedCliProfile("s-cas", null, "2026-11-24T10:00:05.000Z"); // a newer registration
+    expect(db.setObservedCliProfile("s-cas", "codex", "2026-11-24T10:00:06.000Z", "2026-11-24T10:00:00.000Z")).toBe(false); // the old probe lands late
+    expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-cas'").get()).toEqual({ cli_profile_observed: null });
+  });
+  it("schema v27: the two columns exist on a fresh DB", () => {
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(27);
+    const cols = (db.getDb().prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(cols).toEqual(expect.arrayContaining(["cli_profile_observed", "cli_profile_observed_at"]));
   });
 });
 

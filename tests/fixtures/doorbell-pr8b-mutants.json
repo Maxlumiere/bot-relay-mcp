@@ -82,5 +82,47 @@
   "find": "        watchClass: watchClassForDaemon(db, dbPath),\n",
   "replace": "\n",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "reads-caller-profile",
+  "file": "src/wake-coverage-detector.ts",
+  "find": "SELECT cli_profile_observed FROM agents WHERE name = ?",
+  "replace": "SELECT cli_profile AS cli_profile_observed FROM agents WHERE name = ?",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "bindings-error-no-claim",
+  "file": "src/wake-coverage-detector.ts",
+  "find": "        return \"armed\"; // P1-c: a bindings-read ERROR is UNCOVERED, decided BEFORE the profile",
+  "replace": "        /* no two_windows claim */",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "register-takes-supplied",
+  "file": "src/tools/identity.ts",
+  "find": "    setObservedCliProfile(name, own.profile ?? null, at);",
+  "replace": "    setObservedCliProfile(name, supplied, at);",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "no-cas",
+  "file": "src/db.ts",
+  "find": "      : db.prepare(\"UPDATE agents SET cli_profile_observed = ?, cli_profile_observed_at = ? WHERE name = ? AND cli_profile_observed_at IS ?\").run(canon, at, name, expectAt);",
+  "replace": "      : db.prepare(\"UPDATE agents SET cli_profile_observed = ?, cli_profile_observed_at = ? WHERE name = ?\").run(canon, at, name);",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "probe-no-start-guard",
+  "file": "src/liveness.ts",
+  "find": "    if (raw + START_TOKEN_UTC_SUFFIX !== claimedStart) return { profile: null, why: \"the agent pid is another process now (start token differs)\" };\n",
+  "replace": "",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "no-rederive",
+  "file": "src/tools/identity.ts",
+  "find": "  setObservedCliProfile(name, null, at);\n  const ownHost = getOwnHostId();",
+  "replace": "  const ownHost = getOwnHostId();",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
  }
 ]

@@ -23,7 +23,10 @@ import {
   isNameActivelyHeld,
   getAgentWithStatus,
   resolveAvailableInstanceName,
+  setObservedCliProfile,
+  normalizeCliProfile,
 } from "../db.js";
+import { getOwnDetectedAgent, getOwnHostId, probeAgentProfile } from "../liveness.js";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "../transport/websocket.js";
 import { log } from "../logger.js";
@@ -100,6 +103,39 @@ function suffixMintRefusal(requestedName: string) {
     ],
     isError: true,
   };
+}
+
+/**
+ * Doorbell PR 8b: derive cli_profile_observed for a registration. A stdio server that observed its own agent process
+ * (the NEAREST agent above it) uses that, synchronously. Otherwise the column is set to NULL now and, for a pid on THIS
+ * host, a bounded ASYNC probe of the caller-named process fills it in later (compare-and-swap on the observation time,
+ * so a late probe never overwrites a newer registration). The caller's own cli_profile stays informational; when both
+ * are known and differ, one log line says so. Never throws into the registration.
+ */
+export function deriveObservedCliProfile(name: string, input: RegisterAgentInput): void {
+  const at = new Date().toISOString();
+  const supplied = normalizeCliProfile(input.cli_profile);
+  const disagree = (observed: string | null | undefined): void => {
+    if (supplied && observed && supplied !== observed) log.warn(`[register] ${name}: cli_profile supplied "${supplied}" but the relay observed "${observed}" (the observed profile decides wake coverage)`);
+  };
+  const own = getOwnDetectedAgent();
+  if (own && (typeof input.agent_pid !== "number" || input.agent_pid === own.pid)) {
+    setObservedCliProfile(name, own.profile ?? null, at);
+    disagree(own.profile);
+    return;
+  }
+  setObservedCliProfile(name, null, at);
+  const ownHost = getOwnHostId();
+  if (typeof input.agent_pid !== "number") return;
+  if (input.host_id && (!ownHost || input.host_id !== ownHost)) return; // another host's process cannot be probed here
+  void probeAgentProfile(input.agent_pid, input.agent_pid_start ?? null).then((r) => {
+    if (r.why) log.warn(`[register] ${name}: the CLI profile was not observed (${r.why}): it stays NULL`);
+    try {
+      if (setObservedCliProfile(name, r.profile, new Date().toISOString(), at)) disagree(r.profile);
+    } catch {
+      /* the row may be gone: nothing to record */
+    }
+  });
 }
 
 export function handleRegisterAgent(input: RegisterAgentInput) {
@@ -408,6 +444,13 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
     } catch {
       /* liveness is best-effort — never block register */
     }
+  }
+  // Doorbell PR 8b (ruling cc9f2199): the CLI profile the RELAY observes, re-derived at EVERY registration. Never
+  // blocks or fails the registration.
+  try {
+    deriveObservedCliProfile(agent.name, input);
+  } catch {
+    /* best-effort: the observed profile stays as written (NULL reads as UNCOVERED) */
   }
 
   // ADR-0041 R1 (Codex round 1): the receipt is read back AFTER every write,

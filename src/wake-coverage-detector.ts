@@ -153,10 +153,10 @@ export { writeWakeCoverageStatus, resolveWakeCoverageStatusPath };
 export type { WakeCoverageStatus } from "./wake-coverage-status.js";
 
 /**
- * PR 8b (gate brief §6; rulings 7eb82f49, 9ac81564): UNCOVERED is SPLIT by POSITIVE evidence from the relay's own
- * registration record, never declared per agent (no name list, no flag):
- *   - needs_human: the agent's registered CLI profile is known and has no automatic wake (autoWake false, e.g. a
- *     register-only CLI). Mail waits for a person. REPORTED on the same surfaces as the alarms, never as one.
+ * PR 8b (gate brief §6; rulings 7eb82f49, 9ac81564, cc9f2199): UNCOVERED is SPLIT by POSITIVE evidence the relay
+ * OBSERVES itself, never declared per agent (no name list, no flag) and never taken from the caller:
+ *   - needs_human: the CLI profile the relay observed for the agent is known and has no automatic wake (autoWake
+ *     false, e.g. a register-only CLI). Mail waits for a person. REPORTED on the same surfaces as the alarms.
  *   - uncovered:   everything else (a profile with a wake path, a NULL or unknown profile, any read error): the
  *                  alarm. With reason two_windows when two live windows are bound to an agent that armed
  *                  --until-wake (its watch refuses by design: no wake until one closes).
@@ -469,10 +469,11 @@ export function startWakeCoverageSweep(
  * PR 8b (ruling 9ac81564): the agent's wake class, DERIVED from the relay's own record (read-only):
  *   - "two_windows": its --until-wake agent dir exists (it armed that watch) AND two or more live windows are bound
  *     to it (the same judge the watch uses: oneLiveWindow over listAgentBindings, bindingLiveness). Still UNCOVERED.
- *   - "never": its REGISTERED cli_profile is a known profile with autoWake false (profileHasNoAutoWake): no automatic
- *     wake exists for it, so its stuck mail waits for a person (NEEDS_HUMAN).
- *   - else "armed": UNCOVERED, the alarm. A NULL or unknown profile and ANY read error land here, deliberately: the
- *     costly mistake for this detector is a silenced alarm.
+ *   - "never": the profile the RELAY OBSERVED (agents.cli_profile_observed, re-derived at every registration from the
+ *     agent's own process; never the caller-supplied cli_profile) is a known profile with autoWake false: no
+ *     automatic wake exists for it, so its stuck mail waits for a person (NEEDS_HUMAN).
+ *   - else "armed": UNCOVERED, the alarm. A NULL observed profile and ANY read error (a bindings read included,
+ *     decided before the profile) land here, deliberately: the costly mistake for this detector is a silenced alarm.
  */
 export function watchClassForDaemon(db: CompatDatabase, dbPath: string): (agent: string) => WatchClass {
   const own = getOwnHostId();
@@ -484,12 +485,13 @@ export function watchClassForDaemon(db: CompatDatabase, dbPath: string): (agent:
         const mine = bindings.filter((b) => b.agent_name === agent);
         if (oneLiveWindow(mine, own, (b) => bindingLiveness(b, own)).kind === "ambiguous") return "two_windows";
       } catch {
-        /* the bindings cannot be read: no two_windows claim */
+        return "armed"; // P1-c: a bindings-read ERROR is UNCOVERED, decided BEFORE the profile
       }
     }
     try {
-      const row = db.prepare("SELECT cli_profile FROM agents WHERE name = ?").get(agent) as { cli_profile: string | null } | undefined;
-      if (row && profileHasNoAutoWake(row.cli_profile)) return "never";
+      // The profile the RELAY observed (ruling cc9f2199), never the caller-supplied cli_profile.
+      const row = db.prepare("SELECT cli_profile_observed FROM agents WHERE name = ?").get(agent) as { cli_profile_observed: string | null } | undefined;
+      if (row && profileHasNoAutoWake(row.cli_profile_observed)) return "never";
     } catch {
       /* a read error never silences the alarm */
     }

@@ -516,6 +516,7 @@ function applySchemaSetup(db: CompatDatabase): void {
   migrateSchemaToV2_24(db);
   migrateSchemaToV2_25(db);
   migrateSchemaToV2_26(db);
+  migrateSchemaToV2_27(db);
   seedBuiltinTaskSchemas(db);
   finalizeSchemaVersion(db);
   purgeOldRecords(db);
@@ -744,7 +745,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 26;
+export const CURRENT_SCHEMA_VERSION = 27;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -2123,6 +2124,18 @@ function migrateSchemaToV2_25(db: CompatDatabase): void {
  *   - ADR-0043: every key starts with edge_id, and a foreign edge is refused.
  *   - Start tokens are the UTC form ONLY (a CHECK): no legacy acceptance here.
  */
+/**
+ * Doorbell PR 8b (schema v27, ruling cc9f2199): the CLI profile the RELAY OBSERVED for an agent (the nearest agent
+ * process's identity, re-derived at every register; NULL when it cannot be decided) and when. The caller's own
+ * cli_profile stays informational; only this column feeds the wake-coverage verdict. Existing rows stay NULL until each
+ * agent re-registers (NULL reads as UNCOVERED: the safe side).
+ */
+function migrateSchemaToV2_27(db: CompatDatabase): void {
+  const cols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "cli_profile_observed")) db.exec("ALTER TABLE agents ADD COLUMN cli_profile_observed TEXT");
+  if (!cols.some((c) => c.name === "cli_profile_observed_at")) db.exec("ALTER TABLE agents ADD COLUMN cli_profile_observed_at TEXT");
+}
+
 function migrateSchemaToV2_26(db: CompatDatabase): void {
   ensureRelayEdge(db);
   db.exec("CREATE TABLE IF NOT EXISTS connectors " + CONNECTORS_COLUMNS);
@@ -2479,6 +2492,21 @@ export function profileOwesVerdict(cliProfile: string | null | undefined): boole
  * Normalize a caller-supplied CLI profile id against the registry. Anything the
  * registry does not know becomes NULL (= UNKNOWN), never a default.
  */
+/**
+ * Doorbell PR 8b: record the CLI profile the relay OBSERVED for `name` (canonical id, or NULL) and when. `expectAt`
+ * makes it a compare-and-swap on the observation time: a late probe never overwrites a newer registration's value.
+ * Returns whether the row was written.
+ */
+export function setObservedCliProfile(name: string, profile: string | null, at: string, expectAt?: string): boolean {
+  const canon = profile ? (getAgentCliProfile(profile)?.id ?? null) : null;
+  const db = getDb();
+  const r =
+    expectAt === undefined
+      ? db.prepare("UPDATE agents SET cli_profile_observed = ?, cli_profile_observed_at = ? WHERE name = ?").run(canon, at, name)
+      : db.prepare("UPDATE agents SET cli_profile_observed = ?, cli_profile_observed_at = ? WHERE name = ? AND cli_profile_observed_at IS ?").run(canon, at, name, expectAt);
+  return r.changes > 0;
+}
+
 export function normalizeCliProfile(raw: string | null | undefined): string | null {
   if (!raw) return null;
   return getAgentCliProfile(raw) ? raw : null;
