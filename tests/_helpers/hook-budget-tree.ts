@@ -82,7 +82,26 @@ function unclassifiedSecondsReads(hooksDir: string): string[] {
 /** The SECONDS reads a hooks dir would be refused for (exported so the guard itself is tested). */
 export const budgetGuardFindings = (hooksDir: string): string[] => unclassifiedSecondsReads(hooksDir);
 
-export function budgetTree(dir: string, hooksDir: string, binDir: string): string {
+/**
+ * A hook INSTALLED with another declared timeout: rewrite the ONE inline `RELAY_HOOK_BUDGET_SECS=<n>` line of a hook's
+ * source to `secs` (the same assignment production uses; the source of truth stays the profile's hookInstall timeout,
+ * held equal to the shipped line by its own test). REFUSES unless the line occurs exactly once: a future hook edit can
+ * never silently leave the budget at its old value.
+ */
+export function rewriteDeclaredBudget(src: string, secs: number): string {
+  const re = /^RELAY_HOOK_BUDGET_SECS=\d+$/gm;
+  const n = (src.match(re) ?? []).length;
+  if (n !== 1) throw new Error(`rewriteDeclaredBudget: expected exactly 1 RELAY_HOOK_BUDGET_SECS=<n> line, found ${n}: update the helper`);
+  if (!Number.isInteger(secs) || secs < 1) throw new Error(`rewriteDeclaredBudget: not a budget: ${secs}`);
+  return src.replace(re, `RELAY_HOOK_BUDGET_SECS=${secs}`);
+}
+
+/**
+ * `opts.declaredBudget`: per hook file name, the timeout that copy is "installed" with (rewriteDeclaredBudget). For
+ * behaviour tests whose assertions must not depend on the runner's speed; the budget-skip path keeps its own test on
+ * the real declared value.
+ */
+export function budgetTree(dir: string, hooksDir: string, binDir: string, opts: { declaredBudget?: Readonly<Record<string, number>> } = {}): string {
   const base = path.join(dir, "bot-relay-mcp");
   fs.rmSync(dir, { recursive: true, force: true });
   try {
@@ -92,6 +111,10 @@ export function budgetTree(dir: string, hooksDir: string, binDir: string): strin
     const distDir = path.join(path.dirname(binDir), "dist");
     if (fs.existsSync(distDir)) fs.symlinkSync(distDir, path.join(base, "dist"), "junction");
     const copy = path.join(base, "hooks");
+    for (const [hook, secs] of Object.entries(opts.declaredBudget ?? {})) {
+      const p = path.join(copy, hook);
+      fs.writeFileSync(p, rewriteDeclaredBudget(fs.readFileSync(p, "utf-8"), secs));
+    }
     const stray = unclassifiedSecondsReads(copy);
     if (stray.length) throw new Error(`budgetTree: SECONDS read outside the seamed budget arithmetic, unclassified: ${stray.join(" | ")}`);
     const helpers = path.join(copy, "_vault-helpers.sh");

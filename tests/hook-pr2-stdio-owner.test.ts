@@ -23,14 +23,24 @@ import http from "http";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
 import { sandboxEnv } from "./_helpers/sandbox-env.js";
+import { budgetTree, rewriteDeclaredBudget } from "./_helpers/hook-budget-tree.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_INDEX = path.join(REPO, "dist", "index.js");
 const DIST_DB = pathToFileURL(path.join(REPO, "dist", "db.js")).href;
 const RELAY = path.join(REPO, "bin", "relay");
-const HOOKS = path.join(REPO, "hooks");
 const WIN_NO_BASH_HOOKS = process.platform === "win32";
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "hookpr2-")));
+/**
+ * THE BEHAVIOUR ROWS run the hooks INSTALLED with a 30 s declared timeout (a seamed copy, rewriteDeclaredBudget: the
+ * same inline assignment production uses), so the runner's speed cannot decide whether a step runs: CI measured a
+ * 5 s PostToolUse spend 2 s before the liveness restamp and skip it, loudly and by design. The skip path itself has
+ * its own deterministic row on the REAL 5 s copy (HOOKS_REAL_BUDGET).
+ */
+const HOOKS = budgetTree(path.join(ROOT, "hooks-30s"), path.join(REPO, "hooks"), path.join(REPO, "bin"), {
+  declaredBudget: { "post-tool-use-check.sh": 30, "stop-check.sh": 30, "check-relay.sh": 30 },
+});
+const HOOKS_REAL_BUDGET = budgetTree(path.join(ROOT, "hooks-real"), path.join(REPO, "hooks"), path.join(REPO, "bin"));
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 const AGENT = "pr2-agent";
 const SENDER = "pr2-sender";
@@ -270,12 +280,12 @@ fs.writeFileSync(
   `#!/bin/sh\nprintf 'node %s\\n' "$*" >> "${ARGV_LOG}"\ncase "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\nexec "${process.execPath}" "$@"\n`,
   { mode: 0o755 }
 );
-async function runHook(c: Case, hook: string, extra: Record<string, string>, input = "") {
+async function runHook(c: Case, hook: string, extra: Record<string, string>, input = "", hooksDir = HOOKS) {
   fs.rmSync(SQLITE_LOG, { force: true });
   fs.rmSync(CURL_LOG, { force: true });
   fs.rmSync(ARGV_LOG, { force: true });
   const env = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_AGENT_NAME: AGENT, RELAY_TEST_CLOCK: "0", ...extra });
-  const child = spawn("bash", [path.join(HOOKS, hook)], { env, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn("bash", [path.join(hooksDir, hook)], { env, stdio: ["pipe", "pipe", "pipe"] });
   procs.push(child);
   let stdout = "";
   let stderr = "";
@@ -355,6 +365,17 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 2: the hooks read a stdio owner's ma
     expect(steady.livenessCalls, `the steady state: zero liveness calls\n${steady.out}`).toBe(0);
     await stop(o.child);
     expect((await anchorOf(c, AGENT)).agent_pid, "the anchor is the hook's agent pid (this test process)").toBe(process.pid);
+  }, 150_000);
+
+  it("THE BUDGET-SKIP PATH (the REAL 5 s hook, the restamp starved by the budget seam): the skip line is printed and ZERO liveness calls are made", async () => {
+    const c = newCase("budget-skip");
+    const { token } = seedWasmDb(c, "pr2 skip mail");
+    const o = await startStdioOwner(c);
+    const r = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token, RELAY_TEST_STARVE: "the liveness restamp" }, PTU, HOOKS_REAL_BUDGET);
+    expect(r.peekCalls, `precondition: the mail was read through the door\n${r.out}`).toBeGreaterThanOrEqual(1);
+    expect(r.out).toMatch(/no time budget left for the liveness restamp \(\d+s of 5s spent\): skipped\./);
+    expect(r.livenessCalls, `skipped: zero liveness calls\n${r.out}`).toBe(0);
+    await stop(o.child);
   }, 150_000);
 
   it("Q8: a STALE stored start (the same pid, another start, set through the door) → one call, and the anchor is the agent's real one again", async () => {
@@ -635,3 +656,16 @@ describe.skipIf(process.platform === "win32")("#423 R2 P2-3: every signal goes t
     await stop(next.child);
   }, 90_000);
 });
+
+describe("the declared-budget rewrite (tests/_helpers/hook-budget-tree.ts): exactly one line, or it refuses", () => {
+  it("one RELAY_HOOK_BUDGET_SECS line → rewritten; the copies run with 30 (behaviour) and 5 (the real hook)", () => {
+    expect(rewriteDeclaredBudget("a\nRELAY_HOOK_BUDGET_SECS=5\nb\n", 30)).toBe("a\nRELAY_HOOK_BUDGET_SECS=30\nb\n");
+    expect(fs.readFileSync(path.join(HOOKS, "post-tool-use-check.sh"), "utf-8")).toMatch(/^RELAY_HOOK_BUDGET_SECS=30$/m);
+    expect(fs.readFileSync(path.join(HOOKS_REAL_BUDGET, "post-tool-use-check.sh"), "utf-8")).toMatch(/^RELAY_HOOK_BUDGET_SECS=5$/m);
+  });
+  it("ZERO matching lines or TWO → refused (a future hook edit can never silently leave the budget at its old value)", () => {
+    expect(() => rewriteDeclaredBudget("no budget line here\n", 30)).toThrow(/found 0/);
+    expect(() => rewriteDeclaredBudget("RELAY_HOOK_BUDGET_SECS=5\nRELAY_HOOK_BUDGET_SECS=5\n", 30)).toThrow(/found 2/);
+  });
+});
+
