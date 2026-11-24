@@ -1172,7 +1172,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the o
     const r =
       hook === "check-relay.sh"
         ? await run({ RELAY_TEST_CLOCK: "" })
-        : await runHookRealBudgetAsync({ label: `${hook} hung owner peek`, env: {}, clock: "real", assertsCut: /timed out|no time budget|could not be read/i, run });
+        : await runHookRealBudgetAsync({ label: `${hook} hung owner peek`, hooksDir: REAL_BUDGET_HOOKS, env: {}, clock: "real", assertsCut: /timed out|no time budget|could not be read/i, run });
     expect(r.argv, "precondition: the hung step ran").toContain("owner peek");
     expect(r.status, "the hook exited by itself").not.toBeNull();
     expect(r.ms, `the stub sleeps 30s: the hook must end inside its budget\n${r.out}`).toBeLessThan(hook === "check-relay.sh" ? 10_000 : 5_000);

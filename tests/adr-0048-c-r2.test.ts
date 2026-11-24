@@ -634,7 +634,7 @@ describe("Codex #291 R2 #1 — the hook's OWN stdin read is on the budget too (a
       const clocks = hook === "stop-check.sh" ? ([{ starvedSeconds: 2 }] as const) : (["real", { starvedSeconds: 2 }] as const);
       for (const clock of clocks) {
         it(`${hook}: a line every 0.4s, never closed → the hook still ends inside its ${BUDGET[hook]}s budget and prints its cut (${clock === "real" ? "real clock" : "starved clock"})`, async () => {
-          const r = await runHookRealBudgetAsync({ label: `${hook} dribble`, env: {}, clock, assertsCut: /not complete within its time budget|no time budget left for the hook payload read/, run: dribble });
+          const r = await runHookRealBudgetAsync({ label: `${hook} dribble`, hooksDir: REAL_BUDGET_HOOKS, env: {}, clock, assertsCut: /not complete within its time budget|no time budget left for the hook payload read/, run: dribble });
           expect(r.secs, r.out).toBeLessThan(BUDGET[hook]);
         }, 30_000);
       }

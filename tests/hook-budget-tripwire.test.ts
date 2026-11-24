@@ -16,7 +16,7 @@ import { spawnSync, exec, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { hookSpawnRefusal, shellWords } from "./_setup/hook-budget-tripwire.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
-import { runHookRealBudget, REAL_BUDGET_OPTIN } from "./_helpers/hook-real-budget.js";
+import { runHookRealBudget, REAL_BUDGET_OPTIN, REAL_BUDGET_FIXTURE } from "./_helpers/hook-real-budget.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REAL = path.join(REPO, "hooks");
@@ -111,17 +111,18 @@ describe("installed (every test file)", () => {
 describe("runHookRealBudget: the ONE real-budget path", () => {
   it("the real clock: the opt-in is set and the fixed clock removed; a starved clock: RELAY_TEST_CLOCK is the seconds spent", () => {
     const seen: Record<string, string>[] = [];
-    runHookRealBudget({ label: "x", env: { RELAY_TEST_CLOCK: "0", A: "1" }, clock: "real", assertsCut: /cut/, run: (e) => (seen.push(e), { out: "cut" }) });
-    runHookRealBudget({ label: "x", env: { A: "1" }, clock: { starvedSeconds: 2 }, assertsCut: /cut/, run: (e) => (seen.push(e), { out: "cut" }) });
-    expect(seen[0]).toEqual({ A: "1", [REAL_BUDGET_OPTIN]: "1" });
-    expect(seen[1]).toEqual({ A: "1", RELAY_TEST_CLOCK: "2" });
+    runHookRealBudget({ label: "x", hooksDir: SEAMED, env: { RELAY_TEST_CLOCK: "0", A: "1" }, clock: "real", assertsCut: /cut/, run: (e) => (seen.push(e), { out: "cut" }) });
+    runHookRealBudget({ label: "x", hooksDir: SEAMED, env: { A: "1" }, clock: { starvedSeconds: 2 }, assertsCut: /cut/, run: (e) => (seen.push(e), { out: "cut" }) });
+    expect(seen[0]).toEqual({ A: "1", [REAL_BUDGET_OPTIN]: "1", [REAL_BUDGET_FIXTURE]: "1" });
+    expect(seen[1]).toEqual({ A: "1", RELAY_TEST_CLOCK: "2", [REAL_BUDGET_FIXTURE]: "1" });
   });
   it("assertsCut must MATCH: an output without the cut THROWS, naming the seamed default for behaviour rows", () => {
-    expect(() => runHookRealBudget({ label: "x", env: {}, clock: "real", assertsCut: /no time budget left/, run: () => ({ out: "VERDICT=HEALTHY" }) })).toThrow(/does not show the cut[\s\S]*seamed default/);
+    expect(() => runHookRealBudget({ label: "x", hooksDir: SEAMED, env: {}, clock: "real", assertsCut: /no time budget left/, run: () => ({ out: "VERDICT=HEALTHY" }) })).toThrow(/does not show the cut[\s\S]*seamed default/);
   });
   it("a REAL run through it: the seamed real-budget copy, starved at 2 s, prints the payload-read cut", () => {
     const r = runHookRealBudget({
       label: "PostToolUse starved",
+      hooksDir: SEAMED,
       env: { PATH: process.env.PATH ?? "", HOME: ROOT, RELAY_AGENT_NAME: "tw-bob", RELAY_HTTP_PORT: "1" },
       clock: { starvedSeconds: 2 },
       assertsCut: /no time budget left for the hook payload read/,
@@ -134,6 +135,41 @@ describe("runHookRealBudget: the ONE real-budget path", () => {
   });
 });
 
+describe("a real-budget row can only run a copy that declares the PRODUCTION budget", () => {
+  const RAISED = budgetTree(path.join(ROOT, "raised"), REAL, path.join(REPO, "bin")); // the behaviour default (30 s)
+  it("runHookRealBudget given a RAISED (behaviour) copy THROWS before running anything, naming the real-budget fixture", () => {
+    let ran = false;
+    expect(() => runHookRealBudget({ label: "x", hooksDir: RAISED, env: {}, clock: "real", assertsCut: /cut/, run: () => ((ran = true), { out: "cut" }) })).toThrow(/declares 30 s, production declares \d+ s[\s\S]*declaredBudget: "real"/);
+    expect(ran).toBe(false);
+  });
+  it("the tripwire refuses a runHookRealBudget spawn (either clock) whose SCRIPT declares a raised budget, even when hooksDir was a real copy", () => {
+    const script = path.join(RAISED, "post-tool-use-check.sh");
+    expect(hookSpawnRefusal("bash", [script], { env: { [REAL_BUDGET_FIXTURE]: "1", RELAY_TEST_CLOCK: "2" } })).toMatch(/declares 30 s, but production declares/);
+    expect(hookSpawnRefusal("bash", [script], { env: { [REAL_BUDGET_FIXTURE]: "1", [REAL_BUDGET_OPTIN]: "1" } })).toMatch(/declares 30 s, but production declares/);
+    expect(hookSpawnRefusal("bash", [path.join(SEAMED, "post-tool-use-check.sh")], { env: { [REAL_BUDGET_FIXTURE]: "1", RELAY_TEST_CLOCK: "2" } })).toBeNull();
+    expect(hookSpawnRefusal("bash", [script], CLOCK0), "a behaviour row on the raised copy is fine").toBeNull();
+  });
+});
+
+describe("command substitution, eval and sourcing are refused when a hook is named anywhere (conservative)", () => {
+  const hook = path.join(SEAMED, "stop-check.sh"); // even a SEAMED copy: what the string runs cannot be read from its words
+  it.each([
+    ["$( )", `echo "$(bash ${hook})"`],
+    ["backtick", `echo \`bash ${hook}\``],
+    ["eval", `eval "bash ${hook}"`],
+    ["source", `source ${hook}`],
+    [". (dot)", `. ${hook}`],
+    ["a hook name as a substring", `X=$(printf %s "${path.dirname(hook)}/stop-check.sh"); bash "$X"`],
+  ])("%s → refused (exec, a -c string, a shell:true spawn)", (_k, cmd) => {
+    expect(hookSpawnRefusal(cmd, [], { ...CLOCK0, shell: true })).toMatch(/command substitution, eval or source/);
+    expect(hookSpawnRefusal("bash", ["-c", cmd], CLOCK0)).toMatch(/command substitution, eval or source/);
+  });
+  it("substitution WITHOUT a hook name is not the tripwire's business; an installed exec of the $( ) form throws before running", () => {
+    expect(hookSpawnRefusal(`echo "$(date)"`, [], { ...CLOCK0, shell: true })).toBeNull();
+    expect(() => execSync(`echo "$(bash ${path.join(REAL, "stop-check.sh")} < /dev/null)"`, { env: { RELAY_TEST_CLOCK: "0" } })).toThrow(/hook budget tripwire/);
+  });
+});
+
 describe("the opt-in marker is set ONLY by runHookRealBudget", () => {
   it("no other file under tests/ names it (a test cannot set it by hand)", () => {
     const allowed = new Set(["tests/_helpers/hook-real-budget.ts", "tests/hook-budget-tripwire.test.ts"]);
@@ -143,7 +179,7 @@ describe("the opt-in marker is set ONLY by runHookRealBudget", () => {
         const p = path.join(d, e.name);
         if (e.isDirectory()) {
           if (e.name !== "node_modules" && e.name !== "fixtures") walk(p);
-        } else if (/\.(ts|mjs|js)$/.test(e.name) && fs.readFileSync(p, "utf-8").includes("RELAY_TEST_REAL_BUDGET_OPTIN")) {
+        } else if (/\.(ts|mjs|js)$/.test(e.name) && /RELAY_TEST_REAL_BUDGET_(OPTIN|FIXTURE)/.test(fs.readFileSync(p, "utf-8"))) {
           hits.push(path.relative(REPO, p));
         }
       }

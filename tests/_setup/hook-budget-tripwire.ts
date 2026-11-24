@@ -13,6 +13,9 @@
  *     through runHookRealBudget (tests/_helpers/hook-real-budget.ts), which asserts its cut.
  * The message names the opt-in.
  *
+ * A run through runHookRealBudget (its env carries REAL_BUDGET_FIXTURE) must spawn a script declaring the PRODUCTION
+ * budget. A command string that names a hook (as a substring) together with $( ), a backtick, eval or source/. is
+ * REFUSED outright: what it runs cannot be read from its words.
  * WHAT IS CHECKED: child_process's spawn, spawnSync, execFile, execFileSync, exec and execSync (the ESM named imports
  * follow, syncBuiltinESMExports), on the module object every test imports. A shell command (exec, execSync, a
  * `shell: true` spawn, or a shell's -c string) is CONSERVATIVE: any word that names one of the two hooks is treated
@@ -27,7 +30,7 @@ import fs from "fs";
 import path from "path";
 import { syncBuiltinESMExports } from "module";
 import { BUDGET_TREE_MARKER } from "../_helpers/hook-budget-tree.js";
-import { REAL_BUDGET_OPTIN } from "../_helpers/hook-real-budget.js";
+import { REAL_BUDGET_OPTIN, REAL_BUDGET_FIXTURE, declaredBudgetOf, productionBudgetOf } from "../_helpers/hook-real-budget.js";
 
 /** The two hooks, by EXACT basename (a fixture named e.g. legacy-stop-check.sh is not one of them). */
 const HOOK_NAMES = new Set(["post-tool-use-check.sh", "stop-check.sh"]);
@@ -72,6 +75,15 @@ export function shellWords(cmd: string): string[] {
   return words;
 }
 
+/** Command substitution, eval or sourcing: a hook reached that way is not a word the splitter can see. */
+const SUBSTITUTION = /\$\(|`|(^|[\s;&|(])eval(\s|$)|(^|[\s;&|(])(source|\.)\s/;
+const HOOK_SUBSTRING = /(post-tool-use-check|stop-check)\.sh/;
+/** A shell command that names a hook (as a SUBSTRING) together with substitution, eval or sourcing → refused outright. */
+function substitutionRefusal(cmd: string): string | null {
+  if (!SUBSTITUTION.test(cmd) || !HOOK_SUBSTRING.test(cmd)) return null;
+  return `hook budget tripwire: a shell command names a PostToolUse/Stop hook together with command substitution, eval or source (${cmd.slice(0, 160)}): the tripwire cannot tell what that runs, so it refuses it. Spawn the hook directly from a budgetTree copy, or through runHookRealBudget (tests/_helpers/hook-real-budget.ts).`;
+}
+
 /** The hook paths a spawn EXECUTES (or, for a shell command, NAMES: conservative). */
 function executedHookPaths(file: string, argv: string[], shell: boolean): string[] {
   const named = (words: string[]) =>
@@ -107,6 +119,12 @@ export function hookSpawnRefusal(
   const argv = Array.isArray(args) ? args.map(String) : [];
   const env = opts?.env ?? process.env;
   const cwd = opts?.cwd ? String(opts.cwd) : process.cwd();
+  // A command string (exec, a shell:true spawn, a shell's -c operand) with substitution and a hook name: refused.
+  const shellish = SHELLS.has(path.basename(String(file))) ? argv : [];
+  for (const cmd of [opts?.shell ? [String(file), ...argv].join(" ") : null, ...shellish].filter((x): x is string => x !== null)) {
+    const r = substitutionRefusal(cmd);
+    if (r !== null) return r;
+  }
   for (const m of executedHookPaths(String(file), argv, Boolean(opts?.shell))) {
     const spelled = path.resolve(cwd, m);
     // The marker is checked beside the script's REAL path: a marked copy whose hook is a LINK to the real hook runs the
@@ -120,6 +138,14 @@ export function hookSpawnRefusal(
     const name = path.basename(spelled);
     if (!fs.existsSync(path.join(path.dirname(real), BUDGET_TREE_MARKER))) {
       return `hook budget tripwire: ${name} was spawned from a directory that is not a budgetTree copy (${path.dirname(real)}): there the test clock seam does nothing, so the real clock and budget make the row depend on the runner's speed. Run it from a budgetTree copy (tests/_helpers/hook-budget-tree.ts; a behaviour row raises the declared budget). A row that tests the REAL budget uses runHookRealBudget (tests/_helpers/hook-real-budget.ts), which asserts its cut.`;
+    }
+    // A run through runHookRealBudget (either clock) must spawn a script that declares the PRODUCTION budget.
+    if (env[REAL_BUDGET_FIXTURE] === "1" || env[REAL_BUDGET_OPTIN] === "1") {
+      const got = declaredBudgetOf(real);
+      const want = productionBudgetOf(name);
+      if (got !== want) {
+        return `hook budget tripwire: ${name} runs through runHookRealBudget from a copy that declares ${got ?? "no"} s, but production declares ${want} s (${real}): a real-budget row must run the REAL-budget fixture, budgetTree(..., { declaredBudget: "real" }).`;
+      }
     }
     // An EMPTY RELAY_TEST_CLOCK is the real clock too (the seam reads ${RELAY_TEST_CLOCK:-${SECONDS:-0}}).
     if (!env.RELAY_TEST_CLOCK && env[REAL_BUDGET_OPTIN] !== "1") {

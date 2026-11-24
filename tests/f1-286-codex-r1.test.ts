@@ -46,7 +46,6 @@ const STOP_HOOK = path.join(REPO_ROOT, "hooks", "stop-check.sh");
 // can, a starved fixed clock: that helper asserts the cut each one prints (the hook budget tripwire refuses the live hooks).
 const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "f1286-seamed-"));
 const SEAMED_HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
-const SEAMED_DIR = path.dirname(SEAMED_HOOK);
 /** An EXPLICIT real-budget fixture: the stalled-read rows measure the REAL 5 s deadline of PostToolUse/Stop. */
 const REAL_BUDGET_DIR = budgetTree(path.join(SEAMED_ROOT, "real-budget"), path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin"), { declaredBudget: "real" });
 afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
@@ -561,6 +560,7 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
     for (const clock of ["real", { starvedSeconds: 2 }] as const) {
       it(`${label}: the REAL 5s budget (${clock === "real" ? "real clock" : "starved clock"}): the hook ends INSIDE it, LOUD either way (the read timed out, or no budget was left for it)`, () => {
         const { took } = runHookRealBudget({
+          hooksDir: REAL_BUDGET_DIR,
           label: `${label} stalled read`,
           env: {},
           clock,
@@ -692,6 +692,7 @@ describe("#286 P-a — no time budget left: the read is skipped, LOUD, never flo
   it("PostToolUse: a slow hook stdin is CUT at its budget share → CANNOT-JUDGE 'not complete within its time budget', inside 5s, the mail read never started", async () => {
     await runHookRealBudgetAsync({
       label: "PostToolUse slow stdin",
+      hooksDir: REAL_BUDGET_DIR,
       env: {},
       clock: "real",
       assertsCut: /VERDICT=CANNOT-JUDGE reason="hook stdin not complete within its time budget: mail check skipped/,
@@ -704,7 +705,7 @@ describe("#286 P-a — no time budget left: the read is skipped, LOUD, never flo
     const dbPath = path.join(home, "relay.db");
     seedDb(dbPath, "pa2");
     const t0 = Date.now();
-    const child = spawn("bash", [path.join(SEAMED_DIR, "post-tool-use-check.sh")], { env: baseEnv(home, { RELAY_AGENT_NAME: "pa2", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_HOOK_NOTICE_REMIND_SECS: "0", ...extra }, extra) });
+    const child = spawn("bash", [path.join(REAL_BUDGET_DIR, "post-tool-use-check.sh")], { env: baseEnv(home, { RELAY_AGENT_NAME: "pa2", RELAY_DB_PATH: dbPath, RELAY_HTTP_PORT: "1", RELAY_HOOK_NOTICE_REMIND_SECS: "0", ...extra }, extra) });
     let stderr = "";
     child.stderr.on("data", (d) => (stderr += d.toString()));
     child.stdin.on("error", () => {}); // the hook may have ended (EPIPE): expected
