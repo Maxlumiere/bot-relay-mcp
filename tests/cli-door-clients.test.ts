@@ -957,6 +957,9 @@ describe("#442 R3: the self-pair guard FAILS CLOSED when the local instance cann
     expect(r.stderr).toMatch(new RegExp(`cannot tell whether 127\\.0\\.0\\.1:${P} is this machine's own relay`));
     expect(fs.existsSync(path.join(c.home, "p.json")), "no client config was emitted").toBe(false);
     expect(fs.existsSync(path.dirname(typo)), "the unprovisioned instance was not created").toBe(false);
+    await stopDaemon(d.child);
+  }, 120_000);
+});
 
 describe("queue item 3: `relay whoami` (read-only) through the owner door; whoami on the door allowlist", () => {
   it("an INSTANCE daemon + a VAULT token: `relay whoami --agent A --json` answers A's identity through the door; no token reaches the configured port", async () => {
