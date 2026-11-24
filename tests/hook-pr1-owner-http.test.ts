@@ -1453,6 +1453,21 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 3 (as ruled): EVERY local credential
     expect((await agentRow(c, AGENT))?.agent_pid, "the anchor landed").not.toBeNull();
   }, 120_000);
 
+  it("the SAME row with 2 s already spent on the hook's own clock (SECONDS seeded to 2): the behaviour row still restamps, so it can never depend on the runner's speed", async () => {
+    // Bash seeds SECONDS from the environment, so SECONDS=2 makes a hook read 2 s spent at its start: on the REAL
+    // 5 s hook that leaves nothing past the 3 s margin and the restamp is skipped. A behaviour row must run on a
+    // seamed copy (its clock is RELAY_TEST_CLOCK, never SECONDS), so it still restamps however slow the machine is.
+    const c = newCase("p3-ptu-live-starved");
+    const token = seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const spy = await recorder();
+    const r = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port), SECONDS: "2" }, inputFor("post-tool-use-check.sh"));
+    noCredential(spy, token);
+    expect(r.out, "no budget skip in a behaviour row").not.toMatch(/no time budget left for the liveness restamp/);
+    expect(r.argv, `the restamp went through the door\n${r.out}`).toMatch(/owner tool report_liveness|owner liveness/);
+    await stopDaemon(d.child);
+  }, 120_000);
+
   it.each([["the SAME session (launch-bound)", true], ["a DIFFERENT session", false]] as const)("codex-session-start.sh on the door route, a launch marker naming %s: the handoff check asks the door (/owner/v1/session), and the register is %s", async (_what, same) => {
     const c = newCase(`p3-codex-handoff-${same ? "same" : "diff"}`);
     const token = seedNativeDb(c);
