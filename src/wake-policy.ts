@@ -147,7 +147,9 @@ export function readWakePolicy(instanceDir: string, opts: { expectedUid?: number
   if (!sameInstance()) return { ok: false, why: "not the open relay's instance" };
   let fd: number;
   try {
-    fd = fs.openSync(p, fs.constants.O_RDONLY | (posix ? fs.constants.O_NOFOLLOW : 0));
+    // O_NONBLOCK (security review, #447): a FIFO at this name would otherwise block the open before the isFile check
+    // below refuses it (the arm-check, doorbell status --hook and policy --check would hang).
+    fd = fs.openSync(p, fs.constants.O_RDONLY | (posix ? fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK : 0));
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return { ok: false, why: "missing" };

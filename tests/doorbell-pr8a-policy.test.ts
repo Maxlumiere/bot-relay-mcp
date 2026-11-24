@@ -385,6 +385,20 @@ describe("Codex #447 R1: the policy is bound to the OPEN relay's instance; read 
     expect(P.readWakePolicy(INST)).toEqual({ ok: false, why: "schema: a duplicate key" });
     expect(P.hasDuplicateKey('{"a":"x\\"y","b":{"a":1},"c":[{"a":1},{"a":2}]}')).toBe(false); // the control: escapes, nesting, arrays
   });
+  it.skipIf(process.platform === "win32")("a FIFO at the policy name → refused at once (not a regular file), never a hang: the read, policy --check and the arm-check", () => {
+    // Every read runs in a CHILD with a 5 s timeout: a blocking open (the defect) fails this row, it never hangs the run.
+    fs.rmSync(POLICY, { force: true });
+    expect(spawnSync("mkfifo", [POLICY]).status).toBe(0);
+    const DIST = path.join(REPO, "dist", "wake-policy.js");
+    const read = spawnSync(process.execPath, ["-e", `import(require("url").pathToFileURL(process.argv[1]).href).then((m) => process.stdout.write(JSON.stringify(m.readWakePolicy(process.argv[2]))))`, DIST, INST], { encoding: "utf-8", timeout: 5000 });
+    expect([read.status, read.stdout]).toEqual([0, JSON.stringify({ ok: false, why: "not a regular file" })]);
+    const run = (args: string[]) => spawnSync("node", [RELAY_BIN, ...args], { env: env(), encoding: "utf-8", timeout: 5000 });
+    const pc = run(["doorbell", "policy", "--check"]);
+    expect([pc.status, pc.stdout.trim()]).toEqual([1, "[RELAY] doorbell policy: policy_invalid (not a regular file): no agent can be woken"]);
+    const ac = run(["watch", "p-bob", "--arm-check"]);
+    expect([ac.status, ac.stdout.trim()]).toEqual([2, "no-mail: wake policy unreadable (not a regular file). Do not start a watch for p-bob."]);
+    fs.rmSync(POLICY);
+  }, 30_000);
   it("STATED: 4.0 is the number 4 (JSON has no integer type): accepted as 4", () => {
     writePolicy('{"version":1,"optIn":["p-bob"],"wake":[],"pairWakesPerHour":4.0}');
     expect(P.readWakePolicy(INST)).toMatchObject({ ok: true, file: { pairWakesPerHour: 4 } });
@@ -402,7 +416,7 @@ describe("Codex #447 R1: the policy is bound to the OPEN relay's instance; read 
 describe("the mutation fixture (tests/fixtures/doorbell-pr8a-mutants.json; run: node scripts/mutation-sweep.mjs <fixture>)", () => {
   it("every mutant still applies: its find text occurs exactly once in its file; names are unique", () => {
     const M = JSON.parse(fs.readFileSync(path.join(REPO, "tests", "fixtures", "doorbell-pr8a-mutants.json"), "utf-8")) as Array<{ name: string; file: string; find: string }>;
-    expect(M.length).toBeGreaterThanOrEqual(19);
+    expect(M.length).toBeGreaterThanOrEqual(20);
     for (const m of M) expect(fs.readFileSync(path.join(REPO, m.file), "utf-8").split(m.find).length - 1, m.name).toBe(1);
     expect(new Set(M.map((m) => m.name)).size).toBe(M.length);
   });

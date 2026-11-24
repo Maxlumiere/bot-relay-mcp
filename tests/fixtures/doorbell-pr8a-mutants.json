@@ -16,8 +16,8 @@
  {
   "name": "follows-links",
   "file": "src/wake-policy.ts",
-  "find": "fs.constants.O_RDONLY | (posix ? fs.constants.O_NOFOLLOW : 0)",
-  "replace": "fs.constants.O_RDONLY",
+  "find": "fs.constants.O_RDONLY | (posix ? fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK : 0)",
+  "replace": "fs.constants.O_RDONLY | (posix ? fs.constants.O_NONBLOCK : 0)",
   "test": "tests/doorbell-pr8a-policy.test.ts"
  },
  {
@@ -130,6 +130,13 @@
   "file": "src/cli/doorbell.ts",
   "find": "  const held = Object.create(null) as DoorbellStatus[\"held\"];",
   "replace": "  const held = {} as DoorbellStatus[\"held\"];",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "fifo-blocks",
+  "file": "src/wake-policy.ts",
+  "find": "fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK : 0)",
+  "replace": "fs.constants.O_NOFOLLOW : 0)",
   "test": "tests/doorbell-pr8a-policy.test.ts"
  }
 ]
