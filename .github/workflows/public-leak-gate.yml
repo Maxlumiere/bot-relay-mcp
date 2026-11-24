@@ -1,0 +1,66 @@
+# Public leak gate (layer C, the backstop): scans a pull request's METADATA (title, body, commit messages, branch name)
+# against a denylist held in the PUBLIC_DENYLIST repository secret. It NEVER checks out or runs the pull request's code:
+# it checks out the BASE commit only (so a PR that edits the scanner cannot weaken its own scan) and reads the metadata
+# through the API. The scanner prints a field and term indexes only, never the input. A missing secret fails CLOSED.
+name: Public leak gate
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  scan:
+    name: Public leak gate (metadata)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the BASE commit only (never the pull request head)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Assert the checked-out tree IS the base commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$BASE_SHA" || { echo "the checked-out tree is not the base commit: refusing"; exit 1; }
+
+      - name: Fetch the pull request metadata through the API (no code)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          meta="$RUNNER_TEMP/leak-meta"
+          mkdir -p "$meta"
+          gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.title' > "$meta/pr-title"
+          gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.body // ""' > "$meta/pr-body"
+          gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.ref' > "$meta/branch"
+          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits" --jq '.[].commit.message' > "$meta/commit-msg"
+
+      - name: Scan (prints field and term indexes only)
+        env:
+          PUBLIC_DENYLIST: ${{ secrets.PUBLIC_DENYLIST }}
+        run: |
+          meta="$RUNNER_TEMP/leak-meta"
+          worst=0
+          for field in pr-title pr-body branch commit-msg; do
+            rc=0
+            node tools/public-leak-scan/scan.mjs --field "$field" --list-env PUBLIC_DENYLIST < "$meta/$field" || rc=$?
+            [ "$rc" -gt "$worst" ] && worst=$rc
+          done
+          if [ "$worst" -eq 1 ]; then
+            echo "A denylisted term is in this pull request's text (field and term index above). Edit the text to remove it."
+            echo "A revision with the term already exists in this pull request's history: tell the maintainer, because only the web UI removes it."
+            exit 1
+          fi
+          if [ "$worst" -ne 0 ]; then
+            echo "The scan could not run (the denylist is unavailable or invalid): failing closed."
+            exit 1
+          fi
