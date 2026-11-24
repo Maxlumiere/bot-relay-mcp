@@ -44,6 +44,7 @@ describe("the refusal (pure)", () => {
   it("a budgetTree copy on the REAL clock (no RELAY_TEST_CLOCK) → refused, unless through the opt-in", () => {
     expect(hookSpawnRefusal("bash", [path.join(SEAMED, "post-tool-use-check.sh")], { env: {} })).toMatch(/REAL clock .* outside runHookRealBudget/);
     expect(hookSpawnRefusal("bash", [path.join(SEAMED, "post-tool-use-check.sh")], { env: { [REAL_BUDGET_OPTIN]: "1" } })).toBeNull();
+    expect(hookSpawnRefusal("bash", [path.join(SEAMED, "post-tool-use-check.sh")], { env: { RELAY_TEST_CLOCK: "" } }), "an EMPTY clock is the real clock").toMatch(/REAL clock/);
   });
   it("a shell's -c string that runs the real hook → refused", () => {
     expect(hookSpawnRefusal("bash", ["-c", `"${path.join(REAL, "stop-check.sh")}" < /dev/null`], CLOCK0)).toMatch(/not a budgetTree copy/);

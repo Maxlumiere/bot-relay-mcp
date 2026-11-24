@@ -48,7 +48,8 @@ export function hookSpawnRefusal(file: unknown, args: unknown, opts: { env?: Nod
       if (!fs.existsSync(path.join(path.dirname(hook), BUDGET_TREE_MARKER))) {
         return `hook budget tripwire: ${name} was spawned from a directory that is not a budgetTree copy (${path.dirname(hook)}): there the test clock seam does nothing, so the real clock and budget make the row depend on the runner's speed. Run it from a budgetTree copy (tests/_helpers/hook-budget-tree.ts; a behaviour row raises the declared budget). A row that tests the REAL budget uses runHookRealBudget (tests/_helpers/hook-real-budget.ts), which asserts its cut.`;
       }
-      if (env.RELAY_TEST_CLOCK === undefined && env[REAL_BUDGET_OPTIN] !== "1") {
+      // An EMPTY RELAY_TEST_CLOCK is the real clock too (the seam reads ${RELAY_TEST_CLOCK:-${SECONDS:-0}}).
+      if (!env.RELAY_TEST_CLOCK && env[REAL_BUDGET_OPTIN] !== "1") {
         return `hook budget tripwire: ${name} runs on the REAL clock (no RELAY_TEST_CLOCK in its environment) outside runHookRealBudget. Set RELAY_TEST_CLOCK for a fixed clock, or test the real budget through runHookRealBudget (tests/_helpers/hook-real-budget.ts), which asserts its cut.`;
       }
     }
