@@ -81,13 +81,70 @@ export function validatePolicy(v: unknown): PolicyRead {
 }
 
 /**
- * Read <instanceDir>/doorbell-policy.json: opened with O_NOFOLLOW (a link is refused, its target never read), a
- * REGULAR file, mode & 0o077 == 0 and owned by the running user (POSIX), at most POLICY_MAX_BYTES, strict UTF-8, JSON,
- * then the closed schema. Never writes. `expectedUid` is a test seam (default: the running user).
+ * The identity of a relay DB file (device + inode, as exact bigints), or null when it cannot be read. A watch records
+ * it for the DB it OPENED, and every policy read is bound to it (Codex #447 R1 P1).
  */
-export function readWakePolicy(instanceDir: string, opts: { expectedUid?: number } = {}): PolicyRead {
+export function dbIdentity(dbPath: string): string | null {
+  try {
+    const st = fs.statSync(dbPath, { bigint: true });
+    return `${st.dev}:${st.ino}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * TRUE when the JSON text has an object with a DUPLICATE key (JSON.parse keeps the last one silently: an empty
+ * `wake` followed by a permissive one would win). `text` is already known to be valid JSON.
+ */
+export function hasDuplicateKey(text: string): boolean {
+  const stack: Array<Set<string> | null> = [];
+  let expectKey = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "{") {
+      stack.push(new Set());
+      expectKey = true;
+    } else if (c === "[") {
+      stack.push(null);
+      expectKey = false;
+    } else if (c === "}" || c === "]") {
+      stack.pop();
+      expectKey = false;
+    } else if (c === ",") {
+      expectKey = stack[stack.length - 1] instanceof Set;
+    } else if (c === '"') {
+      let j = i + 1;
+      while (text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      if (expectKey) {
+        const key = JSON.parse(text.slice(i, j + 1)) as string;
+        const keys = stack[stack.length - 1] as Set<string>;
+        if (keys.has(key)) return true;
+        keys.add(key);
+        expectKey = false;
+      }
+      i = j;
+    }
+  }
+  return false;
+}
+
+/**
+ * Read <instanceDir>/doorbell-policy.json: opened with O_NOFOLLOW (a link is refused, its target never read), a
+ * REGULAR file, mode & 0o077 == 0 and owned by the running user (POSIX), read to EOF under a hard cap of
+ * POLICY_MAX_BYTES and refused if it changed while read, strict UTF-8, JSON with no duplicate key, then the closed
+ * schema. Never writes. `expectedUid` is a test seam (default: the running user).
+ *
+ * `bound` (Codex #447 R1 P1): the open relay DB (its path and the identity recorded when it was opened). The DB
+ * path's file must still have that identity both BEFORE and AFTER the policy file is opened, so a policy is never
+ * read from another instance (a linked instance dir retargeted under a live watch). Residual, stated: a retarget
+ * away and back between those two checks; Node has no openat to close it fully.
+ */
+export function readWakePolicy(instanceDir: string, opts: { expectedUid?: number; bound?: { dbPath: string; identity: string | null }; afterStat?: () => void } = {}): PolicyRead {
   const p = path.join(instanceDir, POLICY_FILENAME);
   const posix = process.platform !== "win32";
+  const sameInstance = (): boolean => !opts.bound || (opts.bound.identity !== null && dbIdentity(opts.bound.dbPath) === opts.bound.identity);
+  if (!sameInstance()) return { ok: false, why: "not the open relay's instance" };
   let fd: number;
   try {
     fd = fs.openSync(p, fs.constants.O_RDONLY | (posix ? fs.constants.O_NOFOLLOW : 0));
@@ -99,6 +156,7 @@ export function readWakePolicy(instanceDir: string, opts: { expectedUid?: number
     return { ok: false, why: "unreadable" };
   }
   try {
+    if (!sameInstance()) return { ok: false, why: "not the open relay's instance" };
     const st = fs.fstatSync(fd);
     if (!st.isFile()) return { ok: false, why: "not a regular file" };
     if (posix) {
@@ -107,13 +165,19 @@ export function readWakePolicy(instanceDir: string, opts: { expectedUid?: number
       if (uid !== undefined && st.uid !== uid) return { ok: false, why: "not owned by this user" };
     }
     if (st.size > POLICY_MAX_BYTES) return { ok: false, why: "too large" };
-    const buf = Buffer.alloc(st.size);
+    opts.afterStat?.(); // a TEST seam: a write between the stat and the read (the race the re-stat below catches)
+    // To EOF, under a hard cap (one byte past it proves "too large"), then re-stat: a file that grew, shrank or was
+    // rewritten while read is refused, never trusted as its prefix (Codex #447 R1 P2).
+    const buf = Buffer.alloc(POLICY_MAX_BYTES + 1);
     let off = 0;
-    while (off < st.size) {
-      const n = fs.readSync(fd, buf, off, st.size - off, off);
+    for (;;) {
+      const n = fs.readSync(fd, buf, off, buf.length - off, off);
       if (n === 0) break;
       off += n;
+      if (off > POLICY_MAX_BYTES) return { ok: false, why: "too large" };
     }
+    const after = fs.fstatSync(fd);
+    if (off !== st.size || after.size !== st.size || after.mtimeMs !== st.mtimeMs) return { ok: false, why: "changed while being read" };
     let text: string;
     try {
       text = new TextDecoder("utf-8", { fatal: true }).decode(buf.subarray(0, off));
@@ -126,6 +190,7 @@ export function readWakePolicy(instanceDir: string, opts: { expectedUid?: number
     } catch {
       return { ok: false, why: "not JSON" };
     }
+    if (hasDuplicateKey(text)) return { ok: false, why: "schema: a duplicate key" };
     return validatePolicy(parsed);
   } catch {
     return { ok: false, why: "unreadable" };
@@ -152,8 +217,8 @@ export function policyStanding(file: WakePolicyFile, isRegistered: (name: string
 const DENY_INVALID: StandingCheck = () => ({ refused: "policy_invalid" });
 
 /** The policy in force for the relay DB at `dbPath`: read from its instance directory at every call. */
-export function currentWakePolicy(dbPath: string, isRegistered: (name: string) => boolean): { standing: StandingCheck; pairWakesPerHour: number; read: PolicyRead } {
-  const read = readWakePolicy(path.dirname(dbPath));
+export function currentWakePolicy(dbPath: string, isRegistered: (name: string) => boolean, boundIdentity?: string | null): { standing: StandingCheck; pairWakesPerHour: number; read: PolicyRead } {
+  const read = readWakePolicy(path.dirname(dbPath), boundIdentity === undefined ? {} : { bound: { dbPath, identity: boundIdentity } });
   if (!read.ok) return { standing: DENY_INVALID, pairWakesPerHour: DEFAULT_PAIR_WAKES_PER_HOUR, read };
   return { standing: policyStanding(read.file, isRegistered), pairWakesPerHour: read.file.pairWakesPerHour, read };
 }

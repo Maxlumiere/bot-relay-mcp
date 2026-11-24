@@ -345,3 +345,66 @@ describe("the SessionStart lines (policyLines): QUIET before the rollout, LOUD a
     expect(S.policyLines(st({ state: "valid" }, { "p-bob": { reason: "no_standing", count: 1, oldest_age_seconds: 30 } }))).toEqual(["[RELAY] doorbell policy: mail held (no standing to wake): p-bob 1, oldest 30s"]);
   });
 });
+
+describe("Codex #447 R1: the policy is bound to the OPEN relay's instance; read to EOF; no duplicate key; held never loses an agent", () => {
+  beforeEach(() => resetDb());
+  it("P1: a LINKED instance dir retargeted to another instance (with a permissive policy) → refused for the DB that was opened; the right identity reads", () => {
+    const A = path.join(ROOT, "inst-A");
+    const B = path.join(ROOT, "inst-B");
+    for (const d of [A, B]) {
+      fs.rmSync(d, { recursive: true, force: true });
+      fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(d, "relay.db"), d);
+    }
+    fs.writeFileSync(path.join(B, "doorbell-policy.json"), JSON.stringify({ ...GOOD, wake: [{ from: "*", to: "p-bob" }] }), { mode: 0o600 });
+    fs.chmodSync(path.join(B, "doorbell-policy.json"), 0o600);
+    const link = path.join(ROOT, "inst-link");
+    try {
+      fs.unlinkSync(link); // the link itself, never its target
+    } catch {
+      /* absent */
+    }
+    fs.symlinkSync(A, link);
+    const opened = P.dbIdentity(path.join(link, "relay.db")); // the watch opened A
+    fs.unlinkSync(link);
+    fs.symlinkSync(B, link); // retargeted under the live watch
+    expect(P.readWakePolicy(link, { bound: { dbPath: path.join(link, "relay.db"), identity: opened } })).toEqual({ ok: false, why: "not the open relay's instance" });
+    expect(P.currentWakePolicy(path.join(link, "relay.db"), () => true, opened).read).toEqual({ ok: false, why: "not the open relay's instance" });
+    expect(P.readWakePolicy(link, { bound: { dbPath: path.join(link, "relay.db"), identity: P.dbIdentity(path.join(B, "relay.db")) } }).ok).toBe(true); // the control
+    expect(P.readWakePolicy(link, { bound: { dbPath: path.join(link, "relay.db"), identity: null } })).toEqual({ ok: false, why: "not the open relay's instance" }); // unknown identity: fail closed
+  });
+  it("P2: a file that GROWS between the stat and the read (garbage appended after a valid prefix) → refused, never its prefix", () => {
+    writePolicy(GOOD);
+    const r = P.readWakePolicy(INST, { afterStat: () => fs.appendFileSync(POLICY, "garbage") });
+    expect(r).toEqual({ ok: false, why: "changed while being read" });
+  });
+  it("P2: DUPLICATE keys (an empty wake, then a permissive one) → refused; nested too", () => {
+    writePolicy('{"version":1,"optIn":["p-bob"],"wake":[],"wake":[{"from":"*","to":"p-bob"}],"pairWakesPerHour":4}');
+    expect(P.readWakePolicy(INST)).toEqual({ ok: false, why: "schema: a duplicate key" });
+    writePolicy('{"version":1,"optIn":["p-bob"],"wake":[{"from":"p-carol","from":"p-alice","to":"p-bob"}],"pairWakesPerHour":4}');
+    expect(P.readWakePolicy(INST)).toEqual({ ok: false, why: "schema: a duplicate key" });
+    expect(P.hasDuplicateKey('{"a":"x\\"y","b":{"a":1},"c":[{"a":1},{"a":2}]}')).toBe(false); // the control: escapes, nesting, arrays
+  });
+  it("STATED: 4.0 is the number 4 (JSON has no integer type): accepted as 4", () => {
+    writePolicy('{"version":1,"optIn":["p-bob"],"wake":[],"pairWakesPerHour":4.0}');
+    expect(P.readWakePolicy(INST)).toMatchObject({ ok: true, file: { pairWakesPerHour: 4 } });
+  });
+  it("P2: an agent named __proto__ keeps its held mail in doorbell status (a null-prototype record)", () => {
+    db.registerAgent("__proto__", "r", []);
+    writePolicy({ ...GOOD, optIn: ["p-bob", "__proto__"] });
+    db.sendMessage("p-carol", "__proto__", "x", "normal");
+    const j = JSON.parse(relay(["doorbell", "status", "--json"]).stdout) as { held: Record<string, { reason: string; count: number }> };
+    expect(Object.prototype.hasOwnProperty.call(j.held, "__proto__")).toBe(true);
+    expect(j.held["__proto__"]).toMatchObject({ reason: "no_standing", count: 1 });
+  });
+});
+
+describe("the mutation fixture (tests/fixtures/doorbell-pr8a-mutants.json; run: node scripts/mutation-sweep.mjs <fixture>)", () => {
+  it("every mutant still applies: its find text occurs exactly once in its file; names are unique", () => {
+    const M = JSON.parse(fs.readFileSync(path.join(REPO, "tests", "fixtures", "doorbell-pr8a-mutants.json"), "utf-8")) as Array<{ name: string; file: string; find: string }>;
+    expect(M.length).toBeGreaterThanOrEqual(19);
+    for (const m of M) expect(fs.readFileSync(path.join(REPO, m.file), "utf-8").split(m.find).length - 1, m.name).toBe(1);
+    expect(new Set(M.map((m) => m.name)).size).toBe(M.length);
+  });
+});
+

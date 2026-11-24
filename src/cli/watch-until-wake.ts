@@ -383,6 +383,9 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
 
   // PHASE 1 (no lock held): a readable relay DB, then OWNERSHIP (D1). It never creates a sidecar.
   let db: Handle | null = await openDbWaiting(dbPath, intervalMs, say, agent);
+  // Codex #447 R1 P1: the identity of the DB this watch OPENED; every policy read is bound to it (re-recorded on reopen).
+  const { dbIdentity } = await import("../wake-policy.js");
+  let openedDb = dbIdentity(dbPath);
   const closeDb = () => {
     try {
       db?.close();
@@ -504,7 +507,10 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
       if (!rightful()) return;
       const t = now();
       try {
-        if (!db) db = await openDbWaiting(dbPath, intervalMs, say, agent);
+        if (!db) {
+          db = await openDbWaiting(dbPath, intervalMs, say, agent);
+          openedDb = dbIdentity(dbPath);
+        }
         // D1 (iii): the agent's ONE live window must still be this one (by pid + the kernel's start).
         const own = O.stillOwner(window, await agentBindings(db, agent), ownHost, ownerDeps, deadCache);
         if (!own.ok) {
@@ -540,7 +546,7 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
         const woken = W.readWoken(dir);
         // PR 8a: the instance's policy, re-read at every check (a file made invalid while the watch runs wakes nobody).
         const reader = db; // the handle this check read with (the closure below must not see a later reassignment)
-        const d = W.decideWake(read, agent, woken, t, currentWakePolicy(dbPath, (name) => agentRegistered(reader, name)));
+        const d = W.decideWake(read, agent, woken, t, currentWakePolicy(dbPath, (name) => agentRegistered(reader, name), openedDb));
         if (d.wake.length === 0) return; // nothing new to wake for (or a NULL session: keep waiting)
         const senders = d.wake.flatMap((id) => (meta.get(id)?.from ? [meta.get(id)!.from as string] : []));
         if (!rightful()) return;
