@@ -68,7 +68,7 @@ import {
 import { stampNativeHeader } from "./db-header.js";
 import { log } from "./logger.js";
 import { ensureSecureDir, ensureSecureFile, privacyFaults, restrictToOwnerWindows } from "./fs-perms.js";
-import { resolveInstance } from "./instance.js";
+import { resolveInstance, assertInstanceProvisionedAtOpen } from "./instance.js";
 import { checkContainment } from "./approved-roots.js";
 import { emitInboxChanged } from "./inbox-events.js";
 import { VERSION } from "./version.js";
@@ -374,7 +374,9 @@ export async function initializeDb(): Promise<void> {
   // narrowed only after the re-check below (ADR-0048: never chmod through an
   // unverified path).
   const existedBefore = dbNameExists(dbPath);
-  createDbDir(path.dirname(dbPath));
+  // An instance-layout DB is opened only while its instance is provisioned NOW, and its directory is never created
+  // here (it exists when provisioned): a stale resolution or pin cannot recreate a removed instance.
+  if (assertInstanceProvisionedAtOpen(dbPath) === null) createDbDir(path.dirname(dbPath));
   _db = await initDriver(dbPath);
   // Re-check BEFORE anything else touches the file: on a refusal the handle is
   // DISCARDED (a WASM close() would flush its image through the escaped path),
@@ -434,8 +436,9 @@ export function getDb(): CompatDatabase {
   const dir = path.dirname(dbPath);
   const existedBefore = dbNameExists(dbPath);
   // v2.1 Phase 4c.4: same dir + file perm narrowing as the eager init path
-  // (the existing directory is narrowed only after the re-check).
-  createDbDir(dir);
+  // (the existing directory is narrowed only after the re-check). An instance-layout DB: provisioned NOW, and its
+  // directory never created here (as initializeDb).
+  if (assertInstanceProvisionedAtOpen(dbPath) === null) createDbDir(dir);
 
   // Native lazy-init fallback for callers that reach getDb() before
   // initializeDb() (the server and every CLI subcommand `await initializeDb()`

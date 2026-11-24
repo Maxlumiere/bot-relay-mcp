@@ -33,7 +33,10 @@ function makeHome(opts: { instances?: string[]; activeLink?: string }): void {
   const root = path.join(tmpHome, ".bot-relay");
   fs.mkdirSync(root, { recursive: true });
   for (const id of opts.instances ?? []) {
+    // A PROVISIONED instance, as `relay init --instance-id` leaves it: a bare directory is refused as a non-existent
+    // instance (tests/instance-no-autocreate.test.ts), and these rows are about instances that exist.
     fs.mkdirSync(path.join(root, "instances", id), { recursive: true });
+    fs.writeFileSync(path.join(root, "instances", id, "instance.json"), JSON.stringify({ instance_id: id }));
   }
   if (opts.activeLink) {
     fs.symlinkSync(opts.activeLink, path.join(root, "active-instance"));

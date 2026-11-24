@@ -549,6 +549,9 @@ describe("deploy gate — a REAL daemon: real listener pid, real open files, rea
     fs.symlinkSync("a", path.join(RH, "active-instance"));
     fs.rmSync(dbA());
     fs.rmSync(dbB());
+    // Both stay PROVISIONED instances (instance.json, as `relay init --instance-id` writes): with neither a DB nor
+    // instance.json, an instance is non-existent and the daemon refuses to start on it (instance-no-autocreate.test.ts).
+    for (const db of [dbA(), dbB()]) fs.writeFileSync(path.join(path.dirname(db), "instance.json"), "{}");
     const port = await freePort();
     const daemonEnv: Env = {
       PATH: process.env.PATH ?? "",

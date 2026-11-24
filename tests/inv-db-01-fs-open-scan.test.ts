@@ -90,7 +90,7 @@ const INVENTORY: Record<string, Entry> = {
   "src/instance.ts::acquireInstanceLock::readFileSync": { n: 2, source: "the instance's daemon pid file" },
   "src/instance.ts::createInstance::readFileSync": { n: 1, source: "the instance's metadata file" },
   "src/instance.ts::createInstance::writeFileSync": { n: 1, source: "the instance's metadata file" },
-  "src/instance.ts::readInstance::readFileSync": { n: 1, source: "the instance's metadata file" },
+  "src/resolve-instance.ts::readInstanceMetadataFile::readFileSync": { n: 1, source: "the instance's metadata file (instance.json, the ONE reader: readInstance and the provisioning predicate)" },
   "src/instance.ts::setActiveInstance::writeFileSync": { n: 1, source: "the active-instance link file" },
   "src/resolve-instance.ts::resolveInstance::readFileSync": { n: 1, source: "the active-instance marker file" },
   // --- CLI ---

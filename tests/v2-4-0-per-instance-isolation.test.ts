@@ -82,6 +82,7 @@ describe("v2.4.0 E.1 — instance model", () => {
 
   it("(E.1.2) RELAY_INSTANCE_ID flips multi-instance mode + DB path nests under instances/<id>", () => {
     const id = generateInstanceId();
+    createInstance(id, "2.4.0"); // provisioned, as `relay init --instance-id` does: an unprovisioned id is refused
     process.env.RELAY_INSTANCE_ID = id;
     expect(isMultiInstanceMode()).toBe(true);
     expect(resolveActiveInstanceId()).toBe(id);

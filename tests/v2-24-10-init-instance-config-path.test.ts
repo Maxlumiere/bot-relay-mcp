@@ -74,6 +74,9 @@ describe("v2.24.10 init writes to the daemon's resolved config path (P1)", () =>
     const id = "11111111-2222-3333-4444-555555555555";
     const instDir = path.join(relayHome, "instances", id);
     fs.mkdirSync(instDir, { recursive: true });
+    // A PROVISIONED instance (what `relay init --instance-id` writes, and what `use-instance` requires before it sets
+    // the link): a bare directory is a non-existent instance, refused (tests/instance-no-autocreate.test.ts).
+    fs.writeFileSync(path.join(instDir, "instance.json"), JSON.stringify({ instance_id: id }));
     // The symlink `use-instance` sets: `<home>/active-instance` -> "<id>".
     fs.symlinkSync(id, path.join(relayHome, "active-instance"));
 

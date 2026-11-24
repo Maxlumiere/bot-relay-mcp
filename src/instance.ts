@@ -44,6 +44,10 @@ import {
   instancesRootFor,
   instanceIdFault as idFaultUnder,
   ACTIVE_INSTANCE_MARKER,
+  isProvisionedInstance,
+  instanceDirOfDbPath as layoutDirOf,
+  readInstanceMetadataFile,
+  unprovisionedReason,
   type ResolvedInstance,
   type ResolverEnv,
 } from "./resolve-instance.js";
@@ -130,6 +134,33 @@ export function isMultiInstanceMode(): boolean {
 /** Why `id` is not a usable instance id (the resolver's own rule, src/resolve-instance.ts). */
 function instanceIdFault(id: string): string | null {
   return idFaultUnder(id, instancesRoot());
+}
+
+/** The instance directory a DB path names, or null (the resolver's ONE layout test, for this process's env). */
+export function instanceDirOfDbPath(dbPath: string): string | null {
+  return layoutDirOf(dbPath, instancesRoot());
+}
+
+/**
+ * Re-verified AT THE OPEN (Codex #442 R1 P2-2): a DB in the instance layout is opened only while its instance is
+ * provisioned NOW, however it was named (selected, pinned into RELAY_DB_PATH, or an explicit RELAY_DB_PATH into
+ * instances/). The resolution may be stale: the DB or the directory can be removed between it and the open. Returns
+ * the instance directory (whose DB directory the caller must NOT create), or null for any other layout.
+ */
+export function assertInstanceProvisionedAtOpen(dbPath: string): string | null {
+  const dir = instanceDirOfDbPath(dbPath);
+  if (dir === null) return null;
+  let dbExists = false;
+  try {
+    fs.lstatSync(dbPath);
+    dbExists = true;
+  } catch {
+    /* absent */
+  }
+  if (!isProvisionedInstance(dir, dbExists)) {
+    throw new Error(unprovisionedReason(path.basename(dir), `the DB path ${dbPath}`, dir, "name an existing instance"));
+  }
+  return dir;
 }
 
 /** The DB path, or a thrown Error naming the fault. Never the flat DB by accident. */
@@ -233,13 +264,8 @@ export function createInstance(
 export function readInstance(instanceId: string): InstanceMetadata | null {
   const dir = instanceDir(instanceId);
   if (!dir) return null;
-  try {
-    const metaPath = path.join(dir, "instance.json");
-    if (!fs.existsSync(metaPath)) return null;
-    return JSON.parse(fs.readFileSync(metaPath, "utf-8")) as InstanceMetadata;
-  } catch {
-    return null;
-  }
+  // The ONE reader of instance.json (the resolver's provisioning predicate uses it too): a non-object is not a record.
+  return readInstanceMetadataFile(dir) as InstanceMetadata | null;
 }
 
 /** List all instances. Empty array in single-instance mode. */

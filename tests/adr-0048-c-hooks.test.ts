@@ -63,6 +63,9 @@ fs.writeFileSync(
 /** A real relay DB with AGENT registered (and optionally a task for it), built by the real code. */
 function seedDb(dbPath: string, withTask: boolean): void {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  // An instance DB belongs to a PROVISIONED instance (instance.json, as `relay init --instance-id` writes): the open
+  // refuses an instance-layout DB of an unprovisioned instance (tests/instance-no-autocreate.test.ts).
+  if (path.basename(path.dirname(path.dirname(dbPath))) === "instances") fs.writeFileSync(path.join(path.dirname(dbPath), "instance.json"), "{}");
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", `
     process.env.RELAY_DB_PATH = ${JSON.stringify(dbPath)};
     const db = await import(${JSON.stringify(pathToFileURL(DIST_DB).href)});

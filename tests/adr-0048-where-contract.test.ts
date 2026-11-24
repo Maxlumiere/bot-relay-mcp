@@ -35,6 +35,8 @@ const AGENT = "w-agent";
 /** A real relay DB with AGENT registered, built by the real code in a child process. */
 function seedDb(dbPath: string): void {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  // An instance DB belongs to a PROVISIONED instance (instance.json): the open refuses an unprovisioned one's.
+  if (path.basename(path.dirname(path.dirname(dbPath))) === "instances") fs.writeFileSync(path.join(path.dirname(dbPath), "instance.json"), "{}");
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", `
     process.env.RELAY_DB_PATH = ${JSON.stringify(dbPath)};
     const db = await import(${JSON.stringify(pathToFileURL(DIST_DB).href)});
