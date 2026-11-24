@@ -23,7 +23,7 @@ export async function resolveCliAgentToken(verb: string, agent: string, route: R
   const envToken = process.env.RELAY_AGENT_TOKEN;
   if (route.kind === "remote") {
     const { remoteToken, envSelects } = await import("./relay-client.js");
-    const token = await remoteToken(route.host, route.port, agent, { envSelected: envSelects(route.host) });
+    const token = await remoteToken(route.host, route.port, agent, { envSelected: await envSelects(route.host, route.port) });
     if (!token) {
       say(`no token for "${agent}" on the remote relay ${route.host}:${route.port}: set RELAY_AGENT_TOKEN (the local vault is never sent to a remote).\n`);
       return { code: 2 };

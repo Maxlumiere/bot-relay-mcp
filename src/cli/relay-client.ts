@@ -120,20 +120,30 @@ export function toolJson(result: { content?: Array<{ text?: string }> }): Record
 function locationOrigin(location: string, r: PinnedTarget): string {
   try {
     const u = new URL(location, `${r.secure ? "https" : "http"}://${hostHeader(r)}`);
-    return `${u.protocol}//${u.host}`;
+    return `${u.protocol}//${u.host}`.slice(0, 255);
   } catch {
     return "(unparseable target)";
   }
 }
 
-/**
- * A REMOTE relay's refusal, said WITHOUT its own text (an error body can echo the request's secrets): the status and a
- * well-formed error code only (#444 R1 ruling c4454ae5).
- */
+/** The CLOSED set a remote refusal is rendered with (#444 R2, ruling c195b57f): no remote-supplied text, ever. */
+export type RemoteRefusalCode = "auth_error" | "not_found" | "rate_limited" | "server_error" | "unparseable";
+
+/** Classify a remote reply into the closed set (null: not classifiable; then only the HTTP status is shown). */
+export function remoteRefusalCode(status: number, parsed: unknown): RemoteRefusalCode | null {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return "unparseable";
+  const p = parsed as Record<string, unknown>;
+  if (status === 401 || status === 403 || p.error_code === "AUTH_FAILED" || p.auth_error === true) return "auth_error";
+  if (status === 404 || p.error_code === "NOT_FOUND") return "not_found";
+  if (status === 429 || p.error_code === "RATE_LIMITED") return "rate_limited";
+  if (status >= 500) return "server_error";
+  return null;
+}
+
+/** The ONE rendering of a remote refusal: the HTTP status and a closed-set code; the reply's own text is withheld. */
 export function remoteRefusal(status: number, parsed: unknown): string {
-  const code = parsed !== null && typeof parsed === "object" ? (parsed as Record<string, unknown>).error_code : undefined;
-  const shown = typeof code === "string" && /^[A-Z][A-Z0-9_]{1,40}$/.test(code) ? `, ${code}` : "";
-  return `the remote relay refused (status ${status}${shown}; its reply text is withheld: it can carry credentials)`;
+  const code = remoteRefusalCode(status, parsed);
+  return `the remote relay refused (HTTP ${status}${code ? `, ${code}` : ""}; its reply text is withheld: it can carry credentials)`;
 }
 
 /** Host header for a pinned target: an IPv6 literal is bracketed (RFC 7230 §5.4). */
@@ -358,7 +368,41 @@ export async function remoteToken(host: string, port: number, agent: string, opt
   return t !== null && /^[A-Za-z0-9_=.-]{8,128}$/.test(t) ? t : null;
 }
 /** Did the ENVIRONMENT select this remote (RELAY_HTTP_HOST names this host)? */
-export const envSelects = (host: string): boolean => (process.env.RELAY_HTTP_HOST ?? "") === host;
+/**
+ * The relay endpoint the DEFAULT route resolves to, the ONE derivation (whoami, send, resolve and doctor all use it):
+ * RELAY_HTTP_HOST / RELAY_HTTP_PORT, else the config's http_host / http_port (loadConfig applies the env overrides),
+ * else 127.0.0.1:3777.
+ */
+export async function defaultEndpoint(): Promise<{ host: string; port: number }> {
+  let host = "127.0.0.1";
+  let port = 3777;
+  try {
+    const { loadConfig } = await import("../config.js");
+    const cfg = loadConfig();
+    host = cfg.http_host || host;
+    port = cfg.http_port || port;
+  } catch {
+    host = process.env.RELAY_HTTP_HOST || host;
+    port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
+  }
+  return { host, port };
+}
+
+/**
+ * The ENDPOINT an inherited RELAY_AGENT_TOKEN is bound to (#444 R2, ruling 9533449d): the default endpoint, but only when
+ * RELAY_HTTP_HOST is set in this environment; otherwise the token is bound to the LOCAL relay (null). The environment
+ * names no scheme, so none is compared.
+ */
+export async function envTokenEndpoint(): Promise<{ host: string; port: number } | null> {
+  if (!process.env.RELAY_HTTP_HOST) return null;
+  return defaultEndpoint();
+}
+
+/** Does the environment's token belong to THIS endpoint? The host AND the port must equal the bound endpoint's. */
+export async function envSelects(host: string, port: number): Promise<boolean> {
+  const bound = await envTokenEndpoint();
+  return bound !== null && bound.host === host && bound.port === port;
+}
 /**
  * A REMOTE's transport secret (as ruled): its own provisioned file (`relay remote set-http-secret` /
  * `set-dashboard-secret`: agents/remote-<host>-<port>/<kind>.secret), else the environment (RELAY_HTTP_SECRET /

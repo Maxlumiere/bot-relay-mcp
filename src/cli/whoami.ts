@@ -117,17 +117,9 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
 
-  let host = "127.0.0.1";
-  let port = 3777;
-  try {
-    const { loadConfig } = await import("../config.js");
-    const cfg = loadConfig();
-    host = cfg.http_host || host;
-    port = cfg.http_port || port;
-  } catch {
-    host = process.env.RELAY_HTTP_HOST || host;
-    port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
-  }
+  // The ONE derivation of the default endpoint (relay-client.ts defaultEndpoint): the env token is bound to it.
+  const { defaultEndpoint } = await import("./relay-client.js");
+  const { host, port } = await defaultEndpoint();
   const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteSecret, mcpResultOf } = await import("./relay-client.js");
   const route = await routeFor(host, port);
   if (route.kind === "unresolved") {
@@ -141,7 +133,7 @@ export async function run(argv: string[]): Promise<number> {
   const { isValidTokenShape } = await import("../spawn/validation.js");
   const { envSelects: selects } = await import("./relay-client.js");
   const tokenSource =
-    !agent || (route.kind !== "remote" && isValidTokenShape(envToken)) || (route.kind === "remote" && selects(route.host) && isValidTokenShape(envToken))
+    !agent || (route.kind !== "remote" && isValidTokenShape(envToken)) || (route.kind === "remote" && (await selects(route.host, route.port)) && isValidTokenShape(envToken))
       ? "RELAY_AGENT_TOKEN"
       : "the vault";
   if (agent) {
@@ -150,7 +142,7 @@ export async function run(argv: string[]): Promise<number> {
     // TOKEN ONLY (no name): the SAME credential policy as the shared resolver. A REMOTE gets RELAY_AGENT_TOKEN only when
     // the environment selected that remote (RELAY_HTTP_HOST); an inherited local token is never sent elsewhere.
     const { envSelects } = await import("./relay-client.js");
-    if (route.kind === "remote" && !envSelects(route.host)) {
+    if (route.kind === "remote" && !(await envSelects(route.host, route.port))) {
       process.stderr.write(
         `relay whoami: RELAY_AGENT_TOKEN is not selected for the remote relay ${route.host}:${route.port} (set RELAY_HTTP_HOST=${route.host}, or pass --agent NAME for its own vault entry); nothing is sent.\n`,
       );
@@ -161,12 +153,14 @@ export async function run(argv: string[]): Promise<number> {
   if ("code" in resolved) return resolved.code;
 
   let envelope: Record<string, unknown> | null;
+  let remoteStatus = 0;
   try {
     if (route.kind === "remote") {
       const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Agent-Token": resolved.token };
       const secret = await remoteSecret(route.host, route.port, "http");
       if (secret) headers["Authorization"] = `Bearer ${secret}`;
       const r = await remotePost(route, "/mcp", headers, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "whoami", arguments: {} } }));
+      remoteStatus = r.status;
       const result = mcpResultOf(r.text);
       envelope = result ? toolJson(result) : null;
     } else {
@@ -176,13 +170,15 @@ export async function run(argv: string[]): Promise<number> {
     process.stderr.write(`relay whoami: ${transportDiagnostic(route, host, port, err)}\n`);
     return 2;
   }
+  // A TOOL refusal reads differently from a transport failure (above): a remote one through the ONE closed-set helper.
+  const { remoteRefusal } = await import("./relay-client.js");
   if (envelope === null) {
-    process.stderr.write("relay whoami: the relay returned an unparseable tool result\n");
+    process.stderr.write(route.kind === "remote" ? `relay whoami: ${remoteRefusal(remoteStatus, null)}\n` : "relay whoami: the relay returned an unparseable tool result\n");
     return 1;
   }
   const identity = closedIdentity(envelope);
   if (identity === null) {
-    process.stderr.write(`relay whoami: ${safeRefusal(envelope)}\n`);
+    process.stderr.write(route.kind === "remote" ? `relay whoami: ${remoteRefusal(remoteStatus, envelope)}\n` : `relay whoami: ${safeRefusal(envelope)}\n`);
     return 1;
   }
   const name = identity.agent_name as string;

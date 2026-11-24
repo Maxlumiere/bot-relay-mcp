@@ -94,17 +94,9 @@ export async function run(argv: string[]): Promise<number> {
   // --- PR 4 (as ruled): the ROUTE first (src/cli/relay-client.ts). A LOCAL relay (loopback, any spelling) is
   // reached only through its owner door; a REMOTE one by a hardened bearer with per-remote credentials; an
   // unresolved host gets nothing. Host/port: the config, then the environment.
-  let host = "127.0.0.1";
-  let port = 3777;
-  try {
-    const { loadConfig } = await import("../config.js");
-    const cfg = loadConfig();
-    host = cfg.http_host || host;
-    port = cfg.http_port || port;
-  } catch {
-    host = process.env.RELAY_HTTP_HOST || host;
-    port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
-  }
+  // The ONE derivation of the default endpoint (relay-client.ts defaultEndpoint): the env token is bound to it.
+  const { defaultEndpoint } = await import("./relay-client.js");
+  const { host, port } = await defaultEndpoint();
   const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteSecret, mcpResultOf, remoteRefusal } = await import("./relay-client.js");
   const route = await routeFor(host, port);
   if (route.kind === "unresolved") {
