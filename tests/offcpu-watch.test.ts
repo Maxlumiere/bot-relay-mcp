@@ -87,6 +87,8 @@ describe.skipIf(!LINUX)("planted main-thread waits are NAMED as predicted (Linux
     setup.exec("CREATE TABLE t (x INTEGER)");
     setup.close();
     const holder = spawn(process.execPath, ["-e", `const D=require(${JSON.stringify(requireHere.resolve("better-sqlite3"))});const d=new D(${JSON.stringify(dbPath)});d.exec("BEGIN IMMEDIATE");d.exec("INSERT INTO t VALUES (1)");process.stdout.write("held\\n");Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,400);d.exec("COMMIT");d.close();`], { stdio: ["ignore", "pipe", "inherit"] });
+    // Its exit is captured NOW: it exits while the main thread is blocked, before any later listener could attach.
+    const holderExited = new Promise((res) => holder.once("exit", res));
     await new Promise<void>((res) => holder.stdout!.once("data", () => res()));
     const w = startOffCpuWatch({ env: ON })!;
     await wait(30);
@@ -95,7 +97,7 @@ describe.skipIf(!LINUX)("planted main-thread waits are NAMED as predicted (Linux
     db.close();
     await wait(50);
     const rs = await w.stop();
-    await new Promise((res) => holder.once("exit", res));
+    await holderExited;
     fs.rmSync(dir, { recursive: true, force: true });
     console.log(offCpuLines("P3", w, rs).join("\n"));
     expect(stalls(rs).length, JSON.stringify(rs)).toBeGreaterThanOrEqual(1);
@@ -106,6 +108,7 @@ describe.skipIf(!LINUX)("planted main-thread waits are NAMED as predicted (Linux
     const fifo = path.join(dir, "pipe");
     execFileSync("mkfifo", [fifo]);
     const writer = spawn("sh", ["-c", `exec 3>"${fifo}"; sleep 0.3; echo x >&3`], { stdio: "ignore" });
+    const writerExited = new Promise((res) => writer.once("exit", res)); // captured before it can happen
     const fd = fs.openSync(fifo, "r"); // returns once the writer has the FIFO open
     const w = startOffCpuWatch({ env: ON })!;
     await wait(30);
@@ -114,7 +117,7 @@ describe.skipIf(!LINUX)("planted main-thread waits are NAMED as predicted (Linux
     fs.closeSync(fd);
     await wait(50);
     const rs = await w.stop();
-    await new Promise((res) => writer.once("exit", res));
+    await writerExited;
     fs.rmSync(dir, { recursive: true, force: true });
     console.log(offCpuLines("P4", w, rs).join("\n"));
     const reads = stalls(rs, 100).flatMap((r) => r.samples).filter((s) => s.syscall === "read");
