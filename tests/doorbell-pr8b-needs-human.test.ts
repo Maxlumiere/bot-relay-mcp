@@ -59,8 +59,8 @@ function reset(): void {
 /** An agent that drained before, then went dark with mail stuck past the 48 h threshold: today's UNCOVERED. */
 /** `observed`: the profile the relay observed (what the verdict reads); `supplied`: the caller's (informational). */
 function regressed(agent: string, observed: string | null = null, supplied: string | null = null): void {
-  db.registerAgent(agent, "r", [], { cli_profile: supplied });
-  db.setObservedCliProfile(agent, observed, new Date(NOW - 80 * HOUR).toISOString(), { gen: `seed-${agent}` });
+  const { observed_gen } = db.registerAgent(agent, "r", [], { cli_profile: supplied });
+  db.setObservedCliProfile(agent, observed, new Date(NOW - 80 * HOUR).toISOString(), { expectGen: observed_gen });
   db.getDb().prepare("UPDATE agents SET last_drain_at = ? WHERE name = ?").run(new Date(NOW - 72 * HOUR).toISOString(), agent);
   db.getDb()
     .prepare("INSERT INTO messages (id, from_agent, to_agent, content, priority, status, created_at) VALUES (?, 'x', ?, 'm', 'normal', 'pending', ?)")
@@ -253,7 +253,7 @@ describe("A1 §A2 (the doorbell stays unreachable from the server): the daemon's
 describe("the mutation fixture (tests/fixtures/doorbell-pr8b-mutants.json)", () => {
   it("every mutant still applies: its find text occurs exactly once in its file; names are unique", () => {
     const M = JSON.parse(fs.readFileSync(path.join(REPO, "tests", "fixtures", "doorbell-pr8b-mutants.json"), "utf-8")) as Array<{ name: string; file: string; find: string }>;
-    expect(M.length).toBeGreaterThanOrEqual(22);
+    expect(M.length).toBeGreaterThanOrEqual(26);
     for (const m of M) expect(fs.readFileSync(path.join(REPO, m.file), "utf-8").split(m.find).length - 1, m.name).toBe(1);
     expect(new Set(M.map((m) => m.name)).size).toBe(M.length);
   });
@@ -278,18 +278,37 @@ describe("the relay OBSERVES the profile (ruling cc9f2199; 9d0bb9e6: the nearest
     const alone = parseProcessTable([row(10, 1, "/opt/claude/claude"), row(30, 10, "node /r/dist/index.js")].join("\n"));
     expect(findAgentProcess(30, alone)?.profile).toBe("claude");
   });
+  it("R2 P2-b: the command judge and the comm judge must AGREE (full width): a truncated codex-helper, a comm naming another CLI, no comm, or a comm read of another instance → NULL", async () => {
+    const { probeAgentProfile } = await L();
+    const START = "Mon Nov 24 10:00:00 2026";
+    const fake = (bin: string, lstart = START, comm = `/usr/local/bin/${bin}`) => async (args: string[]) =>
+      args.includes("pid=,lstart=,comm=") ? `4242 ${lstart} ${comm}` : `4242 ${lstart} /usr/local/bin/${bin} --flag`;
+    // R2 P2-b: the two judges must AGREE. A width-limited command line (".../codex" for ".../codex-helper") → NULL,
+    // never codex; the comm naming another CLI → NULL; no comm → NULL.
+    const helper = await probeAgentProfile(4242, `${START} UTC`, { run: fake("codex", START, "/usr/local/bin/codex-helper") });
+    expect(helper.profile, "a truncated codex-helper is never codex").toBeNull();
+    expect(helper.why).toMatch(/do not agree/);
+    expect((await probeAgentProfile(4242, `${START} UTC`, { run: fake("codex", START, "/opt/claude/claude") })).profile, "comm says claude, the command says codex").toBeNull();
+    expect((await probeAgentProfile(4242, `${START} UTC`, { run: fake("codex", START, "") })).profile, "no comm").toBeNull();
+    const otherStartComm = async (args: string[]) => (args.includes("pid=,lstart=,comm=") ? `4242 Tue Nov 25 10:00:00 2026 /usr/local/bin/codex` : `4242 ${START} /usr/local/bin/codex --flag`);
+    expect((await probeAgentProfile(4242, `${START} UTC`, { run: otherStartComm })).profile, "a comm read of ANOTHER process instance (another start) is never used").toBeNull();
+  });
   it("probeAgentProfile: the same process (start token equal) → its profile; another process now, a timeout, an error, no pid, no start → NULL with a why", async () => {
     const { probeAgentProfile } = await L();
     const START = "Mon Nov 24 10:00:00 2026";
     // ONE coherent snapshot per probe (pid, start and command in the same read): the fake counts its calls.
-    let calls = 0;
-    const fake = (bin: string, lstart = START) => async (args: string[]) => {
-      calls++;
-      expect(args).toEqual(["-o", "pid=,lstart=,command=", "-p", "4242"]);
-      return `4242 ${lstart} /usr/local/bin/${bin} --flag`;
+    // R2 P2-b: the FULL-WIDTH command line, then the comm read with the same start; both must agree.
+    let seen: string[][] = [];
+    const fake = (bin: string, lstart = START, comm = `/usr/local/bin/${bin}`) => async (args: string[]) => {
+      seen.push(args);
+      return args.includes("pid=,lstart=,comm=") ? `4242 ${lstart} ${comm}` : `4242 ${lstart} /usr/local/bin/${bin} --flag`;
     };
     expect(await probeAgentProfile(4242, `${START} UTC`, { run: fake("codex") })).toEqual({ profile: "codex" });
-    expect(calls, "exactly ONE ps read per probe").toBe(1);
+    expect(seen, "the command read and the comm read, both full width").toEqual([
+      ["-ww", "-o", "pid=,lstart=,command=", "-p", "4242"],
+      ["-ww", "-o", "pid=,lstart=,comm=", "-p", "4242"],
+    ]);
+    seen = [];
     expect((await probeAgentProfile(4242, `${START} UTC`, { run: fake("codex", "Tue Nov 25 10:00:00 2026") })).profile).toBeNull();
     const hang = () => new Promise<string>(() => {});
     const t0 = Date.now();
@@ -301,10 +320,22 @@ describe("the relay OBSERVES the profile (ruling cc9f2199; 9d0bb9e6: the nearest
     expect((await probeAgentProfile(undefined, `${START} UTC`)).why).toBe("no agent pid");
     expect((await probeAgentProfile(4242, null)).why).toMatch(/no agent start token/);
   });
-  /** A fake `ps -axo pid=,ppid=,lstart=,command=` table: THIS process under `parentCmd`, under a claude ancestor. */
-  const table = (parentCmd: string, extra: string[] = []) => async () =>
-    [`9001 1 Mon Nov 24 09:00:00 2026 /opt/claude/claude`, `9002 9001 Mon Nov 24 09:00:01 2026 ${parentCmd}`, `${process.pid} 9002 Mon Nov 24 09:00:02 2026 node /r/dist/index.js`, ...extra].join("\n");
+  /**
+   * A fake `ps`: the table (`-axo pid=,ppid=,lstart=,command=`) has THIS process under `parentCmd`, under a claude
+   * ancestor; a comm read (`-o pid=,lstart=,comm= -p <pid>`) answers that pid's argv0, or `comms[pid]` when given.
+   */
+  const table = (parentCmd: string, extra: string[] = [], comms: Record<number, string> = {}) => {
+    const rows = [`9001 1 Mon Nov 24 09:00:00 2026 /opt/claude/claude`, `9002 9001 Mon Nov 24 09:00:01 2026 ${parentCmd}`, `${process.pid} 9002 Mon Nov 24 09:00:02 2026 node /r/dist/index.js`, ...extra];
+    return async (args: string[] = []) => {
+      if (!args.includes("pid=,lstart=,comm=")) return rows.join("\n");
+      const pid = Number(args[args.length - 1]);
+      const row = rows.map((r) => r.match(/^(\d+) \d+ (\S+ \S+ \S+ \S+ \S+) (\S+)/)).find((m) => m && Number(m[1]) === pid);
+      return row ? `${pid} ${row[2]} ${comms[pid] ?? row[3]}` : "";
+    };
+  };
   const settle = () => new Promise((res) => setTimeout(res, 50));
+  /** The registration generation the row carries now (registerAgent wrote it). */
+  const genOf = (name: string) => (db.getDb().prepare("SELECT cli_profile_observed_gen AS g FROM agents WHERE name = ?").get(name) as { g: string }).g;
   it("a STDIO server walks its OWN ancestry at registration (the nearest agent decides); a supplied profile that disagrees writes ONE log line", async () => {
     const { setOwnDetectedAgent, _setAsyncPsRunnerForTests, _resetStdioObserverForTests } = await L();
     const { handleRegisterAgent } = await import("../src/tools/identity.js");
@@ -346,14 +377,17 @@ describe("the relay OBSERVES the profile (ruling cc9f2199; 9d0bb9e6: the nearest
     const seen: string[][] = [];
     _setAsyncPsRunnerForTests(async (args) => {
       seen.push(args);
-      return args[0] === "-axo" ? (await table("/usr/local/bin/codex")()) : "4343 Mon Nov 24 08:00:00 2026 /opt/claude/claude";
+      return args.includes("-axo") ? (await table("/usr/local/bin/codex")(args)) : "4343 Mon Nov 24 08:00:00 2026 /opt/claude/claude";
     });
     try {
       requestContext.run({ transport: "http" } as never, () =>
-        deriveObservedCliProfile("s-both", { name: "s-both", role: "r", capabilities: [], agent_pid: 4343, agent_pid_start: "Mon Nov 24 08:00:00 2026 UTC" } as never),
+        deriveObservedCliProfile("s-both", { name: "s-both", role: "r", capabilities: [], agent_pid: 4343, agent_pid_start: "Mon Nov 24 08:00:00 2026 UTC" } as never, genOf("s-both")),
       );
       await settle();
-      expect(seen).toEqual([["-o", "pid=,lstart=,command=", "-p", "4343"]]);
+      expect(seen).toEqual([
+        ["-ww", "-o", "pid=,lstart=,command=", "-p", "4343"],
+        ["-ww", "-o", "pid=,lstart=,comm=", "-p", "4343"],
+      ]);
       expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-both'").get()).toEqual({ cli_profile_observed: "claude" });
     } finally {
       _setAsyncPsRunnerForTests(null);
@@ -367,11 +401,11 @@ describe("the relay OBSERVES the profile (ruling cc9f2199; 9d0bb9e6: the nearest
     regressed("s-fresh", null);
     try {
       _setAsyncPsRunnerForTests(table("/usr/local/bin/codex"));
-      deriveObservedCliProfile("s-fresh", { name: "s-fresh", role: "r", capabilities: [] } as never);
+      deriveObservedCliProfile("s-fresh", { name: "s-fresh", role: "r", capabilities: [] } as never, genOf("s-fresh"));
       await settle();
       expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-fresh'").get()).toEqual({ cli_profile_observed: "codex" });
       _setAsyncPsRunnerForTests(table("/bin/zsh")); // the codex ancestor exited: the nearest agent is claude now
-      deriveObservedCliProfile("s-fresh", { name: "s-fresh", role: "r", capabilities: [] } as never);
+      deriveObservedCliProfile("s-fresh", { name: "s-fresh", role: "r", capabilities: [] } as never, genOf("s-fresh"));
       await settle();
       expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-fresh'").get()).toEqual({ cli_profile_observed: "claude" });
     } finally {
@@ -379,11 +413,49 @@ describe("the relay OBSERVES the profile (ruling cc9f2199; 9d0bb9e6: the nearest
       _resetStdioObserverForTests();
     }
   });
-  it("RE-DERIVED at every registration (no COALESCE): a later registration with no observation replaces codex with NULL", async () => {
-    const { deriveObservedCliProfile } = await import("../src/tools/identity.js");
+  it("RE-DERIVED at every registration (no COALESCE): the re-registration's own statement resets codex to NULL, with a NEW generation", () => {
     regressed("s-again", "codex");
-    deriveObservedCliProfile("s-again", { name: "s-again", role: "r", capabilities: [] } as never);
+    const before = genOf("s-again");
+    const { observed_gen } = db.registerAgent("s-again", "r", []);
     expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-again'").get()).toEqual({ cli_profile_observed: null });
+    expect(genOf("s-again")).toBe(observed_gen);
+    expect(observed_gen).not.toBe(before);
+  });
+  it("R2 P2-a: A registers, B registers, A's probe answers LATE → never A's value (B's, or NULL while B's probe is pending)", async () => {
+    const { setOwnDetectedAgent, _setAsyncPsRunnerForTests, _resetStdioObserverForTests } = await L();
+    const { deriveObservedCliProfile } = await import("../src/tools/identity.js");
+    setOwnDetectedAgent(null); // a stdio server: each probe walks the ancestry
+    // Each probe's table read waits until the test releases it with that probe's answer.
+    // The comm read follows its table read at once, so it answers for the parent released for THAT probe.
+    const pending: Array<(parentCmd: string) => void> = [];
+    let released = "/bin/zsh";
+    _setAsyncPsRunnerForTests(async (args) => {
+      if (args.includes("pid=,lstart=,comm=")) return table(released)(args);
+      return new Promise<string>((res) =>
+        pending.push((parentCmd) => {
+          released = parentCmd;
+          void table(parentCmd)(args).then(res);
+        }),
+      );
+    });
+    try {
+      const a = db.registerAgent("s-race", "r", []); // registration A (its own statement installs A's generation)
+      const b = db.registerAgent("s-race", "r", []); // registration B, before A's probe ran
+      // B's probe starts first; A's starts LATE (A's handler resumes after B's whole registration, as across processes).
+      deriveObservedCliProfile("s-race", { name: "s-race", role: "r", capabilities: [] } as never, b.observed_gen);
+      deriveObservedCliProfile("s-race", { name: "s-race", role: "r", capabilities: [] } as never, a.observed_gen);
+      await settle();
+      expect(pending.length, "both probes are waiting").toBe(2);
+      pending[1]!("/usr/local/bin/codex"); // A's probe answers codex
+      await settle();
+      expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-race'").get(), "A's answer writes nothing: the row carries B's generation").toEqual({ cli_profile_observed: null });
+      pending[0]!("/bin/zsh"); // B's probe: the nearest agent is claude
+      await settle();
+      expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-race'").get()).toEqual({ cli_profile_observed: "claude" });
+    } finally {
+      _setAsyncPsRunnerForTests(null);
+      _resetStdioObserverForTests();
+    }
   });
   it("the HTTP path with a HANGING ps: registration succeeds at once, the observed profile is NULL, and stays NULL after the probe's bound (one log line)", async () => {
     const { _setAsyncPsRunnerForTests, PROFILE_PROBE_TIMEOUT_MS } = await L();
@@ -405,12 +477,12 @@ describe("the relay OBSERVES the profile (ruling cc9f2199; 9d0bb9e6: the nearest
     }
   }, 15_000);
   it("P2: a late probe never overwrites a NEWER registration's value, even within the SAME millisecond (the CAS token is a per-registration generation)", () => {
-    regressed("s-cas", null);
     const sameMs = "2026-11-24T10:00:00.000Z";
-    db.setObservedCliProfile("s-cas", null, sameMs, { gen: "reg-1" });
-    db.setObservedCliProfile("s-cas", null, sameMs, { gen: "reg-2" }); // a newer registration, the SAME millisecond
-    expect(db.setObservedCliProfile("s-cas", "codex", sameMs, { expectGen: "reg-1" })).toBe(false); // the old probe lands late
-    expect(db.setObservedCliProfile("s-cas", "claude", sameMs, { expectGen: "reg-2" })).toBe(true); // the current one lands
+    const r1 = db.registerAgent("s-cas", "r", []);
+    const r2 = db.registerAgent("s-cas", "r", []); // a newer registration (two generations, whatever the clock says)
+    expect(r1.observed_gen).not.toBe(r2.observed_gen);
+    expect(db.setObservedCliProfile("s-cas", "codex", sameMs, { expectGen: r1.observed_gen })).toBe(false); // the old probe lands late
+    expect(db.setObservedCliProfile("s-cas", "claude", sameMs, { expectGen: r2.observed_gen })).toBe(true); // the current one lands
     expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-cas'").get()).toEqual({ cli_profile_observed: "claude" });
   });
   it("schema v27: the two columns exist on a fresh DB", () => {

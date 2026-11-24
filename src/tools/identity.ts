@@ -27,7 +27,6 @@ import {
   normalizeCliProfile,
 } from "../db.js";
 import { getOwnHostId, isStdioObserver, probeAgentProfile, probeOwnAncestryProfile } from "../liveness.js";
-import { randomUUID } from "crypto";
 import { fireWebhooks } from "../webhooks.js";
 import { broadcastDashboardEvent } from "../transport/websocket.js";
 import { log } from "../logger.js";
@@ -107,18 +106,17 @@ function suffixMintRefusal(requestedName: string) {
 }
 
 /**
- * Doorbell PR 8b: derive cli_profile_observed for a registration (ruling cc9f2199; Codex #448 R1). The column is set to
- * NULL now with a fresh GENERATION, then a bounded ASYNC probe fills it in, written only while that generation is
- * still the row's (a late probe never overwrites a newer registration). The TRANSPORT selects the probe:
+ * Doorbell PR 8b: derive cli_profile_observed for a registration (ruling cc9f2199; Codex #448 R1 + R2). registerAgent
+ * already reset the column to NULL and wrote this registration's GENERATION in the row's own statement (R2 P2-a); a
+ * bounded ASYNC probe fills it in, written only while that generation is still the row's (an older registration's
+ * probe finds a newer generation and writes nothing). The TRANSPORT selects the probe:
  *   - a stdio server: a FRESH walk of its OWN ancestry (the nearest agent above it); a caller-named pid is ignored;
  *   - otherwise (the HTTP daemon): the caller-named pid on THIS host, one coherent ps snapshot, its start checked.
  * The caller's own cli_profile stays informational; when both are known and differ, one log line says so. Never
  * throws into the registration.
  */
-export function deriveObservedCliProfile(name: string, input: RegisterAgentInput): void {
-  const gen = randomUUID();
+export function deriveObservedCliProfile(name: string, input: RegisterAgentInput, gen: string): void {
   const supplied = normalizeCliProfile(input.cli_profile);
-  setObservedCliProfile(name, null, new Date().toISOString(), { gen });
   const land = (r: { profile: string | null; why?: string }): void => {
     if (r.why) log.warn(`[register] ${name}: the CLI profile was not observed (${r.why}): it stays NULL`);
     try {
@@ -449,7 +447,7 @@ export function handleRegisterAgent(input: RegisterAgentInput) {
   // Doorbell PR 8b (ruling cc9f2199): the CLI profile the RELAY observes, re-derived at EVERY registration. Never
   // blocks or fails the registration.
   try {
-    deriveObservedCliProfile(agent.name, input);
+    deriveObservedCliProfile(agent.name, input, registerResult.observed_gen);
   } catch {
     /* best-effort: the observed profile stays as written (NULL reads as UNCOVERED) */
   }

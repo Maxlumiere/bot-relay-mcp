@@ -107,8 +107,8 @@
  {
   "name": "no-cas",
   "file": "src/db.ts",
-  "find": "WHERE name = ? AND cli_profile_observed_gen IS ?\").run(canon, at, name, key.expectGen);",
-  "replace": "WHERE name = ? AND ? IS NOT NULL\").run(canon, at, name, key.expectGen);",
+  "find": "WHERE name = ? AND cli_profile_observed_gen IS ?\")\n    .run(canon, at, name, key.expectGen);",
+  "replace": "WHERE name = ? AND ? IS NOT NULL\")\n    .run(canon, at, name, key.expectGen);",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
  },
  {
@@ -120,9 +120,9 @@
  },
  {
   "name": "no-rederive",
-  "file": "src/tools/identity.ts",
-  "find": "  setObservedCliProfile(name, null, new Date().toISOString(), { gen });",
-  "replace": "  if (false) setObservedCliProfile(name, null, new Date().toISOString(), { gen });",
+  "file": "src/db.ts",
+  "find": "      \"cli_profile = COALESCE(?, cli_profile), cli_profile_observed = NULL, cli_profile_observed_gen = ? \" +",
+  "replace": "      \"cli_profile = COALESCE(?, cli_profile), cli_profile_observed = cli_profile_observed, cli_profile_observed_gen = ? \" +",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
  },
  {
@@ -142,8 +142,8 @@
  {
   "name": "r1-cas-by-time",
   "file": "src/db.ts",
-  "find": "WHERE name = ? AND cli_profile_observed_gen IS ?\").run(canon, at, name, key.expectGen);",
-  "replace": "WHERE name = ? AND cli_profile_observed_at IS ?\").run(canon, at, name, at);",
+  "find": "WHERE name = ? AND cli_profile_observed_gen IS ?\")\n    .run(canon, at, name, key.expectGen);",
+  "replace": "WHERE name = ? AND cli_profile_observed_at IS ?\")\n    .run(canon, at, name, at);",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
  },
  {
@@ -151,6 +151,34 @@
   "file": "src/tools/identity.ts",
   "find": "  if (isStdioObserver() && currentContext().transport === \"stdio\") {",
   "replace": "  if (isStdioObserver()) {",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "r2-gen-not-installed-by-registration",
+  "file": "src/db.ts",
+  "find": "      \"cli_profile = COALESCE(?, cli_profile), cli_profile_observed = NULL, cli_profile_observed_gen = ? \" +",
+  "replace": "      \"cli_profile = COALESCE(?, cli_profile), cli_profile_observed = NULL, cli_profile_observed_gen = COALESCE(cli_profile_observed_gen, ?) \" +",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "r2-command-judge-only",
+  "file": "src/liveness.ts",
+  "find": "  return byCommand !== null && byCommand === byComm ? byCommand : null;",
+  "replace": "  return byCommand;",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "r2-comm-judge-only",
+  "file": "src/liveness.ts",
+  "find": "  return byCommand !== null && byCommand === byComm ? byCommand : null;",
+  "replace": "  return byComm;",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "r2-comm-start-unchecked",
+  "file": "src/liveness.ts",
+  "find": "  if (!m || Number(m[1]) !== pid || m[2]!.trim() !== start) return null;",
+  "replace": "  if (!m || Number(m[1]) !== pid) return null;",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
  }
 ]
