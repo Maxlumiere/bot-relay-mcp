@@ -50,7 +50,11 @@ function reset(): void {
   _resetAuthRejectionAuditForTests();
   db.getDb();
 }
-beforeEach(reset);
+// An explicit timeout on THIS hook: reset() is a full synchronous DB re-init per test (close, delete the DB and its
+// sidecars, init again). MEASURED on main db623d4: a Windows runner in a slow window took 112.8 s for the step that
+// the same job ran in 18.1 s when green, and this hook crossed vitest's default 10 s (a hook timeout, not an
+// assertion). The work is not under test; its duration is the runner's.
+beforeEach(reset, 60_000);
 afterEach(() => {
   delete process.env.RELAY_ALLOW_OPEN_MINT;
   delete process.env.RELAY_HTTP_SECRET;
