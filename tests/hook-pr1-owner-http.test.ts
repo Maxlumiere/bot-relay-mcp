@@ -49,7 +49,7 @@ const HOOKS = budgetTree(path.join(ROOT, "hooks-seamed"), REAL_HOOKS_SRC, path.j
   declaredBudget: { "post-tool-use-check.sh": 30, "stop-check.sh": 30 }, // SessionStart keeps its own (a timing row bounds it)
 });
 /** A budgetTree copy at the hooks' REAL declared budgets: for the rows that measure the real budget (via the opt-in). */
-const REAL_BUDGET_HOOKS = budgetTree(path.join(ROOT, "hooks-real-budget"), REAL_HOOKS_SRC, path.join(REPO, "bin"));
+const REAL_BUDGET_HOOKS = budgetTree(path.join(ROOT, "hooks-real-budget"), REAL_HOOKS_SRC, path.join(REPO, "bin"), { declaredBudget: "real" });
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 const AGENT = "pr1-agent";
 const KEY_RE = /^[0-9a-f]{32}$/;

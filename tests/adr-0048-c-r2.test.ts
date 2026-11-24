@@ -32,11 +32,15 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 /** The REAL hooks: scanned, copied and sourced here, but never SPAWNED for PostToolUse/Stop (the hook budget tripwire). */
 const HOOKS = path.join(REPO_ROOT, "hooks");
 /**
- * What this file SPAWNS PostToolUse/Stop from: a budgetTree copy at the hooks' REAL declared budgets. Its rows measure
- * the real budget, so they run it on the real clock only through runHookRealBudget (which asserts the cut), or on a
- * fixed clock (RELAY_TEST_CLOCK).
+ * An EXPLICIT real-budget fixture: a budgetTree copy at the hooks' REAL declared budgets. The rows that use it measure
+ * the real budget (the caps are min(own, budget - margin)), so they run it on a fixed clock (RELAY_TEST_CLOCK) or on
+ * the real clock only through runHookRealBudget (which asserts the cut). Never a behaviour row's default.
  */
-const RUN_HOOKS = budgetTree(fs.mkdtempSync(path.join(os.tmpdir(), "adr0048c-r2-hooks-")), HOOKS, path.join(REPO_ROOT, "bin"));
+const REAL_BUDGET_HOOKS = budgetTree(fs.mkdtempSync(path.join(os.tmpdir(), "adr0048c-r2-hooks-")), HOOKS, path.join(REPO_ROOT, "bin"), { declaredBudget: "real" });
+/** The BEHAVIOUR default: a budgetTree copy with PostToolUse/Stop raised to 30 s, so no step is skipped for time. */
+const BEHAVIOUR_HOOKS = budgetTree(fs.mkdtempSync(path.join(os.tmpdir(), "adr0048c-r2-behaviour-")), HOOKS, path.join(REPO_ROOT, "bin"), {
+  declaredBudget: { "post-tool-use-check.sh": 30, "stop-check.sh": 30 },
+});
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "adr0048c-r2-")));
 const HOME = path.join(ROOT, "home");
 const RH = path.join(HOME, ".bot-relay");
@@ -332,7 +336,8 @@ function stubs(dir: string): { curlLog: string; nodeLog: string } {
   return { curlLog, nodeLog };
 }
 
-function timed(hook: string, tag: string, env: Record<string, string>, input = "", hooksDir = RUN_HOOKS) {
+/** `hooksDir` has NO default: every caller names whether it runs the real-budget fixture or another copy. */
+function timed(hook: string, tag: string, env: Record<string, string>, input: string, hooksDir: string) {
   const dir = path.join(ROOT, `stubs-${tag}`);
   const { curlLog, nodeLog } = stubs(dir);
   const t0 = Date.now() / 1000;
@@ -417,7 +422,7 @@ describe("Codex #291 R2 #1 — REMOTE path: after the resolver, every HTTP call 
   }
 
   it("check-relay.sh: a resolver that would take 7.5s is cut at its pre-mail share, so the mail read still runs", () => {
-    const r = timed("check-relay.sh", "w", { RELAY_AGENT_TOKEN: "tok_" + "w".repeat(20), STUB_WHERE: "7.5", STUB_D_mail: "8" });
+    const r = timed("check-relay.sh", "w", { RELAY_AGENT_TOKEN: "tok_" + "w".repeat(20), STUB_WHERE: "7.5", STUB_D_mail: "8" }, "", REAL_BUDGET_HOOKS);
     expect(r.out).toMatch(/relay where timed out after [1-5]s/);
     expect(r.verbs, r.out).toContain("pending");
     expectEveryCallInsideTheBudget(r, 10);
@@ -425,7 +430,7 @@ describe("Codex #291 R2 #1 — REMOTE path: after the resolver, every HTTP call 
   }, 40_000);
 
   it("check-relay.sh: a slow resolver (4.5s) + a remote mail read that hangs → the read's cap is what is LEFT (never a fixed 4s); inside the 10s budget", () => {
-    const r = timed("check-relay.sh", "c", { RELAY_AGENT_TOKEN: "tok_" + "s".repeat(20), STUB_WHERE: "4.5", STUB_D_mail: "8" });
+    const r = timed("check-relay.sh", "c", { RELAY_AGENT_TOKEN: "tok_" + "s".repeat(20), STUB_WHERE: "4.5", STUB_D_mail: "8" }, "", REAL_BUDGET_HOOKS);
     expect(r.verbs, r.out).toEqual(expect.arrayContaining(["where", "pending"]));
     expect(r.curls.map((c) => c.kind), r.out).toContain("mail");
     expectEveryCallInsideTheBudget(r, 10);
@@ -440,7 +445,7 @@ describe("Codex #291 R2 #1 — REMOTE path: after the resolver, every HTTP call 
  * race: bash's SECONDS ticks on whole wall-clock seconds, so a timed row can never pin "no time left", nor "time left".
  */
 function starvedTree(tag: string): string {
-  return budgetTree(path.join(ROOT, `starved-${tag}`), HOOKS, path.join(REPO_ROOT, "bin"));
+  return budgetTree(path.join(ROOT, `starved-${tag}`), HOOKS, path.join(REPO_ROOT, "bin"), { declaredBudget: "real" }); // a real-budget fixture
 }
 
 describe("the test seam's FIXED budget clock does not tick (Codex R1 on the seam: never ASSUME bash's special-variable semantics; measured)", () => {
@@ -535,8 +540,11 @@ describe("Codex #291 R2 #1 — a step with no time left is SKIPPED and said (the
       expect(r.out).toMatch(/\[bot-relay\] no time budget left for the remote health probe/);
       expect(r.verdict, r.out).toMatch(/VERDICT=DEGRADED reason="no time budget left for the remote read"/);
     });
-    it(`${hook}: no time for the remote mail read → the probe runs, the READ never starts; DEGRADED`, () => {
-      const r = timed(hook, `sm-${hook}`, { RELAY_AGENT_TOKEN: "tok_" + "m".repeat(20), RELAY_TEST_STARVE: "the remote mail read", STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "8" }, JSON.stringify({ session_id: "s1" }), starvedTree(`m-${hook}`));
+    it(`${hook}: no time for the remote mail read → the resolver runs, the probe runs, the READ never starts; DEGRADED`, () => {
+      // The token comes from the VAULT (not the environment), so the resolver must run: moved here with the retired row.
+      vaultToken();
+      const r = timed(hook, `sm-${hook}`, { RELAY_TEST_STARVE: "the remote mail read", STUB_D_health: "0.1", STUB_OK_health: "1", STUB_D_mail: "8" }, JSON.stringify({ session_id: "s1" }), starvedTree(`m-${hook}`));
+      expect(r.verbs, `the resolver executed\n${r.out}`).toContain("where");
       // The read NEVER STARTED: exactly one call was made, the probe (the stub logs every call it starts).
       expect(r.curls.map((c) => c.kind), r.out).toEqual(["health"]);
       expect(r.verdict, r.out).toMatch(/VERDICT=DEGRADED reason="no time budget left for the remote read"/);
@@ -598,7 +606,7 @@ describe("Codex #291 R2 #1 — SessionStart's sqlite3 reads run under the watchd
 describe("Codex #291 R2 #1 — the hook's OWN stdin read is on the budget too (a writer that dribbles and never closes)", () => {
   for (const hook of ["check-relay.sh", "post-tool-use-check.sh", "stop-check.sh"]) {
     const dribble = async (env: Record<string, string>) => {
-      const child = spawn("bash", [path.join(RUN_HOOKS, hook)], {
+      const child = spawn("bash", [path.join(REAL_BUDGET_HOOKS, hook)], {
         env: { PATH: process.env.PATH ?? "", HOME, RELAY_AGENT_NAME: AGENT, RELAY_HTTP_PORT: "1", RELAY_WAKE_COVERAGE_STATUS_PATH: path.join(ROOT, "wc.json"), ...env },
       });
       let out = "";
@@ -696,7 +704,7 @@ describe("Codex #291 R2 #2 — a resolution field with NUL or any C0 control is 
     it(`${hook}: a pending answer whose resolution path carries a NUL → DEGRADED, never HEALTHY`, () => {
       const base = path.join(ROOT, `tree-nul-${hook}`, "bot-relay-mcp");
       fs.rmSync(path.dirname(base), { recursive: true, force: true });
-      fs.cpSync(RUN_HOOKS, path.join(base, "hooks"), { recursive: true }); // from the SEAMED copy (fixed clock below)
+      fs.cpSync(BEHAVIOUR_HOOKS, path.join(base, "hooks"), { recursive: true }); // a behaviour row: the raised-budget seamed copy (fixed clock below)
       fs.mkdirSync(path.join(base, "bin"), { recursive: true });
       const env = { ok: true, agent: AGENT, db_path: "/x/relay.db", session_bound: false, count: 0, top_priority: null, messages: [], resolution: { kind: "flat", db_path: path.join(RH, "relay.db") + "\u0000x", exists: true, basis: "no-instances" } };
       fs.writeFileSync(path.join(base, "bin", "relay"), `process.stdout.write(${JSON.stringify(JSON.stringify(env) + "\n")}); process.exit(0);\n`);

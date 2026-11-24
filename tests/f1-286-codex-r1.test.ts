@@ -47,6 +47,8 @@ const STOP_HOOK = path.join(REPO_ROOT, "hooks", "stop-check.sh");
 const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "f1286-seamed-"));
 const SEAMED_HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin")), "check-relay.sh");
 const SEAMED_DIR = path.dirname(SEAMED_HOOK);
+/** An EXPLICIT real-budget fixture: the stalled-read rows measure the REAL 5 s deadline of PostToolUse/Stop. */
+const REAL_BUDGET_DIR = budgetTree(path.join(SEAMED_ROOT, "real-budget"), path.join(REPO_ROOT, "hooks"), path.join(REPO_ROOT, "bin"), { declaredBudget: "real" });
 afterAll(() => fs.rmSync(SEAMED_ROOT, { recursive: true, force: true }));
 
 delete process.env.RELAY_AGENT_TOKEN;
@@ -549,7 +551,7 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
       return { r, took: Date.now() - t0, readStarted: fs.existsSync(marker), out: `${r.stdout ?? ""}\n${r.stderr ?? ""}` };
     };
     it(`${label}: a stalled read is ENDED by its deadline, LOUD (DEGRADED timed out), with NO override (fixed clock: the read always starts)`, () => {
-      const { r, took, readStarted } = stalledRun("seamed", path.join(SEAMED_DIR, path.basename(hook)));
+      const { r, took, readStarted } = stalledRun("seamed", path.join(REAL_BUDGET_DIR, path.basename(hook)));
       expect(readStarted, "precondition: the read started (the stall shim recorded its pid)").toBe(true);
       expect(took, "the deadline, not the 20s stalled child, ends the read").toBeLessThan(9_000);
       expect(r.stderr).toMatch(/VERDICT=DEGRADED reason="relay unreadable: [^"]*timed out/);
@@ -563,7 +565,7 @@ describe("#286 D1 — the relay pending deadline: direct node, a watchdog, files
           env: {},
           clock,
           assertsCut: clock === "real" ? /VERDICT=DEGRADED reason="relay unreadable: [^"]*(timed out|no time budget left)/ : /no time budget left/,
-          run: (e) => stalledRun(clock === "real" ? "real" : "starved", path.join(SEAMED_DIR, path.basename(hook)), e),
+          run: (e) => stalledRun(clock === "real" ? "real" : "starved", path.join(REAL_BUDGET_DIR, path.basename(hook)), e),
         });
         expect(took, `${label} must finish inside its 5s installed budget`).toBeLessThan(5_000);
       }, 45_000);

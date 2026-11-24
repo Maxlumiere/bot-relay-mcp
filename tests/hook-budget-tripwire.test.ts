@@ -12,16 +12,16 @@ import { describe, it, expect, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync, exec, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { hookSpawnRefusal } from "./_setup/hook-budget-tripwire.js";
+import { hookSpawnRefusal, shellWords } from "./_setup/hook-budget-tripwire.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
 import { runHookRealBudget, REAL_BUDGET_OPTIN } from "./_helpers/hook-real-budget.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REAL = path.join(REPO, "hooks");
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "hook-tripwire-"));
-const SEAMED = budgetTree(path.join(ROOT, "seamed"), REAL, path.join(REPO, "bin"));
+const SEAMED = budgetTree(path.join(ROOT, "seamed"), REAL, path.join(REPO, "bin"), { declaredBudget: "real" }); // its starved row measures the REAL budget
 const PLAIN = path.join(ROOT, "plain", "hooks");
 fs.cpSync(REAL, PLAIN, { recursive: true });
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
@@ -49,6 +49,47 @@ describe("the refusal (pure)", () => {
   it("a shell's -c string that runs the real hook → refused", () => {
     expect(hookSpawnRefusal("bash", ["-c", `"${path.join(REAL, "stop-check.sh")}" < /dev/null`], CLOCK0)).toMatch(/not a budgetTree copy/);
   });
+  it("shell flags: a combined cluster (-lc, -ec), an option with a value (-o pipefail), and -- all reach the hook → refused", () => {
+    const hook = path.join(REAL, "stop-check.sh");
+    expect(hookSpawnRefusal("sh", ["-lc", `"${hook}"`], CLOCK0)).toMatch(/not a budgetTree copy/);
+    expect(hookSpawnRefusal("bash", ["-ec", `cd /tmp && bash "${hook}" < /dev/null`], CLOCK0)).toMatch(/not a budgetTree copy/);
+    expect(hookSpawnRefusal("bash", ["-o", "pipefail", hook], CLOCK0)).toMatch(/not a budgetTree copy/);
+    expect(hookSpawnRefusal("bash", ["--norc", "--", hook], CLOCK0)).toMatch(/not a budgetTree copy/);
+    expect(hookSpawnRefusal("bash", ["-x", path.join(SEAMED, "stop-check.sh")], CLOCK0), "a seamed copy behind an option is still allowed").toBeNull();
+  });
+  it("a shell command is CONSERVATIVE (documented): a -c string, exec or a shell:true spawn that merely NAMES the real hook is refused", () => {
+    const hook = path.join(REAL, "post-tool-use-check.sh");
+    expect(hookSpawnRefusal("sh", ["-c", `echo "${hook}"`], CLOCK0)).toMatch(/not a budgetTree copy/);
+    expect(hookSpawnRefusal(`bash "${hook}"`, [], { ...CLOCK0, shell: true })).toMatch(/not a budgetTree copy/);
+  });
+  it("quoted words are honoured: a seamed copy whose path has a SPACE is one word (allowed), in a -c string and in a shell:true spawn", () => {
+    const spaced = budgetTree(path.join(ROOT, "with space"), REAL, path.join(REPO, "bin"));
+    const hook = path.join(spaced, "stop-check.sh");
+    expect(hookSpawnRefusal("bash", ["-c", `"${hook}" < /dev/null`], CLOCK0)).toBeNull();
+    expect(hookSpawnRefusal(`bash '${hook}'`, [], { ...CLOCK0, shell: true })).toBeNull();
+    expect(hookSpawnRefusal("bash", [hook], CLOCK0)).toBeNull();
+  });
+  it.skipIf(process.platform === "win32")("a MARKED copy whose hook is a SYMLINK to the real hook → refused (the marker is judged beside the script's real path)", () => {
+    const linked = path.join(ROOT, "linked");
+    fs.cpSync(SEAMED, linked, { recursive: true });
+    fs.rmSync(path.join(linked, "stop-check.sh"));
+    fs.symlinkSync(path.join(REAL, "stop-check.sh"), path.join(linked, "stop-check.sh"));
+    expect(fs.existsSync(path.join(linked, ".relay-budget-tree")), "precondition: the copy is marked").toBe(true);
+    expect(hookSpawnRefusal("bash", [path.join(linked, "stop-check.sh")], CLOCK0)).toMatch(/not a budgetTree copy/);
+  });
+  it("budgetTree's DEFAULT is the behaviour budget (PostToolUse/Stop at 30 s); a real-budget fixture names itself ('real')", () => {
+    const shipped = (h: string) => /^RELAY_HOOK_BUDGET_SECS=(\d+)$/m.exec(fs.readFileSync(path.join(REAL, h), "utf-8"))![1];
+    const declared = (dir: string, h: string) => /^RELAY_HOOK_BUDGET_SECS=(\d+)$/m.exec(fs.readFileSync(path.join(dir, h), "utf-8"))![1];
+    const def = budgetTree(path.join(ROOT, "default"), REAL, path.join(REPO, "bin"));
+    for (const h of ["post-tool-use-check.sh", "stop-check.sh"]) {
+      expect(declared(def, h), h).toBe("30");
+      expect(declared(SEAMED, h), `${h}: "real" keeps the shipped value`).toBe(shipped(h));
+    }
+    expect(declared(def, "check-relay.sh"), "SessionStart keeps its own").toBe(shipped("check-relay.sh"));
+  });
+  it("shellWords: quotes, escapes and operators", () => {
+    expect(shellWords(`a "b c" 'd e' f\\ g;h|i&&j`)).toEqual(["a", "b c", "d e", "f g", "h", "i", "j"]);
+  });
   it("NOT a run: a fixture named legacy-stop-check.sh; check-relay.sh; a hook's NAME passed as an argument to another program", () => {
     expect(hookSpawnRefusal("bash", [path.join(ROOT, "legacy-stop-check.sh")], { env: {} })).toBeNull();
     expect(hookSpawnRefusal("bash", [path.join(REAL, "check-relay.sh")], { env: {} })).toBeNull();
@@ -59,6 +100,11 @@ describe("the refusal (pure)", () => {
 describe("installed (every test file)", () => {
   it("a spawnSync of the REAL PostToolUse hook THROWS the tripwire's message before anything runs", () => {
     expect(() => spawnSync("bash", [path.join(REAL, "post-tool-use-check.sh")], { env: { RELAY_TEST_CLOCK: "0" } })).toThrow(/hook budget tripwire/);
+  });
+  it("exec and execSync are wrapped too: a shell command running the REAL Stop hook THROWS before anything runs", () => {
+    const cmd = `bash "${path.join(REAL, "stop-check.sh")}" < /dev/null`;
+    expect(() => execSync(cmd, { env: { RELAY_TEST_CLOCK: "0" } })).toThrow(/hook budget tripwire/);
+    expect(() => exec(cmd, { env: { RELAY_TEST_CLOCK: "0" } }, () => {})).toThrow(/hook budget tripwire/);
   });
 });
 
