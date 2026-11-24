@@ -104,6 +104,64 @@ describe("renameReplacingWithWindowsRetry", () => {
   });
 });
 
+describe("the REAL owner endpoint writer through the seam: success after retries, exhaustion, POSIX (Codex #452 R1 P2)", () => {
+  const setup = () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-fs-replace-owner-"));
+    const db = path.join(dir, "relay.db");
+    fs.writeFileSync(db, "");
+    return db;
+  };
+  const temps = () => fs.readdirSync(dir).filter((n) => n.endsWith(".tmp"));
+  it("Windows: EPERM THREE times, then the rename succeeds → the record is written; no temp file left", async () => {
+    const db = setup();
+    const f = flakyRename(3, "EPERM");
+    _setReplaceDepsForTests({ platform: "win32", rename: f.rename, sleep: () => {} });
+    const { writeOwnerEndpoint } = await import("../src/owner-endpoint.js");
+    const file = writeOwnerEndpoint(db, 4343, "http", "inst-y");
+    expect(f.calls.length).toBe(4);
+    expect(JSON.parse(fs.readFileSync(file, "utf-8"))).toMatchObject({ port: 4343, instance_id: "inst-y" });
+    expect(temps()).toEqual([]);
+  });
+  it("Windows: EPERM FIVE times → the writer throws the last error (tagged), the PREVIOUS record is preserved, and no temp file is left", async () => {
+    const db = setup();
+    const { writeOwnerEndpoint, ownerEndpointPath } = await import("../src/owner-endpoint.js");
+    writeOwnerEndpoint(db, 1111, "http", "inst-old"); // the previous record, written normally
+    const before = fs.readFileSync(ownerEndpointPath(db), "utf-8");
+    const f = flakyRename(5, "EPERM");
+    _setReplaceDepsForTests({ platform: "win32", rename: f.rename, sleep: () => {} });
+    let err: ReplaceError | null = null;
+    try {
+      writeOwnerEndpoint(db, 2222, "http", "inst-new");
+    } catch (e) {
+      err = e as ReplaceError;
+    }
+    expect(err?.code).toBe("EPERM");
+    expect(err?.windowsOpenFile).toBe(true);
+    expect(f.calls.length).toBe(WINDOWS_REPLACE_WAITS_MS.length + 1);
+    expect(fs.readFileSync(ownerEndpointPath(db), "utf-8"), "the destination is untouched").toBe(before);
+    expect(temps(), "the writer removed its temp file").toEqual([]);
+  });
+  it("POSIX: EACCES → thrown at ONCE (never retried), the previous record preserved, no temp file left", async () => {
+    const db = setup();
+    const { writeOwnerEndpoint, ownerEndpointPath } = await import("../src/owner-endpoint.js");
+    writeOwnerEndpoint(db, 1111, "http", "inst-old");
+    const before = fs.readFileSync(ownerEndpointPath(db), "utf-8");
+    const f = flakyRename(1, "EACCES");
+    _setReplaceDepsForTests({ platform: "linux", rename: f.rename, sleep: () => { throw new Error("POSIX never waits"); } });
+    let err: ReplaceError | null = null;
+    try {
+      writeOwnerEndpoint(db, 2222, "http", "inst-new");
+    } catch (e) {
+      err = e as ReplaceError;
+    }
+    expect(err?.code).toBe("EACCES");
+    expect(err?.windowsOpenFile).toBe(false);
+    expect(f.calls.length).toBe(1);
+    expect(fs.readFileSync(ownerEndpointPath(db), "utf-8")).toBe(before);
+    expect(temps()).toEqual([]);
+  });
+});
+
 describe("a REAL record writer through the seam: the owner endpoint record", () => {
   it("Windows-shaped EPERM twice on the record's rename → the record is written all the same, and no temp file is left", async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-fs-replace-owner-"));
