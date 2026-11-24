@@ -15,7 +15,8 @@ import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
-import { startOffCpuWatch, offCpuLines, parseProcStat, parseProcSyscall, type StallRecord } from "./_helpers/offcpu-watch.js";
+import { startOffCpuWatch, offCpuLines, parseProcStat, parseProcSyscall, stallVerdict, type StallRecord, type ThreadSample } from "./_helpers/offcpu-watch.js";
+import { withOffCpuWatch } from "./_helpers/offcpu-boundary.js";
 
 const LINUX = process.platform === "linux";
 const requireHere = createRequire(import.meta.url);
@@ -236,6 +237,82 @@ describe("R1: a sample that overlaps the recovery is INCONCLUSIVE (every OS, a f
     expect(samples.length, JSON.stringify(rs)).toBeGreaterThanOrEqual(1);
     expect(samples.some((x) => x.inconclusive === true), JSON.stringify(rs)).toBe(true);
     expect(offCpuLines("x", w, rs).join("\n")).toMatch(/inconclusive: the thread recovered during this sample/);
+  });
+});
+
+describe("R2: a cause is NAMED only when two consecutive samples agree (pure; every OS)", () => {
+  const smp = (state: string, syscall: string, wchan = "w", extra: Partial<ThreadSample> = {}): ThreadSample => ({ atMs: 0, state, syscall, wchan, ...extra });
+  it("two consecutive samples in the same blocked state → named; S or D", () => {
+    expect(stallVerdict([smp("S", "futex"), smp("S", "futex")])).toMatchObject({ kind: "named", syscall: "futex", state: "S" });
+    expect(stallVerdict([smp("D", "fsync"), smp("D", "fsync")])).toMatchObject({ kind: "named", syscall: "fsync", state: "D" });
+    expect(stallVerdict([smp("S", "futex"), smp("S", "futex"), smp("R", "running")])).toMatchObject({ kind: "named", syscall: "futex" });
+  });
+  it("a SINGLE sample, CHANGING samples, unreadable fields, or an inconclusive-marked partner → inconclusive", () => {
+    expect(stallVerdict([smp("S", "futex")])).toEqual({ kind: "inconclusive" });
+    expect(stallVerdict([smp("S", "futex"), smp("S", "epoll_pwait")])).toEqual({ kind: "inconclusive" });
+    expect(stallVerdict([smp("S", "futex", "a"), smp("S", "futex", "b")])).toEqual({ kind: "inconclusive" });
+    expect(stallVerdict([smp("S", "unavailable"), smp("S", "unavailable")])).toEqual({ kind: "inconclusive" });
+    expect(stallVerdict([smp("S", "futex"), smp("S", "futex", "w", { inconclusive: true })])).toEqual({ kind: "inconclusive" });
+  });
+  it("samples all in state R → 'running (CPU, or already recovered)', never a cause", () => {
+    expect(stallVerdict([smp("R", "running"), smp("R", "running")])).toEqual({ kind: "running" });
+    // Runnable but not yet on a CPU: /proc can still show the syscall being returned from. Never a cause.
+    expect(stallVerdict([smp("R", "futex"), smp("R", "futex")])).toEqual({ kind: "running" });
+    const line = offCpuLines("x", { supported: true, stop: async () => [] }, [{ startedAtMs: 0, durationMs: 300, samples: [smp("R", "running"), smp("R", "running")] }])[0]!;
+    expect(line).toMatch(/running \(CPU, or already recovered\)/);
+    expect(line).toMatch(/state observed while the heartbeat was stale; the last sample may be post-recovery/);
+  });
+});
+
+describe.skipIf(!LINUX)("R2: a planted wait that returns BETWEEN samples is inconclusive, never a named syscall (Linux)", () => {
+  it("a 200 ms Atomics.wait sampled every 100 ms (one sample before the recovery) → inconclusive; the same wait sampled every 25 ms → named futex", async () => {
+    const sparse = startOffCpuWatch({ env: ON, sampleEveryMs: 100 })!;
+    await wait(50);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    await wait(50);
+    const rs = await sparse.stop();
+    const line = offCpuLines("sparse", sparse, rs).join("\n");
+    console.log(line);
+    expect(line, JSON.stringify(rs)).toMatch(/inconclusive \(state changed during the stall\)/);
+    expect(line).not.toMatch(/waiting in futex/);
+    const dense = startOffCpuWatch({ env: ON })!;
+    await wait(50);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+    await wait(50);
+    const rd = await dense.stop();
+    expect(offCpuLines("dense", dense, rd).join("\n"), JSON.stringify(rd)).toMatch(/waiting in futex \(state S/);
+  });
+});
+
+describe("R2: the failure BOUNDARY: the watch's whole lifecycle never changes the bar (every OS)", () => {
+  const fakeModule = (over: Partial<typeof import("./_helpers/offcpu-watch.js")>) =>
+    ({ startOffCpuWatch: () => ({ supported: true, stop: async () => [] }), offCpuLines: () => ["OFFCPU x | fine"], ...over }) as unknown as typeof import("./_helpers/offcpu-watch.js");
+  it("flag off → the module is never loaded, the bar's result as is", async () => {
+    let loaded = false;
+    expect(await withOffCpuWatch("x", async () => 42, { env: {}, load: async () => ((loaded = true), fakeModule({})) })).toBe(42);
+    expect(loaded).toBe(false);
+  });
+  it("a REJECTED import → one 'offcpu: unavailable' line, and the bar runs and returns its own result", async () => {
+    const log: string[] = [];
+    const r = await withOffCpuWatch("x", async () => "verdict", { env: ON, load: async () => { throw new Error("no module"); }, log: (l) => log.push(l) });
+    expect(r).toBe("verdict");
+    expect(log).toEqual(["offcpu: unavailable (no module)"]);
+  });
+  it("a THROWING reporter → the bar's own result unchanged; the bar's own exception unchanged (never replaced)", async () => {
+    const throwing = fakeModule({ offCpuLines: (() => { throw new Error("report broke"); }) as never });
+    const log: string[] = [];
+    expect(await withOffCpuWatch("x", async () => "verdict", { env: ON, load: async () => throwing, log: (l) => log.push(l) })).toBe("verdict");
+    expect(log).toEqual(["offcpu: unavailable (report broke)"]);
+    const barErr = new Error("the bar's own failure");
+    await expect(withOffCpuWatch("x", async () => { throw barErr; }, { env: ON, load: async () => throwing, log: () => {} })).rejects.toBe(barErr);
+  });
+  it("a start that THROWS, or a stop that REJECTS → the bar's result unchanged, one unavailable line", async () => {
+    const log: string[] = [];
+    const startThrows = fakeModule({ startOffCpuWatch: (() => { throw new Error("start broke"); }) as never });
+    expect(await withOffCpuWatch("x", async () => 1, { env: ON, load: async () => startThrows, log: (l) => log.push(l) })).toBe(1);
+    const stopRejects = fakeModule({ startOffCpuWatch: (() => ({ supported: true, stop: async () => { throw new Error("stop broke"); } })) as never });
+    expect(await withOffCpuWatch("x", async () => 2, { env: ON, load: async () => stopRejects, log: (l) => log.push(l) })).toBe(2);
+    expect(log).toEqual(["offcpu: unavailable (start broke)", "offcpu: unavailable (stop broke)"]);
   });
 });
 

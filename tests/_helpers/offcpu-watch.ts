@@ -260,6 +260,26 @@ export function startOffCpuWatch(
 }
 const SYSTEM_NAMES_FOR_ARCH = (): Record<number, string> => SYSCALL_NAMES[process.arch] ?? {};
 
+/**
+ * What a stall's samples SHOW (Codex #453 R2): the main thread's state was observed while its heartbeat was stale, and
+ * the last sample may already be post-recovery. So a cause is NAMED only when at least TWO CONSECUTIVE conclusive samples
+ * agree on the same BLOCKED state (S or D, the same syscall and wchan). Samples all in state R read "running (CPU, or
+ * already recovered)", never a cause; anything else is "inconclusive (state changed during the stall)". Pure.
+ */
+export type StallVerdict = { kind: "named"; state: string; syscall: string; wchan: string; fdTarget?: string } | { kind: "running" } | { kind: "inconclusive" };
+export function stallVerdict(samples: readonly ThreadSample[]): StallVerdict {
+  const usable = samples.filter((x) => !x.inconclusive);
+  const blocked = (x: ThreadSample) => (x.state === "S" || x.state === "D") && !["unavailable", "?", "running", "none"].includes(x.syscall) && x.wchan !== "unavailable";
+  const key = (x: ThreadSample) => `${x.state}|${x.syscall}|${x.wchan}|${x.fdTarget ?? ""}`;
+  for (let i = 0; i + 1 < usable.length; i++) {
+    const a = usable[i]!;
+    const b = usable[i + 1]!;
+    if (blocked(a) && blocked(b) && key(a) === key(b)) return { kind: "named", state: a.state, syscall: a.syscall, wchan: a.wchan, ...(a.fdTarget ? { fdTarget: a.fdTarget } : {}) };
+  }
+  if (usable.length > 0 && usable.every((x) => x.state === "R")) return { kind: "running" };
+  return { kind: "inconclusive" };
+}
+
 /** One report line per stall (report-only), the "unavailable" or "not supported" line, or a no-stall line. */
 export function offCpuLines(label: string, watch: OffCpuWatch | null, records: StallRecord[]): string[] {
   if (watch === null) return [];
@@ -267,6 +287,13 @@ export function offCpuLines(label: string, watch: OffCpuWatch | null, records: S
   if (records.length === 0) return [`OFFCPU ${label} | no main-thread stall of the threshold or more`];
   return records.map((r) => {
     const seen = r.samples.map((s) => `${s.atMs}ms ${s.state} ${s.syscall}${s.fdTarget ? ` fd→${s.fdTarget}` : ""}${s.wchan && s.wchan !== "0" ? ` wchan=${s.wchan}` : ""}${s.children ? ` children=[${s.children.join("; ")}]` : ""}${s.inconclusive ? " (inconclusive: the thread recovered during this sample)" : ""}`);
-    return `OFFCPU ${label} | stall ${r.durationMs} ms | ${seen.join(" | ") || "no sample taken"}`;
+    const v = stallVerdict(r.samples);
+    const verdict =
+      v.kind === "named"
+        ? `waiting in ${v.syscall} (state ${v.state}${v.wchan && v.wchan !== "0" ? `, wchan ${v.wchan}` : ""}${v.fdTarget ? `, fd→${v.fdTarget}` : ""})`
+        : v.kind === "running"
+          ? "running (CPU, or already recovered)"
+          : "inconclusive (state changed during the stall)";
+    return `OFFCPU ${label} | stall ${r.durationMs} ms | ${verdict} | state observed while the heartbeat was stale; the last sample may be post-recovery | samples: ${seen.join(" | ") || "none taken"}`;
   });
 }
