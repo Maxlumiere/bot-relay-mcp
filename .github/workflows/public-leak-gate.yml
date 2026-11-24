@@ -1,0 +1,99 @@
+# Public leak gate (layer C, the backstop): scans a pull request's METADATA (title, body, commit messages, branch name)
+# against a denylist held in the PUBLIC_DENYLIST repository secret. It NEVER checks out or runs the pull request's code:
+# it checks out the BASE commit only (so a PR that edits the scanner cannot weaken its own scan) and reads the metadata
+# through the API. The scanner prints a field and term indexes only, never the input. A missing secret fails CLOSED.
+name: Public leak gate
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  scan:
+    name: Public leak gate (metadata)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the BASE commit only (never the pull request head)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Assert the checked-out tree IS the base commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$BASE_SHA" || { echo "the checked-out tree is not the base commit: refusing"; exit 1; }
+
+      - name: Fetch the pull request metadata through the API (no code)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          meta="$RUNNER_TEMP/leak-meta"
+          mkdir -p "$meta"
+          # THE SNAPSHOT: the commits are bound to this EVENT's immutable base and head shas (read from the event file,
+          # never interpolated), so a later force-push cannot lend its pass to this head. The branch is the event's head.ref.
+          base="$(jq -r '.pull_request.base.sha' "$GITHUB_EVENT_PATH")"
+          head="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
+          for sha in "$base" "$head"; do
+            case "$sha" in *[!0-9a-f]*|'') echo "the event's commit shas are unreadable: failing closed"; exit 1 ;; esac
+            [ "${#sha}" -eq 40 ] || { echo "the event's commit shas are unreadable: failing closed"; exit 1; }
+          done
+          jq -r '.pull_request.head.ref' "$GITHUB_EVENT_PATH" > "$meta/branch"
+          # Title and body: the CURRENT text (an edit re-runs this workflow).
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > "$meta/pull.json"
+          jq -r '.title' "$meta/pull.json" > "$meta/pr-title"
+          jq -r '.body // ""' "$meta/pull.json" > "$meta/pr-body"
+          # The commits: ONE compare response (base...head, which also addresses a fork's head in this repo). Its count
+          # and its messages both come from that same file. One response lists at most 250 commits, so: the count must
+          # be a number from 1 to 250, the listed count must equal it, and the last listed commit must be the event's head.
+          gh api "repos/$REPO/compare/$base...$head" > "$meta/compare.json"
+          total="$(jq -r '.total_commits' "$meta/compare.json")"
+          case "$total" in ''|*[!0-9]*) echo "the commit count is unreadable: failing closed"; exit 1 ;; esac
+          if [ "$total" -lt 1 ]; then echo "the pull request has no commits: failing closed"; exit 1; fi
+          if [ "$total" -gt 250 ]; then echo "more than 250 commits: the API cannot list them all; failing closed"; exit 1; fi
+          listed="$(jq -r '.commits | length' "$meta/compare.json")"
+          if [ "$listed" != "$total" ]; then echo "commit list truncated: failing closed"; exit 1; fi
+          last="$(jq -r '.commits[-1].sha' "$meta/compare.json")"
+          if [ "$last" != "$head" ]; then echo "the listed commits do not end at the event's head: failing closed"; exit 1; fi
+          jq -r '.commits[].commit.message' "$meta/compare.json" > "$meta/commit-msg"
+
+      - name: Scan (prints field and term indexes only)
+        env:
+          PUBLIC_DENYLIST: ${{ secrets.PUBLIC_DENYLIST }}
+        run: |
+          meta="$RUNNER_TEMP/leak-meta"
+          worst=0
+          for field in pr-title pr-body branch commit-msg; do
+            rc=0
+            node tools/public-leak-scan/scan.mjs --field "$field" --list-env PUBLIC_DENYLIST < "$meta/$field" > "$meta/out-$field" || rc=$?
+            cat "$meta/out-$field"
+            # The exact outcome rule, read from the captured bytes (never through $(...), which strips newlines):
+            # PASS = exit 0 AND the output byte-equal to "PASS\n"; HIT = exit 1 AND the output exactly ONE line
+            # "FAIL field=<this field> terms=#N[,#N...]"; everything else = could not run.
+            if [ "$rc" -eq 0 ]; then
+              printf 'PASS\n' | cmp -s - "$meta/out-$field" || rc=2
+            elif [ "$rc" -eq 1 ]; then
+              awk -v f="$field" '{ ok = ($0 ~ ("^FAIL field=" f " terms=#[0-9]+(,#[0-9]+)*$")) } END { exit !(NR == 1 && ok) }' "$meta/out-$field" || rc=2
+            else
+              rc=2
+            fi
+            [ "$rc" -gt "$worst" ] && worst=$rc
+          done
+          if [ "$worst" -eq 1 ]; then
+            echo "A denylisted term is in this pull request's text (field and term index above). Edit the text to remove it."
+            echo "A revision with the term already exists in this pull request's history: tell the maintainer, because only the web UI removes it."
+            exit 1
+          fi
+          if [ "$worst" -ne 0 ]; then
+            echo "The scan could not run (the denylist is unavailable or invalid): failing closed."
+            exit 1
+          fi
