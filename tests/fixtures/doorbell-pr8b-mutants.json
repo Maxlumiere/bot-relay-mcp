@@ -1,0 +1,86 @@
+[
+ {
+  "name": "unknown-profile-needs-human",
+  "file": "src/agent-cli-profiles.ts",
+  "find": "  if (!cliProfile) return false;\n  const profile = getAgentCliProfile(cliProfile);\n  return profile !== undefined && profile !== null && profile.autoWake === false;",
+  "replace": "  if (!cliProfile) return true;\n  const profile = getAgentCliProfile(cliProfile);\n  return profile === undefined || profile === null || profile.autoWake === false;",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "armed-reads-needs-human",
+  "file": "src/wake-coverage-detector.ts",
+  "find": "      /* a read error never silences the alarm */\n    }\n    return \"armed\";",
+  "replace": "      /* a read error never silences the alarm */\n    }\n    return \"never\";",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "read-error-needs-human",
+  "file": "src/wake-coverage-detector.ts",
+  "find": "      /* a read error never silences the alarm */",
+  "replace": "      return \"never\";",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "codex-autowake-true",
+  "file": "src/agent-cli-profiles.ts",
+  "find": "  autoWake: false, // register-only hooks",
+  "replace": "  autoWake: true, // register-only hooks",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "claude-autowake-false",
+  "file": "src/agent-cli-profiles.ts",
+  "find": "  autoWake: true, // Stop/PostToolUse hooks",
+  "replace": "  autoWake: false, // Stop/PostToolUse hooks",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "two-windows-to-needs-human",
+  "file": "src/wake-coverage-detector.ts",
+  "find": "      else if (cls === \"two_windows\") reason = \"two_windows\";",
+  "replace": "      else if (cls === \"two_windows\") verdict = \"needs_human\";",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "split-applies-to-unobservable",
+  "file": "src/wake-coverage-detector.ts",
+  "find": "    if (verdict === \"uncovered\" && opts.watchClass) {",
+  "replace": "    if (opts.watchClass) {",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "sink-any-reason",
+  "file": "src/wake-coverage-status.ts",
+  "find": "(typeof ff.reason === \"string\" && KNOWN_REASONS.has(ff.reason))",
+  "replace": "typeof ff.reason === \"string\"",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "needs-human-alarms",
+  "file": "src/wake-coverage-status.ts",
+  "find": "  const uncovered = status.findings.filter((f) => f.verdict === \"uncovered\");",
+  "replace": "  const uncovered = status.findings.filter((f) => f.verdict === \"uncovered\" || f.verdict === \"needs_human\");",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "alarm-drops-queued",
+  "file": "src/wake-coverage-status.ts",
+  "find": "A wake path is broken. ***${queued}`;",
+  "replace": "A wake path is broken. ***`;",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "doorbell-report-as-alarm",
+  "file": "src/cli/doorbell.ts",
+  "find": "v === \"needs_human\" ? \"report\" : \"unjudged\"",
+  "replace": "v === \"needs_human\" ? \"alarm\" : \"unjudged\"",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ },
+ {
+  "name": "daemon-passes-no-class",
+  "file": "src/wake-coverage-detector.ts",
+  "find": "        watchClass: watchClassForDaemon(db, dbPath),\n",
+  "replace": "\n",
+  "test": "tests/doorbell-pr8b-needs-human.test.ts"
+ }
+]

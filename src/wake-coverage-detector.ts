@@ -140,7 +140,7 @@ import { log } from "./logger.js";
 // pulling this file's native-sqlite graph (db.js) in. This file remains the single WRITER
 // (runWakeCoverageSweep) and re-exports the rest so existing importers are unchanged.
 import { writeWakeCoverageStatus, resolveWakeCoverageStatusPath } from "./wake-coverage-status.js";
-import { ensureWatchSeenStore, readWatchSeen } from "./watch-seen.js";
+import { profileHasNoAutoWake } from "./agent-cli-profiles.js";
 import { watchAgentDir, watchableName } from "./watch-paths.js";
 import { oneLiveWindow, bindingLiveness } from "./window-judge.js";
 import { getOwnHostId } from "./liveness.js";
@@ -153,16 +153,16 @@ export { writeWakeCoverageStatus, resolveWakeCoverageStatusPath };
 export type { WakeCoverageStatus } from "./wake-coverage-status.js";
 
 /**
- * PR 8b (gate brief §6; rulings 7eb82f49, 1cd77de6): UNCOVERED is SPLIT by the agent's watch history, DERIVED from
- * the relay's own record, never declared (no name list, no flag):
- *   - needs_human: NO watch of any kind ever ran for this agent (no watch-seen marker), past the grace. Mail waits for
- *     a person. REPORTED on the same surfaces as the alarms, never as one, never hidden.
- *   - uncovered:   a watch existed and the agent stopped draining (its watcher died, a hook went dead): the alarm.
- *                  With reason two_windows when two live windows are bound to it (its --until-wake watch refuses,
- *                  by design: no wake until one closes).
+ * PR 8b (gate brief §6; rulings 7eb82f49, 9ac81564): UNCOVERED is SPLIT by POSITIVE evidence from the relay's own
+ * registration record, never declared per agent (no name list, no flag):
+ *   - needs_human: the agent's registered CLI profile is known and has no automatic wake (autoWake false, e.g. a
+ *     register-only CLI). Mail waits for a person. REPORTED on the same surfaces as the alarms, never as one.
+ *   - uncovered:   everything else (a profile with a wake path, a NULL or unknown profile, any read error): the
+ *                  alarm. With reason two_windows when two live windows are bound to an agent that armed
+ *                  --until-wake (its watch refuses by design: no wake until one closes).
  */
 export type WakeVerdict = "covered" | "uncovered" | "unobservable" | "needs_human";
-/** The agent's watch history, for the split (see watchClassForDaemon). */
+/** The agent's wake class, for the split (see watchClassForDaemon). */
 export type WatchClass = "never" | "two_windows" | "armed";
 /** The closed set of reasons an UNCOVERED finding may carry. */
 export type UncoveredReason = "two_windows";
@@ -448,13 +448,6 @@ export function startWakeCoverageSweep(
   const now = deps.now ?? (() => Date.now());
   const scheduler = deps.scheduler ?? realWakeScheduler();
   const dbPath = deps.dbPath ?? getDbPath();
-  // PR 8b: the watch-seen store exists from the daemon's first sweep, so the GRACE starts at deploy even in a relay
-  // where no watch has run yet (best-effort: a fault leaves the split off, never on).
-  try {
-    ensureWatchSeenStore(dbPath, new Date(now()));
-  } catch (err) {
-    log.warn("[wake-coverage] the watch-seen store could not be created (the NEEDS_HUMAN split stays off): " + String(err));
-  }
   const tick = (): void => {
     try {
       const nowMs = now();
@@ -462,7 +455,7 @@ export function startWakeCoverageSweep(
         nowMs,
         boundMs: cfg.boundMs,
         antiFlapMarginMs: cfg.antiFlapMarginMs,
-        watchClass: watchClassForDaemon(db, dbPath, nowMs),
+        watchClass: watchClassForDaemon(db, dbPath),
       });
     } catch (err) {
       log.debug("[wake-coverage] sweep failed (non-fatal): " + String(err));
@@ -473,16 +466,15 @@ export function startWakeCoverageSweep(
 }
 
 /**
- * PR 8b: the agent's watch history, DERIVED from the relay's own record (read-only):
+ * PR 8b (ruling 9ac81564): the agent's wake class, DERIVED from the relay's own record (read-only):
  *   - "two_windows": its --until-wake agent dir exists (it armed that watch) AND two or more live windows are bound
  *     to it (the same judge the watch uses: oneLiveWindow over listAgentBindings, bindingLiveness). Still UNCOVERED.
- *   - "never": past the watch-seen GRACE, and no watch of ANY kind ever ran for it (no watch-seen marker). NOT the
- *     --until-wake dir: a streaming agent never creates that one.
- *   - else "armed".
- * Within the grace (or with an unreadable store) nothing is "never": the split is off.
+ *   - "never": its REGISTERED cli_profile is a known profile with autoWake false (profileHasNoAutoWake): no automatic
+ *     wake exists for it, so its stuck mail waits for a person (NEEDS_HUMAN).
+ *   - else "armed": UNCOVERED, the alarm. A NULL or unknown profile and ANY read error land here, deliberately: the
+ *     costly mistake for this detector is a silenced alarm.
  */
-export function watchClassForDaemon(db: CompatDatabase, dbPath: string, nowMs: number): (agent: string) => WatchClass {
-  const seen = readWatchSeen(dbPath, nowMs);
+export function watchClassForDaemon(db: CompatDatabase, dbPath: string): (agent: string) => WatchClass {
   const own = getOwnHostId();
   let bindings: ReturnType<typeof listAgentBindings> | null = null;
   return (agent) => {
@@ -495,7 +487,12 @@ export function watchClassForDaemon(db: CompatDatabase, dbPath: string, nowMs: n
         /* the bindings cannot be read: no two_windows claim */
       }
     }
-    if (seen.graceOver && !seen.seen(agent)) return "never";
+    try {
+      const row = db.prepare("SELECT cli_profile FROM agents WHERE name = ?").get(agent) as { cli_profile: string | null } | undefined;
+      if (row && profileHasNoAutoWake(row.cli_profile)) return "never";
+    } catch {
+      /* a read error never silences the alarm */
+    }
     return "armed";
   };
 }

@@ -446,13 +446,6 @@ export async function run(argv: string[]): Promise<number> {
     return ok ? 0 : 1;
   }
 
-  // PR 8b (ruling 1cd77de6): a CONTINUOUS watch (not a --once probe) records "a watch ran for this agent" once, in
-  // the watch-seen store the wake-coverage detector reads. A marker, never a gate: a fault is one stderr line.
-  {
-    const { noteWatchSeen } = await import("../watch-seen.js");
-    noteWatchSeen(process.env.RELAY_DB_PATH as string, agent);
-  }
-
   // --- Continuous watch. Bounded, no busy-spin. Runs until SIGINT/SIGTERM. ---
   let timer: NodeJS.Timeout | null = null;
   let watcher: fs.FSWatcher | null = null;
