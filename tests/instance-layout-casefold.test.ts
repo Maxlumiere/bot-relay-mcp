@@ -20,7 +20,7 @@ import path from "node:path";
 
 import { resolveInstance, createInstance } from "../src/instance.js";
 import { initializeDb, closeDb } from "../src/db.js";
-import { instanceDirOfDbPath, fsIsCaseInsensitiveAt } from "../src/resolve-instance.js";
+import { instanceDirOfDbPath } from "../src/resolve-instance.js";
 
 const ENV_KEYS = ["HOME", "RELAY_HOME", "RELAY_INSTANCE_ID", "RELAY_DB_PATH", "RELAY_CONFIG_PATH", "RELAY_CLAUDE_HOME"] as const;
 let home: string;
@@ -47,34 +47,6 @@ afterEach(() => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-describe("the layout test, pure (the case-insensitivity seam): component by component, the basename included", () => {
-  it("case-INSENSITIVE: a wrong-case basename, a wrong-case tail under an absent instances/, and a wrong-case root component are the layout", () => {
-    fs.mkdirSync(relayRoot(), { recursive: true }); // instances/ absent
-    const ci = { caseInsensitive: true };
-    expect(instanceDirOfDbPath(path.join(instancesRoot(), "stale", "RELAY.DB"), instancesRoot(), ci)).toBe(path.join(instancesRoot(), "stale"));
-    // Spelled under the instances ROOT, never the caller's spelling (so the link checks below the root examine the
-    // root's own components).
-    expect(instanceDirOfDbPath(path.join(relayRoot(), "INSTANCES", "stale", "relay.db"), instancesRoot(), ci)).toBe(path.join(instancesRoot(), "stale"));
-    expect(instanceDirOfDbPath(path.join(relayRoot(), "Instances", "stale", "Relay.Db"), instancesRoot(), ci)).not.toBeNull();
-  });
-  it("case-SENSITIVE: the same wrong-case paths are NOT the layout (they name other files there); the exact path is", () => {
-    fs.mkdirSync(relayRoot(), { recursive: true });
-    const cs = { caseInsensitive: false };
-    expect(instanceDirOfDbPath(path.join(instancesRoot(), "stale", "RELAY.DB"), instancesRoot(), cs)).toBeNull();
-    expect(instanceDirOfDbPath(path.join(relayRoot(), "INSTANCES", "stale", "relay.db"), instancesRoot(), cs)).toBeNull();
-    expect(instanceDirOfDbPath(path.join(instancesRoot(), "stale", "relay.db"), instancesRoot(), cs)).toBe(path.join(instancesRoot(), "stale"));
-  });
-  it("never the layout on any file system: another basename, a deeper path, a sibling root", () => {
-    for (const caseInsensitive of [true, false]) {
-      expect(instanceDirOfDbPath(path.join(instancesRoot(), "stale", "other.db"), instancesRoot(), { caseInsensitive })).toBeNull();
-      expect(instanceDirOfDbPath(path.join(instancesRoot(), "stale", "deeper", "relay.db"), instancesRoot(), { caseInsensitive })).toBeNull();
-      expect(instanceDirOfDbPath(path.join(relayRoot(), "instances-old", "stale", "relay.db"), instancesRoot(), { caseInsensitive })).toBeNull();
-      // a parent SHORTER than the root (the relay home itself, a prefix of instances/) is not the layout either
-      expect(instanceDirOfDbPath(path.join(relayRoot(), "stale", "relay.db"), instancesRoot(), { caseInsensitive })).toBeNull();
-    }
-  });
-});
-
 const CASE_INSENSITIVE = (() => {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-ci-probe-"));
   try {
@@ -85,13 +57,27 @@ const CASE_INSENSITIVE = (() => {
   }
 })();
 
-describe("the detection (fsIsCaseInsensitiveAt) agrees with the file system", () => {
-  it("it reads the temp file system's real behaviour", () => {
-    expect(fsIsCaseInsensitiveAt(home)).toBe(CASE_INSENSITIVE);
+describe("the layout test ALWAYS folds case (ruling c998eaf6): no detection, the same answer on every file system", () => {
+  it("a wrong-case basename, a wrong-case tail under an absent instances/, and a wrong-case root component are the layout (spelled under the root)", () => {
+    fs.mkdirSync(relayRoot(), { recursive: true }); // instances/ absent: nothing on disk decides
+    expect(instanceDirOfDbPath(path.join(instancesRoot(), "stale", "RELAY.DB"), instancesRoot())).toBe(path.join(instancesRoot(), "stale"));
+    expect(instanceDirOfDbPath(path.join(relayRoot(), "INSTANCES", "stale", "relay.db"), instancesRoot())).toBe(path.join(instancesRoot(), "stale"));
+    expect(instanceDirOfDbPath(path.join(relayRoot(), "Instances", "stale", "Relay.Db"), instancesRoot())).not.toBeNull();
+  });
+  it.skipIf(CASE_INSENSITIVE)("on a case-SENSITIVE file system with BOTH INSTANCES/ and instances/: INSTANCES/<id>/relay.db is still recognised (the stated cost: a loud refusal, never a silent second relay)", () => {
+    fs.mkdirSync(path.join(relayRoot(), "INSTANCES", "other"), { recursive: true });
+    fs.mkdirSync(instancesRoot(), { recursive: true });
+    expect(instanceDirOfDbPath(path.join(relayRoot(), "INSTANCES", "other", "relay.db"), instancesRoot())).toBe(path.join(instancesRoot(), "other"));
+  });
+  it("never the layout: another basename, a deeper path, a sibling root, a parent shorter than the root", () => {
+    expect(instanceDirOfDbPath(path.join(instancesRoot(), "stale", "other.db"), instancesRoot())).toBeNull();
+    expect(instanceDirOfDbPath(path.join(instancesRoot(), "stale", "deeper", "relay.db"), instancesRoot())).toBeNull();
+    expect(instanceDirOfDbPath(path.join(relayRoot(), "instances-old", "stale", "relay.db"), instancesRoot())).toBeNull();
+    expect(instanceDirOfDbPath(path.join(relayRoot(), "stale", "relay.db"), instancesRoot())).toBeNull();
   });
 });
 
-describe.skipIf(!CASE_INSENSITIVE)("on THIS case-insensitive file system: each wrong-case path is refused and creates nothing", () => {
+describe("on EVERY file system (always folded): each wrong-case path is refused and creates nothing", () => {
   const refuses = async (dbPath: string, stale: string) => {
     process.env.RELAY_DB_PATH = dbPath;
     expect(resolveInstance()).toMatchObject({ kind: "error", unprovisioned: true });

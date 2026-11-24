@@ -18,7 +18,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { createInstance, _setProvisionSeamForTests } from "../src/instance.js";
-import { readInstanceMetadataFile, fsIsCaseInsensitiveAt } from "../src/resolve-instance.js";
+import { readInstanceMetadataFile, instanceDirOfDbPath } from "../src/resolve-instance.js";
+import * as RESOLVE from "../src/resolve-instance.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENV_KEYS = ["HOME", "RELAY_HOME", "RELAY_INSTANCE_ID", "RELAY_DB_PATH", "RELAY_CONFIG_PATH", "RELAY_CLAUDE_HOME"] as const;
@@ -61,6 +62,28 @@ describe.skipIf(!POSIX)("P1 (ruled): a component swapped between its validation 
     expect(msg).not.toContain(home);
     expect(fs.existsSync(path.join(instances(), "swapped-moved")), "nothing undone: the moved directory is left for a person").toBe(true);
   });
+  it("R2 P1: a swap AND a failing metadata open → the redirect line FIRST (the swap wins), then the original failure", () => {
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r2-ro-"));
+    _setProvisionSeamForTests(() => {
+      const dir = path.join(instances(), "both");
+      fs.renameSync(dir, `${dir}-moved`);
+      fs.chmodSync(elsewhere, 0o500); // the record cannot be created there
+      fs.symlinkSync(elsewhere, dir);
+    });
+    let msg = "";
+    try {
+      createInstance("both", "t");
+    } catch (err) {
+      msg = (err as Error).message;
+    }
+    fs.chmodSync(elsewhere, 0o700);
+    expect(msg).toMatch(/^refusing: the instance directory changed while the instance was being provisioned; the operation may have been redirected\./);
+    expect(msg).toContain("The operation also failed: refusing to provision the instance: its metadata record could not be created");
+    expect(msg).not.toContain(home);
+    expect(msg).not.toContain(elsewhere);
+    expect(fs.readdirSync(elsewhere), "nothing written at the link's target").toEqual([]);
+    fs.rmSync(elsewhere, { recursive: true, force: true });
+  });
   it("the CONTROL: with no swap the same provisioning succeeds", () => {
     _setProvisionSeamForTests(() => {});
     expect(createInstance("calm", "t").instance_id).toBe("calm");
@@ -91,19 +114,48 @@ describe.skipIf(!POSIX)("P2: the metadata reader refuses a STATIC link among its
   });
 });
 
-describe("P2: the case detector only trusts a component on the TARGET's own device", () => {
-  it("a target whose own name has no cased letter, on its OWN device (a mount root), above a case-SENSITIVE parent fs → undetectable → folded (true), never the parent's answer", () => {
-    const target = path.join(home, "2024");
-    fs.mkdirSync(target);
-    const real = fs.realpathSync.native(target);
-    // An ORIGINAL component is a prefix of the real path (the target on device 7, every ancestor on device 1); a
-    // case-SWAPPED spelling is not, and does not exist (the parent fs is case-sensitive).
-    const lstat = (q: string) => {
-      if (q === real) return { dev: 7n, ino: 1n };
-      if (real.startsWith(q)) return { dev: 1n, ino: BigInt(q.length) };
-      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+describe("ruling c998eaf6: case is never DETECTED; the layout test always folds", () => {
+  it("the detector is gone: the resolver exports no case-sensitivity probe", () => {
+    expect("fsIsCaseInsensitiveAt" in RESOLVE).toBe(false);
+  });
+});
+
+describe.skipIf(!POSIX)("R2 P3: no refusal on these paths carries an absolute path", () => {
+  it("the link refusals, a provisioning refusal through a linked instances/, the redirect, use-instance: none names the home, the temp dir or a target", async () => {
+    const msgs: string[] = [];
+    const catchMsg = (f: () => unknown) => {
+      try {
+        f();
+      } catch (err) {
+        msgs.push((err as Error).message);
+      }
     };
-    expect(fsIsCaseInsensitiveAt(target, lstat)).toBe(true);
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r2-p3-"));
+    fs.mkdirSync(path.join(storage, "x"));
+    fs.writeFileSync(path.join(storage, "x", "instance.json"), "{}");
+    fs.symlinkSync(storage, instances()); // a linked instances/
+    const { resolveInstance, setActiveInstance } = await import("../src/instance.js");
+    process.env.RELAY_INSTANCE_ID = "x";
+    msgs.push((resolveInstance() as { reason?: string }).reason ?? "");
+    catchMsg(() => createInstance("y", "t"));
+    catchMsg(() => setActiveInstance("x"));
+    fs.unlinkSync(instances());
+    createInstance("swap", "t");
+    _setProvisionSeamForTests(() => {
+      const dir = path.join(instances(), "swap");
+      fs.renameSync(dir, `${dir}-moved`);
+      fs.mkdirSync(dir);
+    });
+    catchMsg(() => createInstance("swap", "t"));
+    _setProvisionSeamForTests(null);
+    expect(msgs.length, msgs.join("\n")).toBe(4);
+    for (const m of msgs) {
+      expect(m.length, "a refusal").toBeGreaterThan(0);
+      expect(m).not.toContain(home);
+      expect(m).not.toContain(storage);
+      expect(m).not.toContain(fs.realpathSync(os.tmpdir()));
+    }
+    fs.rmSync(storage, { recursive: true, force: true });
   });
 });
 
@@ -218,6 +270,28 @@ describe.skipIf(!POSIX)("ruling 3fc05540: a link BELOW the relay home is never a
     expect(fs.readdirSync(storage).sort()).toEqual(["instance.json", "relay.db"]);
     fs.rmSync(storage, { recursive: true, force: true });
   });
+  it("R2: /outside/alias → instances/link → instances/real: the link traversed BELOW the root is refused, naming instances/link (never the alias, never the real one)", async () => {
+    createInstance("real", "t");
+    fs.symlinkSync(path.join(instances(), "real"), path.join(instances(), "link"));
+    const alias = path.join(home, "outside-alias");
+    fs.symlinkSync(path.join(instances(), "link"), alias);
+    expect(instanceDirOfDbPath(path.join(alias, "relay.db"), instances()), "the layout dir is the link's own name").toBe(path.join(instances(), "link"));
+    process.env.RELAY_DB_PATH = path.join(alias, "relay.db");
+    const { resolveInstance } = await import("../src/instance.js");
+    const r = resolveInstance() as { kind: string; reason?: string };
+    expect(r.kind).toBe("error");
+    expect(r.reason).toContain("the instance directory instances/link is a symbolic link");
+    expect(r.reason).not.toContain("outside-alias");
+  });
+  it("R2 P3: use-instance on a LINKED instance → the link refusal, never a generic 'not found'", async () => {
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r2-storage-"));
+    fs.writeFileSync(path.join(storage, "instance.json"), JSON.stringify({ instance_id: "lnk" }));
+    fs.mkdirSync(instances(), { recursive: true });
+    fs.symlinkSync(storage, path.join(instances(), "lnk"));
+    const { setActiveInstance } = await import("../src/instance.js");
+    expect(() => setActiveInstance("lnk")).toThrow(/the instance directory instances\/lnk is a symbolic link/);
+    fs.rmSync(storage, { recursive: true, force: true });
+  });
   it("the CONTROL: a linked relay HOME (the trust root) with real children still resolves the instance", async () => {
     const realHome = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r1-realhome-"));
     const linkedHome = path.join(home, "linked-relay-home");
@@ -234,7 +308,7 @@ describe.skipIf(!POSIX)("ruling 3fc05540: a link BELOW the relay home is never a
 describe("the mutation fixture (tests/fixtures/instance-0b-mutants.json; run: node scripts/mutation-sweep.mjs <fixture>)", () => {
   it("every mutant still applies: its find text occurs exactly once in its file; names are unique", () => {
     const M = JSON.parse(fs.readFileSync(path.join(REPO, "tests", "fixtures", "instance-0b-mutants.json"), "utf-8")) as Array<{ name: string; file: string; find: string }>;
-    expect(M.length).toBeGreaterThanOrEqual(13);
+    expect(M.length).toBeGreaterThanOrEqual(15);
     for (const m of M) expect(fs.readFileSync(path.join(REPO, m.file), "utf-8").split(m.find).length - 1, m.name).toBe(1);
     expect(new Set(M.map((m) => m.name)).size).toBe(M.length);
   });

@@ -88,7 +88,7 @@ const INVENTORY: Record<string, Entry> = {
   "src/mint-secret.ts::tightenMintSecretMode::openSync": { n: 1, source: "the mint secret file" },
   "src/instance.ts::acquireInstanceLock::openSync": { n: 1, source: "the instance's daemon pid file" },
   "src/instance.ts::acquireInstanceLock::readFileSync": { n: 2, source: "the instance's daemon pid file" },
-  "src/instance.ts::createInstance::openSync": { n: 1, source: "the instance's metadata file's temp sibling (O_CREAT|O_EXCL|O_NOFOLLOW, 0600; renamed over instance.json)" },
+  "src/instance.ts::writeInstanceRecord::openSync": { n: 1, source: "the instance's metadata file's temp sibling (O_CREAT|O_EXCL|O_NOFOLLOW, 0600; renamed over instance.json)" },
   "src/instance.ts::realDirComponent::openSync": { n: 1, source: "one directory component below the relay home root (O_NOFOLLOW|O_DIRECTORY, narrowed to 0700)" },
   "src/resolve-instance.ts::readInstanceMetadataFile::readFileSync": { n: 1, source: "the instance's metadata file (instance.json, the ONE reader: readInstance and the provisioning predicate)" },
   "src/resolve-instance.ts::readInstanceMetadataFile::openSync": { n: 1, source: "the instance's metadata file (O_NOFOLLOW: a linked record is not read)" },

@@ -42,7 +42,7 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "65137158f9f5";
+export const RESOLVER_REVISION = "e71490786213";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";
@@ -161,102 +161,93 @@ export function isProvisionedInstance(instanceDirPath: string, dbExists: boolean
   return dbExists || readInstanceMetadataFile(instanceDirPath) !== null;
 }
 
+/** The fold for file names (APFS / NTFS: Unicode case-insensitive). The layout test ALWAYS folds (ruling c998eaf6). */
+const caseFold = (s: string): string => s.normalize("NFC").toUpperCase().toLowerCase();
+const sameName = (a: string, b: string): boolean => caseFold(a) === caseFold(b);
+/** The components of an absolute path, without its root. */
+const componentsOf = (p: string): string[] => p.split(path.sep).filter((c) => c.length > 0);
+/** Two absolute paths naming the same location, compared component by component, case-folded. */
+const samePathFolded = (a: string, b: string): boolean => {
+  const pa = componentsOf(path.resolve(a));
+  const pb = componentsOf(path.resolve(b));
+  return path.parse(path.resolve(a)).root.toLowerCase() === path.parse(path.resolve(b)).root.toLowerCase() && pa.length === pb.length && pa.every((c, i) => sameName(c, pb[i]!));
+};
+
+/** The bound on links followed by one walk (as the kernel's ELOOP bound). */
+const MAX_LINK_HOPS = 40;
+
 /**
- * The instance directory a DB path names (`<instances root>/<id>/relay.db`), or null for any other layout. Compared
- * lexically AND on real paths (the instances root may not exist yet, or be reached through a link). The ONE layout
- * test: the resolver's explicit branches and the open's re-check (src/db.ts via src/instance.ts) both use it. The
- * directory it returns is always spelled under the instances root.
+ * Resolve `p` by hand (ruling c998eaf6): lstat each component, follow a link by reading it (relative to the directory it
+ * sits in; `..` taken on the RESOLVED path, as the kernel does), and RECORD every link traversed (its resolved location).
+ * A missing component ends the walk with the rest appended as spelled. More than MAX_LINK_HOPS links → null.
  */
-export function instanceDirOfDbPath(dbPath: string, instancesRoot: string, opts: { caseInsensitive?: boolean } = {}): string | null {
-  const dir = path.dirname(dbPath);
-  const parent = path.dirname(dir);
-  // The fast path: the exact spelling.
-  if (path.basename(dbPath) === DB_FILENAME && path.resolve(parent) === path.resolve(instancesRoot)) return dir;
-  // COMPONENT BY COMPONENT (item 0b): each side canonicalised (the nearest EXISTING ancestor through realpath.native,
-  // which returns the on-disk case; the missing tail re-appended in the caller's spelling), then compared per
-  // component, the basename included, case-FOLDED only when the file system is case-insensitive (detected at the
-  // instances root's nearest existing ancestor; undetectable reads as insensitive: a wider layout only refuses more).
-  const nearestReal = (q: string): string | null => {
-    let cur = path.resolve(q);
-    const tail: string[] = [];
-    for (;;) {
-      try {
-        return path.join(fs.realpathSync.native(cur), ...tail);
-      } catch {
-        const up = path.dirname(cur);
-        if (up === cur) return null;
-        tail.unshift(path.basename(cur));
-        cur = up;
-      }
+export function walkPath(p: string): { real: string; links: string[] } | null {
+  const abs = path.resolve(p);
+  let cur = path.parse(abs).root;
+  let pending = componentsOf(abs);
+  const links: string[] = [];
+  let hops = 0;
+  while (pending.length > 0) {
+    const c = pending.shift()!;
+    if (c === ".") continue;
+    if (c === "..") {
+      cur = path.dirname(cur);
+      continue;
     }
-  };
-  const rp = nearestReal(parent);
-  const rr = nearestReal(instancesRoot);
-  if (rp === null || rr === null) return null;
-  const fold = opts.caseInsensitive ?? fsIsCaseInsensitiveAt(instancesRoot);
-  const same = (a: string, b: string): boolean => (fold ? caseFold(a) === caseFold(b) : a === b);
-  if (!same(path.basename(dbPath), DB_FILENAME)) return null;
-  const pa = rp.split(path.sep);
-  const pb = rr.split(path.sep);
-  // Matched through real paths: the directory is returned spelled UNDER THE INSTANCES ROOT (<root>/instances/<id>), never
-  // in the caller's spelling, so every check below the trust root (ruling 3fc05540: no link there) examines the root's
-  // own components. A link OUTSIDE the root that named the DB (an alias) is an access path, not a component below it.
-  return pa.length === pb.length && pa.every((c, i) => same(c, pb[i]!)) ? path.join(path.resolve(instancesRoot), path.basename(dir)) : null;
+    const next = path.join(cur, c);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(next);
+    } catch {
+      return { real: path.join(next, ...pending), links };
+    }
+    if (!st.isSymbolicLink()) {
+      cur = next;
+      continue;
+    }
+    if (++hops > MAX_LINK_HOPS) return null;
+    links.push(next);
+    let target: string;
+    try {
+      target = fs.readlinkSync(next);
+    } catch {
+      return null;
+    }
+    if (path.isAbsolute(target)) cur = path.parse(target).root;
+    pending = [...componentsOf(target), ...pending];
+  }
+  return { real: cur, links };
 }
 
-/** The fold for a case-insensitive file system's names (APFS / NTFS: Unicode case-insensitive). */
-const caseFold = (s: string): string => s.normalize("NFC").toUpperCase().toLowerCase();
-
 /**
- * Is the file system at `p` case-INSENSITIVE? Detected, read-only: on the nearest existing path, find a component
- * with a cased letter and stat its case-swapped spelling; the SAME file (dev + ino) means insensitive, absent or
- * another file means sensitive. No cased component anywhere (undetectable) reads as insensitive (fail closed: the
- * layout test then refuses more, never less).
+ * The instance directory a DB path names (`<instances root>/<id>/relay.db`), or null for any other layout: the ONE
+ * layout test (the resolver's explicit branches and the open's re-check, src/db.ts via src/instance.ts).
+ *
+ * Ruling c998eaf6: the DB path and the relay home are each WALKED (walkPath: every link recorded), and the real target
+ * is compared to the canonical instances root (the relay home's real location + "instances") component by component,
+ * ALWAYS case-insensitively (no detection: over-recognition only applies the stricter instance rules). A link traversed
+ * AT or BELOW the instances root also puts the path in the layout, wherever it leads, so the 3fc05540 refusal names it;
+ * links above the root (the relay home itself, an alias outside it) are access paths. The caller's spelling never
+ * decides. The directory returned is spelled under the instances root: for a link at the instances/<id> level, that
+ * link's own name (so the link check names it).
  */
-export function fsIsCaseInsensitiveAt(p: string, lstat: (q: string) => { dev: bigint; ino: bigint } = (q) => fs.lstatSync(q, { bigint: true })): boolean {
-  let cur = path.resolve(p);
-  for (;;) {
-    try {
-      fs.lstatSync(cur);
-      break;
-    } catch {
-      const up = path.dirname(cur);
-      if (up === cur) return true;
-      cur = up;
-    }
+export function instanceDirOfDbPath(dbPath: string, instancesRoot: string): string | null {
+  const dir = path.dirname(dbPath);
+  // The fast path: the exact spelling (its components are checked by the callers' link check).
+  if (path.basename(dbPath) === DB_FILENAME && path.resolve(path.dirname(dir)) === path.resolve(instancesRoot)) return dir;
+  const home = walkPath(path.dirname(instancesRoot));
+  const walked = walkPath(dbPath);
+  if (home === null || walked === null) return null;
+  const canonRoot = path.join(home.real, path.basename(instancesRoot));
+  const spelledRoot = path.resolve(instancesRoot);
+  // A link traversed at the instances root itself, or at an instances/<id> entry: in the layout, refused by name.
+  for (const l of walked.links) {
+    if (samePathFolded(l, canonRoot)) return path.join(spelledRoot, path.basename(path.dirname(walked.real)));
+    if (samePathFolded(path.dirname(l), canonRoot)) return path.join(spelledRoot, path.basename(l));
   }
-  const real = (() => {
-    try {
-      return fs.realpathSync.native(cur);
-    } catch {
-      return cur;
-    }
-  })();
-  // #449 R1 P2: only a component on the TARGET's own file system says anything about it (a mount root, or a climb
-  // across a mount boundary, would measure the parent's): another device is skipped; none left → undetectable → fold.
-  let targetDev: bigint;
-  try {
-    targetDev = lstat(real).dev;
-  } catch {
-    return true;
-  }
-  const parts = real.split(path.sep);
-  for (let i = parts.length - 1; i >= 0; i--) {
-    const c = parts[i]!;
-    const swapped = [...c].map((ch) => (ch === ch.toUpperCase() ? ch.toLowerCase() : ch.toUpperCase())).join("");
-    if (swapped === c) continue; // no cased letter in this component
-    const here = parts.slice(0, i + 1).join(path.sep);
-    const altHere = [...parts.slice(0, i), swapped].join(path.sep);
-    try {
-      const a = lstat(here);
-      if (a.dev !== targetDev) continue; // another file system: says nothing about the target's
-      const b = lstat(altHere);
-      return a.dev === b.dev && a.ino === b.ino;
-    } catch {
-      return false; // the swapped spelling does not exist: case-sensitive
-    }
-  }
-  return true;
+  if (!sameName(path.basename(walked.real), DB_FILENAME)) return null;
+  const inDir = path.dirname(walked.real);
+  return samePathFolded(path.dirname(inDir), canonRoot) ? path.join(spelledRoot, path.basename(inDir)) : null;
 }
 
 /**

@@ -2,36 +2,29 @@
  {
   "name": "fold-never",
   "file": "src/resolve-instance.ts",
-  "find": "  const fold = opts.caseInsensitive ?? fsIsCaseInsensitiveAt(instancesRoot);",
-  "replace": "  const fold = opts.caseInsensitive ?? false;",
+  "find": "const sameName = (a: string, b: string): boolean => caseFold(a) === caseFold(b);",
+  "replace": "const sameName = (a: string, b: string): boolean => a === b;",
   "test": "tests/instance-layout-casefold.test.ts"
  },
  {
   "name": "basename-exact-only",
   "file": "src/resolve-instance.ts",
-  "find": "  if (!same(path.basename(dbPath), DB_FILENAME)) return null;",
-  "replace": "  if (path.basename(dbPath) !== DB_FILENAME) return null;",
-  "test": "tests/instance-layout-casefold.test.ts"
- },
- {
-  "name": "detection-always-sensitive",
-  "file": "src/resolve-instance.ts",
-  "find": "      return a.dev === b.dev && a.ino === b.ino;",
-  "replace": "      return a.dev === b.dev && a.ino === b.ino && false;",
+  "find": "  if (!sameName(path.basename(walked.real), DB_FILENAME)) return null;",
+  "replace": "  if (path.basename(walked.real) !== DB_FILENAME) return null;",
   "test": "tests/instance-layout-casefold.test.ts"
  },
  {
   "name": "component-count-unchecked",
   "file": "src/resolve-instance.ts",
-  "find": "  return pa.length === pb.length && pa.every((c, i) => same(c, pb[i]!)) ? path.join(path.resolve(instancesRoot), path.basename(dir)) : null;",
-  "replace": "  return pa.every((c, i) => pb[i] !== undefined && same(c, pb[i]!)) ? path.join(path.resolve(instancesRoot), path.basename(dir)) : null;",
+  "find": " && pa.length === pb.length && pa.every((c, i) => sameName(c, pb[i]!));",
+  "replace": " && pa.every((c, i) => pb[i] !== undefined && sameName(c, pb[i]!));",
   "test": "tests/instance-layout-casefold.test.ts"
  },
  {
   "name": "r1-no-post-write-check",
   "file": "src/instance.ts",
-  "find": "  assertChainUnchanged(chain);\n  return meta;",
-  "replace": "  return meta;",
+  "find": "  return checkedAfterWrites(chain, () => writeInstanceRecord(instanceId, version, label, dir));",
+  "replace": "  return writeInstanceRecord(instanceId, version, label, dir);",
   "test": "tests/instance-0b-r1.test.ts"
  },
  {
@@ -49,13 +42,6 @@
   "test": "tests/instance-0b-r1.test.ts"
  },
  {
-  "name": "r1-detector-any-device",
-  "file": "src/resolve-instance.ts",
-  "find": "      if (a.dev !== targetDev) continue; // another file system: says nothing about the target's\n",
-  "replace": "",
-  "test": "tests/instance-0b-r1.test.ts"
- },
- {
   "name": "r1-native-error-leaks-path",
   "file": "src/instance.ts",
   "find": "  } catch {\n    throw new Error(`refusing to provision the instance: the ${role} changed while it was being checked (a symbolic link, or not a directory)`);\n  }",
@@ -65,7 +51,7 @@
  {
   "name": "r1-temp-left-behind",
   "file": "src/instance.ts",
-  "find": "    fs.renameSync(tmp, metaPath);\n  } catch (err) {\n    fs.rmSync(tmp, { force: true });",
+  "find": "    fs.renameSync(tmp, metaPath);\n  } catch (err) {\n    removeTempQuietly(tmp);",
   "replace": "    fs.renameSync(tmp, metaPath);\n  } catch (err) {\n    void tmp;",
   "test": "tests/instance-0b-r1.test.ts"
  },
@@ -86,8 +72,36 @@
  {
   "name": "r1-layout-returns-caller-spelling",
   "file": "src/resolve-instance.ts",
-  "find": "? path.join(path.resolve(instancesRoot), path.basename(dir)) : null;",
-  "replace": "? dir : null;",
+  "find": "  return samePathFolded(path.dirname(inDir), canonRoot) ? path.join(spelledRoot, path.basename(inDir)) : null;",
+  "replace": "  return samePathFolded(path.dirname(inDir), canonRoot) ? dir : null;",
+  "test": "tests/instance-0b-r1.test.ts"
+ },
+ {
+  "name": "r2-walk-links-ignored",
+  "file": "src/resolve-instance.ts",
+  "find": "  for (const l of walked.links) {",
+  "replace": "  for (const l of [] as string[]) {",
+  "test": "tests/instance-0b-r1.test.ts"
+ },
+ {
+  "name": "r2-names-the-target-not-the-link",
+  "file": "src/resolve-instance.ts",
+  "find": "    if (samePathFolded(path.dirname(l), canonRoot)) return path.join(spelledRoot, path.basename(l));",
+  "replace": "    if (samePathFolded(path.dirname(l), canonRoot)) return path.join(spelledRoot, path.basename(path.dirname(walked.real)));",
+  "test": "tests/instance-0b-r1.test.ts"
+ },
+ {
+  "name": "r2-chain-checked-on-success-only",
+  "file": "src/instance.ts",
+  "find": "  const redirect = chainRedirect(chain);\n  if (redirect !== null) {\n    throw new Error(failed ?",
+  "replace": "  const redirect = failed ? null : chainRedirect(chain);\n  if (redirect !== null) {\n    throw new Error(failed ?",
+  "test": "tests/instance-0b-r1.test.ts"
+ },
+ {
+  "name": "r2-use-instance-generic",
+  "file": "src/instance.ts",
+  "find": "    if (linked !== null) throw new Error(linked);",
+  "replace": "    void linked;",
   "test": "tests/instance-0b-r1.test.ts"
  }
 ]

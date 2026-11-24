@@ -50,6 +50,7 @@ import {
   INSTANCE_METADATA_FILENAME,
   INSTANCES_DIRNAME,
   unprovisionedReason,
+  linkedInstanceComponent,
   type ResolvedInstance,
   type ResolverEnv,
 } from "./resolve-instance.js";
@@ -264,7 +265,13 @@ interface ComponentIdentity {
   ino: bigint;
 }
 const identityOf = (p: string, role: string): ComponentIdentity => {
-  const st = fs.lstatSync(p, { bigint: true });
+  let st: fs.BigIntStats;
+  try {
+    st = fs.lstatSync(p, { bigint: true });
+  } catch {
+    // #449 R2 P3: a native error names the path; the refusal names the ROLE.
+    throw new Error(`refusing to provision the instance: the ${role} could not be checked`);
+  }
   return { role, path: p, dev: st.dev, ino: st.ino };
 };
 
@@ -276,14 +283,23 @@ export function _setProvisionSeamForTests(fn: (() => void) | null): void {
 
 /** One directory component below the trust root: created when absent, refused unless it is a REAL directory. */
 function realDirComponent(p: string, role: string): ComponentIdentity {
-  let st = lstatOrNull(p);
+  let st: fs.Stats | null;
+  try {
+    st = lstatOrNull(p);
+  } catch {
+    throw new Error(`refusing to provision the instance: the ${role} could not be checked`);
+  }
   if (!st) {
     try {
       fs.mkdirSync(p, { mode: 0o700 });
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw new Error(`refusing to provision the instance: the ${role} could not be created`);
     }
-    st = lstatOrNull(p);
+    try {
+      st = lstatOrNull(p);
+    } catch {
+      throw new Error(`refusing to provision the instance: the ${role} could not be checked`);
+    }
   }
   if (!st || st.isSymbolicLink() || !st.isDirectory()) {
     throw new Error(`refusing to provision the instance: the ${role} is not a real directory (a symbolic link, or not a directory)`);
@@ -307,7 +323,9 @@ function realDirComponent(p: string, role: string): ComponentIdentity {
 
 /** The instance directory, every component below the relay home real (created one at a time). */
 export function provisionInstanceDir(instanceId: string): string {
-  return provisionInstanceChain(instanceId).dir;
+  const { dir, chain } = provisionInstanceChain(instanceId);
+  assertChainUnchanged(chain);
+  return dir;
 }
 
 /** provisionInstanceDir, plus each component's identity from the trust root down (for the post-write re-check). */
@@ -317,9 +335,12 @@ function provisionInstanceChain(instanceId: string): { dir: string; chain: Compo
   const root = relayHomeRealRoot();
   const chain = [identityOf(root, "relay home")];
   const instances = path.join(root, INSTANCES_DIRNAME);
-  chain.push(realDirComponent(instances, "instances directory"));
   const dir = path.join(instances, instanceId);
-  chain.push(realDirComponent(dir, "instance directory"));
+  // #449 R2 P1: a component may be CREATED here (the first write): a failure after that still checks the chain so far.
+  checkedAfterWrites(chain, () => {
+    chain.push(realDirComponent(instances, "instances directory"));
+    chain.push(realDirComponent(dir, "instance directory"));
+  });
   return { dir, chain };
 }
 
@@ -329,7 +350,7 @@ function provisionInstanceChain(instanceId: string): { dir: string; chain: Compo
  * loudly, by ROLE (never the path). Nothing is undone: undoing through a swapped path could delete or chmod at the
  * other end; a person decides.
  */
-function assertChainUnchanged(chain: ComponentIdentity[]): void {
+function chainRedirect(chain: ComponentIdentity[]): string | null {
   for (const c of chain) {
     let same = false;
     try {
@@ -339,8 +360,44 @@ function assertChainUnchanged(chain: ComponentIdentity[]): void {
       same = false;
     }
     if (!same) {
-      throw new Error(`refusing: the ${c.role} changed while the instance was being provisioned; the operation may have been redirected. Nothing was undone: check it before using this instance.`);
+      return `refusing: the ${c.role} changed while the instance was being provisioned; the operation may have been redirected. Nothing was undone: check it before using this instance.`;
     }
+  }
+  return null;
+}
+function assertChainUnchanged(chain: ComponentIdentity[]): void {
+  const redirect = chainRedirect(chain);
+  if (redirect !== null) throw new Error(redirect);
+}
+
+/**
+ * #449 R2 P1 (ruling c998eaf6): run `work` (which writes), then check the chain on EVERY exit path, failures included.
+ * A changed component wins: the redirect line comes first, and the original failure, if any, follows it.
+ */
+function checkedAfterWrites<T>(chain: ComponentIdentity[], work: () => T): T {
+  let result: T | undefined;
+  let failure: unknown = null;
+  let failed = false;
+  try {
+    result = work();
+  } catch (err) {
+    failed = true;
+    failure = err;
+  }
+  const redirect = chainRedirect(chain);
+  if (redirect !== null) {
+    throw new Error(failed ? `${redirect} The operation also failed: ${failure instanceof Error ? failure.message : String(failure)}` : redirect);
+  }
+  if (failed) throw failure;
+  return result as T;
+}
+
+/** Remove a temp file; a failure to remove it (e.g. a swapped ancestor) is never a native, path-bearing error. */
+function removeTempQuietly(tmp: string): void {
+  try {
+    fs.rmSync(tmp, { force: true });
+  } catch {
+    /* #449 R2 P3: nothing path-bearing escapes; the caller's role refusal (and the chain check) speak */
   }
 }
 
@@ -358,6 +415,11 @@ export function createInstance(
   label?: string | null,
 ): InstanceMetadata {
   const { dir, chain } = provisionInstanceChain(instanceId);
+  return checkedAfterWrites(chain, () => writeInstanceRecord(instanceId, version, label, dir));
+}
+
+/** createInstance's record write (its every failure phrased by ROLE, no temp file left); the caller checks the chain. */
+function writeInstanceRecord(instanceId: string, version: string, label: string | null | undefined, dir: string): InstanceMetadata {
   provisionSeam?.();
   const metaPath = path.join(dir, INSTANCE_METADATA_FILENAME);
   const existing = readInstanceMetadataFile(dir) as InstanceMetadata | null;
@@ -382,14 +444,14 @@ export function createInstance(
     fs.fsyncSync(fd);
   } catch {
     fs.closeSync(fd);
-    fs.rmSync(tmp, { force: true });
+    removeTempQuietly(tmp);
     throw new Error("refusing to provision the instance: its metadata record could not be written");
   }
   fs.closeSync(fd);
   try {
     fs.renameSync(tmp, metaPath);
   } catch (err) {
-    fs.rmSync(tmp, { force: true });
+    removeTempQuietly(tmp);
     const code = (err as NodeJS.ErrnoException).code;
     throw new Error(
       code === "EISDIR" || code === "ENOTEMPTY" || code === "EEXIST"
@@ -397,8 +459,17 @@ export function createInstance(
         : "refusing to provision the instance: its metadata record could not be put in place",
     );
   }
-  assertChainUnchanged(chain);
   return meta;
+}
+
+/**
+ * #449 R2 P3: why `instanceId` has no readable record, when the reason is a LINK below the relay home (ruling
+ * 3fc05540): the specific refusal, never a generic "not found". Null otherwise (absent, corrupt, an invalid id).
+ */
+export function instanceLinkRefusal(instanceId: string): string | null {
+  if (instanceIdFault(instanceId)) return null;
+  const dir = path.join(instancesRoot(), instanceId);
+  return linkedInstanceComponent(dir) === null ? null : unprovisionedReason(instanceId, "its id", dir, "");
 }
 
 /** Read an instance's metadata. Returns null on missing / corrupt. */
@@ -760,6 +831,8 @@ export function acquireInstanceLock(
  */
 export function setActiveInstance(instanceId: string): void {
   if (!readInstance(instanceId)) {
+    const linked = instanceLinkRefusal(instanceId);
+    if (linked !== null) throw new Error(linked);
     throw new Error(
       `instance "${instanceId}" not found. Run \`relay init --instance-id=${instanceId}\` first.`,
     );
