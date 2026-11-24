@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Check out the BASE commit only (never the pull request head)
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
@@ -42,6 +42,14 @@ jobs:
           gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.title' > "$meta/pr-title"
           gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.body // ""' > "$meta/pr-body"
           gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.ref' > "$meta/branch"
+          # COMPLETENESS, or fail closed: the PR's reported commit count, at least 1 and at most 250 (the commits endpoint
+          # lists no more than 250, so a larger PR cannot be enumerated), equal to the count of shas actually fetched.
+          expected="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.commits')"
+          case "$expected" in ''|*[!0-9]*) echo "the commit count is unreadable: failing closed"; exit 1 ;; esac
+          if [ "$expected" -lt 1 ]; then echo "the pull request reports no commits: failing closed"; exit 1; fi
+          if [ "$expected" -gt 250 ]; then echo "more than 250 commits: the API cannot list them all; failing closed"; exit 1; fi
+          got="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits" --jq '.[].sha' | grep -c .)" || got=0
+          if [ "$got" != "$expected" ]; then echo "commit list truncated: failing closed"; exit 1; fi
           gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits" --jq '.[].commit.message' > "$meta/commit-msg"
 
       - name: Scan (prints field and term indexes only)
@@ -52,7 +60,12 @@ jobs:
           worst=0
           for field in pr-title pr-body branch commit-msg; do
             rc=0
-            node tools/public-leak-scan/scan.mjs --field "$field" --list-env PUBLIC_DENYLIST < "$meta/$field" || rc=$?
+            out="$(node tools/public-leak-scan/scan.mjs --field "$field" --list-env PUBLIC_DENYLIST < "$meta/$field")" || rc=$?
+            printf '%s\n' "$out"
+            # The scanner's caller contract: PASS is exit 0 AND the output exactly "PASS"; anything else cannot be trusted.
+            if [ "$rc" -eq 0 ] && [ "$out" != "PASS" ]; then rc=2; fi
+            case "$out" in "FAIL field=$field terms=#"*) ;; *) [ "$rc" -eq 1 ] && rc=2 ;; esac
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then rc=2; fi
             [ "$rc" -gt "$worst" ] && worst=$rc
           done
           if [ "$worst" -eq 1 ]; then

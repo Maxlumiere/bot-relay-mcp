@@ -51,6 +51,18 @@ describe("the workflow's safety shape", () => {
     expect(WF).not.toMatch(/--list\s+\S*\$\{\{/);
   });
 
+  it("pins actions/checkout to a FULL commit sha (a privileged workflow)", () => {
+    expect(WF).toMatch(/uses: actions\/checkout@[0-9a-f]{40} # v/);
+    expect(WF).not.toMatch(/uses: actions\/checkout@v\d/);
+  });
+
+  it("no step may continue on error, and every commit listing paginates", () => {
+    expect(WF).not.toMatch(/continue-on-error/);
+    const commitCalls = WF.match(/gh api [^\n]*pulls\/\$PR_NUMBER\/commits[^\n]*/g) ?? [];
+    expect(commitCalls.length).toBeGreaterThanOrEqual(2);
+    for (const c of commitCalls) expect(c, c).toContain("--paginate");
+  });
+
   it("asks for read-only permissions", () => {
     expect(WF).toMatch(/permissions:\n {2}contents: read\n {2}pull-requests: read\n/);
     expect(WF).not.toMatch(/: write/);
@@ -109,3 +121,86 @@ describe("the public scanner copy", () => {
     }
   });
 });
+
+/** A workflow step's run block, executed with bash. */
+function stepScript(name: string): string {
+  const m = new RegExp(`- name: ${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n[\\s\\S]*?\\n {8}run: \\|\\n([\\s\\S]*?)(?:\\n {6}- name:|\\s*$)`).exec(WF);
+  expect(m, `the step "${name}" exists`).not.toBeNull();
+  return m![1]!.split("\n").map((l) => l.replace(/^ {10}/, "")).join("\n");
+}
+
+describe("the metadata fetch step, run for real against a stub gh (completeness or fail closed)", () => {
+  /** A stub `gh` answering the four reads from env: the count reported, the shas listed, the messages. */
+  function runFetch(opts: { reported: string; listed: number }): { status: number | null; out: string } {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "leakgate-gh-"));
+    fs.writeFileSync(
+      path.join(bin, "gh"),
+      `#!/bin/sh\ncase "$*" in\n  *"--jq .commits"*) printf '%s\\n' "$STUB_REPORTED" ;;\n  *"/commits --jq .[].sha"*) i=0; while [ $i -lt "$STUB_LISTED" ]; do echo "sha$i"; i=$((i+1)); done ;;\n  *"/commits --jq .[].commit.message"*) echo "fix: a message" ;;\n  *) echo "a value" ;;\nesac\n`,
+      { mode: 0o755 },
+    );
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "leakgate-meta-"));
+    const r = spawnSync("bash", ["-e", "-c", stepScript("Fetch the pull request metadata through the API (no code)")], {
+      encoding: "utf-8",
+      env: { PATH: `${bin}:${process.env.PATH ?? ""}`, RUNNER_TEMP: tmp, PR_NUMBER: "7", REPO: "o/r", GH_TOKEN: "x", STUB_REPORTED: opts.reported, STUB_LISTED: String(opts.listed) },
+    });
+    return { status: r.status, out: r.stdout + r.stderr };
+  }
+  it("a complete listing (3 reported, 3 listed) → exit 0", () => {
+    const r = runFetch({ reported: "3", listed: 3 });
+    expect(r.status, r.out).toBe(0);
+  });
+  it("TRUNCATED (3 reported, 2 listed) → exit 1, 'commit list truncated: failing closed'", () => {
+    const r = runFetch({ reported: "3", listed: 2 });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("commit list truncated: failing closed");
+  });
+  it("ZERO commits → exit 1 (an empty listing never scans clean)", () => {
+    expect(runFetch({ reported: "0", listed: 0 }).status).toBe(1);
+  });
+  it("MORE THAN 250 commits (the API's ceiling) → exit 1, even when the listing looks complete", () => {
+    const r = runFetch({ reported: "251", listed: 251 });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("more than 250 commits");
+  });
+  it("an unreadable commit count → exit 1", () => {
+    expect(runFetch({ reported: "null", listed: 1 }).status).toBe(1);
+  });
+});
+
+describe("the scan step honours the scanner's caller contract (PASS = exit 0 AND exactly 'PASS')", () => {
+  it("a term in the TITLE and in the BRANCH name → FAIL lines for both fields", () => {
+    const r = runScanStep({ "pr-title": "zorblax approved", branch: "fix/zorblax" }, { PUBLIC_DENYLIST: LIST });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("FAIL field=pr-title terms=#2");
+    expect(r.out).toContain("FAIL field=branch terms=#2");
+  });
+
+  /** The Scan step with a SUBSTITUTE scanner (in a temp tree): exit code + output chosen by the row. */
+  function withScanner(body: string): { status: number | null; out: string } {
+    const tree = fs.mkdtempSync(path.join(os.tmpdir(), "leakgate-tree-"));
+    fs.mkdirSync(path.join(tree, "tools", "public-leak-scan"), { recursive: true });
+    fs.writeFileSync(path.join(tree, "tools", "public-leak-scan", "scan.mjs"), body);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "leakgate-"));
+    fs.mkdirSync(path.join(tmp, "leak-meta"));
+    for (const k of ["pr-title", "pr-body", "branch", "commit-msg"]) fs.writeFileSync(path.join(tmp, "leak-meta", k), "clean");
+    const r = spawnSync("bash", ["-e", "-c", stepScript("Scan (prints field and term indexes only)")], { cwd: tree, encoding: "utf-8", env: { PATH: process.env.PATH ?? "", RUNNER_TEMP: tmp, PUBLIC_DENYLIST: LIST } });
+    return { status: r.status, out: r.stdout + r.stderr };
+  }
+  it("a scanner that exits 0 with OTHER output → 'could not run' (exit 1), never a pass", () => {
+    const r = withScanner('process.stdout.write("OK\\n");\n');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("could not run");
+  });
+  it("a scanner CRASH (an uncaught exception: exit 1 without a FAIL line) → 'could not run', never read as a term", () => {
+    const r = withScanner('throw new Error("boom");\n');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("could not run");
+    expect(r.out).not.toContain("A denylisted term");
+  });
+  it("a scanner exiting 3 → 'could not run'", () => {
+    const r = withScanner("process.exit(3);\n");
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("could not run");
+  });
+});
+
