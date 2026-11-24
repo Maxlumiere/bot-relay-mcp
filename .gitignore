@@ -1,5 +1,6 @@
 # Dependencies + build output
-node_modules/
+# no trailing slash: bin/new-worktree links node_modules (a symlink is not a directory)
+node_modules
 dist/
 
 # v2.5.0 Tether — VSCode extension build artifacts (subdir tsc emits to out/)

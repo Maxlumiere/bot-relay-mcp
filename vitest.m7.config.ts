@@ -4,6 +4,12 @@
  * Run: npx vitest run --config vitest.m7.config.ts   (or tests/m7/run-m7.sh, which prints the report)
  */
 import { withOperatorTripwire } from "./tests/_setup/vitest-tripwire-base.mjs";
+import { isolationFault } from "./tests/m7/isolation.mjs";
+
+// ISOLATION FIRST (Codex #446 R2, ruling 0c3deae0): evaluated at config load, before any global setup or setup file
+// creates a temp dir. Read-only. A temp root inside the real (passwd) home refuses the run here.
+const m7Fault = process.env.M7_RUNNER === "1" ? isolationFault() : null;
+if (m7Fault) throw new Error(`m7: refusing: ${m7Fault}`);
 
 export default withOperatorTripwire({
   test: {

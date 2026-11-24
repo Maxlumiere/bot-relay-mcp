@@ -26,6 +26,13 @@ import { systemBinarySeamPath } from "../_helpers/system-binary-seam-env.js";
 // Launched ONLY by tests/m7/run-m7.sh (its refusals run first): any other launcher (the full config, a bare vitest)
 // is refused before a window opens or a DB is touched.
 if (process.env.M7_RUNNER !== "1") throw new Error("m7: refusing: run tests/m7/run-m7.sh (it checks the sandbox before anything is written)");
+// ISOLATION, AGAIN, FIRST (ruling 0c3deae0: the runner marker alone is never enough): before this file creates any
+// temp dir, the temp root must resolve outside the real (passwd) home. Read-only.
+{
+  const { isolationFault } = await import("./isolation.mjs");
+  const fault = isolationFault(process.env);
+  if (fault) throw new Error(`m7: refusing: ${fault}`);
+}
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const RELAY_BIN = path.join(REPO, "bin", "relay");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "m7-measure-")));
@@ -52,7 +59,14 @@ const SHA = process.env.M7_SHA ?? "unknown";
 const REPORT = process.env.M7_REPORT ?? path.join(ROOT, "m7-report.json");
 type Verdict = "PASS" | "FAIL" | "NOT_DRIVEN";
 const results: Array<{ check: string; verdict: Verdict; evidence: string[]; note?: string }> = [];
-const write = () => fs.writeFileSync(REPORT, JSON.stringify({ sha: SHA, platform: `${process.platform} ${os.release()}`, node: process.version, at: new Date().toISOString(), results }, null, 2));
+// THE REPORT: created EXCLUSIVELY (O_CREAT|O_EXCL|O_NOFOLLOW, 0600): an existing path or a link is refused, never
+// written through. Every update rewrites it through this one descriptor.
+const reportFd = fs.openSync(REPORT, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (process.platform === "win32" ? 0 : fs.constants.O_NOFOLLOW), 0o600);
+const write = () => {
+  const body = Buffer.from(JSON.stringify({ sha: SHA, platform: `${process.platform} ${os.release()}`, node: process.version, at: new Date().toISOString(), results }, null, 2));
+  fs.ftruncateSync(reportFd, 0);
+  fs.writeSync(reportFd, body, 0, body.length, 0);
+};
 
 /** One check: `fn` collects evidence and asserts; a throw is FAIL (with the assertion's text), recorded, then rethrown. */
 async function measure(check: string, fn: (ev: string[]) => Promise<string | void>): Promise<void> {
@@ -134,25 +148,46 @@ let win: TestWindow;
 const openWin = (agent: string | null = AGENT) => {
   const w = openWindow(path.join(ROOT, `win-${windows.length}-${Date.now()}`), env());
   windows.push(w);
+  recordWindow(w);
   if (agent) bind(w, agent);
   return w;
 };
 const short = (s: string) => s.trim().replace(/RELAY_DB_PATH='[^']+'/g, "RELAY_DB_PATH='<sandbox>'").replace(/'[^']*\/bin\/relay'/g, "'<repo>/bin/relay'");
 
-/** Close EVERY window even when one close rejects, then SIGKILL any whose recorded pid still runs. */
-async function closeAll(ws: TestWindow[]): Promise<void> {
+/** Every pid ever recorded for a window this file opened: its shell, every node it ran, its supervisor. */
+const recordedPids = new Set<number>();
+const recordWindow = (w: TestWindow) => {
+  for (const p of [w.pid, w.leaderPid, ...w.pids]) if (Number.isInteger(p) && p > 1) recordedPids.add(p);
+};
+/**
+ * Close EVERY window even when one close rejects, then SIGKILL every RECORDED pid still alive (never by pattern).
+ * Returns the recorded pids that STILL survive (verified with kill -0).
+ */
+async function closeAll(ws: TestWindow[]): Promise<number[]> {
+  for (const w of ws) recordWindow(w);
   await Promise.allSettled(ws.map((w) => w.close()));
-  for (const w of ws) if (alive(w.pid)) {
+  for (const w of ws) recordWindow(w); // pids a run added while closing
+  const targets = [...recordedPids].filter((p) => alive(p));
+  for (const p of targets) {
     try {
-      process.kill(w.pid, "SIGKILL");
+      process.kill(p, "SIGKILL");
     } catch {
       /* gone between the check and the kill */
     }
   }
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline && targets.some((p) => alive(p))) await new Promise((r) => setTimeout(r, 50));
+  return targets.filter((p) => alive(p));
 }
 
 afterAll(async () => {
-  await closeAll(windows.splice(0));
+  const survivors = await closeAll(windows.splice(0));
+  if (survivors.length > 0) {
+    // LOUD: a process this run started outlives it. The run FAILS, even if every check passed.
+    results.push({ check: "cleanup", verdict: "FAIL", evidence: [`${survivors.length} recorded process(es) still alive after the kill: pids ${survivors.join(", ")}`] });
+    write();
+    throw new Error(`m7: cleanup FAILED: recorded pids still alive: ${survivors.join(", ")}`);
+  }
   write();
   db.closeDb();
   fs.rmSync(ROOT, { recursive: true, force: true });
@@ -161,7 +196,8 @@ afterAll(async () => {
 
 describe.skipIf(!OWN)(`M7 (doorbell PR 8 gate brief §4) on ${SHA}`, () => {
   beforeEach(async () => {
-    await closeAll(windows.splice(0));
+    const left = await closeAll(windows.splice(0));
+    if (left.length > 0) throw new Error(`m7: cleanup FAILED between checks: recorded pids still alive: ${left.join(", ")}`);
     db.closeDb();
     fs.rmSync(path.join(ROOT, "inst"), { recursive: true, force: true });
     fs.rmSync(HOME, { recursive: true, force: true });
