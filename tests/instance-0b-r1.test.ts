@@ -190,6 +190,17 @@ describe.skipIf(!POSIX)("ruling 3fc05540: a link BELOW the relay home is never a
     expect(r.reason).toContain("instances/ is a symbolic link");
     fs.rmSync(storage, { recursive: true, force: true });
   });
+  it("an ALIAS OUTSIDE the relay home (an explicit RELAY_DB_PATH through ~/alias -> <home>/instances) is only an access path: it resolves as the instance, never the link line", async () => {
+    createInstance("ok", "t");
+    const alias = path.join(home, "alias-instances");
+    fs.symlinkSync(instances(), alias);
+    process.env.RELAY_DB_PATH = path.join(alias, "ok", "relay.db");
+    const { resolveInstance, assertInstanceProvisionedAtOpen } = await import("../src/instance.js");
+    const r = resolveInstance() as { kind: string; reason?: string };
+    expect(r.reason ?? "", "never the link line for a link outside the root").not.toMatch(/symbolic link/);
+    expect(r.kind).toBe("explicit-db");
+    expect(assertInstanceProvisionedAtOpen(path.join(alias, "ok", "relay.db")), "the instance dir, spelled under the root").toBe(path.join(instances(), "ok"));
+  });
   it("the CONTROL: a linked relay HOME (the trust root) with real children still resolves the instance", async () => {
     const realHome = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r1-realhome-"));
     const linkedHome = path.join(home, "linked-relay-home");
