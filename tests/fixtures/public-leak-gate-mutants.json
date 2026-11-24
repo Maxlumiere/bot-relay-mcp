@@ -1,0 +1,107 @@
+[
+  {
+    "name": "checkout-head-sha",
+    "find": "ref: ${{ github.event.pull_request.base.sha }}\n          persist",
+    "replace": "ref: ${{ github.event.pull_request.head.sha }}\n          persist"
+  },
+  {
+    "name": "base-assertion-dropped",
+    "find": "          test \"$(git rev-parse HEAD)\" = \"$BASE_SHA\" || { echo \"the checked-out tree is not the base commit: refusing\"; exit 1; }\n",
+    "replace": "          true\n"
+  },
+  {
+    "name": "title-interpolated",
+    "find": "          jq -r '.title' \"$meta/pull.json\" > \"$meta/pr-title\"",
+    "replace": "          echo \"${{ github.event.pull_request.title }}\" > \"$meta/pr-title\""
+  },
+  {
+    "name": "secret-as-list-arg",
+    "find": "--field \"$field\" --list-env PUBLIC_DENYLIST <",
+    "replace": "--field \"$field\" --list ${{ secrets.PUBLIC_DENYLIST }} <"
+  },
+  {
+    "name": "could-not-run-passes",
+    "find": "          if [ \"$worst\" -ne 0 ]; then",
+    "replace": "          if false; then"
+  },
+  {
+    "name": "input-echoed",
+    "find": "            rc=0\n",
+    "replace": "            rc=0\n            cat \"$meta/$field\"\n"
+  },
+  {
+    "name": "write-permission",
+    "find": "  pull-requests: read\n",
+    "replace": "  pull-requests: write\n"
+  },
+  {
+    "name": "checkout-unpinned",
+    "find": "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+    "replace": "uses: actions/checkout@v7"
+  },
+  {
+    "name": "truncation-guard-removed",
+    "find": "          if [ \"$listed\" != \"$total\" ]; then echo \"commit list truncated: failing closed\"; exit 1; fi\n",
+    "replace": ""
+  },
+  {
+    "name": "zero-commits-allowed",
+    "find": "          if [ \"$total\" -lt 1 ]; then echo \"the pull request has no commits: failing closed\"; exit 1; fi\n",
+    "replace": ""
+  },
+  {
+    "name": "ceiling-removed",
+    "find": "          if [ \"$total\" -gt 250 ]; then echo \"more than 250 commits: the API cannot list them all; failing closed\"; exit 1; fi\n",
+    "replace": ""
+  },
+  {
+    "name": "ceiling-off-by-one",
+    "find": "[ \"$total\" -gt 250 ]",
+    "replace": "[ \"$total\" -gt 251 ]"
+  },
+  {
+    "name": "head-binding-removed",
+    "find": "          if [ \"$last\" != \"$head\" ]; then echo \"the listed commits do not end at the event's head: failing closed\"; exit 1; fi\n",
+    "replace": ""
+  },
+  {
+    "name": "compare-from-mutable-head",
+    "find": "          gh api \"repos/$REPO/compare/$base...$head\" > \"$meta/compare.json\"",
+    "replace": "          head_now=\"$(jq -r '.head.sha' \"$meta/pull.json\")\"; head=\"$head_now\"\n          gh api \"repos/$REPO/compare/$base...$head\" > \"$meta/compare.json\""
+  },
+  {
+    "name": "pass-contract-removed",
+    "find": "              printf 'PASS\\n' | cmp -s - \"$meta/out-$field\" || rc=2\n",
+    "replace": "              true\n"
+  },
+  {
+    "name": "pass-via-command-substitution",
+    "find": "              printf 'PASS\\n' | cmp -s - \"$meta/out-$field\" || rc=2\n",
+    "replace": "              [ \"$(cat \"$meta/out-$field\")\" = \"PASS\" ] || rc=2\n"
+  },
+  {
+    "name": "hit-prefix-match",
+    "find": "(\"^FAIL field=\" f \" terms=#[0-9]+(,#[0-9]+)*$\")",
+    "replace": "(\"^FAIL field=\" f \" terms=#\")"
+  },
+  {
+    "name": "hit-any-line",
+    "find": "END { exit !(NR == 1 && ok) }",
+    "replace": "END { exit !ok }"
+  },
+  {
+    "name": "hit-any-field",
+    "find": "(\"^FAIL field=\" f \" terms=",
+    "replace": "(\"^FAIL field=[a-z-]+ terms="
+  },
+  {
+    "name": "hit-check-removed",
+    "find": "              awk -v f=\"$field\" '{ ok = ($0 ~ (\"^FAIL field=\" f \" terms=#[0-9]+(,#[0-9]+)*$\")) } END { exit !(NR == 1 && ok) }' \"$meta/out-$field\" || rc=2\n",
+    "replace": "              true\n"
+  },
+  {
+    "name": "continue-on-error-scan",
+    "find": "      - name: Scan (prints field and term indexes only)\n",
+    "replace": "      - name: Scan (prints field and term indexes only)\n        continue-on-error: true\n"
+  }
+]

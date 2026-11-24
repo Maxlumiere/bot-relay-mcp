@@ -39,18 +39,32 @@ jobs:
           set -euo pipefail
           meta="$RUNNER_TEMP/leak-meta"
           mkdir -p "$meta"
-          gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.title' > "$meta/pr-title"
-          gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.body // ""' > "$meta/pr-body"
-          gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.ref' > "$meta/branch"
-          # COMPLETENESS, or fail closed: the PR's reported commit count, at least 1 and at most 250 (the commits endpoint
-          # lists no more than 250, so a larger PR cannot be enumerated), equal to the count of shas actually fetched.
-          expected="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.commits')"
-          case "$expected" in ''|*[!0-9]*) echo "the commit count is unreadable: failing closed"; exit 1 ;; esac
-          if [ "$expected" -lt 1 ]; then echo "the pull request reports no commits: failing closed"; exit 1; fi
-          if [ "$expected" -gt 250 ]; then echo "more than 250 commits: the API cannot list them all; failing closed"; exit 1; fi
-          got="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits" --jq '.[].sha' | grep -c .)" || got=0
-          if [ "$got" != "$expected" ]; then echo "commit list truncated: failing closed"; exit 1; fi
-          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits" --jq '.[].commit.message' > "$meta/commit-msg"
+          # THE SNAPSHOT: the commits are bound to this EVENT's immutable base and head shas (read from the event file,
+          # never interpolated), so a later force-push cannot lend its pass to this head. The branch is the event's head.ref.
+          base="$(jq -r '.pull_request.base.sha' "$GITHUB_EVENT_PATH")"
+          head="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
+          for sha in "$base" "$head"; do
+            case "$sha" in *[!0-9a-f]*|'') echo "the event's commit shas are unreadable: failing closed"; exit 1 ;; esac
+            [ "${#sha}" -eq 40 ] || { echo "the event's commit shas are unreadable: failing closed"; exit 1; }
+          done
+          jq -r '.pull_request.head.ref' "$GITHUB_EVENT_PATH" > "$meta/branch"
+          # Title and body: the CURRENT text (an edit re-runs this workflow).
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > "$meta/pull.json"
+          jq -r '.title' "$meta/pull.json" > "$meta/pr-title"
+          jq -r '.body // ""' "$meta/pull.json" > "$meta/pr-body"
+          # The commits: ONE compare response (base...head, which also addresses a fork's head in this repo). Its count
+          # and its messages both come from that same file. One response lists at most 250 commits, so: the count must
+          # be a number from 1 to 250, the listed count must equal it, and the last listed commit must be the event's head.
+          gh api "repos/$REPO/compare/$base...$head" > "$meta/compare.json"
+          total="$(jq -r '.total_commits' "$meta/compare.json")"
+          case "$total" in ''|*[!0-9]*) echo "the commit count is unreadable: failing closed"; exit 1 ;; esac
+          if [ "$total" -lt 1 ]; then echo "the pull request has no commits: failing closed"; exit 1; fi
+          if [ "$total" -gt 250 ]; then echo "more than 250 commits: the API cannot list them all; failing closed"; exit 1; fi
+          listed="$(jq -r '.commits | length' "$meta/compare.json")"
+          if [ "$listed" != "$total" ]; then echo "commit list truncated: failing closed"; exit 1; fi
+          last="$(jq -r '.commits[-1].sha' "$meta/compare.json")"
+          if [ "$last" != "$head" ]; then echo "the listed commits do not end at the event's head: failing closed"; exit 1; fi
+          jq -r '.commits[].commit.message' "$meta/compare.json" > "$meta/commit-msg"
 
       - name: Scan (prints field and term indexes only)
         env:
@@ -60,12 +74,18 @@ jobs:
           worst=0
           for field in pr-title pr-body branch commit-msg; do
             rc=0
-            out="$(node tools/public-leak-scan/scan.mjs --field "$field" --list-env PUBLIC_DENYLIST < "$meta/$field")" || rc=$?
-            printf '%s\n' "$out"
-            # The scanner's caller contract: PASS is exit 0 AND the output exactly "PASS"; anything else cannot be trusted.
-            if [ "$rc" -eq 0 ] && [ "$out" != "PASS" ]; then rc=2; fi
-            case "$out" in "FAIL field=$field terms=#"*) ;; *) [ "$rc" -eq 1 ] && rc=2 ;; esac
-            if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then rc=2; fi
+            node tools/public-leak-scan/scan.mjs --field "$field" --list-env PUBLIC_DENYLIST < "$meta/$field" > "$meta/out-$field" || rc=$?
+            cat "$meta/out-$field"
+            # The exact outcome rule, read from the captured bytes (never through $(...), which strips newlines):
+            # PASS = exit 0 AND the output byte-equal to "PASS\n"; HIT = exit 1 AND the output exactly ONE line
+            # "FAIL field=<this field> terms=#N[,#N...]"; everything else = could not run.
+            if [ "$rc" -eq 0 ]; then
+              printf 'PASS\n' | cmp -s - "$meta/out-$field" || rc=2
+            elif [ "$rc" -eq 1 ]; then
+              awk -v f="$field" '{ ok = ($0 ~ ("^FAIL field=" f " terms=#[0-9]+(,#[0-9]+)*$")) } END { exit !(NR == 1 && ok) }' "$meta/out-$field" || rc=2
+            else
+              rc=2
+            fi
             [ "$rc" -gt "$worst" ] && worst=$rc
           done
           if [ "$worst" -eq 1 ]; then
