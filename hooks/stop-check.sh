@@ -126,6 +126,7 @@ RELAY_VERDICT_DETAIL=""
 relay_emit_verdict() {
   relay_in_main_shell || return 0
   _l="[RELAY] VERDICT=${RELAY_VERDICT} reason=\"${RELAY_VERDICT_REASON}\"${RELAY_VERDICT_DETAIL}"
+  _l="${_l//[[:cntrl:]]/?}" # one line, always (a control character can never start a second verdict line)
   if [ "${RELAY_VERDICT_STREAM:-stdout}" = "stderr" ]; then echo "$_l" >&2; else echo "$_l"; fi
 }
 trap relay_emit_verdict EXIT
