@@ -382,6 +382,10 @@ export async function run(argv: string[]): Promise<number> {
     const { runUntilWake, runLockStatus, runArmCheck } = await import("./watch-until-wake.js");
     if (args.lockStatus) return runLockStatus(agent);
     if (args.armCheck) return runArmCheck(agent);
+    // #443 R2 P2-a: a signal marks the process TERMINATING, so the exit bin/relay makes with the code runUntilWake
+    // returns is BOUNDED; a second signal is absorbed (exit 0, never "killed by signal").
+    const { markTerminatingOnSignals } = await import("../exit-after-flush.js");
+    markTerminatingOnSignals();
     return runUntilWake(agent, { intervalMs: args.intervalMs, ...(args.dormantCheckMs ? { dormantCheckMs: args.dormantCheckMs } : {}), ...(args.anchorUnknownBoundMs ? { anchorUnknownBoundMs: args.anchorUnknownBoundMs } : {}) });
   }
 
@@ -460,12 +464,10 @@ export async function run(argv: string[]): Promise<number> {
       /* ignore */
     }
   };
-  const onSignal = (): void => {
-    stop();
-    process.exit(0);
-  };
-  process.on("SIGINT", onSignal);
-  process.on("SIGTERM", onSignal);
+  // #443 R1: the signal exit drains queued wake lines (a consumer that paused can have >64 KiB queued), BOUNDED so a
+  // stuck or gone reader cannot hang the watch (it would keep its lock and block the next arm).
+  const { installSignalExit } = await import("../exit-after-flush.js");
+  installSignalExit(stop);
 
   check(); // baseline / surface existing mail
 

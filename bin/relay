@@ -151,20 +151,33 @@ function printHelp(requested) {
   );
 }
 
+// THE ONE EXIT POINT: every exit below goes through exitAfterFlush (src/exit-after-flush.ts, loaded from dist/ at the
+// top of main), which drains stdout/stderr before process.exit (a bare process.exit cut piped output at 65,536 bytes).
+// `return` after it.
+let exitAfterFlush;
 async function main() {
+  // ONE implementation, loaded by DYNAMIC import (ruling c07c9674): a missing or stale build is said in one line.
+  // A bare process.exit is safe HERE: nothing has been written yet.
+  try {
+    ({ exitAfterFlush } = await import("../dist/exit-after-flush.js"));
+    if (typeof exitAfterFlush !== "function") throw new Error("no exitAfterFlush export");
+  } catch {
+    process.stderr.write("relay: build missing or out of date (dist/exit-after-flush.js); run npm run build\n");
+    process.exit(1);
+  }
   const argv = process.argv.slice(2);
   const askedForHelp =
     argv[0] === "help" || argv[0] === "--help" || argv[0] === "-h";
   if (askedForHelp) {
     printHelp(true); // requested → stdout, exit 0
-    process.exit(0);
+    return exitAfterFlush(0);
   }
   if (argv.length === 0) {
     // NO ARGS IS AN ERROR, not a help request. Exiting 0 here was half the
     // reason the poisoned-substitution failure was silent: `set -e` and `||`
     // guards both saw success.
     printHelp(false);
-    process.exit(2);
+    return exitAfterFlush(2);
   }
 
   const sub = argv[0];
@@ -173,16 +186,16 @@ async function main() {
   if (!modulePath) {
     process.stderr.write(`relay: unknown subcommand "${sub}"\n\n`);
     printHelp(false); // error path → stderr
-    process.exit(1);
+    return exitAfterFlush(1);
   }
 
   try {
     const mod = await import(modulePath);
     const code = await mod.run(rest);
-    process.exit(typeof code === "number" ? code : 0);
+    return exitAfterFlush(typeof code === "number" ? code : 0);
   } catch (err) {
     process.stderr.write(`relay ${sub}: ${err instanceof Error ? err.message : String(err)}\n`);
-    process.exit(1);
+    return exitAfterFlush(1);
   }
 }
 

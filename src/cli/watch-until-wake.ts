@@ -42,6 +42,7 @@
  * prints nothing is never "the window is gone". Only the kernel says gone (ESRCH, a different process on
  * the pid, or, for the launching shell, a reparent). On an unreadable start the watch takes no action.
  */
+import { isTerminating } from "../exit-after-flush.js";
 import fs from "fs";
 import path from "path";
 
@@ -265,7 +266,7 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
   const say = (line: string) => process.stderr.write(`${line}\n`);
   const L = await import("../liveness.js");
   const W = await import("../watch-wake.js");
-  // THE BIRTH ANCHOR (architect fedac068 (a)): the launching shell, its start captured ONCE, now (up to
+  // THE BIRTH ANCHOR (ruling fedac068 (a)): the launching shell, its start captured ONCE, now (up to
   // BIRTH_START_RETRIES immediate retries), and NEVER adopted later: a start read after the shell could
   // have died might be an impostor's, which would make a dormant watch immortal. Not captured = the
   // shell is judged by the reparent and ESRCH alone.
@@ -321,6 +322,8 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
       };
       process.once("SIGTERM", () => end(0, `no-mail: stopped (signal) while dormant: ${reason}`));
       process.once("SIGINT", () => end(0, `no-mail: stopped (signal) while dormant: ${reason}`));
+      // A signal that landed BETWEEN phases (absorbed by the terminating marker, before this phase listened) still ends it.
+      if (isTerminating()) end(0, `no-mail: stopped (signal) while dormant: ${reason}`);
       // BOUNDEDNESS (ruling a98ec836): a dormant watch blind to its window for the bound (in AWAKE time) is
       // made LOUD (its record rewritten), and quiet again once it can see it. It stays dormant either way:
       // an unobservable window is never "gone".
@@ -461,6 +464,7 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
     const onSignal = () => settle({ kind: "exit", code: 0, line: `no-mail: stopped (signal): the watch for ${agent} was stopped.` });
     process.once("SIGTERM", onSignal);
     process.once("SIGINT", onSignal);
+    if (isTerminating()) onSignal(); // a signal absorbed before this phase listened still stops it
 
     /**
      * Still the RIGHTFUL holder? Checked on every check AND immediately before every write (D2).
