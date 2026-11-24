@@ -14,6 +14,7 @@ import path from "path";
 import os from "os";
 import { resolveInstance, configPathFor } from "../instance.js";
 import { withDeadline } from "../http-deadline.js";
+import { RelayClientError as RelayClientErrorClass } from "./relay-client.js";
 
 type Status = "PASS" | "WARN" | "FAIL";
 interface CheckResult {
@@ -407,6 +408,11 @@ function checkHooks(): CheckResult {
  * probe. Exit 0 iff every check PASS (WARN is advisory, FAIL sinks the
  * overall status).
  */
+/** A remote-supplied version-like value, shown only in a safe shape (else "(unrecognised)"); never verbatim text. */
+function safeToken(v: unknown): string {
+  return typeof v === "string" && /^[0-9A-Za-z.+-]{1,32}$/.test(v) ? v : "(unrecognised)";
+}
+
 async function remoteDoctor(hubUrlRaw: string): Promise<number> {
   let hubUrl: URL;
   try {
@@ -421,6 +427,26 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
   }
   const base = `${hubUrl.protocol}//${hubUrl.host}`;
   const results: CheckResult[] = [];
+  // #444 R2 (ruling 9533449d): an inherited RELAY_AGENT_TOKEN is bound to ONE endpoint (relay-client envTokenEndpoint,
+  // the default route's resolution). A remote hub at ANY other endpoint, with no token of its own provisioned, is
+  // refused BEFORE ANY REQUEST (not even the token-less /health probe): the operator's environment names another relay.
+  if (process.env.RELAY_AGENT_TOKEN) {
+    const { routeFor, envTokenEndpoint, envSelects, remoteToken } = await import("./relay-client.js");
+    const hp = hubUrl.port ? Number(hubUrl.port) : hubUrl.protocol === "https:" ? 443 : 80;
+    const route = await routeFor(hubUrl.hostname.replace(/^\[|\]$/g, ""), hp, hubUrl.protocol === "https:");
+    const bound = await envTokenEndpoint();
+    // The ONE comparison (relay-client envSelects against the ONE derivation): no second derivation here.
+    if (route.kind === "remote" && bound !== null && !(await envSelects(route.host, route.port))) {
+      const own = await remoteToken(route.host, route.port, process.env.RELAY_AGENT_NAME ?? "", { envSelected: false });
+      if (!own) {
+        process.stderr.write(
+          `relay doctor: RELAY_AGENT_TOKEN is bound to ${bound.host}:${bound.port} (RELAY_HTTP_HOST / RELAY_HTTP_PORT), not ${route.host}:${route.port}, ` +
+            "and this hub has no token of its own; refusing before any request (nothing is sent).\n",
+        );
+        return 2;
+      }
+    }
+  }
 
   // 1. Reachability + /health body.
   interface HealthBody {
@@ -449,7 +475,7 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
       results.push({
         name: `hub ${base}/health`,
         status: "PASS",
-        detail: `responding (version=${health?.version ?? "?"}, protocol_version=${health?.protocol_version ?? "?"})`,
+        detail: `responding (version=${safeToken(health?.version)}, protocol_version=${safeToken(health?.protocol_version)})`,
       });
     }
   } catch (err) {
@@ -472,13 +498,13 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
         results.push({
           name: "protocol compatibility",
           status: "PASS",
-          detail: `client=${clientProto}, hub=${health.protocol_version} (same major)`,
+          detail: `client=${clientProto}, hub=${safeToken(health.protocol_version)} (same major)`,
         });
       } else {
         results.push({
           name: "protocol compatibility",
           status: "FAIL",
-          detail: `client=${clientProto}, hub=${health.protocol_version} (different major — upgrade one side)`,
+          detail: `client=${clientProto}, hub=${safeToken(health.protocol_version)} (different major — upgrade one side)`,
         });
       }
     } catch {
@@ -493,7 +519,7 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
       // PR 4 (as ruled): the token goes through relay-client. A LOOPBACK hub URL (any spelling) is this machine's
       // relay, reached only through its owner door; a remote hub by a hardened bearer (no redirect, no proxy, the
       // checked address); an unresolved host gets nothing.
-      const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, mcpResultOf, remoteToken, envSelects, RelayClientError } = await import("./relay-client.js");
+      const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, mcpResultOf, remoteToken, envSelects, RelayClientError, remoteRefusal } = await import("./relay-client.js");
       const hubPort = hubUrl.port ? Number(hubUrl.port) : hubUrl.protocol === "https:" ? 443 : 80;
       const route = await routeFor(hubUrl.hostname.replace(/^\[|\]$/g, ""), hubPort, hubUrl.protocol === "https:");
       if (route.kind === "unresolved") throw new RelayClientError(unresolvedMessage(route));
@@ -506,7 +532,7 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
       } else {
         // As ruled on #434: a flag-chosen remote never gets the launcher's RELAY_AGENT_TOKEN (it usually belongs to the
         // LOCAL relay): only when RELAY_HTTP_HOST names this hub; otherwise the hub's own vault entry.
-        const remoteTok = await remoteToken(route.host, route.port, process.env.RELAY_AGENT_NAME ?? "", { envSelected: envSelects(route.host) });
+        const remoteTok = await remoteToken(route.host, route.port, process.env.RELAY_AGENT_NAME ?? "", { envSelected: await envSelects(route.host, route.port) });
         if (!remoteTok) throw new RelayClientError(`no token for this hub: RELAY_AGENT_TOKEN is used only when RELAY_HTTP_HOST names the hub; otherwise its own vault entry (agents/remote-${route.host}-${route.port}/<agent>.token)`);
         const r = await remotePost(
           route,
@@ -523,11 +549,12 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
         results.push({
           name: "token auth",
           status: "FAIL",
-          detail: `RELAY_AGENT_TOKEN rejected by hub: ${body.error ?? "unknown"}`,
+          detail: `RELAY_AGENT_TOKEN rejected by hub: ${remoteRefusal(httpStatus, body)}`,
         });
       } else if (body?.status === "ok") {
-        const agent = body.agent_name ?? "(unnamed)";
-        const state = body.auth_state ?? "(unknown)";
+        // Remote-supplied fields are shown only in a SAFE shape (an agent name, a closed auth state), never verbatim.
+        const agent = typeof body.agent_name === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(body.agent_name) ? body.agent_name : "(unrecognised)";
+        const state = typeof body.auth_state === "string" && ["active", "legacy_bootstrap", "recovery_pending", "revoked"].includes(body.auth_state) ? body.auth_state : "(unrecognised)";
         results.push({
           name: "token auth",
           status: "PASS",
@@ -544,7 +571,8 @@ async function remoteDoctor(hubUrlRaw: string): Promise<number> {
       results.push({
         name: "token auth",
         status: "WARN",
-        detail: `probe failed: ${err instanceof Error ? err.message : String(err)}`,
+        // Only the client's OWN message (RelayClientError: a redirect by its origin only); other exception text is withheld.
+        detail: `probe failed: ${err instanceof RelayClientErrorClass ? err.message : "a transport error (details withheld: they can carry credentials)"}`,
       });
     }
   } else {

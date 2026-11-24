@@ -20,7 +20,6 @@
  * resolved, bad ids, auth/transport failure) exits NON-ZERO so `$(relay resolve …)`
  * fails loudly instead of capturing an empty/garbage value.
  */
-import { isValidTokenShape } from "../spawn/validation.js";
 
 interface Args {
   messageIds: string[];
@@ -95,18 +94,10 @@ export async function run(argv: string[]): Promise<number> {
   // --- PR 4 (as ruled): the ROUTE first (src/cli/relay-client.ts). A LOCAL relay (loopback, any spelling) is
   // reached only through its owner door; a REMOTE one by a hardened bearer with per-remote credentials; an
   // unresolved host gets nothing. Host/port: the config, then the environment.
-  let host = "127.0.0.1";
-  let port = 3777;
-  try {
-    const { loadConfig } = await import("../config.js");
-    const cfg = loadConfig();
-    host = cfg.http_host || host;
-    port = cfg.http_port || port;
-  } catch {
-    host = process.env.RELAY_HTTP_HOST || host;
-    port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
-  }
-  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteToken, remoteSecret, envSelects, mcpResultOf } = await import("./relay-client.js");
+  // The ONE derivation of the default endpoint (relay-client.ts defaultEndpoint): the env token is bound to it.
+  const { defaultEndpoint } = await import("./relay-client.js");
+  const { host, port } = await defaultEndpoint();
+  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteSecret, mcpResultOf, remoteRefusal } = await import("./relay-client.js");
   const route = await routeFor(host, port);
   if (route.kind === "unresolved") {
     process.stderr.write(`relay resolve: ${unresolvedMessage(route)}\n`);
@@ -119,93 +110,10 @@ export async function run(argv: string[]): Promise<number> {
   // the local DB BEFORE we POST. No mint path — resolve requires an already-
   // registered identity. A stale/missing/mismatched vault token is a LOCAL refusal
   // (exit 2, NO POST) — same discipline as `relay send`.
-  let token: string | null = null;
-  const envToken = process.env.RELAY_AGENT_TOKEN;
-  if (route.kind === "remote") {
-    // A REMOTE gets only ITS credential: RELAY_AGENT_TOKEN, or its own vault scope. Never the local vault.
-    token = await remoteToken(route.host, route.port, agent, { envSelected: envSelects(route.host) });
-    if (!token) {
-      process.stderr.write(
-        `relay resolve: no token for "${agent}" on the remote relay ${route.host}:${route.port}: set RELAY_AGENT_TOKEN ` +
-          "(the local vault is never sent to a remote).\n"
-      );
-      return 2;
-    }
-  } else if (isValidTokenShape(envToken)) {
-    token = envToken;
-  } else {
-    // ADR-0048: the ONE strict resolver; a fault is said and ends the verb.
-    const { pinResolvedDbPath } = await import("./_instance-db.js");
-    const resolveFault = await pinResolvedDbPath();
-    if (resolveFault) {
-      process.stderr.write(`relay resolve: instance resolution failed: ${resolveFault}\n`);
-      return 2;
-    }
-    let dbOpen = false;
-    try {
-      const { initializeDb, getAgentAuthData } = await import("../db.js");
-      await initializeDb();
-      dbOpen = true;
-      const { defaultTokenStore } = await import("../token-store.js");
-      const vaultToken = await defaultTokenStore().read(agent);
-      const authData = getAgentAuthData(agent);
-      // SEC-20 (Codex #315 R1 P3): the row's STATE first. A revoke scrubs the vault, so checking the vault first
-      // told a revoked agent "mismatched, use --force".
-      const { revokedStateOf } = await import("../auth-verdict.js");
-      const revoked = revokedStateOf(authData);
-      if (revoked) {
-        process.stderr.write(
-          `relay resolve: agent "${agent}" is ${revoked === "recovery_pending" ? "awaiting recovery" : "revoked"}: its token authorizes nothing (AUTH_FAILED).\n` +
-            `  • Re-register with its recovery token, or reset the identity: relay recover ${agent}\n`
-        );
-        return 2;
-      }
-      if (authData && authData.token_hash) {
-        // SEC-20: the one authorizer (state, then hash, then revalidate), never the hash alone: a revoked
-        // row keeps its hash, so its vault token still matches.
-        const { authorizeAgentToken } = await import("../authorize-token.js");
-        const a = vaultToken ? await authorizeAgentToken(agent, vaultToken) : null;
-        if (a?.ok) {
-          token = vaultToken;
-        } else if (a && (a.refusal === "revoked" || a.refusal === "recovery_pending")) {
-          process.stderr.write(
-            `relay resolve: agent "${agent}" is ${a.refusal === "recovery_pending" ? "awaiting recovery" : "revoked"}: its token authorizes nothing (AUTH_FAILED).\n` +
-              `  • Re-register with its recovery token, or reset the identity: relay recover ${agent}\n`
-          );
-          return 2;
-        } else {
-          process.stderr.write(
-            `relay resolve: the vault token for "${agent}" does not authenticate against the DB ` +
-              "(missing / stale / mismatched). NOT sending a mismatched credential.\n" +
-              `  • Rotate deliberately (invalidates the old token): relay mint-token ${agent} --force\n` +
-              `  • Or reset the identity: relay recover ${agent}\n`
-          );
-          return 2;
-        }
-      } else {
-        process.stderr.write(
-          `relay resolve: no usable token for "${agent}" — not registered locally and ` +
-            "env RELAY_AGENT_TOKEN is unset/invalid. Export RELAY_AGENT_TOKEN or register first.\n"
-        );
-        return 2;
-      }
-    } catch (err) {
-      process.stderr.write(
-        `relay resolve: could not resolve a token: ${err instanceof Error ? err.message : String(err)}\n`
-      );
-      return 2;
-    } finally {
-      if (dbOpen) {
-        try {
-          const { closeDb } = await import("../db.js");
-          closeDb();
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-  }
-
+  const { resolveCliAgentToken } = await import("./agent-token.js");
+  const resolved = await resolveCliAgentToken("resolve", agent, route);
+  if ("code" in resolved) return resolved.code;
+  const token: string | null = resolved.token;
   if (!token) {
     // Defensive: every branch above set token or returned; never POST tokenless.
     process.stderr.write(`relay resolve: could not resolve a token for "${agent}".\n`);
@@ -227,7 +135,7 @@ export async function run(argv: string[]): Promise<number> {
       status = r.status;
       const result = mcpResultOf(r.text);
       if (!result) {
-        process.stderr.write(`relay resolve: the relay returned an unparseable response (${r.status}) — ${r.text.slice(0, 300)}\n`);
+        process.stderr.write(`relay resolve: the remote relay returned an unparseable response (status ${r.status}; its text is withheld: it can carry credentials)\n`);
         return 1;
       }
       envelope = toolJson(result);
@@ -248,7 +156,7 @@ export async function run(argv: string[]): Promise<number> {
   const res = { ok: status >= 200 && status < 300, status };
 
   if (!res.ok || envelope?.success === false) {
-    process.stderr.write(`relay resolve: ${envelope?.error ?? `daemon returned ${res.status}`}\n`);
+    process.stderr.write(route.kind === "remote" ? `relay resolve: ${remoteRefusal(res.status, envelope)}\n` : `relay resolve: ${envelope?.error ?? `daemon returned ${res.status}`}\n`);
     return 1;
   }
 
