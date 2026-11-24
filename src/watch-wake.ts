@@ -34,7 +34,7 @@ import { AGENT_NAME_PATTERN } from "./types.js";
 /** An agent name that can name a watch dir: a valid agent name that is not all dots. */
 // PR 8b: the name and path rules live in src/watch-paths.ts (pure; shared with the daemon's sweep); re-exported.
 export { watchableName, watchAgentDir } from "./watch-paths.js";
-import { watchableName, watchAgentDir } from "./watch-paths.js";
+import { watchAgentDir } from "./watch-paths.js";
 
 import { ALLOW_ALL, DEFAULT_PAIR_WAKES_PER_HOUR, PAIR_WINDOW_MS, pairKey, type StandingCheck, type WakeMeta } from "./wake-policy.js";
 export { ALLOW_ALL, DEFAULT_PAIR_WAKES_PER_HOUR, PAIR_WINDOW_MS, pairKey, type StandingCheck, type WakeMeta };
