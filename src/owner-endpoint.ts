@@ -81,7 +81,7 @@ export const OWNER_DOOR_HEALTH = "/owner/v1/health";
 export const OWNER_DOOR_SESSION = "/owner/v1/session";
 /** PR 4 (as ruled): the CLI's credential-bearing tool calls, an ALLOWLIST of exactly the tools its verbs call. */
 export const OWNER_DOOR_TOOL = "/owner/v1/tool";
-export const OWNER_DOOR_TOOL_ALLOWLIST: ReadonlySet<string> = new Set(["send_message", "resolve_messages", "health_check", "register_agent", "get_messages"]);
+export const OWNER_DOOR_TOOL_ALLOWLIST: ReadonlySet<string> = new Set(["send_message", "resolve_messages", "health_check", "register_agent", "get_messages", "whoami"]);
 export const OWNER_DOOR_PATHS: ReadonlySet<string> = new Set([OWNER_DOOR_PEEK, OWNER_DOOR_LIVENESS, OWNER_DOOR_REGISTER, OWNER_DOOR_HEALTH, OWNER_DOOR_SESSION, OWNER_DOOR_TOOL]);
 
 /** The owner-peek gate, before any parse: the two door endpoints, POST, without an MCP session. */

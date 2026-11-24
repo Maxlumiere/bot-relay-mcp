@@ -124,18 +124,10 @@ export async function run(argv: string[]): Promise<number> {
   // --- PR 4 (as ruled): the ROUTE first (src/cli/relay-client.ts). A LOCAL relay (loopback, any spelling) is
   // reached only through its owner door; a REMOTE one by a hardened bearer with per-remote credentials; an
   // unresolved host gets nothing. Host/port: the config, then the environment.
-  let host = "127.0.0.1";
-  let port = 3777;
-  try {
-    const { loadConfig } = await import("../config.js");
-    const cfg = loadConfig();
-    host = cfg.http_host || host;
-    port = cfg.http_port || port;
-  } catch {
-    host = process.env.RELAY_HTTP_HOST || host;
-    port = process.env.RELAY_HTTP_PORT ? parseInt(process.env.RELAY_HTTP_PORT, 10) : port;
-  }
-  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteToken, remoteSecret, envSelects, RelayClientError } = await import("./relay-client.js");
+  // The ONE derivation of the default endpoint (relay-client.ts defaultEndpoint): the env token is bound to it.
+  const { defaultEndpoint } = await import("./relay-client.js");
+  const { host, port } = await defaultEndpoint();
+  const { routeFor, unresolvedMessage, localTool, toolJson, remotePost, remoteToken, remoteSecret, envSelects, RelayClientError, remoteRefusal } = await import("./relay-client.js");
   const route = await routeFor(host, port);
   if (route.kind === "unresolved") {
     process.stderr.write(`relay send: ${unresolvedMessage(route)}\n`);
@@ -154,7 +146,7 @@ export async function run(argv: string[]): Promise<number> {
   const envToken = process.env.RELAY_AGENT_TOKEN;
   if (route.kind === "remote") {
     // A REMOTE gets only ITS credential: RELAY_AGENT_TOKEN, or its own vault scope. Never the local vault.
-    token = await remoteToken(route.host, route.port, from, { envSelected: envSelects(route.host) });
+    token = await remoteToken(route.host, route.port, from, { envSelected: await envSelects(route.host, route.port) });
     if (!token) {
       process.stderr.write(
         `relay send: no token for "${from}" on the remote relay ${route.host}:${route.port}: set RELAY_AGENT_TOKEN ` +
@@ -293,7 +285,9 @@ export async function run(argv: string[]): Promise<number> {
 
   if (status < 200 || status >= 300 || (parsed && parsed.success === false)) {
     process.stderr.write(
-      `relay send: daemon returned ${status} — ${parsed?.error ?? text.slice(0, 300)}\n`
+      route.kind === "remote"
+        ? `relay send: ${remoteRefusal(status, parsed)}\n`
+        : `relay send: daemon returned ${status} — ${parsed?.error ?? text.slice(0, 300)}\n`
     );
     return 1;
   }
@@ -311,11 +305,17 @@ export async function run(argv: string[]): Promise<number> {
   // and an id-only stdout that can be empty at exit 0 is worthless). Require a
   // non-empty string id; otherwise diagnose to STDERR and exit non-zero so the
   // capture fails loudly instead of silently binding "".
+  // A REMOTE reply that is not a real success:true renders through the ONE closed-set helper (ruling d559d33f); the
+  // "no usable message_id" line below is only for a reply that really says success:true.
+  if (route.kind === "remote" && parsed?.success !== true) {
+    process.stderr.write(`relay send: ${remoteRefusal(status, parsed)}\n`);
+    return 1;
+  }
   const id = typeof parsed?.message_id === "string" ? parsed.message_id.trim() : "";
   if (!id) {
     process.stderr.write(
       `relay send: daemon returned success but no usable message_id — refusing to emit an empty capture. ` +
-        `Response: ${text.slice(0, 300)}\n`
+        (route.kind === "remote" ? "(the remote's reply text is withheld: it can carry credentials)\n" : `Response: ${text.slice(0, 300)}\n`)
     );
     return 1;
   }

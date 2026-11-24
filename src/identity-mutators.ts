@@ -104,7 +104,7 @@ export const VERIFY_SITES: Readonly<Record<string, VerifySite>> = Object.freeze(
     writes: "the dashboard send_message as `from`: refused with retry when the auth generation moved during the verify, then revalidate (SEC-20) synchronously, with no await, immediately before the send",
   },
   "src/mint-reuse.ts:stableMintOrReuse": { awaits: ["authorizeAgentToken"], kind: "none", writes: "returns the vault token for reuse (never a revoked row's)" },
-  "src/cli/resolve.ts:run": { awaits: ["authorizeAgentToken"], kind: "none", writes: "nothing in the DB: the token is sent on, and the daemon verifies it again" },
+  "src/cli/agent-token.ts:resolveCliAgentToken": { awaits: ["authorizeAgentToken"], kind: "none", writes: "nothing in the DB: the token is sent on (relay resolve, relay whoami), and the daemon verifies it again" },
   "src/cli/send.ts:run": { awaits: ["authorizeAgentToken"], kind: "none", writes: "nothing in the DB: the token is sent on, and the daemon verifies it again" },
 });
 
