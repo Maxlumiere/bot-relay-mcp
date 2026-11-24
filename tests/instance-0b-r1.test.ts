@@ -164,6 +164,20 @@ describe.skipIf(!POSIX)("ruling 3fc05540: a link BELOW the relay home is never a
     expect(fs.readdirSync(storage)).toEqual(["instance.json"]);
     fs.rmSync(storage, { recursive: true, force: true });
   });
+  it("a linked instances/<id> holding a relay.db (no record) → the same line: a DB behind a link is NOT a provisioning; the open refuses", async () => {
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r1-storage-"));
+    fs.writeFileSync(path.join(storage, "relay.db"), "");
+    fs.mkdirSync(instances(), { recursive: true });
+    fs.symlinkSync(storage, path.join(instances(), "a"));
+    process.env.RELAY_INSTANCE_ID = "a";
+    const { resolveInstance } = await import("../src/instance.js");
+    const r = resolveInstance() as { kind: string; reason?: string };
+    expect(r.kind).toBe("error");
+    expect(r.reason).toMatch(LINE);
+    const { assertInstanceProvisionedAtOpen } = await import("../src/instance.js");
+    expect(() => assertInstanceProvisionedAtOpen(path.join(instances(), "a", "relay.db"))).toThrow(/instances\/a is a symbolic link/);
+    fs.rmSync(storage, { recursive: true, force: true });
+  });
   it("a linked instances/ → the same line, naming instances/", async () => {
     const storage = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r1-storage-"));
     fs.mkdirSync(path.join(storage, "a"));
