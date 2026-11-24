@@ -42,7 +42,7 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "2124ee055f67";
+export const RESOLVER_REVISION = "a9d948119621";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";
@@ -156,16 +156,15 @@ export function isProvisionedInstance(instanceDirPath: string, dbExists: boolean
  * lexically AND on real paths (the instances root may not exist yet, or be reached through a link). The ONE layout
  * test: the resolver's explicit branches and the open's re-check (src/db.ts via src/instance.ts) both use it.
  */
-export function instanceDirOfDbPath(dbPath: string, instancesRoot: string): string | null {
-  if (path.basename(dbPath) !== DB_FILENAME) return null;
+export function instanceDirOfDbPath(dbPath: string, instancesRoot: string, opts: { caseInsensitive?: boolean } = {}): string | null {
   const dir = path.dirname(dbPath);
   const parent = path.dirname(dir);
-  const root = instancesRoot;
-  if (path.resolve(parent) === path.resolve(root)) return dir; // the fast path
-  // realpathSync.NATIVE: on a case-insensitive file system it returns the on-disk case, where JS realpathSync keeps
-  // the caller's (MEASURED, macOS: ".../INSTANCES" stays upper-case under realpathSync, ".../instances" under
-  // .native), so a wrong-case path into instances/ is recognised. The nearest EXISTING ancestor is resolved and the
-  // missing tail re-appended (the instances root itself may not exist yet).
+  // The fast path: the exact spelling.
+  if (path.basename(dbPath) === DB_FILENAME && path.resolve(parent) === path.resolve(instancesRoot)) return dir;
+  // COMPONENT BY COMPONENT (item 0b): each side canonicalised (the nearest EXISTING ancestor through realpath.native,
+  // which returns the on-disk case; the missing tail re-appended in the caller's spelling), then compared per
+  // component, the basename included, case-FOLDED only when the file system is case-insensitive (detected at the
+  // instances root's nearest existing ancestor; undetectable reads as insensitive: a wider layout only refuses more).
   const nearestReal = (q: string): string | null => {
     let cur = path.resolve(q);
     const tail: string[] = [];
@@ -181,8 +180,60 @@ export function instanceDirOfDbPath(dbPath: string, instancesRoot: string): stri
     }
   };
   const rp = nearestReal(parent);
-  const rr = nearestReal(root);
-  return rp !== null && rr !== null && rp === rr ? dir : null;
+  const rr = nearestReal(instancesRoot);
+  if (rp === null || rr === null) return null;
+  const fold = opts.caseInsensitive ?? fsIsCaseInsensitiveAt(instancesRoot);
+  const same = (a: string, b: string): boolean => (fold ? caseFold(a) === caseFold(b) : a === b);
+  if (!same(path.basename(dbPath), DB_FILENAME)) return null;
+  const pa = rp.split(path.sep);
+  const pb = rr.split(path.sep);
+  return pa.length === pb.length && pa.every((c, i) => same(c, pb[i]!)) ? dir : null;
+}
+
+/** The fold for a case-insensitive file system's names (APFS / NTFS: Unicode case-insensitive). */
+const caseFold = (s: string): string => s.normalize("NFC").toUpperCase().toLowerCase();
+
+/**
+ * Is the file system at `p` case-INSENSITIVE? Detected, read-only: on the nearest existing path, find a component
+ * with a cased letter and stat its case-swapped spelling; the SAME file (dev + ino) means insensitive, absent or
+ * another file means sensitive. No cased component anywhere (undetectable) reads as insensitive (fail closed: the
+ * layout test then refuses more, never less).
+ */
+export function fsIsCaseInsensitiveAt(p: string): boolean {
+  let cur = path.resolve(p);
+  for (;;) {
+    try {
+      fs.lstatSync(cur);
+      break;
+    } catch {
+      const up = path.dirname(cur);
+      if (up === cur) return true;
+      cur = up;
+    }
+  }
+  const real = (() => {
+    try {
+      return fs.realpathSync.native(cur);
+    } catch {
+      return cur;
+    }
+  })();
+  const parts = real.split(path.sep);
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const c = parts[i]!;
+    const swapped = [...c].map((ch) => (ch === ch.toUpperCase() ? ch.toLowerCase() : ch.toUpperCase())).join("");
+    if (swapped === c) continue; // no cased letter in this component
+    const here = parts.slice(0, i + 1).join(path.sep);
+    const altHere = [...parts.slice(0, i), swapped].join(path.sep);
+    try {
+      const a = fs.lstatSync(here, { bigint: true });
+      const b = fs.lstatSync(altHere, { bigint: true });
+      return a.dev === b.dev && a.ino === b.ino;
+    } catch {
+      return false; // the swapped spelling does not exist: case-sensitive
+    }
+  }
+  return true;
 }
 
 /** The refusal for a selected instance that was never provisioned: the id, what named it, how to create or select one. */
