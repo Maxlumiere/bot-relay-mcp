@@ -26,6 +26,7 @@ import { AsyncLocalStorage } from "async_hooks";
 import childProcess, { spawn } from "child_process";
 import { installSyncRecorder, type SyncRecorder } from "./_helpers/sync-call-recorder.js";
 import { LAPSE_MAX_BUSY, OCCUPANCY_FLOOR, lapseReport, lapsedPool, occupancy, type PoolOccupancy, type PoolWork } from "./_helpers/pool-occupancy.js";
+import { startOffCpuWatch, offCpuLines } from "./_helpers/offcpu-watch.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-b-")));
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
@@ -1309,7 +1310,14 @@ function announce(bare: string): void {
 type BarOpts = { onLoop?: () => void; onOpen?: () => void; poolControl?: PoolWork; authPool?: PoolWork; controlOnLoop?: () => void; measureImpl?: typeof measure };
 async function runBar(label: string, port: number, load: Load, opts: BarOpts = {}): Promise<BarStats> {
   const signal = barSignalStore.getStore() ?? NEVER_ABORTED; // THIS test's lifetime, however late this runs
-  return withDiag(process.env, (rec) => runBarMeasured(label, port, load, opts, rec, signal), signal, label); // rec is null unless RELAY_TIMING_DIAG=1
+  // REPORT ONLY: the off-CPU wait watch (null unless RELAY_TIMING_OFFCPU=1; tests/_helpers/offcpu-watch.ts). Its OFFCPU
+  // lines name what the MAIN thread waited on in any stall; nothing here reads them.
+  const watch = startOffCpuWatch();
+  try {
+    return await withDiag(process.env, (rec) => runBarMeasured(label, port, load, opts, rec, signal), signal, label); // rec is null unless RELAY_TIMING_DIAG=1
+  } finally {
+    if (watch) for (const line of offCpuLines(label, watch, await watch.stop())) console.log(line);
+  }
 }
 async function runBarMeasured(label: string, port: number, load: Load, opts: BarOpts, rec: SyncRecorder | null, signal: AbortSignal = NEVER_ABORTED): Promise<BarStats> {
   // `measureImpl`: a seam for the WIRING MUTANT only (a measure that drops the occupancy reading).
