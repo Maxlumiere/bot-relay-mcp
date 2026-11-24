@@ -27,6 +27,7 @@ import { colocatedConfigPathFor } from "./instance.js";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
 import { acquireOwnerLock, assertSingleLink, canonicalReplaceTarget, holdsOwnerLock, lockKey, probeOwnerLock, OwnerLockError, type OwnerLock } from "./db-owner-lock.js";
+import { renameReplacingWithWindowsRetry, type ReplaceError } from "./fs-replace.js";
 import {
   assertDriverHeaderAllows,
   noteNativeHandleOpened,
@@ -1038,21 +1039,15 @@ let persistRename: (from: string, to: string) => void = (from, to) => fs.renameS
 export function _setPersistRenameForTests(fn: ((from: string, to: string) => void) | null): void {
   persistRename = fn ?? ((from, to) => fs.renameSync(from, to));
 }
-const WINDOWS_OPEN_FILE_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
-/** The atomic replace: Windows cannot replace a file another process holds open, so a short bounded retry, then named. */
+/** The atomic replace (src/fs-replace.ts: the ONE Windows-only bounded retry), then a NAMED refusal. */
 function replaceWithRetry(tmp: string, target: string): void {
-  const waits = process.platform === "win32" ? [25, 50, 100, 200] : [];
-  for (let i = 0; ; i++) {
+  {
     try {
-      persistRename(tmp, target);
+      renameReplacingWithWindowsRetry(tmp, target, { rename: persistRename });
       return;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code ?? "";
-      const openOnWindows = process.platform === "win32" && WINDOWS_OPEN_FILE_CODES.has(code);
-      if (openOnWindows && i < waits.length) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waits[i]);
-        continue;
-      }
+      const openOnWindows = (err as ReplaceError).windowsOpenFile === true;
       const why = openOnWindows ? "another process has the DB file open; Windows cannot replace it" : `the DB file could not be replaced (${code || (err as Error).message})`;
       throw new Error(
         `wasm persist refused: ${why}; nothing was written to ${target}. The change stays in memory and is written ` +
