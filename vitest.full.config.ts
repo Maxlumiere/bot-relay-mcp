@@ -14,6 +14,7 @@ export default withOperatorTripwire({
     globalSetup: ["./tests/global-user-config-tripwire.ts"],
     setupFiles: ["./tests/_setup/hermetic-config.ts", "./tests/_setup/no-fs-on-held-db.ts"],
     include: ["tests/**/*.test.ts"],
-    exclude: ["node_modules/**", "dist/**"],
+    // Doorbell PR 8 M7: the measurement harness runs only through tests/m7/run-m7.sh (vitest.m7.config.ts).
+    exclude: ["node_modules/**", "dist/**", "tests/m7/**"],
   },
 });

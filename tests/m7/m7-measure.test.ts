@@ -23,6 +23,9 @@ import { startToken } from "../helpers/start-token.js";
 import { budgetTree } from "../_helpers/hook-budget-tree.js";
 import { systemBinarySeamPath } from "../_helpers/system-binary-seam-env.js";
 
+// Launched ONLY by tests/m7/run-m7.sh (its refusals run first): any other launcher (the full config, a bare vitest)
+// is refused before a window opens or a DB is touched.
+if (process.env.M7_RUNNER !== "1") throw new Error("m7: refusing: run tests/m7/run-m7.sh (it checks the sandbox before anything is written)");
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const RELAY_BIN = path.join(REPO, "bin", "relay");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "m7-measure-")));
@@ -136,8 +139,20 @@ const openWin = (agent: string | null = AGENT) => {
 };
 const short = (s: string) => s.trim().replace(/RELAY_DB_PATH='[^']+'/g, "RELAY_DB_PATH='<sandbox>'").replace(/'[^']*\/bin\/relay'/g, "'<repo>/bin/relay'");
 
+/** Close EVERY window even when one close rejects, then SIGKILL any whose recorded pid still runs. */
+async function closeAll(ws: TestWindow[]): Promise<void> {
+  await Promise.allSettled(ws.map((w) => w.close()));
+  for (const w of ws) if (alive(w.pid)) {
+    try {
+      process.kill(w.pid, "SIGKILL");
+    } catch {
+      /* gone between the check and the kill */
+    }
+  }
+}
+
 afterAll(async () => {
-  for (const w of windows) await w.close();
+  await closeAll(windows.splice(0));
   write();
   db.closeDb();
   fs.rmSync(ROOT, { recursive: true, force: true });
@@ -146,7 +161,7 @@ afterAll(async () => {
 
 describe.skipIf(!OWN)(`M7 (doorbell PR 8 gate brief §4) on ${SHA}`, () => {
   beforeEach(async () => {
-    for (const w of windows.splice(0)) await w.close();
+    await closeAll(windows.splice(0));
     db.closeDb();
     fs.rmSync(path.join(ROOT, "inst"), { recursive: true, force: true });
     fs.rmSync(HOME, { recursive: true, force: true });
@@ -285,6 +300,7 @@ describe.skipIf(!OWN)(`M7 (doorbell PR 8 gate brief §4) on ${SHA}`, () => {
   it("check 6: `relay pending --watch-status` and `relay doorbell status` in the never, live, stale and absent states", () =>
     measure("6", async (ev) => {
       const states: Record<string, string> = {};
+      const doorbell: Record<string, string> = {};
       const read = (label: string) => {
         const p = relay(["pending", AGENT, "--json", "--watch-status"]);
         const d = relay(["doorbell", "status"]);
@@ -302,7 +318,15 @@ describe.skipIf(!OWN)(`M7 (doorbell PR 8 gate brief §4) on ${SHA}`, () => {
           /* recorded as unparsed */
         }
         states[label] = watch;
-        ev.push(`${label}: pending exit ${p.status}, watch=${watch}; doorbell status exit ${d.status}: ${short(d.stdout).slice(0, 200)}; --json dormant_watches=${dormant}`);
+        let shape = "(unparsed)";
+        try {
+          const j = JSON.parse(dj.stdout) as Record<string, unknown>;
+          shape = typeof j.state === "string" && typeof j.dormant_watches === "object" && j.dormant_watches !== null && typeof j.escalations === "object" ? "ok" : "missing fields";
+        } catch {
+          /* recorded as unparsed */
+        }
+        doorbell[label] = `${d.status}/${dj.status}/${shape}`;
+        ev.push(`${label}: pending exit ${p.status}, watch=${watch}; doorbell status exit ${d.status}: ${short(d.stdout).slice(0, 200)}; --json exit ${dj.status}, shape ${shape}, dormant_watches=${dormant}`);
       };
       read("never");
       const r = win.runRelayWatch([AGENT, ...WATCH]);
@@ -319,6 +343,8 @@ describe.skipIf(!OWN)(`M7 (doorbell PR 8 gate brief §4) on ${SHA}`, () => {
       await within(r.exited, 10_000);
       read("absent");
       expect(states).toEqual({ never: "never", live: "live", stale: "stale", absent: "absent" });
+      // `relay doorbell status` (text and --json) answers in every state: exit 0 and the documented JSON shape.
+      expect(doorbell).toEqual({ never: "0/0/ok", live: "0/0/ok", stale: "0/0/ok", absent: "0/0/ok" });
       return "the stale state is INDUCED (the holder SIGSTOPped and its heartbeat aged past HEARTBEAT_STALE_MS on the awake clock), as the pr7 suite does; `doorbell status` reports the supervisor (not-installed in a sandbox) and dormant-watch counts, not a per-agent watch state.";
     }), 60_000);
 
