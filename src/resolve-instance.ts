@@ -42,7 +42,7 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "ebb616a399f9";
+export const RESOLVER_REVISION = "101f07906f45";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";
@@ -253,8 +253,32 @@ export function fsIsCaseInsensitiveAt(p: string, lstat: (q: string) => { dev: bi
   return true;
 }
 
+/**
+ * Ruling 3fc05540: below the trust root (the relay home, which MAY be a link) every component is real, for read AND
+ * write; a linked instances/ or instances/<id> is NOT an instance. Which one is a link, by its relative name, or null.
+ */
+export function linkedInstanceComponent(instanceDirPath: string): string | null {
+  const id = path.basename(instanceDirPath);
+  for (const [p, name] of [[path.dirname(instanceDirPath), "instances/"], [instanceDirPath, `instances/${id}`]] as const) {
+    try {
+      if (fs.lstatSync(p).isSymbolicLink()) return name;
+    } catch {
+      /* absent: not a link */
+    }
+  }
+  return null;
+}
+
 /** The refusal for a selected instance that was never provisioned: the id, what named it, how to create or select one. */
 export function unprovisionedReason(id: string, namedBy: string, instanceDirPath: string, select: string): string {
+  // A LINK below the relay home gets its own refusal (never "does not exist"), with the supported way to move storage.
+  const linked = linkedInstanceComponent(instanceDirPath);
+  if (linked !== null) {
+    return (
+      `relay: the instance directory ${linked} is a symbolic link, which is not allowed below the relay home. To keep the ` +
+      `relay on other storage, move or link the WHOLE relay home (RELAY_HOME / ~/.bot-relay) instead.`
+    );
+  }
   return (
     `instance "${id}" (named by ${namedBy}) does not exist: ${instanceDirPath} holds no ${INSTANCE_METADATA_FILENAME} and no ` +
     `${DB_FILENAME}. Opening it would CREATE an empty relay that looks connected while its peers use another instance, ` +

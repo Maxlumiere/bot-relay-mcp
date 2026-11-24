@@ -68,5 +68,12 @@
   "find": "    fs.renameSync(tmp, metaPath);\n  } catch (err) {\n    fs.rmSync(tmp, { force: true });",
   "replace": "    fs.renameSync(tmp, metaPath);\n  } catch (err) {\n    void tmp;",
   "test": "tests/instance-0b-r1.test.ts"
+ },
+ {
+  "name": "r1-link-refusal-generic",
+  "file": "src/resolve-instance.ts",
+  "find": "  const linked = linkedInstanceComponent(instanceDirPath);\n  if (linked !== null) {",
+  "replace": "  const linked = linkedInstanceComponent(instanceDirPath);\n  if (linked !== null && false) {",
+  "test": "tests/instance-0b-r1.test.ts"
  }
 ]

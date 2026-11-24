@@ -145,10 +145,54 @@ describe("P3 + the security fold-ins: role-only errors, no temp left behind, no 
   });
 });
 
+describe.skipIf(!POSIX)("ruling 3fc05540: a link BELOW the relay home is never an instance, with its own refusal (read and write)", () => {
+  const LINE = /^relay: the instance directory (instances\/a|instances\/) is a symbolic link, which is not allowed below the relay home\. To keep the relay on other storage, move or link the WHOLE relay home \(RELAY_HOME \/ ~\/\.bot-relay\) instead\.$/;
+  it("a linked instances/<id> → the specific line (never 'does not exist'); the open refuses and creates nothing", async () => {
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r1-storage-"));
+    fs.writeFileSync(path.join(storage, "instance.json"), "{}");
+    fs.mkdirSync(instances(), { recursive: true });
+    fs.symlinkSync(storage, path.join(instances(), "a"));
+    process.env.RELAY_INSTANCE_ID = "a";
+    const { resolveInstance } = await import("../src/instance.js");
+    const r = resolveInstance() as { kind: string; reason?: string };
+    expect(r.kind).toBe("error");
+    expect(r.reason).toMatch(LINE);
+    expect(r.reason).toContain("instances/a ");
+    const { initializeDb, closeDb } = await import("../src/db.js");
+    await expect(initializeDb()).rejects.toThrow(/is a symbolic link, which is not allowed below the relay home/);
+    closeDb();
+    expect(fs.readdirSync(storage)).toEqual(["instance.json"]);
+    fs.rmSync(storage, { recursive: true, force: true });
+  });
+  it("a linked instances/ → the same line, naming instances/", async () => {
+    const storage = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r1-storage-"));
+    fs.mkdirSync(path.join(storage, "a"));
+    fs.writeFileSync(path.join(storage, "a", "instance.json"), "{}");
+    fs.symlinkSync(storage, instances());
+    process.env.RELAY_INSTANCE_ID = "a";
+    const { resolveInstance } = await import("../src/instance.js");
+    const r = resolveInstance() as { kind: string; reason?: string };
+    expect(r.reason).toMatch(LINE);
+    expect(r.reason).toContain("instances/ is a symbolic link");
+    fs.rmSync(storage, { recursive: true, force: true });
+  });
+  it("the CONTROL: a linked relay HOME (the trust root) with real children still resolves the instance", async () => {
+    const realHome = fs.mkdtempSync(path.join(os.tmpdir(), "relay-0b-r1-realhome-"));
+    const linkedHome = path.join(home, "linked-relay-home");
+    fs.symlinkSync(realHome, linkedHome);
+    process.env.RELAY_HOME = linkedHome;
+    createInstance("ok", "t");
+    process.env.RELAY_INSTANCE_ID = "ok";
+    const { resolveInstance } = await import("../src/instance.js");
+    expect((resolveInstance() as { kind: string }).kind).toBe("instance");
+    fs.rmSync(realHome, { recursive: true, force: true });
+  });
+});
+
 describe("the mutation fixture (tests/fixtures/instance-0b-mutants.json; run: node scripts/mutation-sweep.mjs <fixture>)", () => {
   it("every mutant still applies: its find text occurs exactly once in its file; names are unique", () => {
     const M = JSON.parse(fs.readFileSync(path.join(REPO, "tests", "fixtures", "instance-0b-mutants.json"), "utf-8")) as Array<{ name: string; file: string; find: string }>;
-    expect(M.length).toBeGreaterThanOrEqual(10);
+    expect(M.length).toBeGreaterThanOrEqual(11);
     for (const m of M) expect(fs.readFileSync(path.join(REPO, m.file), "utf-8").split(m.find).length - 1, m.name).toBe(1);
     expect(new Set(M.map((m) => m.name)).size).toBe(M.length);
   });
