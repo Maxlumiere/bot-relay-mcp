@@ -64,7 +64,7 @@ describe("the replace helper's test seam is test-only", () => {
 // new seam is covered the day it lands. Comments are stripped first (a comment that cites a seam is not a caller).
 // ---------------------------------------------------------------------------------------------------------------------
 /** A test seam, by name. */
-export const SEAM_NAME = /^__test/;
+export const SEAM_NAME = /^__test|ForTests$/;
 const SRC_FILE = /\.(ts|mts|cts|js|mjs|cjs)$/;
 
 /** The text with its comments removed (block and line comments; a "//" inside a string literal is kept). */
