@@ -18,6 +18,9 @@ import path from "path";
  *                                     loop). With 0, every budgeted step gets exactly min(own, what an instant
  *                                     arrival leaves), whatever the runner's speed.
  *   RELAY_TEST_STARVE=<case pattern>  those steps get 0s: the REAL skip path runs.
+ *   RELAY_TEST_ELAPSED_AT=<case pattern> with RELAY_TEST_ELAPSED=<n>: while THOSE steps budget, the clock reads n
+ *                                     seconds spent; each keeps its NORMAL own cap, so the hook's own subtraction
+ *                                     (relay_margin_secs / relay_premail_secs) decides whether it runs.
  *   RELAY_TEST_STARVE_AFTER=<n>       with RELAY_TEST_STARVE_COUNT=<file>: the matching steps run normally for their
  *                                     first n calls (counted in that file: the calls run in subshells), then starve. A
  *                                     walk is cut MID-WAY by the budget at an exact call, whatever the runner's speed.
@@ -82,7 +85,26 @@ function unclassifiedSecondsReads(hooksDir: string): string[] {
 /** The SECONDS reads a hooks dir would be refused for (exported so the guard itself is tested). */
 export const budgetGuardFindings = (hooksDir: string): string[] => unclassifiedSecondsReads(hooksDir);
 
-export function budgetTree(dir: string, hooksDir: string, binDir: string): string {
+/**
+ * A hook INSTALLED with another declared timeout: rewrite the ONE inline `RELAY_HOOK_BUDGET_SECS=<n>` line of a hook's
+ * source to `secs` (the same assignment production uses; the source of truth stays the profile's hookInstall timeout,
+ * held equal to the shipped line by its own test). REFUSES unless the line occurs exactly once: a future hook edit can
+ * never silently leave the budget at its old value.
+ */
+export function rewriteDeclaredBudget(src: string, secs: number): string {
+  const re = /^RELAY_HOOK_BUDGET_SECS=\d+$/gm;
+  const n = (src.match(re) ?? []).length;
+  if (n !== 1) throw new Error(`rewriteDeclaredBudget: expected exactly 1 RELAY_HOOK_BUDGET_SECS=<n> line, found ${n}: update the helper`);
+  if (!Number.isInteger(secs) || secs < 1) throw new Error(`rewriteDeclaredBudget: not a budget: ${secs}`);
+  return src.replace(re, `RELAY_HOOK_BUDGET_SECS=${secs}`);
+}
+
+/**
+ * `opts.declaredBudget`: per hook file name, the timeout that copy is "installed" with (rewriteDeclaredBudget). For
+ * behaviour tests whose assertions must not depend on the runner's speed; the budget-skip path keeps its own test on
+ * the real declared value.
+ */
+export function budgetTree(dir: string, hooksDir: string, binDir: string, opts: { declaredBudget?: Readonly<Record<string, number>> } = {}): string {
   const base = path.join(dir, "bot-relay-mcp");
   fs.rmSync(dir, { recursive: true, force: true });
   try {
@@ -92,6 +114,10 @@ export function budgetTree(dir: string, hooksDir: string, binDir: string): strin
     const distDir = path.join(path.dirname(binDir), "dist");
     if (fs.existsSync(distDir)) fs.symlinkSync(distDir, path.join(base, "dist"), "junction");
     const copy = path.join(base, "hooks");
+    for (const [hook, secs] of Object.entries(opts.declaredBudget ?? {})) {
+      const p = path.join(copy, hook);
+      fs.writeFileSync(p, rewriteDeclaredBudget(fs.readFileSync(p, "utf-8"), secs));
+    }
     const stray = unclassifiedSecondsReads(copy);
     if (stray.length) throw new Error(`budgetTree: SECONDS read outside the seamed budget arithmetic, unclassified: ${stray.join(" | ")}`);
     const helpers = path.join(copy, "_vault-helpers.sh");
@@ -112,7 +138,7 @@ export function budgetTree(dir: string, hooksDir: string, binDir: string): strin
           "",
           "# TEST ONLY (budgetTree): RELAY_TEST_STARVE. See tests/_helpers/hook-budget-tree.ts.",
           `eval "$(declare -f relay_budget_for | sed '1s/^relay_budget_for/relay_budget_for_real/')"`,
-          'relay_budget_for() { case "$1" in ${RELAY_TEST_STARVE:-}) relay_test_starve_now && { relay_budget_for_real "$1" 0 "${3:-}"; return; }; relay_budget_for_real "$@" ;; *) relay_budget_for_real "$@" ;; esac; }',
+          'relay_budget_for() { case "$1" in ${RELAY_TEST_ELAPSED_AT:-}) local RELAY_TEST_CLOCK="${RELAY_TEST_ELAPSED:?RELAY_TEST_ELAPSED_AT needs RELAY_TEST_ELAPSED}"; relay_budget_for_real "$@"; return ;; esac; case "$1" in ${RELAY_TEST_STARVE:-}) relay_test_starve_now && { relay_budget_for_real "$1" 0 "${3:-}"; return; }; relay_budget_for_real "$@" ;; *) relay_budget_for_real "$@" ;; esac; }',
           'relay_test_starve_now() { [ -n "${RELAY_TEST_STARVE_AFTER:-}" ] && [ -n "${RELAY_TEST_STARVE_COUNT:-}" ] || return 0; local n; n=$(cat "$RELAY_TEST_STARVE_COUNT" 2>/dev/null); n=$(( ${n:-0} + 1 )); printf \'%s\' "$n" > "$RELAY_TEST_STARVE_COUNT"; [ "$n" -gt "$RELAY_TEST_STARVE_AFTER" ]; }',
           "",
         ].join("\n"),
