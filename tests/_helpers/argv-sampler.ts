@@ -9,11 +9,13 @@
  *
  * COVERAGE BY HANDSHAKE, never by timing (the standing rule for observer tests): the process under observation is
  * held alive by the test's own fake server, which calls `waitForSamples(n, deadlineMs)` before it answers. That
- * resolves once n samples have STARTED after the call (and finished), so each one is a snapshot taken while the
- * request (and the client that sent it) was provably in flight; it REJECTS past the deadline (a coverage failure
- * blocks, it never passes). `heldSamples` counts those samples, and a row asserts it against its bar.
+ * resolves `true` once n samples have STARTED inside the hold and COMPLETED while it was still held, so each one is a
+ * snapshot taken while the request (and the client that sent it) was provably in flight; past the deadline it
+ * resolves `false` (the row must assert the handshake: a coverage failure blocks, it never passes).
+ * A FAILED observation (ps could not spawn, exited non-zero, or timed out) is never counted as a sample: it is recorded
+ * in `failures`, and the row asserts there are none. Every wait is bounded, including `stop()`.
  */
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 
 /**
  * Can `ps -axww -o args=` show a process's FULL argv on this machine? A unique marker is put on a child's argv, and the
@@ -38,43 +40,79 @@ export function argvSamplerProbe(): { visible: boolean; why: string } {
 }
 
 export interface ArgvSampler {
-  /** Every completed sample. */
+  /** Every SUCCESSFUL sample. */
   readonly sampled: number;
-  /** Completed samples that STARTED inside a `waitForSamples` hold. */
+  /** Successful samples that started inside a hold and completed while that hold was still active. */
   readonly heldSamples: number;
   /** The `ps` lines that held the secret ("" when none did). */
   readonly leaked: string;
-  /** Resolves once `n` samples have started after this call and finished; rejects past `deadlineMs`. */
-  waitForSamples(n: number, deadlineMs: number): Promise<void>;
-  /** Stops the loop and waits for the sample in flight. */
+  /** Every FAILED observation (never counted as a sample). */
+  readonly failures: readonly string[];
+  /** true once `n` held samples completed inside this hold; false past `deadlineMs`. Settles exactly once. */
+  waitForSamples(n: number, deadlineMs: number): Promise<boolean>;
+  /** Stops the loop; kills and reaps a sample in flight. Bounded. */
   stop(): Promise<void>;
 }
 
-export function startArgvSampler(secret: string, opts: { gapMs?: number } = {}): ArgvSampler {
+interface Hold {
+  need: number;
+  got: number;
+  active: boolean;
+  settle: (ok: boolean) => void;
+}
+
+/** `opts.ps` replaces the observer command (tests of the sampler itself: a failing, slow or stuck observer). */
+export function startArgvSampler(secret: string, opts: { gapMs?: number; sampleTimeoutMs?: number; ps?: [string, string[]] } = {}): ArgvSampler {
   let sampled = 0;
   let heldSamples = 0;
   let leaked = "";
+  const failures: string[] = [];
   let done = false;
-  let holds = 0; // active waitForSamples calls
-  const waiters: { need: number; got: number; resolve: () => void }[] = [];
+  let inFlight: ChildProcess | null = null;
+  const holds = new Set<Hold>();
+
+  /** One `ps` run, bounded; resolves its stdout, or a failure reason. */
+  const sample = (): Promise<{ out: string } | { failed: string }> =>
+    new Promise((resolve) => {
+      let settled = false;
+      const finish = (r: { out: string } | { failed: string }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        inFlight = null;
+        resolve(r);
+      };
+      const [cmd, args] = opts.ps ?? ["ps", ["-axww", "-o", "args="]];
+      const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "ignore"] });
+      inFlight = p;
+      let o = "";
+      p.stdout!.on("data", (d: Buffer) => (o += d));
+      p.on("error", (e) => finish({ failed: `ps could not spawn (${e.message})` }));
+      p.on("close", (code, signal) => finish(code === 0 ? { out: o } : { failed: `ps exited ${code ?? signal}` }));
+      const timer = setTimeout(() => {
+        p.kill("SIGKILL");
+        finish({ failed: `ps timed out after ${opts.sampleTimeoutMs ?? 5_000} ms` });
+      }, opts.sampleTimeoutMs ?? 5_000);
+    });
+
   const loop = (async () => {
     while (!done) {
-      const startedInHold = holds > 0;
-      const startedFor = waiters.slice(); // only the waiters already waiting when this sample STARTED
-      const out = await new Promise<string>((resolve) => {
-        const p = spawn("ps", ["-axww", "-o", "args="], { stdio: ["ignore", "pipe", "ignore"] });
-        let o = "";
-        p.stdout.on("data", (d: Buffer) => (o += d));
-        p.on("close", () => resolve(o));
-        p.on("error", () => resolve(""));
-      });
-      sampled++;
-      if (startedInHold) heldSamples++;
-      if (out.includes(secret)) leaked = out.split("\n").filter((l) => l.includes(secret)).join("\n");
-      for (const w of startedFor) if (++w.got >= w.need) w.resolve();
-      await new Promise((r) => setTimeout(r, opts.gapMs ?? 20));
+      const startedIn = [...holds].filter((h) => h.active); // the holds active when this sample STARTED
+      const r = await sample();
+      if ("failed" in r) {
+        failures.push(r.failed);
+      } else {
+        sampled++;
+        if (r.out.includes(secret)) leaked = r.out.split("\n").filter((l) => l.includes(secret)).join("\n");
+        // Counted only for holds STILL active at completion (a sample finishing after a release proves nothing).
+        const stillHeld = startedIn.filter((h) => h.active);
+        if (stillHeld.length > 0) heldSamples++;
+        for (const h of stillHeld) if (++h.got >= h.need) h.settle(true);
+      }
+      if (!done) await new Promise((res) => setTimeout(res, opts.gapMs ?? 20));
     }
   })();
+
   return {
     get sampled() {
       return sampled;
@@ -85,27 +123,29 @@ export function startArgvSampler(secret: string, opts: { gapMs?: number } = {}):
     get leaked() {
       return leaked;
     },
+    get failures() {
+      return failures;
+    },
     waitForSamples(n, deadlineMs) {
-      holds++;
-      return new Promise<void>((resolve, reject) => {
-        const w = { need: n, got: 0, resolve: () => {} };
-        const timer = setTimeout(() => {
-          waiters.splice(waiters.indexOf(w), 1);
-          holds--;
-          reject(new Error(`argv sampler: ${w.got} of ${n} samples within ${deadlineMs} ms: coverage NOT guaranteed`));
-        }, deadlineMs);
-        w.resolve = () => {
+      return new Promise<boolean>((resolve) => {
+        const h: Hold = { need: n, got: 0, active: true, settle: () => {} };
+        const timer = setTimeout(() => h.settle(false), deadlineMs);
+        h.settle = (ok) => {
+          if (!h.active) return; // settles exactly once
+          h.active = false;
           clearTimeout(timer);
-          waiters.splice(waiters.indexOf(w), 1);
-          holds--;
-          resolve();
+          holds.delete(h);
+          resolve(ok);
         };
-        waiters.push(w);
+        holds.add(h);
       });
     },
     async stop() {
       done = true;
-      await loop;
+      for (const h of [...holds]) h.settle(false);
+      const p = inFlight as ChildProcess | null;
+      if (p && p.exitCode === null && p.signalCode === null) p.kill("SIGKILL");
+      await Promise.race([loop, new Promise((res) => setTimeout(res, 10_000))]);
     },
   };
 }

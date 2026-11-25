@@ -21,6 +21,7 @@ import { pathToFileURL } from "url";
 import type { Server as HttpServer } from "http";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
 import { startArgvSampler, argvSamplerProbe } from "./_helpers/argv-sampler.js";
+import { reportCoverageGap } from "./_helpers/coverage-gap.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-d-")));
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
@@ -306,6 +307,8 @@ describe("the hooks send the secret without exposing it (Q2)", () => {
   const PROBE = argvSamplerProbe();
   const argvNotEvaluated = !PROBE.visible;
   console.log(`[argv-sampler] probe: ${PROBE.visible ? "visible" : `NOT_EVALUATED: ${PROBE.why}`}`);
+  // A gap proven at runtime is VISIBLE: one "coverage gaps: …" line in the log and the CI job's step summary.
+  if (argvNotEvaluated) reportCoverageGap("pr-d-mint-gate argv non-exposure (3 rows)", PROBE.why, "a Windows argv sampler (Get-CimInstance Win32_Process CommandLine) behind the same probe and handshake");
   it.skipIf(process.platform === "win32")("the argv sampler can SEE a planted argv on macOS and Linux (the leak rows below are never vacuous there)", () => {
     expect(PROBE, PROBE.why).toMatchObject({ visible: true });
   });
@@ -319,38 +322,43 @@ describe("the hooks send the secret without exposing it (Q2)", () => {
     ensureMintSecret(ROOT);
     const secret = secretNow();
     let received: string | undefined;
+    const handshakes: boolean[] = [];
     const sampler = startArgvSampler(secret, { gapMs: opts.gapMs });
     const srv = createServer((req, res) => {
       received = req.headers["x-relay-secret"] as string | undefined;
       // Hold curl ALIVE until the sampler has its samples (a handshake, not a timer); a coverage failure fails the bar.
-      sampler.waitForSamples(4, 20_000).then(
-        () => res.end("{}"),
-        () => res.end("{}"),
-      );
+      void sampler.waitForSamples(4, 20_000).then((ok) => {
+        handshakes.push(ok);
+        res.end("{}");
+      });
     });
     await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
     const port = (srv.address() as { port: number }).port;
     const helpers = path.resolve("hooks/_vault-helpers.sh");
     // The PLANTED twin puts the secret on curl's argv (what the helper exists to prevent): the sampler must catch it.
+    // The secret reaches ONLY curl's argv: bash expands it from its environment (bash's own -c argv holds "$PLANTED").
     const send = opts.plantLeak
-      ? `curl -s -m 30 -H "X-Relay-Secret: ${secret}" -X POST http://127.0.0.1:${port}/mcp -d '{}' >/dev/null`
+      ? `curl -s -m 30 -H "X-Relay-Secret: $PLANTED" -X POST http://127.0.0.1:${port}/mcp -d '{}' >/dev/null`
       : `{ relay_mint_secret_curl_config || true; } | curl -s -m 30 -K - -X POST http://127.0.0.1:${port}/mcp -d '{}' >/dev/null`;
     const script = `. ${JSON.stringify(helpers)}; RELAY_RES_LOADED=1; RELAY_RES_KIND=instance; RELAY_RES_DB_PATH=${JSON.stringify(path.join(ROOT, "relay.db"))}; ${send}`;
     // ASYNC: the server and the sampler live on THIS loop (a spawnSync would block both: MEASURED, curl timed out).
     const child = await new Promise<{ status: number | null; stderr: string }>((resolve) => {
-      const p = spawn("bash", ["-c", script], { stdio: ["ignore", "ignore", "pipe"] });
+      const p = spawn("bash", ["-c", script], { stdio: ["ignore", "ignore", "pipe"], env: opts.plantLeak ? { ...process.env, PLANTED: secret } : process.env });
       let stderr = "";
       p.stderr.on("data", (d: Buffer) => (stderr += d));
       p.on("close", (status) => resolve({ status, stderr }));
     });
     await sampler.stop();
     await new Promise<void>((r) => srv.close(() => r()));
-    return { child, received, secret, sampler };
+    expect(script, "the planted secret is not in bash's own argv").not.toContain(secret);
+    return { child, received, secret, sampler, handshakes };
   }
 
   it.skipIf(argvNotEvaluated)("relay_mint_secret_curl_config | curl -K -: the server receives X-Relay-Secret, and NO process's argv ever holds the secret", async () => {
     const r = await curlWithSecret({ gapMs: 20 });
     expect(r.child.status, r.child.stderr).toBe(0);
+    expect(r.handshakes, "the coverage handshake succeeded").toEqual([true]);
+    expect(r.sampler.failures, "no failed observation").toEqual([]);
     expect(r.received, "the server received the secret as X-Relay-Secret").toBe(r.secret);
     expect(r.sampler.heldSamples, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
     expect(r.sampler.leaked, "no argv held the secret").toBe("");
@@ -359,14 +367,20 @@ describe("the hooks send the secret without exposing it (Q2)", () => {
   it.skipIf(argvNotEvaluated)("the same, with a SLOW sampler (300 ms between samples, a slow runner): coverage still holds (> 3 samples while curl is alive)", async () => {
     const r = await curlWithSecret({ gapMs: 300 });
     expect(r.child.status, r.child.stderr).toBe(0);
+    expect(r.handshakes, "the coverage handshake succeeded").toEqual([true]);
+    expect(r.sampler.failures, "no failed observation").toEqual([]);
     expect(r.sampler.heldSamples, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
     expect(r.sampler.leaked, "no argv held the secret").toBe("");
   }, 60_000);
 
   it.skipIf(argvNotEvaluated)("a PLANTED leak (the secret on curl's argv) is CAUGHT once coverage is guaranteed, even with a slow sampler", async () => {
     const r = await curlWithSecret({ gapMs: 300, plantLeak: true });
+    expect(r.handshakes, "the coverage handshake succeeded").toEqual([true]);
+    expect(r.sampler.failures, "no failed observation").toEqual([]);
     expect(r.sampler.heldSamples, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
     expect(r.sampler.leaked, "the planted argv leak is caught").toContain(r.secret);
+    // UNAMBIGUOUS: every line that held it is curl's (bash's argv never carried it).
+    for (const line of r.sampler.leaked.split("\n")) expect(line, "the leak is curl's argv").toMatch(/\bcurl\b/);
   }, 60_000);
 
   it("a symlinked or malformed secret file sends NOTHING (the server then refuses, loudly)", () => {
