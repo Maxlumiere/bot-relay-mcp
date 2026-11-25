@@ -20,10 +20,14 @@ import { fileURLToPath } from "node:url";
  * with a list that carries the canary (the quotes and commas keep normalisation from rejoining it).
  */
 export const CANARY = ["zq", "canary", "7f3e9a1d"].join("-");
-/** Optional, beside this file: "<label><TAB><path>" lines naming copies whose bytes must equal this file's. Its presence
- * makes this the PRIVATE canonical copy: only then does --self-test check copies and the secret's hash. */
+/** Optional, beside this file: "<label><TAB><path>" lines naming copies whose bytes must equal this file's (the private
+ * canonical copy's DRIFT check; a public copy has none). */
 const COPIES_FILE = "copies.tsv";
-/** Beside the --list file (private self-test): line 1 = the SHA-256 of the list as flattened when the CI secret was set. */
+/**
+ * Beside a --list FILE: line 1 = the SHA-256 of the list as flattened when the CI secret was set. A FILE list is private
+ * by definition (the CI form is --list-env), so a --self-test with a FILE list ALWAYS checks it: privacy is decided by
+ * how the list arrives, never by a file that could silently disappear.
+ */
 const SECRET_HASH_FILE = "public-denylist.secret.sha256";
 /** The field labels a caller may pass: a CLOSED set, so a label can never carry derived (leaking) text. */
 export const FIELDS = new Set([
@@ -178,7 +182,8 @@ export function secretStale(terms, listPath) {
   if (!listPath) return true;
   let recorded;
   try {
-    recorded = fs.readFileSync(path.join(path.dirname(fs.realpathSync(listPath)), SECRET_HASH_FILE), "utf-8").split(/\r?\n/)[0].trim();
+    // The EXACT first line: only its line ending is stripped (a trailing space is a different line).
+    recorded = fs.readFileSync(path.join(path.dirname(fs.realpathSync(listPath)), SECRET_HASH_FILE), "utf-8").split(/\r?\n/)[0];
   } catch {
     return true;
   }
@@ -187,6 +192,17 @@ export function secretStale(terms, listPath) {
 }
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+/** The private ref the published main is fetched into (fully qualified: no ref-name ambiguity, no refspec dependence). */
+const PUBLISHED_REF = "refs/leak-scan/published-main";
+/**
+ * The fetch's hardening: no inherited credential helper (the copies live in PUBLIC repos), no interactive ssh, no
+ * submodule recursion, no tags, no FETCH_HEAD; main is fetched EXPLICITLY (a narrowed refspec or a single-branch
+ * checkout cannot leave a stale origin/main standing in for it).
+ */
+const FETCH_ARGS = [
+  "-c", "credential.helper=", "-c", "core.sshCommand=ssh -o BatchMode=yes", "-c", "protocol.ext.allow=never",
+  "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", "origin", `+refs/heads/main:${PUBLISHED_REF}`,
+];
 /**
  * The PUBLISHED bytes of a copy that lives in a git repo: `git fetch`, then `git show origin/main:<path>` (never the
  * working tree: a local checkout may be a deploy tree, deliberately behind). Returns undefined when the copy is not
@@ -195,22 +211,27 @@ const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
  */
 function publishedBytes(target) {
   const dir = path.dirname(target);
+  if (!fs.existsSync(dir)) return null; // the copy's directory is absent: drift
   let root;
   try {
-    root = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], env: GIT_ENV, timeout: 30_000 }).trim();
-  } catch {
-    return undefined; // not in a git repo (or its directory is absent)
+    root = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], env: GIT_ENV, timeout: 30_000 }).trim();
+  } catch (err) {
+    // Only a CONFIRMED non-repository is read from disk; any other discovery failure (no git, a timeout, a broken
+    // repo) cannot be told apart from a stale published copy, so it cannot evaluate.
+    const e = /** @type {{ status?: number; stderr?: string }} */ (err);
+    if (e.status === 128 && /not a git repository/i.test(String(e.stderr ?? ""))) return undefined;
+    throw new CannotEvaluate("a copy's repository could not be determined");
   }
   try {
-    execFileSync("git", ["-C", root, "fetch", "--quiet", "origin"], { stdio: ["ignore", "ignore", "ignore"], env: GIT_ENV, timeout: 120_000 });
+    execFileSync("git", ["-C", root, ...FETCH_ARGS], { stdio: ["ignore", "ignore", "ignore"], env: GIT_ENV, timeout: 120_000 });
   } catch {
     throw new CannotEvaluate("a copy's published branch could not be fetched");
   }
   const rel = path.relative(fs.realpathSync(root), path.join(fs.realpathSync(dir), path.basename(target))).split(path.sep).join("/");
   try {
-    return execFileSync("git", ["-C", root, "show", `origin/main:${rel}`], { stdio: ["ignore", "pipe", "ignore"], env: GIT_ENV, timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
+    return execFileSync("git", ["-C", root, "show", `${PUBLISHED_REF}:${rel}`], { stdio: ["ignore", "pipe", "ignore"], env: GIT_ENV, timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
   } catch {
-    return null; // absent from origin/main
+    return null; // absent from the published main
   }
 }
 
@@ -268,10 +289,9 @@ function main() {
     const terms = loadList(args);
     if (args.selfTest) {
       if (findTerms(`a canary ${CANARY} here`, terms).length === 0) throw new CannotEvaluate("the canary did not go red");
-      // PRIVATE checks (only the canonical copy carries a copies file): the secret's hash, then the published copies.
-      const isPrivate = fs.existsSync(path.join(path.dirname(fileURLToPath(import.meta.url)), COPIES_FILE));
+      // PRIVATE checks: a FILE list (never CI's --list-env) checks the secret's hash; a copies file checks the copies.
       let failed = false;
-      if (isPrivate && secretStale(terms, args.list)) {
+      if (args.list && secretStale(terms, args.list)) {
         process.stdout.write("SECRET STALE: re-flatten and re-set PUBLIC_DENYLIST\n");
         failed = true;
       }
