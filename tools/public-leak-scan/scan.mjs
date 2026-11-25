@@ -7,7 +7,7 @@
 // The SELF-TEST (and its DRIFT labels, printed verbatim) is for the private canonical copy: never run it in a public context.
 // CALLERS: treat EVERY outcome except a scan-mode exit 0 with the output "PASS" as a refusal (exit 1, exit 2, a
 // signal, a timeout, a spawn failure, any other output).
-import { execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -191,7 +191,49 @@ export function secretStale(terms, listPath) {
   return recorded !== now;
 }
 
-const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+/**
+ * git's environment is built from an ALLOWLIST, never inherited and patched: nothing else (GIT_ASKPASS, SSH_ASKPASS,
+ * GIT_SSH, a credential helper's variables, GIT_DIR, …) can reach it by construction. Prompts are off everywhere.
+ */
+function gitEnv() {
+  const env = { LANG: "C", LC_ALL: "C", GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: "ssh -o BatchMode=yes", GCM_INTERACTIVE: "never" };
+  const keep = ["PATH", "HOME", "TMPDIR"];
+  if (process.platform === "win32") keep.push("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "TEMP", "TMP");
+  for (const k of keep) if (typeof process.env[k] === "string") env[k] = process.env[k];
+  return env;
+}
+/** git's own timeout for a fetch (milliseconds); LEAK_SCAN_GIT_TIMEOUT_MS may only SHORTEN it (a test hook). */
+const FETCH_TIMEOUT_MS = Math.min(120_000, Number(process.env.LEAK_SCAN_GIT_TIMEOUT_MS) > 0 ? Number(process.env.LEAK_SCAN_GIT_TIMEOUT_MS) : 120_000);
+
+/**
+ * Run git, bounded: in its OWN process group (POSIX), so a timeout kills and reaps the WHOLE group (an ssh or a
+ * credential helper it started can never survive it). Resolves { code, stdout, stderr, timedOut, spawnError }.
+ */
+function runGit(args, timeoutMs) {
+  return new Promise((resolve) => {
+    const p = spawn("git", args, { env: gitEnv(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+    const out = [];
+    let err = "";
+    let timedOut = false;
+    let spawnError = null;
+    p.stdout.on("data", (d) => out.push(d));
+    p.stderr.on("data", (d) => (err += d.toString()));
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        if (process.platform !== "win32" && p.pid) process.kill(-p.pid, "SIGKILL");
+        else p.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }, timeoutMs);
+    p.on("error", (e) => (spawnError = e));
+    p.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout: Buffer.concat(out), stderr: err, timedOut, spawnError });
+    });
+  });
+}
 /** The private ref the published main is fetched into (fully qualified: no ref-name ambiguity, no refspec dependence). */
 const PUBLISHED_REF = "refs/leak-scan/published-main";
 /**
@@ -200,7 +242,7 @@ const PUBLISHED_REF = "refs/leak-scan/published-main";
  * checkout cannot leave a stale origin/main standing in for it).
  */
 const FETCH_ARGS = [
-  "-c", "credential.helper=", "-c", "core.sshCommand=ssh -o BatchMode=yes", "-c", "protocol.ext.allow=never",
+  "-c", "credential.helper=", "-c", "protocol.ext.allow=never",
   "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", "origin", `+refs/heads/main:${PUBLISHED_REF}`,
 ];
 /**
@@ -209,34 +251,26 @@ const FETCH_ARGS = [
  * in a git repo (its file is read instead), null when origin/main does not hold it (drift). A fetch that fails is
  * CannotEvaluate: an unverifiable copy never passes.
  */
-function publishedBytes(target) {
+async function publishedBytes(target) {
   const dir = path.dirname(target);
   if (!fs.existsSync(dir)) return null; // the copy's directory is absent: drift
-  let root;
-  try {
-    root = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], env: GIT_ENV, timeout: 30_000 }).trim();
-  } catch (err) {
+  const found = await runGit(["-C", dir, "rev-parse", "--show-toplevel"], 30_000);
+  if (found.code !== 0) {
     // Only a CONFIRMED non-repository is read from disk; any other discovery failure (no git, a timeout, a broken
     // repo) cannot be told apart from a stale published copy, so it cannot evaluate.
-    const e = /** @type {{ status?: number; stderr?: string }} */ (err);
-    if (e.status === 128 && /not a git repository/i.test(String(e.stderr ?? ""))) return undefined;
+    if (!found.spawnError && !found.timedOut && found.code === 128 && /not a git repository/i.test(found.stderr)) return undefined;
     throw new CannotEvaluate("a copy's repository could not be determined");
   }
-  try {
-    execFileSync("git", ["-C", root, ...FETCH_ARGS], { stdio: ["ignore", "ignore", "ignore"], env: GIT_ENV, timeout: 120_000 });
-  } catch {
-    throw new CannotEvaluate("a copy's published branch could not be fetched");
-  }
+  const root = found.stdout.toString("utf-8").trim();
+  const fetched = await runGit(["-C", root, ...FETCH_ARGS], FETCH_TIMEOUT_MS);
+  if (fetched.code !== 0) throw new CannotEvaluate("a copy's published branch could not be fetched");
   const rel = path.relative(fs.realpathSync(root), path.join(fs.realpathSync(dir), path.basename(target))).split(path.sep).join("/");
-  try {
-    return execFileSync("git", ["-C", root, "show", `${PUBLISHED_REF}:${rel}`], { stdio: ["ignore", "pipe", "ignore"], env: GIT_ENV, timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
-  } catch {
-    return null; // absent from the published main
-  }
+  const shown = await runGit(["-C", root, "show", `${PUBLISHED_REF}:${rel}`], 30_000);
+  return shown.code === 0 ? shown.stdout : null; // absent from the published main → null (drift)
 }
 
 /** The labels of listed copies whose PUBLISHED bytes differ from this file's (absent copies count as drift). */
-export function copyDrift(here = fileURLToPath(import.meta.url)) {
+export async function copyDrift(here = fileURLToPath(import.meta.url)) {
   let listing;
   try {
     listing = fs.readFileSync(path.join(path.dirname(here), COPIES_FILE), "utf-8");
@@ -252,7 +286,7 @@ export function copyDrift(here = fileURLToPath(import.meta.url)) {
     if (!label || !p) continue;
     const target = p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
     let theirs = null;
-    const published = publishedBytes(target);
+    const published = await publishedBytes(target);
     if (published === undefined) {
       try {
         theirs = crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex");
@@ -283,7 +317,7 @@ function parseArgs(argv) {
   return a;
 }
 
-function main() {
+async function main() {
   try {
     const args = parseArgs(process.argv.slice(2));
     const terms = loadList(args);
@@ -295,7 +329,7 @@ function main() {
         process.stdout.write("SECRET STALE: re-flatten and re-set PUBLIC_DENYLIST\n");
         failed = true;
       }
-      const drift = copyDrift();
+      const drift = await copyDrift();
       for (const label of drift) process.stdout.write(`DRIFT: ${label}\n`);
       if (drift.length > 0) {
         process.stderr.write(`public-leak-scan: ${drift.length} cop${drift.length === 1 ? "y differs" : "ies differ"} from this file; re-run the sync script\n`);
@@ -321,4 +355,4 @@ function main() {
   }
 }
 
-process.exitCode = main();
+process.exitCode = await main();
