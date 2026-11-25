@@ -20,6 +20,10 @@ on:
         description: "How many A/A runs (each ~1 min)"
         required: false
         default: "5"
+      offcpu:
+        description: "1 = also watch the main thread for off-CPU waits (RELAY_TIMING_OFFCPU, Linux /proc; report only)"
+        required: false
+        default: "0"
 
 jobs:
   aa-diag:
@@ -49,11 +53,13 @@ jobs:
           RELAY_TIMING_BARS: '1'
           RELAY_TIMING_DIAG: '1'
           RUNS: ${{ inputs.runs }}
+          OFFCPU: ${{ inputs.offcpu }}
         run: |
           case "$RUNS" in ''|*[!0-9]*) echo "runs must be a number, got '$RUNS'"; exit 1 ;; esac
+          case "$OFFCPU" in 0) ;; 1) export RELAY_TIMING_OFFCPU=1 ;; *) echo "offcpu must be 0 or 1, got '$OFFCPU'"; exit 1 ;; esac
           [ "$RUNS" -ge 1 ] && [ "$RUNS" -le 20 ] || { echo "runs must be 1..20, got $RUNS"; exit 1; }
           {
-            echo "## A/A stall diagnostics ($RUNS runs, $(node --version), $(uname -sr))"
+            echo "## A/A stall diagnostics ($RUNS runs, offcpu=$OFFCPU, $(node --version), $(uname -sr))"
           } >> "$GITHUB_STEP_SUMMARY"
           for i in $(seq 1 "$RUNS"); do
             echo "::group::A/A run $i of $RUNS"
@@ -72,11 +78,15 @@ jobs:
               echo "### run $i (vitest exit $rc)"
               if [ "$completed" = 0 ]; then
                 echo "INCOMPLETE run / no diagnostic output (vitest exit $rc): no DIAG A/A TERMINAL marker"
-                [ -n "$lines" ] && { echo '```'; echo "$lines"; echo '```'; }
+                if [ -n "$lines" ]; then echo '```'; echo "$lines"; echo '```'; fi
               elif printf '%s\n' "$lines" | grep -q '^BREACH '; then
                 echo '```'; echo "$lines"; echo '```'
               else
                 echo "no breach (the bar completed)"
               fi
+              # Every run's BAR line (its medians: the neutrality comparison, flag on vs off) and any OFFCPU line.
+              barlines=$(printf '%s\n' "$clean" | grep -E '^(BAR A/A|OFFCPU) ' || true)
+              # An if, never `[ … ] && …`: under bash -e an empty list would end the collection.
+              if [ -n "$barlines" ]; then echo '```'; echo "$barlines"; echo '```'; fi
             } >> "$GITHUB_STEP_SUMMARY"
           done
