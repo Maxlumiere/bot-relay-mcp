@@ -1309,7 +1309,19 @@ function announce(bare: string): void {
 type BarOpts = { onLoop?: () => void; onOpen?: () => void; poolControl?: PoolWork; authPool?: PoolWork; controlOnLoop?: () => void; measureImpl?: typeof measure };
 async function runBar(label: string, port: number, load: Load, opts: BarOpts = {}): Promise<BarStats> {
   const signal = barSignalStore.getStore() ?? NEVER_ABORTED; // THIS test's lifetime, however late this runs
-  return withDiag(process.env, (rec) => runBarMeasured(label, port, load, opts, rec, signal), signal, label); // rec is null unless RELAY_TIMING_DIAG=1
+  const bar = () => withDiag(process.env, (rec) => runBarMeasured(label, port, load, opts, rec, signal), signal, label); // rec is null unless RELAY_TIMING_DIAG=1
+  // Without RELAY_TIMING_OFFCPU=1 the bar runs EXACTLY as before: no import, no watch, no extra await.
+  if (process.env.RELAY_TIMING_OFFCPU !== "1") return bar();
+  // REPORT ONLY, inside the failure boundary (tests/_helpers/offcpu-boundary.ts): the watch's whole lifecycle can never
+  // change the bar's result or exception.
+  let withOffCpuWatch: (typeof import("./_helpers/offcpu-boundary.js"))["withOffCpuWatch"];
+  try {
+    ({ withOffCpuWatch } = await import("./_helpers/offcpu-boundary.js"));
+  } catch (err) {
+    console.log(`offcpu: unavailable (${err instanceof Error ? err.message : String(err)})`);
+    return bar(); // the boundary itself could not load: the bar runs untouched
+  }
+  return withOffCpuWatch(label, bar);
 }
 async function runBarMeasured(label: string, port: number, load: Load, opts: BarOpts, rec: SyncRecorder | null, signal: AbortSignal = NEVER_ABORTED): Promise<BarStats> {
   // `measureImpl`: a seam for the WIRING MUTANT only (a measure that drops the occupancy reading).
