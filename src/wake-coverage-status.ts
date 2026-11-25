@@ -85,7 +85,9 @@ export function writeWakeCoverageStatus(statusPath: string, status: WakeCoverage
 /** The verdicts the detector can emit (mirrors WakeVerdict in wake-coverage-detector.ts). A
  *  finding carrying any other verdict is a corrupt record — rejected, not silently treated as
  *  "not uncovered". Keep in sync if WakeVerdict grows. */
-const KNOWN_VERDICTS = new Set(["covered", "uncovered", "unobservable"]);
+const KNOWN_VERDICTS = new Set(["covered", "uncovered", "unobservable", "needs_human"]);
+/** PR 8b: the CLOSED set of reasons a finding may carry (additive within v:1; any other value → UNKNOWN). */
+const KNOWN_REASONS = new Set(["two_windows"]);
 
 /** The EXACT top-level keys a v:1 record may carry. A CLOSED schema: any other key (a legacy
  *  uncoveredCount, a typo, injected data) makes the record UNKNOWN rather than silently accepted —
@@ -123,7 +125,8 @@ export function isValidWakeCoverageStatus(x: unknown): x is WakeCoverageStatus {
       if (typeof f !== "object" || f === null) return false;
       const ff = f as Record<string, unknown>;
       const verdict = ff.verdict;
-      return typeof ff.agent === "string" && typeof verdict === "string" && KNOWN_VERDICTS.has(verdict);
+      const reasonOk = ff.reason === undefined || (typeof ff.reason === "string" && KNOWN_REASONS.has(ff.reason));
+      return typeof ff.agent === "string" && typeof verdict === "string" && KNOWN_VERDICTS.has(verdict) && reasonOk;
     })
   );
 }
@@ -224,18 +227,28 @@ export function formatWakeCoverageStatusLine(
   // stored uncoveredCount (codex P1 r2). A fresh, versioned, schema-valid record whose count says 0
   // while its findings list an uncovered agent must NOT read OK: trust the evidence, never the
   // denormalized field, which can disagree with the very findings it claims to summarize.
+  // PR 8b: NEEDS_HUMAN (no automatic wake ever existed for the agent) is REPORTED on this same line, never hidden,
+  // never counted as an alarm: it is appended to whichever verdict the rest of the findings give.
+  const needsHuman = status.findings.filter((f) => f.verdict === "needs_human");
+  const queued = needsHuman.length
+    ? ` Queued for a person (no automatic wake exists; mail waits): ${needsHuman.map((f) => `${sanitizeLine(String(f.agent))} (${f.pendingCount} message(s), oldest ${humanAge(f.oldestAgeMs)})`).join(", ")}.`
+    : "";
   const uncovered = status.findings.filter((f) => f.verdict === "uncovered");
   if (uncovered.length > 0) {
-    const names = uncovered.map((f) => sanitizeLine(String(f.agent))).join(", ");
-    return `[RELAY] *** wake-coverage: ${uncovered.length} agent(s) UNCOVERED — mail is piling up unwoken: ${names}. A wake path is broken. ***`;
+    const names = uncovered.map((f) => `${sanitizeLine(String(f.agent))}${(f as { reason?: string }).reason === "two_windows" ? " (two windows bound: close one)" : ""}`).join(", ");
+    return `[RELAY] *** wake-coverage: ${uncovered.length} agent(s) UNCOVERED — mail is piling up unwoken: ${names}. A wake path is broken. ***${queued}`;
   }
   // ONLY an EMPTY findings list is healthy. A finding means an agent has mail STUCK past the
   // threshold; if none are "uncovered" the rest are UNOBSERVABLE — stuck mail whose coverage the
   // detector cannot judge (no durable drain marker). Unjudgeable is NOT checked-and-healthy (codex):
   // surface it and name the agents; never collapse "I can't tell, and there IS stuck mail" into OK.
-  if (status.findings.length > 0) {
-    const names = status.findings.map((f) => sanitizeLine(String(f.agent))).join(", ");
-    return `[RELAY] wake-coverage: UNKNOWN — ${status.findings.length} agent(s) with mail stuck past the threshold cannot be judged (UNOBSERVABLE — no drain marker): ${names}. Coverage unconfirmed, not healthy.`;
+  const unobservable = status.findings.filter((f) => f.verdict !== "needs_human");
+  if (unobservable.length > 0) {
+    const names = unobservable.map((f) => sanitizeLine(String(f.agent))).join(", ");
+    return `[RELAY] wake-coverage: UNKNOWN — ${unobservable.length} agent(s) with mail stuck past the threshold cannot be judged (UNOBSERVABLE — no drain marker): ${names}. Coverage unconfirmed, not healthy.${queued}`;
+  }
+  if (needsHuman.length > 0) {
+    return `[RELAY] wake-coverage: NEEDS_HUMAN (a report, not an alarm; as of ${humanAge(ageMs)}).${queued}`;
   }
   // ALWAYS emit OK (a sink that speaks only on failure is indistinguishable from a dead sink),
   // and CARRY THE AGE so a drifting age exposes a stopped-but-still-"OK" sweep (Q1).

@@ -74,8 +74,8 @@ function row(id: string) {
 describe("ADR-0011 (1) migration-safe — default LOG, no historical overdue", () => {
   it("the schema migrated to the current version (v26; v24 added disposition)", () => {
     getDb();
-    expect(getSchemaVersion()).toBe(26);
-    expect(CURRENT_SCHEMA_VERSION).toBe(26);
+    expect(getSchemaVersion()).toBe(27);
+    expect(CURRENT_SCHEMA_VERSION).toBe(27);
   });
 
   it("send_message with no disposition defaults to 'log'", () => {

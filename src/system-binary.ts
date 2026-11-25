@@ -31,7 +31,7 @@
 import fs from "fs";
 import path from "path";
 import { walkPath, PathWalkError, type WalkFs, type WalkResult } from "./path-walk.js";
-import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "child_process";
+import { spawn, spawnSync, type ChildProcess, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "child_process";
 
 /**
  * A system tool could not be located at a trusted absolute path. What each caller does with it (Codex #336 R2 NEW-4:
@@ -292,3 +292,42 @@ export function execSystem(name: SystemBinaryName, args: string[], opts: Omit<Sy
   }
   return r.stdout ?? "";
 }
+
+/**
+ * Doorbell PR 8b: execSystem's contract WITHOUT blocking the event loop (a register path on the shared daemon must not
+ * stall on a hung tool). The same trusted absolute path, clean-base env and argv0, never a shell. Resolves stdout on
+ * exit 0; REJECTS on a tool that cannot be located, fails to start, exits non-zero or on a signal, or outlives
+ * `timeoutMs` (it is then SIGKILLed: a hard bound, never a wait).
+ */
+export function execSystemAsync(name: SystemBinaryName, args: string[], opts: { timeoutMs: number; named?: Readonly<Record<string, string>> }): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let child: ChildProcess;
+    try {
+      // systemBinary(name) INLINE as the program (the SEC-22 scanner's trusted form): a tool it cannot locate throws here.
+      child = spawn(systemBinary(name), args, { env: systemEnv(name, opts.named), argv0: name, shell: false, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    let out = "";
+    let settled = false;
+    const finish = (err: Error | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(out);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(new Error(`${name} timed out after ${opts.timeoutMs} ms`));
+    }, opts.timeoutMs);
+    child.stdout?.setEncoding("utf-8");
+    child.stdout?.on("data", (d: string) => {
+      if (out.length < 1 << 20) out += d;
+    });
+    child.on("error", (err) => finish(err));
+    child.on("close", (code, signal) => finish(code === 0 ? null : new Error(`${name} ${args.join(" ")} failed (status=${code}, signal=${signal})`)));
+  });
+}
+
