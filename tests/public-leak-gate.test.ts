@@ -12,6 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -128,10 +129,74 @@ describe("the scan step, run for real (bash, fixture list)", () => {
 });
 
 describe("the public scanner copy", () => {
-  it("self-tests against a list carrying the canary (no copies file here, so no drift check)", () => {
-    const r = spawnSync(process.execPath, [SCAN, "--self-test", "--list", FIXTURE], { encoding: "utf-8" });
+  it("self-tests against an ENVIRONMENT list carrying the canary (CI's public form: no secret check, no copies file)", () => {
+    const r = spawnSync(process.execPath, [SCAN, "--self-test", "--list-env", "FIXTURE_LIST"], { encoding: "utf-8", env: { PATH: process.env.PATH, FIXTURE_LIST: LIST } });
     expect(r.status, r.stderr).toBe(0);
     expect(r.stdout.trim()).toBe("self-test: PASS");
+  });
+
+  // The PRIVATE self-test's own rows (the secret's hash; copies compared with what is PUBLISHED) live with the canonical
+  // scanner, outside this repo. These rows hold the same contract on THIS copy, with fixture lists and a fixture repo.
+  it("a FILE list is private by definition: its self-test ALWAYS checks the secret's hash, so a missing hash file is SECRET STALE (exit 2)", () => {
+    const r = spawnSync(process.execPath, [SCAN, "--self-test", "--list", FIXTURE], { encoding: "utf-8", env: { PATH: process.env.PATH } });
+    expect(r.status, r.stdout + r.stderr).toBe(2);
+    expect(r.stdout).toMatch(/SECRET STALE: re-flatten and re-set PUBLIC_DENYLIST/);
+    expect(r.stdout + r.stderr, "never a path").not.toContain(path.dirname(FIXTURE));
+  });
+
+  /** A temp copy of THIS scanner with a copies file naming a copy inside a fixture repo (a local bare origin). */
+  function privateCopyWithRepo(): { dir: string; list: string; copy: string; git: (cwd: string, ...a: string[]) => void; bare: string } {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "leakgate-private-")));
+    fs.copyFileSync(SCAN, path.join(dir, "scan.mjs"));
+    const list = path.join(dir, "fixture.txt");
+    fs.writeFileSync(list, LIST);
+    // The secret's hash beside the FILE list: the flattening is the list's terms joined by "\n", plus a final "\n".
+    const terms = LIST.split("\n").filter((t) => t.trim() !== "");
+    fs.writeFileSync(path.join(dir, "public-denylist.secret.sha256"), `${crypto.createHash("sha256").update(`${terms.join("\n")}\n`).digest("hex")}\n`);
+    const git = (cwd: string, ...a: string[]) => {
+      const r = spawnSync("git", ["-c", "user.name=fx", "-c", "user.email=fx@invalid", "-c", "init.defaultBranch=main", ...a], { cwd, encoding: "utf-8" });
+      expect(r.status, `git ${a.join(" ")}: ${r.stderr}`).toBe(0);
+    };
+    const bare = path.join(dir, "origin.git");
+    git(dir, "init", "-q", "--bare", bare);
+    const work = path.join(dir, "work");
+    git(dir, "clone", "-q", bare, work);
+    const copy = path.join(work, "tools", "public-leak-scan", "scan.mjs");
+    fs.mkdirSync(path.dirname(copy), { recursive: true });
+    fs.copyFileSync(SCAN, copy);
+    git(work, "add", "-A");
+    git(work, "commit", "-q", "-m", "publish");
+    git(work, "push", "-q", "origin", "HEAD:main");
+    fs.writeFileSync(path.join(dir, "copies.tsv"), `fixture-repo\t${copy}\n`);
+    return { dir, list, copy, git, bare };
+  }
+  const privateSelfTest = (p: { dir: string; list: string }) =>
+    spawnSync(process.execPath, [path.join(p.dir, "scan.mjs"), "--self-test", "--list", p.list], { encoding: "utf-8", env: { PATH: process.env.PATH, GIT_TERMINAL_PROMPT: "0" } });
+
+  it("a NARROWED refspec cannot hide a stale published copy: main is fetched explicitly → DRIFT (exit 2)", () => {
+    const p = privateCopyWithRepo();
+    const work = path.dirname(path.dirname(path.dirname(p.copy)));
+    p.git(work, "push", "-q", "origin", "HEAD:other");
+    p.git(work, "config", "remote.origin.fetch", "+refs/heads/other:refs/remotes/origin/other");
+    const other = path.join(p.dir, "other");
+    p.git(p.dir, "clone", "-q", p.bare, other);
+    fs.appendFileSync(path.join(other, "tools", "public-leak-scan", "scan.mjs"), "// published on main only\n");
+    p.git(other, "commit", "-q", "-am", "drift");
+    p.git(other, "push", "-q", "origin", "HEAD:main");
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(2);
+    expect(r.stdout).toMatch(/^DRIFT: fixture-repo$/m);
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  });
+
+  it("a FETCH that fails → cannot evaluate (exit 2), never a pass", () => {
+    const p = privateCopyWithRepo();
+    p.git(path.dirname(path.dirname(path.dirname(p.copy))), "remote", "set-url", "origin", path.join(p.dir, "gone.git"));
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(2);
+    expect(r.stderr).toMatch(/cannot evaluate \(a copy's published branch could not be fetched\)/);
+    expect(r.stdout).not.toMatch(/PASS/);
+    fs.rmSync(p.dir, { recursive: true, force: true });
   });
 
   it("names no private location: no home path, no list location, no workspace path", () => {
