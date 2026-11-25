@@ -794,7 +794,9 @@ describe("stop-check.sh (Stop) and post-tool-use-check.sh (every tool call)", SL
       const token = dbRegister(name, "tester", []).plaintext_token as string;
       const r = await run([hook], { ...remoteEnv(name, home(`${label}-remote-ctl`), token), RELAY_TEST_STARVE: "the remote mail read" }, stdin);
       expect(toolCalls("get_messages").length, "the read never ran: CI's precondition failure, made deterministic").toBe(0);
-      expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the remote mail read \(\d+s of 5s spent\): skipped\./);
+      // The skip NAMES its step (this row's property); the declared budget's value is not (it is pinned on the explicit
+      // real-budget fixtures in tests/adr-0048-c-r2.test.ts; this copy runs the behaviour default).
+      expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the remote mail read \(\d+s of \d+s spent\): skipped\./);
     });
   }
 
@@ -822,7 +824,7 @@ describe("stop-check.sh (Stop) and post-tool-use-check.sh (every tool call)", SL
     getDb().prepare("UPDATE agents SET agent_pid = 999999, agent_pid_start = 'never' WHERE name = ?").run(name);
     const r = await run([ptuSeamed("ptu-live-ctl")], { ...localEnv(name, home("ptu-live-ctl"), token), RELAY_TEST_CLOCK: "0", RELAY_TEST_STARVE: "the liveness restamp" }, PTU_STDIN);
     expect(toolCalls("report_liveness").length, "the restamp never ran: the starved step, made deterministic").toBe(0);
-    expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the liveness restamp \(\d+s of 5s spent\): skipped\./);
+    expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the liveness restamp \(\d+s of \d+s spent\): skipped\./); // the step named; the budget value is not this row's property
   });
 });
 

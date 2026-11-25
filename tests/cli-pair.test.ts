@@ -27,6 +27,12 @@ import os from "os";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import type { Server as HttpServer } from "http";
+import { startArgvSampler, argvSamplerProbe, argvVerdict } from "./_helpers/argv-sampler.js";
+import { reportCoverageGap } from "./_helpers/coverage-gap.js";
+// The argv row needs a ps that can SHOW argv; where it cannot it would pass vacuously, so it reports NOT_EVALUATED.
+const ARGV_PROBE = argvSamplerProbe();
+console.log(`[argv-sampler] probe: ${ARGV_PROBE.visible ? "visible" : `NOT_EVALUATED: ${ARGV_PROBE.why}`}`);
+if (!ARGV_PROBE.visible) reportCoverageGap("cli-pair (5) argv non-exposure", ARGV_PROBE.why, "a Windows argv sampler (Get-CimInstance Win32_Process CommandLine) behind the same probe and handshake");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -239,27 +245,20 @@ describe("v2.1 Phase 7r — relay pair CLI (PR-D: the hub's secret never rides a
     expect(r.stderr).not.toMatch(/cannot reach hub/); // refused at argv parsing, before the hub is contacted
   });
 
-  it("(5) PR-D Q2: pairing with --secret-file, no process's argv EVER holds the secret (ps sampler)", async () => {
+  it.skipIf(process.platform === "win32")("(5a) the argv sampler can SEE a planted argv on macOS and Linux (row 5 is never vacuous there)", () => {
+    expect(ARGV_PROBE, ARGV_PROBE.why).toMatchObject({ visible: true });
+  });
+
+  it.skipIf(!ARGV_PROBE.visible)("(5) PR-D Q2: pairing with --secret-file, no process's argv EVER holds the secret (ps sampler)", async (ctx) => {
     const { url } = await startHubWithEnv({ RELAY_HTTP_SECRET: undefined });
     const hubSecret = fs.readFileSync(hubSecretFile(), "utf-8").trim();
-    let leaked = "";
-    let sampled = 0;
-    let done = false;
-    const sampler = (async () => {
-      while (!done) {
-        const out = await new Promise<string>((resolve) => {
-          const p = spawn("ps", ["-axww", "-o", "args="], { stdio: ["ignore", "pipe", "ignore"] });
-          let o = "";
-          p.stdout.on("data", (d: Buffer) => (o += d));
-          p.on("close", () => resolve(o));
-        });
-        sampled++;
-        if (out.includes(hubSecret)) leaked = out.split("\n").filter((l) => l.includes(hubSecret)).join("\n");
-        await new Promise((r) => setTimeout(r, 15));
-      }
-    })();
-    // A proxy that holds each /mcp reply for 1 s keeps pair ALIVE long enough to be sampled (it otherwise
-    // finishes in ~350 ms, about 2 ps samples: too few to prove anything).
+    // COVERAGE BAR: more than 3 `ps` samples taken while pair is provably alive (an /mcp request of its in flight at
+    // the proxy). GUARANTEED BY A HANDSHAKE: the proxy answers each /mcp request only after the sampler reports 4
+    // samples STARTED after it arrived (waitForSamples); past a 20 s deadline it answers anyway and the bar fails.
+    // The WITNESS: pair's own non-secret argv (a unique agent name): a sample counts only if it shows pair with a pid.
+    const pairName = `ps-test-${process.pid}-${Date.now() % 100000}`;
+    const sampler = startArgvSampler(hubSecret, pairName, { gapMs: 15 });
+    const handshakes: boolean[] = [];
     const { createServer } = await import("http");
     const proxy = createServer(async (req, res) => {
       const chunks: Buffer[] = [];
@@ -268,20 +267,26 @@ describe("v2.1 Phase 7r — relay pair CLI (PR-D: the hub's secret never rides a
       for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string" && k !== "host" && k !== "content-length") headers[k] = v;
       const upstream = await fetch(`${url}${req.url}`, { method: req.method, headers, body: req.method === "POST" ? Buffer.concat(chunks) : undefined });
       const body = await upstream.text();
-      if (req.url?.startsWith("/mcp")) await new Promise((r) => setTimeout(r, 1000));
+      if (req.url?.startsWith("/mcp")) handshakes.push(await sampler.waitForSamples(4, 20_000));
       res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
       res.end(body);
     });
     await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", () => r()));
     const proxyUrl = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
     const out = outFile();
-    const r = await runPair([proxyUrl, "--name", "ps-test", "--secret-file", secretFileWith(hubSecret), "--output", out, "--yes"]);
-    done = true;
-    await sampler;
+    const r = await runPair([proxyUrl, "--name", pairName, "--secret-file", secretFileWith(hubSecret), "--output", out, "--yes"]);
+    await sampler.stop();
     await new Promise<void>((res) => proxy.close(() => res()));
     expect(r.status, r.stderr).toBe(0);
-    expect(sampled, "the sampler ran while pair was alive").toBeGreaterThan(3);
-    expect(leaked, "no argv held the secret").toBe("");
+    expect(handshakes.length, "pair made /mcp requests").toBeGreaterThan(0);
+    const verdict = argvVerdict(handshakes, sampler);
+    if (verdict.kind === "NOT_EVALUATED") {
+      reportCoverageGap("cli-pair (5) argv non-exposure", verdict.why, "a Windows argv sampler (Get-CimInstance Win32_Process CommandLine) behind the same probe and handshake");
+      ctx.skip(verdict.why);
+    }
+    expect(verdict, "the observation was sound (no failed observation, every handshake held)").toEqual({ kind: "PASS" });
+    expect(sampler.heldSamples, "the sampler ran while pair was alive").toBeGreaterThan(3);
+    expect(sampler.leaked, "no argv held the secret").toBe("");
     // Codex R1 #3: and no OUTPUT stream held either credential (the token exists only in the 0600 file).
     const token = readConfig(out)["bot-relay"].headers["X-Agent-Token"] as string;
     for (const stream of [r.stdout, r.stderr]) {

@@ -40,7 +40,7 @@ const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "hookpr2-")))
 const HOOKS = budgetTree(path.join(ROOT, "hooks-30s"), path.join(REPO, "hooks"), path.join(REPO, "bin"), {
   declaredBudget: { "post-tool-use-check.sh": 30, "stop-check.sh": 30, "check-relay.sh": 30 },
 });
-const HOOKS_REAL_BUDGET = budgetTree(path.join(ROOT, "hooks-real"), path.join(REPO, "hooks"), path.join(REPO, "bin"));
+const HOOKS_REAL_BUDGET = budgetTree(path.join(ROOT, "hooks-real"), path.join(REPO, "hooks"), path.join(REPO, "bin"), { declaredBudget: "real" });
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 const AGENT = "pr2-agent";
 const SENDER = "pr2-sender";
