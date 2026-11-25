@@ -41,9 +41,9 @@
  * extraction is unit-testable.
  */
 import fs from "node:fs";
-import { execSystem, type SystemBinaryName } from "./system-binary.js";
+import { execSystem, execSystemAsync, type SystemBinaryName } from "./system-binary.js";
 import { log } from "./logger.js";
-import { profileProcessPatternSource } from "./agent-cli-profiles.js";
+import { profileProcessPatternSource, AGENT_CLI_PROFILES } from "./agent-cli-profiles.js";
 
 export type HostPlatform = "darwin" | "linux" | "win32" | string;
 
@@ -256,6 +256,8 @@ export interface ProcEntry {
 export interface AgentProcess {
   pid: number;
   startedAt: string;
+  /** PR 8b: the CLI profile of THIS (the nearest) agent process: exactly one profile's pattern matches it, else null. */
+  profile?: string | null;
 }
 
 /**
@@ -449,7 +451,8 @@ export function findAgentProcess(
       !selfExcludePattern.test(parent.command) &&
       processIdentityIsAgent(parent.command, parent.comm, agentPattern)
     ) {
-      return { pid: parent.pid, startedAt: parent.startedAt };
+      // The NEAREST agent decides (ruling 9d0bb9e6): a Codex session run inside a Claude one is codex.
+      return { pid: parent.pid, startedAt: parent.startedAt, profile: observedProfileOf(parent.command, parent.comm) };
     }
     cur = parent;
     depth++;
@@ -668,3 +671,145 @@ export function agentProcessAdvertised(name: string, run: CommandRunner = defaul
   if (!out) return false;
   return out.split("\n").some((line) => line.includes(needle));
 }
+
+/**
+ * Doorbell PR 8b (ruling cc9f2199): the CLI profile of ONE process, judged by the same identity rule as the liveness
+ * probe (processIdentityIsAgent: basenames, never the raw command string). EXACTLY one profile's processPattern
+ * matches → its canonical id; none, or more than one (two patterns on that one process) → null.
+ */
+export function observedProfileOf(command: string, comm: string | undefined): string | null {
+  const hits = AGENT_CLI_PROFILES.filter((p) => processIdentityIsAgent(command, comm, new RegExp(`^(${p.processPattern})$`, "i")));
+  return hits.length === 1 ? hits[0]!.id : null;
+}
+
+/**
+ * Codex #448 R2 P2-b: the profile two INDEPENDENT judges agree on, or null. The command judge reads the full command
+ * line (argv0, or a runtime's script); the comm judge reads the kernel's executable name. A truncated command line
+ * (".../codex" for ".../codex-helper"), or the two naming different CLIs, gives null: the alarm, the safe side.
+ */
+export function agreedProfileOf(command: string, comm: string | undefined): string | null {
+  if (!comm || !comm.trim()) return null;
+  const byCommand = observedProfileOf(command, undefined);
+  const byComm = observedProfileOf(command, comm);
+  return byCommand !== null && byCommand === byComm ? byCommand : null;
+}
+
+/**
+ * The kernel's executable name for `pid`, read FULL WIDTH with its start: null unless the start equals `start` (the
+ * same process instance as the caller's other read). Throws on a ps failure (the caller bounds it).
+ */
+async function commOf(run: AsyncPsRunner, pid: number, start: string, timeoutMs: number): Promise<string | null> {
+  const out = (await run(["-ww", "-o", "pid=,lstart=,comm=", "-p", String(pid)], { startTokenForm: "utc", timeoutMs })).trim();
+  const m = out.match(/^(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
+  if (!m || Number(m[1]) !== pid || m[2]!.trim() !== start) return null;
+  return m[3]!.trim();
+}
+
+/**
+ * Whether THIS process is a stdio server (transport/stdio.ts marks it at startup). The TRANSPORT selects how a
+ * registration's profile is observed (Codex #448 R1 P1): a stdio server always walks its OWN ancestry; a caller-named
+ * pid never selects that path.
+ */
+let stdioObserver = false;
+/** The agent process this stdio server observed above itself at startup (for liveness; never reused as the profile). */
+let ownDetectedAgent: AgentProcess | null = null;
+export function setOwnDetectedAgent(p: AgentProcess | null): void {
+  stdioObserver = true;
+  ownDetectedAgent = p;
+}
+export function getOwnDetectedAgent(): AgentProcess | null {
+  return ownDetectedAgent;
+}
+export function isStdioObserver(): boolean {
+  return stdioObserver;
+}
+/** TESTS ONLY. */
+export function _resetStdioObserverForTests(): void {
+  stdioObserver = false;
+  ownDetectedAgent = null;
+}
+
+/** An ASYNC, time-bounded `ps` (never blocks the event loop); injectable for tests. */
+export type AsyncPsRunner = (args: string[], opts: { startTokenForm: StartTokenForm; timeoutMs: number }) => Promise<string>;
+const defaultAsyncPs: AsyncPsRunner = (args, opts) =>
+  execSystemAsync("ps", args, { timeoutMs: opts.timeoutMs, named: startTokenEnv({}, opts.startTokenForm) as Record<string, string> });
+let asyncPs: AsyncPsRunner = defaultAsyncPs;
+/** TESTS ONLY: swap the async ps (a slow or hanging one); null restores the real one. */
+export function _setAsyncPsRunnerForTests(r: AsyncPsRunner | null): void {
+  asyncPs = r ?? defaultAsyncPs;
+}
+
+/** The register path's bound on a profile probe (ruling 9d0bb9e6): past it, the profile is NULL and registration goes on. */
+export const PROFILE_PROBE_TIMEOUT_MS = 1000;
+
+/** `work`, bounded by `timeoutMs` overall: a timeout or any error → { profile: null, why }. Never throws. */
+async function bounded(work: Promise<{ profile: string | null; why?: string }>, timeoutMs: number): Promise<{ profile: string | null; why?: string }> {
+  let t: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        t = setTimeout(() => reject(new Error(`the profile probe timed out after ${timeoutMs} ms`)), timeoutMs);
+      }),
+    ]);
+  } catch (err) {
+    return { profile: null, why: err instanceof Error ? err.message : String(err) };
+  } finally {
+    if (t) clearTimeout(t);
+  }
+}
+
+/**
+ * Doorbell PR 8b, the HTTP register path: OBSERVE the CLI profile of a caller-named agent process on THIS host. Its
+ * start and FULL-WIDTH command come in one read (Codex #448 R1 P2), the start must equal the claimed one (the reuse
+ * guard), and its comm, read with the same start, must corroborate (R2 P2-b: agreedProfileOf). Two reads are safe: an
+ * exec between them can only make the judges disagree, which is NULL. Any doubt → NULL with the reason. Never throws;
+ * bounded overall.
+ * RESIDUAL (stated, ADR-0036): on this path the caller names the pid.
+ */
+export async function probeAgentProfile(
+  pid: number | undefined | null,
+  claimedStart: string | undefined | null,
+  opts: { run?: AsyncPsRunner; timeoutMs?: number } = {},
+): Promise<{ profile: string | null; why?: string }> {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return { profile: null, why: "no agent pid" };
+  if (!claimedStart) return { profile: null, why: "no agent start token (the reuse guard needs one)" };
+  const run = opts.run ?? asyncPs;
+  const timeoutMs = opts.timeoutMs ?? PROFILE_PROBE_TIMEOUT_MS;
+  return bounded(
+    (async () => {
+      const out = (await run(["-ww", "-o", "pid=,lstart=,command=", "-p", String(pid)], { startTokenForm: "utc", timeoutMs })).trim();
+      const m = out.match(/^(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
+      if (!m || Number(m[1]) !== pid || !RAW_START_TOKEN_RE.test(m[2]!)) return { profile: null, why: "no coherent process record for the agent pid" };
+      if (m[2]! + START_TOKEN_UTC_SUFFIX !== claimedStart) return { profile: null, why: "the agent pid is another process now (start token differs)" };
+      const comm = await commOf(run, pid, m[2]!.trim(), timeoutMs);
+      const profile = agreedProfileOf(m[3]!.trim(), comm ?? undefined);
+      return profile === null ? { profile: null, why: "the command line and the executable name do not agree on one CLI" } : { profile };
+    })(),
+    timeoutMs,
+  );
+}
+
+/**
+ * Doorbell PR 8b, the stdio register path (Codex #448 R1 P1 + P2): a FRESH, bounded walk of THIS process's own
+ * ancestry at every registration, from ONE `ps` table snapshot: the NEAREST agent-identity process above it decides
+ * (findAgentProcess). Never the startup cache, never a caller-named pid. None found, a timeout or an error → NULL.
+ */
+export async function probeOwnAncestryProfile(opts: { run?: AsyncPsRunner; timeoutMs?: number; selfPid?: number } = {}): Promise<{ profile: string | null; why?: string }> {
+  const run = opts.run ?? asyncPs;
+  const timeoutMs = opts.timeoutMs ?? PROFILE_PROBE_TIMEOUT_MS;
+  return bounded(
+    (async () => {
+      const table = parseProcessTable(await run(["-ww", "-axo", "pid=,ppid=,lstart=,command="], { startTokenForm: "utc", timeoutMs }));
+      const agent = findAgentProcess(opts.selfPid ?? process.pid, table);
+      if (!agent) return { profile: null, why: "no agent process above this relay" };
+      // R2 P2-b: the nearest agent's comm, read with its start, must corroborate its full-width command line.
+      const entry = table.get(agent.pid);
+      const comm = entry ? await commOf(run, agent.pid, entry.startedAt, timeoutMs) : null;
+      const profile = entry ? agreedProfileOf(entry.command, comm ?? undefined) : null;
+      return profile === null ? { profile: null, why: "the command line and the executable name do not agree on one CLI" } : { profile };
+    })(),
+    timeoutMs,
+  );
+}
+

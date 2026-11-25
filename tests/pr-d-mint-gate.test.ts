@@ -20,6 +20,8 @@ import { spawn, spawnSync } from "child_process";
 import { pathToFileURL } from "url";
 import type { Server as HttpServer } from "http";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { startArgvSampler, argvSamplerProbe, argvVerdict } from "./_helpers/argv-sampler.js";
+import { reportCoverageGap } from "./_helpers/coverage-gap.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-d-")));
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
@@ -50,7 +52,11 @@ function reset(): void {
   _resetAuthRejectionAuditForTests();
   db.getDb();
 }
-beforeEach(reset);
+// An explicit timeout on THIS hook: reset() is a full synchronous DB re-init per test (close, delete the DB and its
+// sidecars, init again). MEASURED on main db623d4: a Windows runner in a slow window took 112.8 s for the step that
+// the same job ran in 18.1 s when green, and this hook crossed vitest's default 10 s (a hook timeout, not an
+// assertion). The work is not under test; its duration is the runner's.
+beforeEach(reset, 60_000);
 afterEach(() => {
   delete process.env.RELAY_ALLOW_OPEN_MINT;
   delete process.env.RELAY_HTTP_SECRET;
@@ -296,50 +302,106 @@ describe("the secret file under concurrency", () => {
 });
 
 describe("the hooks send the secret without exposing it (Q2)", () => {
-  it("relay_mint_secret_curl_config | curl -K -: the server receives X-Relay-Secret, and NO process's argv ever holds the secret", async () => {
+  // The argv rows need a ps that can SHOW a process's argv. Where it cannot, they would pass vacuously: they report
+  // NOT_EVALUATED (with the probe's reason) instead, and on macOS/Linux the probe itself must pass (a row below).
+  const PROBE = argvSamplerProbe();
+  const argvNotEvaluated = !PROBE.visible;
+  console.log(`[argv-sampler] probe: ${PROBE.visible ? "visible" : `NOT_EVALUATED: ${PROBE.why}`}`);
+  // A gap proven at runtime is VISIBLE: one "coverage gaps: …" line in the log and the CI job's step summary.
+  if (argvNotEvaluated) reportCoverageGap("pr-d-mint-gate argv non-exposure (3 rows)", PROBE.why, "a Windows argv sampler (Get-CimInstance Win32_Process CommandLine) behind the same probe and handshake");
+  it.skipIf(process.platform === "win32")("the argv sampler can SEE a planted argv on macOS and Linux (the leak rows below are never vacuous there)", () => {
+    expect(PROBE, PROBE.why).toMatchObject({ visible: true });
+  });
+  /**
+   * COVERAGE BAR: more than 3 `ps` samples taken while curl is provably alive (its request is in flight at the fake
+   * server). GUARANTEED BY A HANDSHAKE: the server answers only after the sampler reports 4 samples STARTED after the
+   * request arrived (waitForSamples); past a 20 s deadline it answers anyway and the bar fails (it never passes).
+   * A sample counts only if it WITNESSES curl (a table line with a pid and curl's non-secret marker, a URL query); a
+   * table that never shows it makes the row NOT_EVALUATED (a visible coverage gap), never a pass.
+   */
+  async function curlWithSecret(opts: { gapMs: number; plantLeak?: boolean; ps?: [string, string[]] }) {
     const { createServer } = await import("http");
     ensureMintSecret(ROOT);
     const secret = secretNow();
     let received: string | undefined;
+    const handshakes: boolean[] = [];
+    const witness = `mint-witness-${process.pid}-${Date.now()}`; // non-secret, on curl's argv only
+    const sampler = startArgvSampler(secret, witness, { gapMs: opts.gapMs, ps: opts.ps });
     const srv = createServer((req, res) => {
       received = req.headers["x-relay-secret"] as string | undefined;
-      setTimeout(() => res.end("{}"), 400); // hold the request open so the sampler sees curl alive
+      // Hold curl ALIVE until the sampler has its samples (a handshake, not a timer); a coverage failure fails the bar.
+      void sampler.waitForSamples(4, 20_000).then((ok) => {
+        handshakes.push(ok);
+        res.end("{}");
+      });
     });
     await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
     const port = (srv.address() as { port: number }).port;
     const helpers = path.resolve("hooks/_vault-helpers.sh");
-    const script = `. ${JSON.stringify(helpers)}; RELAY_RES_LOADED=1; RELAY_RES_KIND=instance; RELAY_RES_DB_PATH=${JSON.stringify(path.join(ROOT, "relay.db"))}; { relay_mint_secret_curl_config || true; } | curl -s -m 5 -K - -X POST http://127.0.0.1:${port}/mcp -d '{}' >/dev/null`;
-    let sampled = 0;
-    let leaked = "";
-    let done = false;
-    const sampler = (async () => {
-      while (!done) {
-        const out = await new Promise<string>((resolve) => {
-          const p = spawn("ps", ["-axww", "-o", "args="], { stdio: ["ignore", "pipe", "ignore"] });
-          let o = "";
-          p.stdout.on("data", (d: Buffer) => (o += d));
-          p.on("close", () => resolve(o));
-        });
-        sampled++;
-        if (out.includes(secret)) leaked = out.split("\n").filter((l) => l.includes(secret)).join("\n");
-        await new Promise((r) => setTimeout(r, 20));
-      }
-    })();
+    // The PLANTED twin puts the secret on curl's argv (what the helper exists to prevent): the sampler must catch it.
+    // The secret reaches ONLY curl's argv: bash expands it from its environment (bash's own -c argv holds "$PLANTED").
+    const send = opts.plantLeak
+      ? `curl -s -m 30 -H "X-Relay-Secret: $PLANTED" -X POST "http://127.0.0.1:${port}/mcp?w=$WITNESS" -d '{}' >/dev/null`
+      : `{ relay_mint_secret_curl_config || true; } | curl -s -m 30 -K - -X POST "http://127.0.0.1:${port}/mcp?w=$WITNESS" -d '{}' >/dev/null`;
+    const script = `. ${JSON.stringify(helpers)}; RELAY_RES_LOADED=1; RELAY_RES_KIND=instance; RELAY_RES_DB_PATH=${JSON.stringify(path.join(ROOT, "relay.db"))}; ${send}`;
     // ASYNC: the server and the sampler live on THIS loop (a spawnSync would block both: MEASURED, curl timed out).
     const child = await new Promise<{ status: number | null; stderr: string }>((resolve) => {
-      const p = spawn("bash", ["-c", script], { stdio: ["ignore", "ignore", "pipe"] });
+      const p = spawn("bash", ["-c", script], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, WITNESS: witness, ...(opts.plantLeak ? { PLANTED: secret } : {}) } });
       let stderr = "";
       p.stderr.on("data", (d: Buffer) => (stderr += d));
       p.on("close", (status) => resolve({ status, stderr }));
     });
-    done = true;
-    await sampler;
+    await sampler.stop();
     await new Promise<void>((r) => srv.close(() => r()));
-    expect(child.status, child.stderr).toBe(0);
-    expect(received, "the server received the secret as X-Relay-Secret").toBe(secret);
-    expect(sampled, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
-    expect(leaked, "no argv held the secret").toBe("");
-  }, 30_000);
+    expect(script, "the planted secret is not in bash's own argv").not.toContain(secret);
+    expect(script, "the witness is on curl's argv only (bash's holds $WITNESS)").not.toContain(witness);
+    return { child, received, secret, sampler, handshakes, witness, verdict: argvVerdict(handshakes, sampler) };
+  }
+  /** NOT_EVALUATED → one visible coverage-gap line, then the row is skipped at runtime (never a pass). */
+  function evaluatedOrSkip(r: { verdict: ReturnType<typeof argvVerdict> }, row: string, skip: (note?: string) => void): void {
+    if (r.verdict.kind === "NOT_EVALUATED") {
+      reportCoverageGap(`pr-d-mint-gate ${row}`, r.verdict.why, "a Windows argv sampler (Get-CimInstance Win32_Process CommandLine) behind the same probe and handshake");
+      skip(r.verdict.why);
+    }
+    expect(r.verdict, "the observation was sound (no failed observation, the handshake held)").toEqual({ kind: "PASS" });
+  }
+
+  it.skipIf(argvNotEvaluated)("relay_mint_secret_curl_config | curl -K -: the server receives X-Relay-Secret, and NO process's argv ever holds the secret", async (ctx) => {
+    const r = await curlWithSecret({ gapMs: 20 });
+    expect(r.child.status, r.child.stderr).toBe(0);
+    evaluatedOrSkip(r, "argv non-exposure", ctx.skip);
+    expect(r.received, "the server received the secret as X-Relay-Secret").toBe(r.secret);
+    expect(r.sampler.heldSamples, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
+    expect(r.sampler.leaked, "no argv held the secret").toBe("");
+  }, 60_000);
+
+  it.skipIf(argvNotEvaluated)("the same, with a SLOW sampler (300 ms between samples, a slow runner): coverage still holds (> 3 samples while curl is alive)", async (ctx) => {
+    const r = await curlWithSecret({ gapMs: 300 });
+    expect(r.child.status, r.child.stderr).toBe(0);
+    evaluatedOrSkip(r, "argv non-exposure (slow sampler)", ctx.skip);
+    expect(r.sampler.heldSamples, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
+    expect(r.sampler.leaked, "no argv held the secret").toBe("");
+  }, 60_000);
+
+  it.skipIf(argvNotEvaluated)("a PLANTED leak (the secret on curl's argv) is CAUGHT once coverage is guaranteed, even with a slow sampler", async (ctx) => {
+    const r = await curlWithSecret({ gapMs: 300, plantLeak: true });
+    evaluatedOrSkip(r, "planted-leak twin", ctx.skip);
+    expect(r.sampler.heldSamples, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
+    expect(r.sampler.leaked, "the planted argv leak is caught").toContain(r.secret);
+    // UNAMBIGUOUS: every line that held it is curl's (bash's argv never carried it), and carries curl's witness.
+    for (const line of r.sampler.leaked.split("\n")) {
+      expect(line, "the leak is curl's argv").toMatch(/\bcurl\b/);
+      expect(line, "the leak line is the witnessed target").toContain(r.witness);
+    }
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("an observer whose table NEVER witnesses curl (exit 0, an empty table) → the verdict is NOT_EVALUATED, never a pass", async () => {
+    const r = await curlWithSecret({ gapMs: 20, ps: ["sh", ["-c", "exit 0"]] });
+    expect(r.sampler.sampled, "no table witnessed curl").toBe(0);
+    expect(r.sampler.blindSamples).toBeGreaterThan(0);
+    expect(r.handshakes, "the hold was never satisfied").toEqual([false]);
+    expect(r.verdict.kind).toBe("NOT_EVALUATED");
+  }, 60_000);
 
   it("a symlinked or malformed secret file sends NOTHING (the server then refuses, loudly)", () => {
     const helpers = path.resolve("hooks/_vault-helpers.sh");

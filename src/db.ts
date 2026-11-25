@@ -516,6 +516,7 @@ function applySchemaSetup(db: CompatDatabase): void {
   migrateSchemaToV2_24(db);
   migrateSchemaToV2_25(db);
   migrateSchemaToV2_26(db);
+  migrateSchemaToV2_27(db);
   seedBuiltinTaskSchemas(db);
   finalizeSchemaVersion(db);
   purgeOldRecords(db);
@@ -744,7 +745,7 @@ function initSchema(db: CompatDatabase): void {
  * Migrations are idempotent and run unconditionally at init; the version
  * bump is the semantic marker visible to backup/restore.
  */
-export const CURRENT_SCHEMA_VERSION = 26;
+export const CURRENT_SCHEMA_VERSION = 27;
 
 /**
  * Read the live DB's recorded schema version. Throws if the table is
@@ -2123,6 +2124,20 @@ function migrateSchemaToV2_25(db: CompatDatabase): void {
  *   - ADR-0043: every key starts with edge_id, and a foreign edge is refused.
  *   - Start tokens are the UTC form ONLY (a CHECK): no legacy acceptance here.
  */
+/**
+ * Doorbell PR 8b (schema v27, ruling cc9f2199): the CLI profile the RELAY OBSERVED for an agent (the nearest agent
+ * process's identity, re-derived at every register; NULL when it cannot be decided) and when. The caller's own
+ * cli_profile stays informational; only this column feeds the wake-coverage verdict. Existing rows stay NULL until each
+ * agent re-registers (NULL reads as UNCOVERED: the safe side).
+ */
+function migrateSchemaToV2_27(db: CompatDatabase): void {
+  const cols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "cli_profile_observed")) db.exec("ALTER TABLE agents ADD COLUMN cli_profile_observed TEXT");
+  if (!cols.some((c) => c.name === "cli_profile_observed_at")) db.exec("ALTER TABLE agents ADD COLUMN cli_profile_observed_at TEXT");
+  // The registration GENERATION (a uuid per registration): the compare-and-swap token a late probe must match.
+  if (!cols.some((c) => c.name === "cli_profile_observed_gen")) db.exec("ALTER TABLE agents ADD COLUMN cli_profile_observed_gen TEXT");
+}
+
 function migrateSchemaToV2_26(db: CompatDatabase): void {
   ensureRelayEdge(db);
   db.exec("CREATE TABLE IF NOT EXISTS connectors " + CONNECTORS_COLUMNS);
@@ -2479,6 +2494,20 @@ export function profileOwesVerdict(cliProfile: string | null | undefined): boole
  * Normalize a caller-supplied CLI profile id against the registry. Anything the
  * registry does not know becomes NULL (= UNKNOWN), never a default.
  */
+/**
+ * Doorbell PR 8b: record the CLI profile the relay OBSERVED for `name` (canonical id, or NULL) and when: a probe's
+ * answer, written only while the row still carries THAT registration's generation (Codex #448 R1 P2: a unique token,
+ * never a millisecond timestamp; R2 P2-a: the generation itself is written by registerAgent, in the registration's
+ * own statement). Returns whether the row was written.
+ */
+export function setObservedCliProfile(name: string, profile: string | null, at: string, key: { expectGen: string }): boolean {
+  const canon = profile ? (getAgentCliProfile(profile)?.id ?? null) : null;
+  const r = getDb()
+    .prepare("UPDATE agents SET cli_profile_observed = ?, cli_profile_observed_at = ? WHERE name = ? AND cli_profile_observed_gen IS ?")
+    .run(canon, at, name, key.expectGen);
+  return r.changes > 0;
+}
+
 export function normalizeCliProfile(raw: string | null | undefined): string | null {
   if (!raw) return null;
   return getAgentCliProfile(raw) ? raw : null;
@@ -4939,8 +4968,12 @@ export function registerAgent(
      */
     expected_session_id?: string | null;
   } = {}
-): { agent: AgentWithStatus; plaintext_token: string | null; auto_assigned: QueuedAssignment[]; registration_recovery: string | null } {
+): { agent: AgentWithStatus; plaintext_token: string | null; auto_assigned: QueuedAssignment[]; registration_recovery: string | null; observed_gen: string } {
   const db = getDb();
+  // Doorbell PR 8b (Codex #448 R2 P2-a): this registration's observation GENERATION, written by the SAME statement that
+  // writes the agent row (with the observed profile reset to NULL). SQLite orders those writes across relay processes,
+  // so a probe answering for an older registration finds a newer generation and writes nothing.
+  const observed_gen = uuidv4();
   const timestamp = now();
   const capsJson = JSON.stringify(capabilities);
   // v2.0 final (#6): rotate session_id on EVERY register_agent call. A new
@@ -5079,7 +5112,7 @@ export function registerAgent(
       "terminal_title_ref = ?, host_shell_pids = ?, host_id = ?, agent_status = ?, " +
       "auth_state = ?, recovery_token_hash = ?, revoked_at = ?, " +
       "signal_received_at = NULL, signal_kind = NULL, server_version = ?, " +
-      "cli_profile = COALESCE(?, cli_profile) " +
+      "cli_profile = COALESCE(?, cli_profile), cli_profile_observed = NULL, cli_profile_observed_gen = ? " +
       "WHERE name = ? AND auth_state = ? AND token_hash IS ? AND recovery_token_hash IS ?" +
       (applySessionCas ? " AND session_id IS ?" : "");
     const r = db.prepare(reregisterSql).run(
@@ -5094,6 +5127,7 @@ export function registerAgent(
       // COALESCE: a re-register that does not know its profile must not ERASE a
       // profile an earlier register established.
       normalizeCliProfile(options.cli_profile),
+      observed_gen,
       name, existingState, existing.token_hash, casRecoveryHash,
       ...(applySessionCas ? [options.expected_session_id ?? null] : [])
     );
@@ -5159,8 +5193,8 @@ export function registerAgent(
       // schema v16: host_shell_pids (JSON) + host_id captured on first register.
       // ADR-0002: `class` captured on FIRST register (NULL if undeclared →
       // read as 'unclassified'). A re-register never writes it (immutable).
-      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id, class, server_version, cli_profile, registration_recovery_hash, registration_recovery_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId, options.class ?? null, VERSION, normalizeCliProfile(options.cli_profile), regRecoveryHash, regRecoveryExpiresAt);
+      "INSERT INTO agents (id, name, role, capabilities, last_seen, created_at, token_hash, token_lookup, session_id, session_started_at, description, agent_status, managed, terminal_title_ref, host_shell_pids, host_id, class, server_version, cli_profile, registration_recovery_hash, registration_recovery_expires_at, cli_profile_observed_gen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(id, name, role, capsJson, timestamp, timestamp, token_hash, computeTokenLookup(plaintext_token), session_id, timestamp, description, managed, titleRef, hostShellPidsJson, hostId, options.class ?? null, VERSION, normalizeCliProfile(options.cli_profile), regRecoveryHash, regRecoveryExpiresAt, observed_gen);
     bumpAuthGeneration(); // ADR-0003: fresh token_hash + token_lookup written
 
     // v2.0: populate normalized agent_capabilities table.
@@ -5208,7 +5242,7 @@ export function registerAgent(
   // was preserved → skipped), first-registration sets both token + recovery.
   // Never before commit; a failed re-register plants no throwaway.
   registerPersistedSecret(name, plaintext_token, registration_recovery);
-  return { agent: agentWithStatus, plaintext_token, auto_assigned, registration_recovery };
+  return { agent: agentWithStatus, plaintext_token, auto_assigned, registration_recovery, observed_gen };
 }
 
 /** Fetch an agent's auth record (includes token_hash) by name. */

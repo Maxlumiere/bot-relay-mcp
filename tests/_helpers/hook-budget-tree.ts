@@ -18,6 +18,9 @@ import path from "path";
  *                                     loop). With 0, every budgeted step gets exactly min(own, what an instant
  *                                     arrival leaves), whatever the runner's speed.
  *   RELAY_TEST_STARVE=<case pattern>  those steps get 0s: the REAL skip path runs.
+ *   RELAY_TEST_ELAPSED_AT=<case pattern> with RELAY_TEST_ELAPSED=<n>: while THOSE steps budget, the clock reads n
+ *                                     seconds spent; each keeps its NORMAL own cap, so the hook's own subtraction
+ *                                     (relay_margin_secs / relay_premail_secs) decides whether it runs.
  *   RELAY_TEST_STARVE_AFTER=<n>       with RELAY_TEST_STARVE_COUNT=<file>: the matching steps run normally for their
  *                                     first n calls (counted in that file: the calls run in subshells), then starve. A
  *                                     walk is cut MID-WAY by the budget at an exact call, whatever the runner's speed.
@@ -33,6 +36,8 @@ import path from "path";
  * `$HOOKS_DIR/../dist/wake-coverage-status.js` and silently skips the wake-coverage line without it, so a copy
  * without dist/ (as before this) differed from the real hooks on that line.
  */
+/** The marker file a budgetTree copy carries in its hooks directory (the tripwire's test for "seamed"). */
+export const BUDGET_TREE_MARKER = ".relay-budget-tree";
 export const BUDGET_CLOCK_READ = "${SECONDS:-0}";
 export const BUDGET_CLOCK_SEAMED = "${RELAY_TEST_CLOCK:-${SECONDS:-0}}";
 export const BUDGET_FUNCTIONS = ["relay_margin_secs", "relay_pending_deadline"] as const;
@@ -82,7 +87,32 @@ function unclassifiedSecondsReads(hooksDir: string): string[] {
 /** The SECONDS reads a hooks dir would be refused for (exported so the guard itself is tested). */
 export const budgetGuardFindings = (hooksDir: string): string[] => unclassifiedSecondsReads(hooksDir);
 
-export function budgetTree(dir: string, hooksDir: string, binDir: string): string {
+/**
+ * A hook INSTALLED with another declared timeout: rewrite the ONE inline `RELAY_HOOK_BUDGET_SECS=<n>` line of a hook's
+ * source to `secs` (the same assignment production uses; the source of truth stays the profile's hookInstall timeout,
+ * held equal to the shipped line by its own test). REFUSES unless the line occurs exactly once: a future hook edit can
+ * never silently leave the budget at its old value.
+ */
+export function rewriteDeclaredBudget(src: string, secs: number): string {
+  const re = /^RELAY_HOOK_BUDGET_SECS=\d+$/gm;
+  const n = (src.match(re) ?? []).length;
+  if (n !== 1) throw new Error(`rewriteDeclaredBudget: expected exactly 1 RELAY_HOOK_BUDGET_SECS=<n> line, found ${n}: update the helper`);
+  if (!Number.isInteger(secs) || secs < 1) throw new Error(`rewriteDeclaredBudget: not a budget: ${secs}`);
+  return src.replace(re, `RELAY_HOOK_BUDGET_SECS=${secs}`);
+}
+
+/** The BEHAVIOUR default: PostToolUse and Stop "installed" with 30 s, so a behaviour row never loses a step to time. */
+export const BEHAVIOUR_BUDGET: Readonly<Record<string, number>> = Object.freeze({ "post-tool-use-check.sh": 30, "stop-check.sh": 30 });
+
+/**
+ * `opts.declaredBudget`: the timeout each hook of the copy is "installed" with (rewriteDeclaredBudget).
+ *   - omitted → BEHAVIOUR_BUDGET (the default: a behaviour row's assertions must not depend on the runner's speed);
+ *   - "real" → the hooks' REAL declared budgets, untouched: an EXPLICIT real-budget fixture (a row that measures the
+ *     budget arithmetic or its skip path names itself this way);
+ *   - a record → exactly those budgets, per hook file name.
+ */
+export function budgetTree(dir: string, hooksDir: string, binDir: string, opts: { declaredBudget?: Readonly<Record<string, number>> | "real" } = {}): string {
+  const declared = opts.declaredBudget === "real" ? {} : (opts.declaredBudget ?? BEHAVIOUR_BUDGET);
   const base = path.join(dir, "bot-relay-mcp");
   fs.rmSync(dir, { recursive: true, force: true });
   try {
@@ -92,6 +122,13 @@ export function budgetTree(dir: string, hooksDir: string, binDir: string): strin
     const distDir = path.join(path.dirname(binDir), "dist");
     if (fs.existsSync(distDir)) fs.symlinkSync(distDir, path.join(base, "dist"), "junction");
     const copy = path.join(base, "hooks");
+    // The seam's MARKER (tests/_setup/hook-budget-tripwire.ts reads it): a hook spawned from a directory without it runs
+    // on the real clock and budget. A file, not a line in a helper, so a row that corrupts the helpers keeps it.
+    fs.writeFileSync(path.join(copy, BUDGET_TREE_MARKER), "a budgetTree copy: the test clock seam is installed\n");
+    for (const [hook, secs] of Object.entries(declared)) {
+      const p = path.join(copy, hook);
+      fs.writeFileSync(p, rewriteDeclaredBudget(fs.readFileSync(p, "utf-8"), secs));
+    }
     const stray = unclassifiedSecondsReads(copy);
     if (stray.length) throw new Error(`budgetTree: SECONDS read outside the seamed budget arithmetic, unclassified: ${stray.join(" | ")}`);
     const helpers = path.join(copy, "_vault-helpers.sh");
@@ -112,7 +149,7 @@ export function budgetTree(dir: string, hooksDir: string, binDir: string): strin
           "",
           "# TEST ONLY (budgetTree): RELAY_TEST_STARVE. See tests/_helpers/hook-budget-tree.ts.",
           `eval "$(declare -f relay_budget_for | sed '1s/^relay_budget_for/relay_budget_for_real/')"`,
-          'relay_budget_for() { case "$1" in ${RELAY_TEST_STARVE:-}) relay_test_starve_now && { relay_budget_for_real "$1" 0 "${3:-}"; return; }; relay_budget_for_real "$@" ;; *) relay_budget_for_real "$@" ;; esac; }',
+          'relay_budget_for() { case "$1" in ${RELAY_TEST_ELAPSED_AT:-}) local RELAY_TEST_CLOCK="${RELAY_TEST_ELAPSED:?RELAY_TEST_ELAPSED_AT needs RELAY_TEST_ELAPSED}"; relay_budget_for_real "$@"; return ;; esac; case "$1" in ${RELAY_TEST_STARVE:-}) relay_test_starve_now && { relay_budget_for_real "$1" 0 "${3:-}"; return; }; relay_budget_for_real "$@" ;; *) relay_budget_for_real "$@" ;; esac; }',
           'relay_test_starve_now() { [ -n "${RELAY_TEST_STARVE_AFTER:-}" ] && [ -n "${RELAY_TEST_STARVE_COUNT:-}" ] || return 0; local n; n=$(cat "$RELAY_TEST_STARVE_COUNT" 2>/dev/null); n=$(( ${n:-0} + 1 )); printf \'%s\' "$n" > "$RELAY_TEST_STARVE_COUNT"; [ "$n" -gt "$RELAY_TEST_STARVE_AFTER" ]; }',
           "",
         ].join("\n"),

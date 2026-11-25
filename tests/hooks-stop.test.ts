@@ -481,7 +481,7 @@ describe("Stop hook — graceful degradation", () => {
       RELAY_HTTP_HOST: "127.0.0.1",
       RELAY_HTTP_PORT: "1",
       RELAY_DB_PATH: "/tmp/bot-relay-stop-hook-test-does-not-exist-" + process.pid + "/relay.db",
-    }, { script: REAL_HOOK_SCRIPT });
+    }); // the seamed copy (a fixed clock): this row bounds a hang, it does not measure the real budget
     expect(r.code).toBe(0);
     expect(r.stdout).toBe("");
     expect(r.durationMs).toBeLessThan(7000); // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe, do NOT tighten

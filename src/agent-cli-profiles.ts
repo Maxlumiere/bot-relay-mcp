@@ -119,6 +119,12 @@ export interface AgentCliProfile {
    */
   processPattern: string;
   hookInstall: HookInstall;
+  /**
+   * Doorbell PR 8b (ruling 9ac81564): does an agent on this CLI have an AUTOMATIC wake path at all (a hook, a watch
+   * the CLI can arm)? false means mail to it waits for a person: the wake-coverage detector reports such an agent
+   * NEEDS_HUMAN instead of UNCOVERED. Positive evidence only: see profileHasNoAutoWake.
+   */
+  autoWake: boolean;
   launch: LaunchSpec;
   wake: WakeSpec;
 }
@@ -139,6 +145,7 @@ const CLAUDE: AgentCliProfile = {
       { event: "Stop", matcher: "*", script: "hooks/stop-check.sh", timeout: 5 },
     ],
   },
+  autoWake: true, // Stop/PostToolUse hooks and the relay watch wake a Claude Code session
   launch: {
     strategy: "binary", // run `claude` directly (the historical spawn path).
     launcherScript: null,
@@ -181,6 +188,7 @@ const CODEX: AgentCliProfile = {
       },
     ],
   },
+  autoWake: false, // register-only hooks, no watch it can arm: its mail waits for a person
   launch: {
     // Codex launches via bin/codex-relay — it pre-registers the Tether PID
     // handshake (host_shell_pids) FROM THE SHELL before exec'ing codex with the
@@ -224,3 +232,16 @@ export function getAgentCliProfile(id: string): AgentCliProfile | undefined {
 export function profileProcessPatternSource(): string {
   return AGENT_CLI_PROFILES.map((p) => p.processPattern).join("|");
 }
+
+/**
+ * Doorbell PR 8b: TRUE only when `cliProfile` names a KNOWN profile whose autoWake is false (positive evidence that
+ * no automatic wake exists). A null, empty or unknown profile is FALSE: the detector keeps the agent UNCOVERED, the
+ * alarm. This is DELIBERATELY the opposite default from profileOwesVerdict (db.ts), which under-covers an unknown
+ * profile: there the costly mistake is a false alarm, here it is a SILENCED one.
+ */
+export function profileHasNoAutoWake(cliProfile: string | null | undefined): boolean {
+  if (!cliProfile) return false;
+  const profile = getAgentCliProfile(cliProfile);
+  return profile !== undefined && profile !== null && profile.autoWake === false;
+}
+

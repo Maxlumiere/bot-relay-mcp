@@ -35,7 +35,7 @@ export default withOperatorTripwire({
     // sets its own RELAY_CONFIG_PATH at its module top overrides it (asserted in
     // tests/config-isolation.test.ts). Scoped to config+secrets, NOT RELAY_HOME.
     // (The operator tripwire is put FIRST, before this, by withOperatorTripwire.)
-    setupFiles: ["./tests/_setup/hermetic-config.ts", "./tests/_setup/no-fs-on-held-db.ts"],
+    setupFiles: ["./tests/_setup/hermetic-config.ts", "./tests/_setup/no-fs-on-held-db.ts", "./tests/_setup/hook-budget-tripwire.ts"],
     include: ["tests/**/*.test.ts"],
     exclude: [
       "node_modules/**",
@@ -48,6 +48,8 @@ export default withOperatorTripwire({
       // their own CI step): racers and real daemons must not share the runner with the parallel suite.
       "tests/inv-db-01-owner-lock-race.test.ts",
       "tests/inv-db-01-single-owner-blackbox.test.ts",
+      // Doorbell PR 8 M7: the measurement harness runs on demand only (vitest.m7.config.ts).
+      "tests/m7/**",
     ],
     // v2.1 Phase 8 (CI-fix): CI disk + network are meaningfully slower than
     // local macOS. Webhook-firing tests, HTTP-probe tests, and file-IO-heavy

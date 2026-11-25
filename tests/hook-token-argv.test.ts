@@ -289,6 +289,21 @@ const seamedPath = (p: string) => (SEAMED_HOOKS && p.startsWith(HOOKS_DIR + path
 /** EVERY argument, not only the first: the `bash -x` trace mode runs ["-x", <hook>], where args[0] is the flag. */
 const routeArgs = (args: string[]) => args.map(seamedPath);
 
+/**
+ * A stdin write error a run tolerates: EPIPE (the child exited without reading it), and ENOTCONN only once the child
+ * has EXITED (macOS stdio pipes are socketpairs, so a write after the child exits can surface as ENOTCONN). Any other
+ * code, or ENOTCONN from a child still running, fails the run.
+ */
+function stdinErrorTolerated(code: string | undefined, childExited: boolean): boolean {
+  return code === "EPIPE" || (code === "ENOTCONN" && childExited);
+}
+/**
+ * How long an ENOTCONN waits for the child's exit (libuv may report the error just before the exit event). This grace
+ * proves the child EVENTUALLY exited, not that its exit preceded the write: accepted for a harness (ordering them would
+ * need instrumentation of libuv's internals).
+ */
+const ENOTCONN_EXIT_WAIT_MS = 2000;
+
 function run(args: string[], env: Record<string, string>, stdin = "", fd5?: string): Promise<RunResult> {
   fs.rmSync(ARGV_DIR, { recursive: true, force: true });
   fs.mkdirSync(ARGV_DIR);
@@ -306,10 +321,18 @@ function run(args: string[], env: Record<string, string>, stdin = "", fd5?: stri
     // 'close', not 'exit': a process can exit while another still holds its stdout, so its output has not drained.
     child.on("close", (code) => resolve({ code, stdout, stderr }));
     child.on("error", reject);
-    // A child may exit before reading its stdin (most of these never read it): EPIPE then means "not read", nothing
-    // more. Any other stdin error fails the run.
+    // A child may exit before reading its stdin (most of these never read it): EPIPE (or, on macOS, ENOTCONN once it
+    // has exited) then means "not read", nothing more. Any other stdin error fails the run.
+    let exited = false;
+    child.on("exit", () => (exited = true));
     child.stdin.on("error", (e: NodeJS.ErrnoException) => {
-      if (e.code !== "EPIPE") reject(e);
+      if (stdinErrorTolerated(e.code, exited)) return;
+      if (e.code === "ENOTCONN") {
+        const t = setTimeout(() => reject(e), ENOTCONN_EXIT_WAIT_MS);
+        child.once("exit", () => clearTimeout(t));
+        return;
+      }
+      reject(e);
     });
     child.stdin.end(stdin);
   }).finally(() => {
@@ -492,6 +515,13 @@ describe("the harness itself: run() returns only after the child's output has dr
   it("a last chunk written AFTER the shell exits (by a process still holding its stdout) is captured", async () => {
     const r = await run(["-c", "(sleep 0.3; printf late-chunk) & exit 0"], {});
     expect(r.stdout).toBe("late-chunk");
+  });
+  it("the stdin-error policy: EPIPE is tolerated; ENOTCONN ONLY after the child exited; any other code fails", () => {
+    expect(stdinErrorTolerated("EPIPE", false)).toBe(true);
+    expect(stdinErrorTolerated("EPIPE", true)).toBe(true);
+    expect(stdinErrorTolerated("ENOTCONN", true), "a write after the child exited (macOS socketpair stdio)").toBe(true);
+    expect(stdinErrorTolerated("ENOTCONN", false), "the child still running: a real fault").toBe(false);
+    for (const code of ["EBADF", "EIO", "ECONNRESET", undefined]) expect(stdinErrorTolerated(code, true), String(code)).toBe(false);
   });
   it("a child that exits WITHOUT reading a large stdin: run() resolves (EPIPE means not read, not a failure)", async () => {
     const r = await run(["-c", "exit 0"], {}, "x".repeat(4 * 1024 * 1024));
@@ -764,7 +794,9 @@ describe("stop-check.sh (Stop) and post-tool-use-check.sh (every tool call)", SL
       const token = dbRegister(name, "tester", []).plaintext_token as string;
       const r = await run([hook], { ...remoteEnv(name, home(`${label}-remote-ctl`), token), RELAY_TEST_STARVE: "the remote mail read" }, stdin);
       expect(toolCalls("get_messages").length, "the read never ran: CI's precondition failure, made deterministic").toBe(0);
-      expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the remote mail read \(\d+s of 5s spent\): skipped\./);
+      // The skip NAMES its step (this row's property); the declared budget's value is not (it is pinned on the explicit
+      // real-budget fixtures in tests/adr-0048-c-r2.test.ts; this copy runs the behaviour default).
+      expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the remote mail read \(\d+s of \d+s spent\): skipped\./);
     });
   }
 
@@ -792,7 +824,7 @@ describe("stop-check.sh (Stop) and post-tool-use-check.sh (every tool call)", SL
     getDb().prepare("UPDATE agents SET agent_pid = 999999, agent_pid_start = 'never' WHERE name = ?").run(name);
     const r = await run([ptuSeamed("ptu-live-ctl")], { ...localEnv(name, home("ptu-live-ctl"), token), RELAY_TEST_CLOCK: "0", RELAY_TEST_STARVE: "the liveness restamp" }, PTU_STDIN);
     expect(toolCalls("report_liveness").length, "the restamp never ran: the starved step, made deterministic").toBe(0);
-    expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the liveness restamp \(\d+s of 5s spent\): skipped\./);
+    expect(r.stderr).toMatch(/\[bot-relay\] no time budget left for the liveness restamp \(\d+s of \d+s spent\): skipped\./); // the step named; the budget value is not this row's property
   });
 });
 

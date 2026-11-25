@@ -194,9 +194,9 @@ export async function openRelayDbIfWritten(dbPath: string, afterFirstRead?: () =
  * as `relay fleet` judges a window (src/cli/fleet.ts). Never agents.agent_status or agents.session_id:
  * a window is alive or dead by kernel fact, whatever the relay last recorded about the agent.
  */
-export function bindingLiveness(b: { host_id: string; window_pid?: number | null; window_pid_start?: string | null }, ownHostId: string | null): import("./liveness.js").AnchorVerdict {
-  return anchorLivenessVerdict({ host_id: b.host_id, agent_pid: b.window_pid ?? null, agent_pid_start: b.window_pid_start ?? null }, ownHostId);
-}
+// PR 8b: moved to src/window-judge.ts (shared with the daemon's sweep); re-exported unchanged.
+export { bindingLiveness } from "./window-judge.js";
+import { bindingLiveness } from "./window-judge.js";
 
 /**
  * PR 7: the supervisor's view of the watch on an agent's ONE live window `w`. The window dir is keyed
