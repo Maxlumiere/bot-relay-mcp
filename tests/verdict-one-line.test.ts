@@ -91,6 +91,14 @@ describe.skipIf(WIN)("the one writer: relay_verdict_set + the emitter (sourced)"
     const r = sourced(V, `RELAY_VERDICT_REASON="$R"; RELAY_VERDICT_DETAIL="$D"`, { R: `a${forge("HEALTHY")}`, D: forge("MUTE") });
     expect(r.lines).toHaveLength(1);
   });
+  it("the EMITTER refuses a word outside the total order too: a DIRECT assignment of an unknown word is emitted as CANNOT-JUDGE, naming it", () => {
+    for (const w of ["BOGUS", "healthy", ""]) {
+      const r = sourced(V, `RELAY_VERDICT="$W"; RELAY_VERDICT_REASON="the reason"`, { W: w });
+      expect(r.lines, w).toHaveLength(1);
+      expect(r.lines[0], w).toBe(`[RELAY] VERDICT=CANNOT-JUDGE reason="invalid verdict word refused (${w}): the reason"`);
+    }
+    expect(sourced(V, `RELAY_VERDICT=MUTE; RELAY_VERDICT_REASON=r`).lines[0], "a valid word passes unchanged").toBe('[RELAY] VERDICT=MUTE reason="r"');
+  });
   it("idempotent through relay_verdict_raise: a joined reason is not re-escaped; quotes and multibyte text pass unchanged", () => {
     const r = sourced(V, `relay_verdict_set DEGRADED "$R"; relay_verdict_raise DEGRADED 'b "q" …'`, { R: "a\nb" });
     expect(r.lines).toEqual([`[RELAY] VERDICT=DEGRADED reason="a?b; b "q" …"`]);
@@ -155,6 +163,10 @@ describe.skipIf(WIN)("MUTANTS (executable): each change to a copy of the hooks t
   it("the writer accepts any word → an invalid word is emitted as is", () => {
     const t = hooksTree((d) => replaceOnce(path.join(d, "_verdict.sh"), "  if ! relay_verdict_word_ok \"$_w\"; then", "  if false; then"));
     expect(sourced(path.join(t, "_verdict.sh"), `relay_verdict_set BOGUS r`).lines[0]).toBe('[RELAY] VERDICT=BOGUS reason="r"');
+  });
+  it("the emitter does not check the word → a directly assigned unknown word is emitted as is", () => {
+    const t = hooksTree((d) => replaceOnce(path.join(d, "_verdict.sh"), "  if ! relay_verdict_word_ok \"$RELAY_VERDICT\"; then", "  if false; then"));
+    expect(sourced(path.join(t, "_verdict.sh"), `RELAY_VERDICT=BOGUS; RELAY_VERDICT_REASON=r`).lines[0]).toBe('[RELAY] VERDICT=BOGUS reason="r"');
   });
   it("the emitter does not neutralise → a direct assignment forges a second line", () => {
     const t = hooksTree((d) => replaceOnce(path.join(d, "_verdict.sh"), '  _relay_verdict_line="${_relay_verdict_line//[[:cntrl:]]/?}"\n', ""));
