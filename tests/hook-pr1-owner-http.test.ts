@@ -971,6 +971,9 @@ fs.writeFileSync(
     `if [ -n "$FAKE_NODE_HANG" ]; then case "$*" in *"$FAKE_NODE_HANG"*) exec sleep 30 ;; esac; fi\n` +
     `case "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\n` +
     `if [ -n "$FAKE_PENDING_RC" ] && [ "$2" = pending ]; then exit "$FAKE_PENDING_RC"; fi\n` +
+    // A SLOW RUNNER: each REAL start of the steps before the owner door (the mail read, the resolver) costs this many
+    // seconds; an answer served above (FAKE_WHERE_FILE / FAKE_PENDING_RC) costs nothing.
+    `case "$2 $3" in "pending "*|"where --fields") if [ -n "$FAKE_NODE_SLOW" ]; then sleep "$FAKE_NODE_SLOW"; fi ;; esac\n` +
     `exec "${process.execPath}" "$@"\n`,
   { mode: 0o755 }
 );
@@ -1168,7 +1171,9 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the o
     // The REAL budget, on the REAL clock (the hung step must actually start, so no starved variant): SessionStart
     // directly (outside the hook budget tripwire's scope); PostToolUse/Stop through runHookRealBudgetAsync, whose
     // cut is the line below (timed out / no time budget / could not be read).
-    const run = (extra: Record<string, string>) => runHook(c, hook, { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "owner peek", ...extra }, inputFor(hook), REAL_BUDGET_HOOKS);
+    // COVERAGE (the observer needs the hook to REACH the hung step): on a SLOW runner the steps before the owner door
+    // must not spend its budget share, so the row runs as one (FAKE_NODE_SLOW: every real start of those steps costs 2 s).
+    const run = (extra: Record<string, string>) => runHook(c, hook, { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "owner peek", FAKE_NODE_SLOW: "2", ...extra }, inputFor(hook), REAL_BUDGET_HOOKS);
     const r =
       hook === "check-relay.sh"
         ? await run({ RELAY_TEST_CLOCK: "" })
