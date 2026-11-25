@@ -211,6 +211,12 @@ export type ArgvVerdict = { kind: "PASS" } | { kind: "FAIL"; why: string } | { k
  * The run's verdict, BEFORE the leak assertion: FAIL on any failed observation or a missed handshake with a working
  * observer; NOT_EVALUATED when the handshake failed only because the table never witnessed the target (blind samples,
  * no failures); PASS otherwise (then the row asserts the leak).
+ *
+ * RE-RUN POLICY (the two FAIL kinds stay distinguishable by their messages):
+ * - A FAIL here ("failed observations: …" or "the coverage handshake failed …") is a COVERAGE failure, not a code
+ *   verdict: a re-run on the SAME SHA is allowed, and it still BLOCKS until a run evaluates.
+ * - A FAIL of the LEAK assertion itself (the secret seen on an argv: "no argv held the secret") is a CODE verdict,
+ *   FINAL for that SHA: never re-run it away.
  */
 export function argvVerdict(handshakes: readonly boolean[], s: Pick<ArgvSampler, "failures" | "blindSamples" | "heldSamples">): ArgvVerdict {
   if (s.failures.length > 0) return { kind: "FAIL", why: `failed observations: ${s.failures.slice(0, 3).join("; ")}` };
