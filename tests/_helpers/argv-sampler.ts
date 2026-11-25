@@ -13,7 +13,29 @@
  * request (and the client that sent it) was provably in flight; it REJECTS past the deadline (a coverage failure
  * blocks, it never passes). `heldSamples` counts those samples, and a row asserts it against its bar.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+
+/**
+ * Can `ps -axww -o args=` show a process's FULL argv on this machine? A unique marker is put on a child's argv, and the
+ * probe asks `ps` for it. Where it cannot (e.g. a ps that rejects `-o args=`, or shows no foreign argv), every row that
+ * relies on the sampler would pass VACUOUSLY: such a row must report NOT_EVALUATED, never PASS.
+ */
+export function argvSamplerProbe(): { visible: boolean; why: string } {
+  const marker = `argv-probe-${process.pid}-${Date.now()}`;
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 4000)", marker], { stdio: "ignore" });
+  try {
+    for (let i = 0; i < 20; i++) {
+      const r = spawnSync("ps", ["-axww", "-o", "args="], { encoding: "utf-8", timeout: 5_000 });
+      if (r.error) return { visible: false, why: `ps could not run (${r.error.message})` };
+      if (r.status !== 0) return { visible: false, why: `ps -axww -o args= exited ${r.status}: ${(r.stderr ?? "").trim().slice(0, 120)}` };
+      if ((r.stdout ?? "").includes(marker)) return { visible: true, why: "ps -axww -o args= shows a child's full argv" };
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50); // the child may not be listed yet
+    }
+    return { visible: false, why: "ps -axww -o args= ran but never listed a child's argv marker" };
+  } finally {
+    child.kill("SIGKILL");
+  }
+}
 
 export interface ArgvSampler {
   /** Every completed sample. */

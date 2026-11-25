@@ -20,7 +20,7 @@ import { spawn, spawnSync } from "child_process";
 import { pathToFileURL } from "url";
 import type { Server as HttpServer } from "http";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
-import { startArgvSampler } from "./_helpers/argv-sampler.js";
+import { startArgvSampler, argvSamplerProbe } from "./_helpers/argv-sampler.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-d-")));
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
@@ -301,9 +301,18 @@ describe("the secret file under concurrency", () => {
 });
 
 describe("the hooks send the secret without exposing it (Q2)", () => {
+  // The argv rows need a ps that can SHOW a process's argv. Where it cannot, they would pass vacuously: they report
+  // NOT_EVALUATED (with the probe's reason) instead, and on macOS/Linux the probe itself must pass (a row below).
+  const PROBE = argvSamplerProbe();
+  const argvNotEvaluated = !PROBE.visible;
+  console.log(`[argv-sampler] probe: ${PROBE.visible ? "visible" : `NOT_EVALUATED: ${PROBE.why}`}`);
+  it.skipIf(process.platform === "win32")("the argv sampler can SEE a planted argv on macOS and Linux (the leak rows below are never vacuous there)", () => {
+    expect(PROBE, PROBE.why).toMatchObject({ visible: true });
+  });
   /**
    * COVERAGE BAR: more than 3 `ps` samples taken while curl is provably alive (its request is in flight at the fake
-   * server). GUARANTEED BY: (in this RED commit, still a fixed 400 ms hold; the fix makes it a handshake).
+   * server). GUARANTEED BY A HANDSHAKE: the server answers only after the sampler reports 4 samples STARTED after the
+   * request arrived (waitForSamples); past a 20 s deadline it answers anyway and the bar fails (it never passes).
    */
   async function curlWithSecret(opts: { gapMs: number; plantLeak?: boolean }) {
     const { createServer } = await import("http");
@@ -313,7 +322,11 @@ describe("the hooks send the secret without exposing it (Q2)", () => {
     const sampler = startArgvSampler(secret, { gapMs: opts.gapMs });
     const srv = createServer((req, res) => {
       received = req.headers["x-relay-secret"] as string | undefined;
-      setTimeout(() => res.end("{}"), 400); // hold the request open so the sampler sees curl alive
+      // Hold curl ALIVE until the sampler has its samples (a handshake, not a timer); a coverage failure fails the bar.
+      sampler.waitForSamples(4, 20_000).then(
+        () => res.end("{}"),
+        () => res.end("{}"),
+      );
     });
     await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
     const port = (srv.address() as { port: number }).port;
@@ -335,7 +348,7 @@ describe("the hooks send the secret without exposing it (Q2)", () => {
     return { child, received, secret, sampler };
   }
 
-  it("relay_mint_secret_curl_config | curl -K -: the server receives X-Relay-Secret, and NO process's argv ever holds the secret", async () => {
+  it.skipIf(argvNotEvaluated)("relay_mint_secret_curl_config | curl -K -: the server receives X-Relay-Secret, and NO process's argv ever holds the secret", async () => {
     const r = await curlWithSecret({ gapMs: 20 });
     expect(r.child.status, r.child.stderr).toBe(0);
     expect(r.received, "the server received the secret as X-Relay-Secret").toBe(r.secret);
@@ -343,14 +356,14 @@ describe("the hooks send the secret without exposing it (Q2)", () => {
     expect(r.sampler.leaked, "no argv held the secret").toBe("");
   }, 60_000);
 
-  it("the same, with a SLOW sampler (300 ms between samples, a slow runner): coverage still holds (> 3 samples while curl is alive)", async () => {
+  it.skipIf(argvNotEvaluated)("the same, with a SLOW sampler (300 ms between samples, a slow runner): coverage still holds (> 3 samples while curl is alive)", async () => {
     const r = await curlWithSecret({ gapMs: 300 });
     expect(r.child.status, r.child.stderr).toBe(0);
     expect(r.sampler.heldSamples, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
     expect(r.sampler.leaked, "no argv held the secret").toBe("");
   }, 60_000);
 
-  it("a PLANTED leak (the secret on curl's argv) is CAUGHT once coverage is guaranteed, even with a slow sampler", async () => {
+  it.skipIf(argvNotEvaluated)("a PLANTED leak (the secret on curl's argv) is CAUGHT once coverage is guaranteed, even with a slow sampler", async () => {
     const r = await curlWithSecret({ gapMs: 300, plantLeak: true });
     expect(r.sampler.heldSamples, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
     expect(r.sampler.leaked, "the planted argv leak is caught").toContain(r.secret);
