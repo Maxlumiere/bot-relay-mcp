@@ -239,7 +239,8 @@ resolve_relay_db_path() {
 resolve_relay_token_path() {
   local name="$1"
   if ! relay_whole_match "$name" '^[A-Za-z0-9_.-]{1,64}$'; then
-    echo "[bot-relay hook] invalid agent name \"$name\" for vault path (mirrors AGENT_NAME_RE in src/token-store.ts)" >&2
+    # The rejected name is echoed with its control characters neutralised: a newline in it must not start a line.
+    echo "[bot-relay hook] invalid agent name \"${name//[[:cntrl:]]/?}\" for vault path (mirrors AGENT_NAME_RE in src/token-store.ts)" >&2
     return 1
   fi
   local db_path
@@ -675,7 +676,7 @@ read_relay_token_from_vault() {
 resolve_relay_spawn_manifest_path() {
   local name="$1"
   if ! relay_whole_match "$name" '^[A-Za-z0-9_.-]{1,64}$'; then
-    echo "[bot-relay hook] invalid agent name \"$name\" for manifest path" >&2
+    echo "[bot-relay hook] invalid agent name \"${name//[[:cntrl:]]/?}\" for manifest path" >&2
     return 1
   fi
   local db_path
