@@ -42,7 +42,7 @@ import { checkContainment, type ContainmentModel } from "./approved-roots.js";
  * they run, and a mismatch is VISIBLE instead of a silent divergence. A test
  * recomputes the hash: change either file and it tells you the new value.
  */
-export const RESOLVER_REVISION = "2124ee055f67";
+export const RESOLVER_REVISION = "e71490786213";
 
 /** The instance layout, written HERE only (a tripwire test holds that). */
 export const ACTIVE_INSTANCE_MARKER = "active-instance";
@@ -117,11 +117,35 @@ export type ResolvedInstance =
  * `relay list-instances`) and isProvisionedInstance below both use it, so "this instance exists" has one meaning.
  */
 export function readInstanceMetadataFile(instanceDirPath: string): Record<string, unknown> | null {
+  const file = path.join(instanceDirPath, INSTANCE_METADATA_FILENAME);
+  let fd: number | null = null;
   try {
-    const v: unknown = JSON.parse(fs.readFileSync(path.join(instanceDirPath, INSTANCE_METADATA_FILENAME), "utf-8"));
+    // Never through a link (item 0b): O_NOFOLLOW where the platform has it; elsewhere (Windows) a link is refused
+    // by lstat first. A link at the record's name is not a provisioning record.
+    const noFollow = fs.constants.O_NOFOLLOW;
+    if (noFollow === undefined && fs.lstatSync(file).isSymbolicLink()) return null;
+    // #449 R1 P2: the record's ANCESTORS are real directories too (the instance dir and its parent, instances/): a
+    // STATIC link there (instances/<id> → elsewhere) would otherwise lend another tree's record. No race is needed
+    // for that one, so it is refused outright.
+    for (const d of [instanceDirPath, path.dirname(instanceDirPath)]) {
+      const st = fs.lstatSync(d);
+      if (st.isSymbolicLink() || !st.isDirectory()) return null;
+    }
+    // O_NONBLOCK: a FIFO at the record's name would otherwise block the open before the isFile check refuses it.
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (noFollow ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+    if (!fs.fstatSync(fd).isFile()) return null;
+    const v: unknown = JSON.parse(fs.readFileSync(fd, "utf-8"));
     return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
   } catch {
     return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* a close failure leaves nothing to undo */
+      }
+    }
   }
 }
 
@@ -132,45 +156,126 @@ export function readInstanceMetadataFile(instanceDirPath: string): Record<string
  * instance directories as a side effect.
  */
 export function isProvisionedInstance(instanceDirPath: string, dbExists: boolean): boolean {
+  // Ruling 3fc05540: a linked instances/ or instances/<id> is never an instance, whatever it holds (a DB too).
+  if (linkedInstanceComponent(instanceDirPath) !== null) return false;
   return dbExists || readInstanceMetadataFile(instanceDirPath) !== null;
 }
 
+/** The fold for file names (APFS / NTFS: Unicode case-insensitive). The layout test ALWAYS folds (ruling c998eaf6). */
+const caseFold = (s: string): string => s.normalize("NFC").toUpperCase().toLowerCase();
+const sameName = (a: string, b: string): boolean => caseFold(a) === caseFold(b);
+/** The components of an absolute path, without its root. */
+const componentsOf = (p: string): string[] => p.split(path.sep).filter((c) => c.length > 0);
+/** Two absolute paths naming the same location, compared component by component, case-folded. */
+const samePathFolded = (a: string, b: string): boolean => {
+  const pa = componentsOf(path.resolve(a));
+  const pb = componentsOf(path.resolve(b));
+  return path.parse(path.resolve(a)).root.toLowerCase() === path.parse(path.resolve(b)).root.toLowerCase() && pa.length === pb.length && pa.every((c, i) => sameName(c, pb[i]!));
+};
+
+/** The bound on links followed by one walk (as the kernel's ELOOP bound). */
+const MAX_LINK_HOPS = 40;
+
 /**
- * The instance directory a DB path names (`<instances root>/<id>/relay.db`), or null for any other layout. Compared
- * lexically AND on real paths (the instances root may not exist yet, or be reached through a link). The ONE layout
- * test: the resolver's explicit branches and the open's re-check (src/db.ts via src/instance.ts) both use it.
+ * Resolve `p` by hand (ruling c998eaf6): lstat each component, follow a link by reading it (relative to the directory it
+ * sits in; `..` taken on the RESOLVED path, as the kernel does), and RECORD every link traversed (its resolved location).
+ * A missing component ends the walk with the rest appended as spelled. More than MAX_LINK_HOPS links → null.
+ */
+export function walkPath(p: string): { real: string; links: string[] } | null {
+  const abs = path.resolve(p);
+  let cur = path.parse(abs).root;
+  let pending = componentsOf(abs);
+  const links: string[] = [];
+  let hops = 0;
+  while (pending.length > 0) {
+    const c = pending.shift()!;
+    if (c === ".") continue;
+    if (c === "..") {
+      cur = path.dirname(cur);
+      continue;
+    }
+    const next = path.join(cur, c);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(next);
+    } catch {
+      return { real: path.join(next, ...pending), links };
+    }
+    if (!st.isSymbolicLink()) {
+      cur = next;
+      continue;
+    }
+    if (++hops > MAX_LINK_HOPS) return null;
+    links.push(next);
+    let target: string;
+    try {
+      target = fs.readlinkSync(next);
+    } catch {
+      return null;
+    }
+    if (path.isAbsolute(target)) cur = path.parse(target).root;
+    pending = [...componentsOf(target), ...pending];
+  }
+  return { real: cur, links };
+}
+
+/**
+ * The instance directory a DB path names (`<instances root>/<id>/relay.db`), or null for any other layout: the ONE
+ * layout test (the resolver's explicit branches and the open's re-check, src/db.ts via src/instance.ts).
+ *
+ * Ruling c998eaf6: the DB path and the relay home are each WALKED (walkPath: every link recorded), and the real target
+ * is compared to the canonical instances root (the relay home's real location + "instances") component by component,
+ * ALWAYS case-insensitively (no detection: over-recognition only applies the stricter instance rules). A link traversed
+ * AT or BELOW the instances root also puts the path in the layout, wherever it leads, so the 3fc05540 refusal names it;
+ * links above the root (the relay home itself, an alias outside it) are access paths. The caller's spelling never
+ * decides. The directory returned is spelled under the instances root: for a link at the instances/<id> level, that
+ * link's own name (so the link check names it).
  */
 export function instanceDirOfDbPath(dbPath: string, instancesRoot: string): string | null {
-  if (path.basename(dbPath) !== DB_FILENAME) return null;
   const dir = path.dirname(dbPath);
-  const parent = path.dirname(dir);
-  const root = instancesRoot;
-  if (path.resolve(parent) === path.resolve(root)) return dir; // the fast path
-  // realpathSync.NATIVE: on a case-insensitive file system it returns the on-disk case, where JS realpathSync keeps
-  // the caller's (MEASURED, macOS: ".../INSTANCES" stays upper-case under realpathSync, ".../instances" under
-  // .native), so a wrong-case path into instances/ is recognised. The nearest EXISTING ancestor is resolved and the
-  // missing tail re-appended (the instances root itself may not exist yet).
-  const nearestReal = (q: string): string | null => {
-    let cur = path.resolve(q);
-    const tail: string[] = [];
-    for (;;) {
-      try {
-        return path.join(fs.realpathSync.native(cur), ...tail);
-      } catch {
-        const up = path.dirname(cur);
-        if (up === cur) return null;
-        tail.unshift(path.basename(cur));
-        cur = up;
-      }
+  // The fast path: the exact spelling (its components are checked by the callers' link check).
+  if (path.basename(dbPath) === DB_FILENAME && path.resolve(path.dirname(dir)) === path.resolve(instancesRoot)) return dir;
+  const home = walkPath(path.dirname(instancesRoot));
+  const walked = walkPath(dbPath);
+  if (home === null || walked === null) return null;
+  const canonRoot = path.join(home.real, path.basename(instancesRoot));
+  const spelledRoot = path.resolve(instancesRoot);
+  // A link traversed at the instances root itself, or at an instances/<id> entry: in the layout, refused by name.
+  for (const l of walked.links) {
+    if (samePathFolded(l, canonRoot)) return path.join(spelledRoot, path.basename(path.dirname(walked.real)));
+    if (samePathFolded(path.dirname(l), canonRoot)) return path.join(spelledRoot, path.basename(l));
+  }
+  if (!sameName(path.basename(walked.real), DB_FILENAME)) return null;
+  const inDir = path.dirname(walked.real);
+  return samePathFolded(path.dirname(inDir), canonRoot) ? path.join(spelledRoot, path.basename(inDir)) : null;
+}
+
+/**
+ * Ruling 3fc05540: below the trust root (the relay home, which MAY be a link) every component is real, for read AND
+ * write; a linked instances/ or instances/<id> is NOT an instance. Which one is a link, by its relative name, or null.
+ */
+export function linkedInstanceComponent(instanceDirPath: string): string | null {
+  const id = path.basename(instanceDirPath);
+  for (const [p, name] of [[path.dirname(instanceDirPath), "instances/"], [instanceDirPath, `instances/${id}`]] as const) {
+    try {
+      if (fs.lstatSync(p).isSymbolicLink()) return name;
+    } catch {
+      /* absent: not a link */
     }
-  };
-  const rp = nearestReal(parent);
-  const rr = nearestReal(root);
-  return rp !== null && rr !== null && rp === rr ? dir : null;
+  }
+  return null;
 }
 
 /** The refusal for a selected instance that was never provisioned: the id, what named it, how to create or select one. */
 export function unprovisionedReason(id: string, namedBy: string, instanceDirPath: string, select: string): string {
+  // A LINK below the relay home gets its own refusal (never "does not exist"), with the supported way to move storage.
+  const linked = linkedInstanceComponent(instanceDirPath);
+  if (linked !== null) {
+    return (
+      `relay: the instance directory ${linked} is a symbolic link, which is not allowed below the relay home. To keep the ` +
+      `relay on other storage, move or link the WHOLE relay home (RELAY_HOME / ~/.bot-relay) instead.`
+    );
+  }
   return (
     `instance "${id}" (named by ${namedBy}) does not exist: ${instanceDirPath} holds no ${INSTANCE_METADATA_FILENAME} and no ` +
     `${DB_FILENAME}. Opening it would CREATE an empty relay that looks connected while its peers use another instance, ` +
