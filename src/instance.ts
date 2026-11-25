@@ -47,7 +47,10 @@ import {
   isProvisionedInstance,
   instanceDirOfDbPath as layoutDirOf,
   readInstanceMetadataFile,
+  INSTANCE_METADATA_FILENAME,
+  INSTANCES_DIRNAME,
   unprovisionedReason,
+  linkedInstanceComponent,
   type ResolvedInstance,
   type ResolverEnv,
 } from "./resolve-instance.js";
@@ -229,25 +232,197 @@ export function generateInstanceId(): string {
 }
 
 /**
+ * Item 0b (Codex #442 R1 P2-3): explicit provisioning never follows a link below the relay home.
+ *
+ * The trust boundary is the relay home ROOT, resolved ONCE with realpath (it MAY be a link: an operator can keep
+ * ~/.bot-relay elsewhere). Every component BELOW it (instances/, instances/<id>/) must be a real directory: lstat'd,
+ * created one component at a time (never `recursive: true` over an unchecked path), and narrowed to 0700 through a
+ * no-follow descriptor. A link or a non-directory is refused with a content-free line naming its ROLE (no link
+ * target is read or printed).
+ */
+function relayHomeRealRoot(): string {
+  const root = botRelayRoot();
+  // Above the trust boundary is the operator's own home: creating the root's missing ancestors there is not a
+  // descent through anything this code must distrust.
+  if (!lstatOrNull(root)) fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  return fs.realpathSync(root);
+}
+
+function lstatOrNull(p: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(p);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/** A validated component's identity (#449 R1 P1): re-checked after the last write step. */
+interface ComponentIdentity {
+  role: string;
+  path: string;
+  dev: bigint;
+  ino: bigint;
+}
+const identityOf = (p: string, role: string): ComponentIdentity => {
+  let st: fs.BigIntStats;
+  try {
+    st = fs.lstatSync(p, { bigint: true });
+  } catch {
+    // #449 R2 P3: a native error names the path; the refusal names the ROLE.
+    throw new Error(`refusing to provision the instance: the ${role} could not be checked`);
+  }
+  return { role, path: p, dev: st.dev, ino: st.ino };
+};
+
+/** TESTS ONLY: runs between the validation of the chain and the writes (a swap injected in the window). */
+let provisionSeam: (() => void) | null = null;
+export function _setProvisionSeamForTests(fn: (() => void) | null): void {
+  provisionSeam = fn;
+}
+
+/** One directory component below the trust root: created when absent, refused unless it is a REAL directory. */
+function realDirComponent(p: string, role: string): ComponentIdentity {
+  let st: fs.Stats | null;
+  try {
+    st = lstatOrNull(p);
+  } catch {
+    throw new Error(`refusing to provision the instance: the ${role} could not be checked`);
+  }
+  if (!st) {
+    try {
+      fs.mkdirSync(p, { mode: 0o700 });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw new Error(`refusing to provision the instance: the ${role} could not be created`);
+    }
+    try {
+      st = lstatOrNull(p);
+    } catch {
+      throw new Error(`refusing to provision the instance: the ${role} could not be checked`);
+    }
+  }
+  if (!st || st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error(`refusing to provision the instance: the ${role} is not a real directory (a symbolic link, or not a directory)`);
+  }
+  if (process.platform === "win32") return identityOf(p, role);
+  // Narrow an existing directory through a descriptor that cannot follow a link swapped in after the lstat. A native
+  // failure (a swap between the lstat and the open) names the path: it is mapped to the ROLE (#449 R1 P3).
+  let fd: number;
+  try {
+    fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  } catch {
+    throw new Error(`refusing to provision the instance: the ${role} changed while it was being checked (a symbolic link, or not a directory)`);
+  }
+  try {
+    fs.fchmodSync(fd, 0o700);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return identityOf(p, role);
+}
+
+/** The instance directory, every component below the relay home real (created one at a time). */
+export function provisionInstanceDir(instanceId: string): string {
+  const { dir, chain } = provisionInstanceChain(instanceId);
+  assertChainUnchanged(chain);
+  return dir;
+}
+
+/** provisionInstanceDir, plus each component's identity from the trust root down (for the post-write re-check). */
+function provisionInstanceChain(instanceId: string): { dir: string; chain: ComponentIdentity[] } {
+  const idFault = instanceIdFault(instanceId);
+  if (idFault) throw new Error(`invalid instance_id "${instanceId}": ${idFault}`);
+  const root = relayHomeRealRoot();
+  const chain = [identityOf(root, "relay home")];
+  const instances = path.join(root, INSTANCES_DIRNAME);
+  const dir = path.join(instances, instanceId);
+  // #449 R2 P1: a component may be CREATED here (the first write): a failure after that still checks the chain so far.
+  checkedAfterWrites(chain, () => {
+    chain.push(realDirComponent(instances, "instances directory"));
+    chain.push(realDirComponent(dir, "instance directory"));
+  });
+  return { dir, chain };
+}
+
+/**
+ * #449 R1 P1 (ruling af911583): after the LAST write step, every component must still be the one validated. Node has
+ * no openat, so a component swapped for a link inside the window cannot be PREVENTED; it is DETECTED here and refused
+ * loudly, by ROLE (never the path). Nothing is undone: undoing through a swapped path could delete or chmod at the
+ * other end; a person decides.
+ */
+function chainRedirect(chain: ComponentIdentity[]): string | null {
+  for (const c of chain) {
+    let same = false;
+    try {
+      const st = fs.lstatSync(c.path, { bigint: true });
+      same = !st.isSymbolicLink() && st.dev === c.dev && st.ino === c.ino;
+    } catch {
+      same = false;
+    }
+    if (!same) {
+      return `refusing: the ${c.role} changed while the instance was being provisioned; the operation may have been redirected. Nothing was undone: check it before using this instance.`;
+    }
+  }
+  return null;
+}
+function assertChainUnchanged(chain: ComponentIdentity[]): void {
+  const redirect = chainRedirect(chain);
+  if (redirect !== null) throw new Error(redirect);
+}
+
+/**
+ * #449 R2 P1 (ruling c998eaf6): run `work` (which writes), then check the chain on EVERY exit path, failures included.
+ * A changed component wins: the redirect line comes first, and the original failure, if any, follows it.
+ */
+function checkedAfterWrites<T>(chain: ComponentIdentity[], work: () => T): T {
+  let result: T | undefined;
+  let failure: unknown = null;
+  let failed = false;
+  try {
+    result = work();
+  } catch (err) {
+    failed = true;
+    failure = err;
+  }
+  const redirect = chainRedirect(chain);
+  if (redirect !== null) {
+    throw new Error(failed ? `${redirect} The operation also failed: ${failure instanceof Error ? failure.message : String(failure)}` : redirect);
+  }
+  if (failed) throw failure;
+  return result as T;
+}
+
+/** Remove a temp file; a failure to remove it (e.g. a swapped ancestor) is never a native, path-bearing error. */
+function removeTempQuietly(tmp: string): void {
+  try {
+    fs.rmSync(tmp, { force: true });
+  } catch {
+    /* #449 R2 P3: nothing path-bearing escapes; the caller's role refusal (and the chain check) speak */
+  }
+}
+
+/**
  * Create a per-instance directory + write instance.json metadata.
  * Idempotent: re-creating an existing instance refreshes the
  * `daemon_version_first_seen` but leaves `created_at` intact.
+ * Item 0b: no link is followed. The directories come from provisionInstanceDir; the record is read with O_NOFOLLOW
+ * (readInstanceMetadataFile) and written to a fresh temp file (O_CREAT|O_EXCL|O_NOFOLLOW, 0600) renamed over the
+ * name, so a link at instance.json is REPLACED and its target never written.
  */
 export function createInstance(
   instanceId: string,
   version: string,
   label?: string | null,
 ): InstanceMetadata {
-  const dir = instanceDir(instanceId);
-  if (!dir) throw new Error("createInstance requires non-null instance_id");
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const metaPath = path.join(dir, "instance.json");
-  let existing: InstanceMetadata | null = null;
-  try {
-    if (fs.existsSync(metaPath)) {
-      existing = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as InstanceMetadata;
-    }
-  } catch { /* treat corrupt as absent */ }
+  const { dir, chain } = provisionInstanceChain(instanceId);
+  return checkedAfterWrites(chain, () => writeInstanceRecord(instanceId, version, label, dir));
+}
+
+/** createInstance's record write (its every failure phrased by ROLE, no temp file left); the caller checks the chain. */
+function writeInstanceRecord(instanceId: string, version: string, label: string | null | undefined, dir: string): InstanceMetadata {
+  provisionSeam?.();
+  const metaPath = path.join(dir, INSTANCE_METADATA_FILENAME);
+  const existing = readInstanceMetadataFile(dir) as InstanceMetadata | null;
   const now = new Date().toISOString();
   const meta: InstanceMetadata = {
     instance_id: instanceId,
@@ -256,8 +431,45 @@ export function createInstance(
     daemon_version_first_seen: existing?.daemon_version_first_seen ?? version,
     label: label ?? existing?.label ?? null,
   };
-  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), { mode: 0o600 });
+  const tmp = path.join(dir, `.${INSTANCE_METADATA_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
+  // Every failure here is phrased by ROLE (never the path) and leaves no temp file behind.
+  let fd: number;
+  try {
+    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+  } catch {
+    throw new Error("refusing to provision the instance: its metadata record could not be created in the instance directory");
+  }
+  try {
+    fs.writeSync(fd, JSON.stringify(meta, null, 2));
+    fs.fsyncSync(fd);
+  } catch {
+    fs.closeSync(fd);
+    removeTempQuietly(tmp);
+    throw new Error("refusing to provision the instance: its metadata record could not be written");
+  }
+  fs.closeSync(fd);
+  try {
+    fs.renameSync(tmp, metaPath);
+  } catch (err) {
+    removeTempQuietly(tmp);
+    const code = (err as NodeJS.ErrnoException).code;
+    throw new Error(
+      code === "EISDIR" || code === "ENOTEMPTY" || code === "EEXIST"
+        ? "refusing to provision the instance: its metadata record (instance.json) is not a regular file"
+        : "refusing to provision the instance: its metadata record could not be put in place",
+    );
+  }
   return meta;
+}
+
+/**
+ * #449 R2 P3: why `instanceId` has no readable record, when the reason is a LINK below the relay home (ruling
+ * 3fc05540): the specific refusal, never a generic "not found". Null otherwise (absent, corrupt, an invalid id).
+ */
+export function instanceLinkRefusal(instanceId: string): string | null {
+  if (instanceIdFault(instanceId)) return null;
+  const dir = path.join(instancesRoot(), instanceId);
+  return linkedInstanceComponent(dir) === null ? null : unprovisionedReason(instanceId, "its id", dir, "");
 }
 
 /** Read an instance's metadata. Returns null on missing / corrupt. */
@@ -619,6 +831,8 @@ export function acquireInstanceLock(
  */
 export function setActiveInstance(instanceId: string): void {
   if (!readInstance(instanceId)) {
+    const linked = instanceLinkRefusal(instanceId);
+    if (linked !== null) throw new Error(linked);
     throw new Error(
       `instance "${instanceId}" not found. Run \`relay init --instance-id=${instanceId}\` first.`,
     );

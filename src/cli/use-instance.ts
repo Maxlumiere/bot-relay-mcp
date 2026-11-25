@@ -15,7 +15,7 @@
  * active-instance symlink is a CLI convenience, not an override for
  * running daemons.
  */
-import { setActiveInstance, readInstance, resolveActiveInstanceId } from "../instance.js";
+import { setActiveInstance, readInstance, resolveActiveInstanceId, instanceLinkRefusal } from "../instance.js";
 
 function printUsage(requested = false): void {
   // STREAM DISCIPLINE: usage is diagnostic on the ERROR path, so it goes to
@@ -59,6 +59,12 @@ export async function run(argv: string[]): Promise<number> {
   }
   const meta = readInstance(id);
   if (!meta) {
+    // #449 R2 P3: a linked instance directory gets the relay's link refusal, never a generic "not found".
+    const linked = instanceLinkRefusal(id);
+    if (linked !== null) {
+      process.stderr.write(`${linked}\n`);
+      return 2;
+    }
     process.stderr.write(
       `relay use-instance: instance "${id}" not found. ` +
       `Run \`relay list-instances\` to see available ids, ` +

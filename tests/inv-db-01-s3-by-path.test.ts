@@ -821,7 +821,10 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(fs.existsSync(staged), "the staged copy is removed").toBe(false);
   }, 60_000);
 
-  it.skipIf(WIN_DIR_SYMLINK)("R2 P2-3: a SYMLINKED instance directory (instances/a -> storage) still belongs to its instance: A's wasm declaration refuses B's native opener (absent DB: nothing created; legacy DB: refused, hook skip-declared-wasm)", async () => {
+  // Ruling 3fc05540 SUPERSEDES the R2 P2-3 pin: below the relay home every component is real, for read AND write, so
+  // a linked instances/<id> is NOT an instance. It is refused with its own line (move or link the WHOLE relay home
+  // instead), and nothing is created at the link's target.
+  it.skipIf(WIN_DIR_SYMLINK)("ruling 3fc05540 (supersedes R2 P2-3): a SYMLINKED instance directory (instances/a -> storage) is NOT an instance: its open is refused with the link line, nothing created", async () => {
     const root = path.join(caseDir, ".bot-relay", "instances");
     fs.mkdirSync(path.join(root, "b"), { recursive: true });
     fs.writeFileSync(path.join(root, "b", "config.json"), JSON.stringify({ sqlite_driver: "native" }), { mode: 0o600 });
@@ -835,11 +838,12 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     process.env.RELAY_INSTANCE_ID = "b";
     const aDb = path.join(root, "a", "relay.db");
     process.env.RELAY_DB_PATH = aDb;
-    expect(() => db.getDb()).toThrow(/declares sqlite_driver "wasm"/);
+    expect(() => db.getDb()).toThrow(/the instance directory instances\/a is a symbolic link, which is not allowed below the relay home/);
     expect(fs.existsSync(path.join(storage, "relay.db")), "nothing was created").toBe(false);
+    // With a DB present behind the link, the raw open and the hooks' verdict refuse too (read AND write).
     makeDb(path.join(storage, "relay.db"), 0, ["row-1"]);
-    await expect(openRawRelayDb(aDb, { readonly: true })).rejects.toThrow(/declares sqlite_driver "wasm"/);
-    expect(hookDbVerdict(aDb)).toBe("skip-declared-wasm");
+    await expect(openRawRelayDb(aDb, { readonly: true })).rejects.toThrow(/REFUSING a raw native open/);
+    expect(hookDbVerdict(aDb), "the hooks skip it (never a sqlite3 read)").toMatch(/^skip-/);
   });
 
   it.skipIf(WIN_FILE_SYMLINK)("R2 P2-3: a DB path that is itself a SYMLINK INTO an instance directory belongs to that instance: A's wasm declaration refuses it (raw open, hook skip-declared-wasm)", async () => {

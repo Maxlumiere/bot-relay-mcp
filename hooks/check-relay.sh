@@ -74,6 +74,7 @@ RELAY_VERDICT_DETAIL=""
 relay_emit_verdict() {
   relay_in_main_shell || return 0
   _l="[RELAY] VERDICT=${RELAY_VERDICT} reason=\"${RELAY_VERDICT_REASON}\"${RELAY_VERDICT_DETAIL}"
+  _l="${_l//[[:cntrl:]]/?}" # one line, always (a control character can never start a second verdict line)
   if [ "${RELAY_VERDICT_STREAM:-stdout}" = "stderr" ]; then echo "$_l" >&2; else echo "$_l"; fi
 }
 trap relay_emit_verdict EXIT
@@ -318,11 +319,12 @@ fi
 
 # Allowed character set for agent name and role
 if ! [[ "$AGENT_NAME" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
-  echo "[bot-relay] RELAY_AGENT_NAME has invalid characters or length. Allowed: [A-Za-z0-9_.-], 1-64 chars. Got: '$AGENT_NAME'" >&2
+  # Echoed with control characters neutralised: a newline in the rejected value must not start a (verdict) line.
+  echo "[bot-relay] RELAY_AGENT_NAME has invalid characters or length. Allowed: [A-Za-z0-9_.-], 1-64 chars. Got: '${AGENT_NAME//[[:cntrl:]]/?}'" >&2
   exit 0
 fi
 if ! [[ "$AGENT_ROLE" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
-  echo "[bot-relay] RELAY_AGENT_ROLE has invalid characters or length. Allowed: [A-Za-z0-9_.-], 1-64 chars. Got: '$AGENT_ROLE'" >&2
+  echo "[bot-relay] RELAY_AGENT_ROLE has invalid characters or length. Allowed: [A-Za-z0-9_.-], 1-64 chars. Got: '${AGENT_ROLE//[[:cntrl:]]/?}'" >&2
   exit 0
 fi
 # Capabilities: comma-separated tokens of the same character set.
