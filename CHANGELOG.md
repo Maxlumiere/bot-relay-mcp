@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### A linked directory below the relay home is no longer an instance
+
+- **Changed (behaviour):** below the relay home, every directory must be a real directory, for reads as well as writes. An `instances/` directory, or an `instances/<id>` directory, that is a symbolic link is no longer treated as an instance. Opening it, selecting it or provisioning into it is refused with its own message, non-zero, and nothing is created at the link's target: `relay: the instance directory instances/<id> is a symbolic link, which is not allowed below the relay home. To keep the relay on other storage, move or link the WHOLE relay home (RELAY_HOME / ~/.bot-relay) instead.` Migration: if you kept an instance directory on other storage through a link, link or move the whole relay home instead. The relay home itself may still be a link.
+
+
 ### The hooks reach their relay daemon through its owner door
 
 - **Added:** every relay DAEMON (native or wasm) writes an owner record (version 3) beside its database once it is listening (`.<db>.relay-owner.json`, version 2: the host 127.0.0.1, its port, its pid and start, a per-owner key; never deleted, overwritten by the next owner). It is written through ONE file descriptor: created exclusively, made private (mode 0600; on Windows an owner-only ACL), verified (its owner, its permissions, and that its name still names that file), and only then given the key. Any fault publishes no record. The record names its instance and its database's canonical path. The record always names a listener the hooks reach as 127.0.0.1. A daemon that 127.0.0.1 cannot reach also opens a second listener on 127.0.0.1 that serves only the owner door (every other request gets 403, and a WebSocket upgrade is closed): for example one bound to `::1` or a LAN address, or one whose Host allowlist leaves 127.0.0.1 out.

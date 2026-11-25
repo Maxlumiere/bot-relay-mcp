@@ -534,9 +534,14 @@ export async function run(argv: string[], rootOverride?: string): Promise<number
   // ---- 1. config.json (reconcile) ------------------------------------------
   ensureSecureDir(defaultBotRelayDir(), 0o700);
   if (effectiveInstanceId && perInstanceDir) {
-    ensureSecureDir(path.dirname(perInstanceDir), 0o700);
-    ensureSecureDir(perInstanceDir, 0o700);
-    createInstance(effectiveInstanceId, "relay-init");
+    // Item 0b: createInstance creates and narrows instances/ and <id>/ itself, never through a link (ensureSecureDir
+    // would mkdir -p and chmod THROUGH one).
+    try {
+      createInstance(effectiveInstanceId, "relay-init");
+    } catch (err) {
+      process.stderr.write(`relay init: ${err instanceof Error ? err.message : String(err)}\n`);
+      return 1;
+    }
   }
   // ADR-0006 (a) — secret-by-default. Operator-power endpoints are authed
   // regardless of network position (ADR-0006 b), which requires an operator

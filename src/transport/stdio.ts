@@ -9,7 +9,7 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import type { Readable, Writable } from "node:stream";
 import { createServer } from "../server.js";
 import { endAgentSessionOnSignal, getAgentSessionId, logAudit, recordOwnConnector, setAgentLivenessAnchor } from "../db.js";
-import { detectAgentProcess, type AgentProcess } from "../liveness.js";
+import { detectAgentProcess, setOwnDetectedAgent, type AgentProcess } from "../liveness.js";
 import { LOADED_BUILD } from "../loaded-build.js";
 import { log } from "../logger.js";
 import { broadcastDashboardEvent } from "./websocket.js";
@@ -302,6 +302,7 @@ export async function startStdioServer(
   // what is installed. Best-effort: a failed stamp leaves the window UNKNOWN, the
   // safe direction, and never blocks startup, but it is never silent.
   detectedAgentProcess = detectAgentProcess();
+  setOwnDetectedAgent(detectedAgentProcess); // PR 8b: register_agent on this server derives cli_profile_observed from it
   stampOwnConnector(detectedAgentProcess, LOADED_BUILD);
   const name = process.env.RELAY_AGENT_NAME;
   if (name && name !== "default") {
