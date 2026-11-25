@@ -32,14 +32,28 @@ describe("a coverage gap is visible", () => {
     }
     expect(fs.readFileSync(summary, "utf-8")).toBe("## earlier step\ncoverage gaps: rows X NOT_EVALUATED (why); follow-up: next\n");
   });
-  it("off CI (no step summary), or an unwritable summary: logged only, and it never throws", () => {
+  it("off CI (no step summary): printed to stdout only, never throws", () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       expect(() => reportCoverageGap("r", "w", "n", {})).not.toThrow();
-      expect(() => reportCoverageGap("r", "w", "n", { GITHUB_STEP_SUMMARY: path.join(ROOT, "no-such-dir", "s.md") })).not.toThrow();
-      expect(log).toHaveBeenCalledTimes(2);
+      expect(log).toHaveBeenCalledTimes(1);
     } finally {
       log.mockRestore();
     }
+  });
+  it("on CI, an UNWRITABLE step summary FAILS with one line (the gap can never vanish)", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(() => reportCoverageGap("r", "w", "n", { GITHUB_STEP_SUMMARY: path.join(ROOT, "no-such-dir", "s.md") })).toThrow(
+        /^coverage gaps: the CI step summary could not be appended \(.+\): coverage gaps: r NOT_EVALUATED \(w\); follow-up: n$/,
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+  it("the reason is SANITIZED: control characters stripped, length capped", () => {
+    const line = coverageGapLine("r", `bad\u0000\u001b[31mreason\n${"x".repeat(400)}`, "n");
+    expect(line).not.toMatch(/[\u0000-\u001f\u007f]/);
+    expect(line.length).toBeLessThan(260);
   });
 });
