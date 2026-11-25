@@ -27,12 +27,12 @@ delete process.env.RELAY_AGENT_TOKEN;
 const { startHttpServer } = await import("../src/transport/http.js");
 const { closeDb, getDb } = await import("../src/db.js");
 const { log } = await import("../src/logger.js");
-const { _setReplaceDepsForTests, WINDOWS_REPLACE_WAITS_MS } = await import("../src/fs-replace.js");
+const { __testSetReplaceDeps, WINDOWS_REPLACE_WAITS_MS } = await import("../src/fs-replace.js");
 const { ownerEndpointPath } = await import("../src/owner-endpoint.js");
 
 let server: HttpServer | null = null;
 afterAll(() => {
-  _setReplaceDepsForTests(null);
+  __testSetReplaceDeps(null);
   server?.close();
   closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
@@ -42,7 +42,7 @@ describe("the owner endpoint record's logging caller (the HTTP daemon)", () => {
   it("Windows: the record's rename refused past the bounded retries → the NAMED warning, the daemon still serves, no record and no temp file", async () => {
     getDb();
     let calls = 0;
-    _setReplaceDepsForTests({
+    __testSetReplaceDeps({
       platform: "win32",
       rename: () => {
         calls++;

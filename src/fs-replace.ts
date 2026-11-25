@@ -26,8 +26,9 @@ const blockFor = (ms: number): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 };
 let testDeps: ReplaceDeps | null = null;
-/** TESTS ONLY: the deps every call uses when it passes none (a Windows-shaped failing rename on any OS). */
-export function _setReplaceDepsForTests(deps: ReplaceDeps | null): void {
+/** TESTS ONLY (the __test prefix; tests/fs-replace-test-seam-tripwire.test.ts fails if any other src/ file names
+ * it): the deps every call uses when it passes none (a Windows-shaped failing rename on any OS). */
+export function __testSetReplaceDeps(deps: ReplaceDeps | null): void {
   testDeps = deps;
 }
 

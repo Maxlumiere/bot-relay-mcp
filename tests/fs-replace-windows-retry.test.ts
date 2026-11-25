@@ -15,7 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { renameReplacingWithWindowsRetry, WINDOWS_REPLACE_WAITS_MS, _setReplaceDepsForTests, type ReplaceError } from "../src/fs-replace.js";
+import { renameReplacingWithWindowsRetry, WINDOWS_REPLACE_WAITS_MS, __testSetReplaceDeps, type ReplaceError } from "../src/fs-replace.js";
 
 /** A rename that fails `failures` times with `code`, then performs the real rename. */
 function flakyRename(failures: number, code: string) {
@@ -35,7 +35,7 @@ const fresh = () => {
   fs.writeFileSync(path.join(dir, "dst"), "old");
 };
 afterEach(() => {
-  _setReplaceDepsForTests(null);
+  __testSetReplaceDeps(null);
   if (dir) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -115,7 +115,7 @@ describe("the REAL owner endpoint writer through the seam: success after retries
   it("Windows: EPERM THREE times, then the rename succeeds → the record is written; no temp file left", async () => {
     const db = setup();
     const f = flakyRename(3, "EPERM");
-    _setReplaceDepsForTests({ platform: "win32", rename: f.rename, sleep: () => {} });
+    __testSetReplaceDeps({ platform: "win32", rename: f.rename, sleep: () => {} });
     const { writeOwnerEndpoint } = await import("../src/owner-endpoint.js");
     const file = writeOwnerEndpoint(db, 4343, "http", "inst-y");
     expect(f.calls.length).toBe(4);
@@ -128,7 +128,7 @@ describe("the REAL owner endpoint writer through the seam: success after retries
     writeOwnerEndpoint(db, 1111, "http", "inst-old"); // the previous record, written normally
     const before = fs.readFileSync(ownerEndpointPath(db), "utf-8");
     const f = flakyRename(5, "EPERM");
-    _setReplaceDepsForTests({ platform: "win32", rename: f.rename, sleep: () => {} });
+    __testSetReplaceDeps({ platform: "win32", rename: f.rename, sleep: () => {} });
     let err: ReplaceError | null = null;
     try {
       writeOwnerEndpoint(db, 2222, "http", "inst-new");
@@ -147,7 +147,7 @@ describe("the REAL owner endpoint writer through the seam: success after retries
     writeOwnerEndpoint(db, 1111, "http", "inst-old");
     const before = fs.readFileSync(ownerEndpointPath(db), "utf-8");
     const f = flakyRename(1, "EACCES");
-    _setReplaceDepsForTests({ platform: "linux", rename: f.rename, sleep: () => { throw new Error("POSIX never waits"); } });
+    __testSetReplaceDeps({ platform: "linux", rename: f.rename, sleep: () => { throw new Error("POSIX never waits"); } });
     let err: ReplaceError | null = null;
     try {
       writeOwnerEndpoint(db, 2222, "http", "inst-new");
@@ -168,7 +168,7 @@ describe("a REAL record writer through the seam: the owner endpoint record", () 
     const db = path.join(dir, "relay.db");
     fs.writeFileSync(db, "");
     const f = flakyRename(2, "EPERM");
-    _setReplaceDepsForTests({ platform: "win32", rename: f.rename, sleep: () => {} });
+    __testSetReplaceDeps({ platform: "win32", rename: f.rename, sleep: () => {} });
     const { writeOwnerEndpoint } = await import("../src/owner-endpoint.js");
     const file = writeOwnerEndpoint(db, 4242, "http", "inst-x");
     expect(f.calls.length, "two refused renames, then the real one").toBe(3);
