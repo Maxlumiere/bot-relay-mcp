@@ -181,7 +181,12 @@ relay_emit_verdict() {
   # Only the hook's MAIN shell emits (relay_in_main_shell, defined by every hook before it sources this).
   # FAIL CLOSED: without that function there is no way to tell the main shell, so nothing is emitted.
   if ! declare -F relay_in_main_shell >/dev/null 2>&1 || ! relay_in_main_shell; then return 0; fi
-  # The line is neutralised again here: a direct assignment to the variables bypasses relay_verdict_set.
+  # The line is checked again here: a direct assignment to the variables bypasses relay_verdict_set, so an unknown
+  # word is refused (CANNOT-JUDGE, naming it) and every control character is neutralised.
+  if ! relay_verdict_word_ok "$RELAY_VERDICT"; then
+    RELAY_VERDICT_REASON="invalid verdict word refused (${RELAY_VERDICT}): ${RELAY_VERDICT_REASON}"
+    RELAY_VERDICT="CANNOT-JUDGE"
+  fi
   _relay_verdict_line="[RELAY] VERDICT=${RELAY_VERDICT} reason=\"${RELAY_VERDICT_REASON}\"${RELAY_VERDICT_DETAIL}"
   _relay_verdict_line="${_relay_verdict_line//[[:cntrl:]]/?}"
   if [ "$RELAY_VERDICT_STREAM" = "stderr" ]; then

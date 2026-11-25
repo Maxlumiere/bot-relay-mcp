@@ -77,9 +77,10 @@ describe.skipIf(WIN)("the one writer: relay_verdict_set + the emitter (sourced)"
     expect(r.lines[0]).toMatch(/^\[RELAY\] VERDICT=HEALTHY reason="okx\?\[RELAY\] VERDICT=HEALTHY reason="forged"\?\?\?" agent="ax\?\[RELAY\] VERDICT=MUTE/);
     expect(r.stored).not.toMatch(CONTROL);
   });
-  it("a word outside the total order is REFUSED: CANNOT-JUDGE, the reason naming the refused word (neutralised)", () => {
+  it("a word outside the total order is REFUSED by the setter (STORED as CANNOT-JUDGE), the reason naming the refused word (neutralised)", () => {
     for (const w of ["BOGUS", `HEALTHY${forge("MUTE")}`, "healthy", ""]) {
       const r = sourced(V, `relay_verdict_set "$W" "the reason"`, { W: w });
+      expect(r.stored.startsWith("CANNOT-JUDGE|invalid verdict word refused ("), `${w}: refused at the setter`).toBe(true);
       expect(r.lines, w).toHaveLength(1);
       expect(r.lines[0], w).toMatch(/^\[RELAY\] VERDICT=CANNOT-JUDGE reason="invalid verdict word refused \([^\n]*\): the reason"$/);
     }
@@ -160,9 +161,11 @@ describe.skipIf(WIN)("MUTANTS (executable): each change to a copy of the hooks t
     const t = hooksTree((d) => replaceOnce(path.join(d, "_verdict.sh"), 'RELAY_VERDICT_REASON="${_r//[[:cntrl:]]/?}"', 'RELAY_VERDICT_REASON="$_r"'));
     expect(sourced(path.join(t, "_verdict.sh"), `relay_verdict_set HEALTHY "$R"`, { R: `ok${forge("HEALTHY")}` }).stored).toMatch(CONTROL);
   });
-  it("the writer accepts any word → an invalid word is emitted as is", () => {
+  it("the writer accepts any word → the unknown word is STORED (the emitter still refuses it: defence in depth)", () => {
     const t = hooksTree((d) => replaceOnce(path.join(d, "_verdict.sh"), "  if ! relay_verdict_word_ok \"$_w\"; then", "  if false; then"));
-    expect(sourced(path.join(t, "_verdict.sh"), `relay_verdict_set BOGUS r`).lines[0]).toBe('[RELAY] VERDICT=BOGUS reason="r"');
+    const r = sourced(path.join(t, "_verdict.sh"), `relay_verdict_set BOGUS r`);
+    expect(r.stored).toBe("BOGUS|r|");
+    expect(r.lines[0]).toMatch(/^\[RELAY\] VERDICT=CANNOT-JUDGE reason="invalid verdict word refused \(BOGUS\): r"$/);
   });
   it("the emitter does not check the word → a directly assigned unknown word is emitted as is", () => {
     const t = hooksTree((d) => replaceOnce(path.join(d, "_verdict.sh"), "  if ! relay_verdict_word_ok \"$RELAY_VERDICT\"; then", "  if false; then"));
