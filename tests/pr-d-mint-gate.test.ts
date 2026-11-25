@@ -20,6 +20,7 @@ import { spawn, spawnSync } from "child_process";
 import { pathToFileURL } from "url";
 import type { Server as HttpServer } from "http";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { startArgvSampler } from "./_helpers/argv-sampler.js";
 
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pr-d-")));
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
@@ -300,11 +301,16 @@ describe("the secret file under concurrency", () => {
 });
 
 describe("the hooks send the secret without exposing it (Q2)", () => {
-  it("relay_mint_secret_curl_config | curl -K -: the server receives X-Relay-Secret, and NO process's argv ever holds the secret", async () => {
+  /**
+   * COVERAGE BAR: more than 3 `ps` samples taken while curl is provably alive (its request is in flight at the fake
+   * server). GUARANTEED BY: (in this RED commit, still a fixed 400 ms hold; the fix makes it a handshake).
+   */
+  async function curlWithSecret(opts: { gapMs: number; plantLeak?: boolean }) {
     const { createServer } = await import("http");
     ensureMintSecret(ROOT);
     const secret = secretNow();
     let received: string | undefined;
+    const sampler = startArgvSampler(secret, { gapMs: opts.gapMs });
     const srv = createServer((req, res) => {
       received = req.headers["x-relay-secret"] as string | undefined;
       setTimeout(() => res.end("{}"), 400); // hold the request open so the sampler sees curl alive
@@ -312,23 +318,11 @@ describe("the hooks send the secret without exposing it (Q2)", () => {
     await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
     const port = (srv.address() as { port: number }).port;
     const helpers = path.resolve("hooks/_vault-helpers.sh");
-    const script = `. ${JSON.stringify(helpers)}; RELAY_RES_LOADED=1; RELAY_RES_KIND=instance; RELAY_RES_DB_PATH=${JSON.stringify(path.join(ROOT, "relay.db"))}; { relay_mint_secret_curl_config || true; } | curl -s -m 5 -K - -X POST http://127.0.0.1:${port}/mcp -d '{}' >/dev/null`;
-    let sampled = 0;
-    let leaked = "";
-    let done = false;
-    const sampler = (async () => {
-      while (!done) {
-        const out = await new Promise<string>((resolve) => {
-          const p = spawn("ps", ["-axww", "-o", "args="], { stdio: ["ignore", "pipe", "ignore"] });
-          let o = "";
-          p.stdout.on("data", (d: Buffer) => (o += d));
-          p.on("close", () => resolve(o));
-        });
-        sampled++;
-        if (out.includes(secret)) leaked = out.split("\n").filter((l) => l.includes(secret)).join("\n");
-        await new Promise((r) => setTimeout(r, 20));
-      }
-    })();
+    // The PLANTED twin puts the secret on curl's argv (what the helper exists to prevent): the sampler must catch it.
+    const send = opts.plantLeak
+      ? `curl -s -m 30 -H "X-Relay-Secret: ${secret}" -X POST http://127.0.0.1:${port}/mcp -d '{}' >/dev/null`
+      : `{ relay_mint_secret_curl_config || true; } | curl -s -m 30 -K - -X POST http://127.0.0.1:${port}/mcp -d '{}' >/dev/null`;
+    const script = `. ${JSON.stringify(helpers)}; RELAY_RES_LOADED=1; RELAY_RES_KIND=instance; RELAY_RES_DB_PATH=${JSON.stringify(path.join(ROOT, "relay.db"))}; ${send}`;
     // ASYNC: the server and the sampler live on THIS loop (a spawnSync would block both: MEASURED, curl timed out).
     const child = await new Promise<{ status: number | null; stderr: string }>((resolve) => {
       const p = spawn("bash", ["-c", script], { stdio: ["ignore", "ignore", "pipe"] });
@@ -336,14 +330,31 @@ describe("the hooks send the secret without exposing it (Q2)", () => {
       p.stderr.on("data", (d: Buffer) => (stderr += d));
       p.on("close", (status) => resolve({ status, stderr }));
     });
-    done = true;
-    await sampler;
+    await sampler.stop();
     await new Promise<void>((r) => srv.close(() => r()));
-    expect(child.status, child.stderr).toBe(0);
-    expect(received, "the server received the secret as X-Relay-Secret").toBe(secret);
-    expect(sampled, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
-    expect(leaked, "no argv held the secret").toBe("");
-  }, 30_000);
+    return { child, received, secret, sampler };
+  }
+
+  it("relay_mint_secret_curl_config | curl -K -: the server receives X-Relay-Secret, and NO process's argv ever holds the secret", async () => {
+    const r = await curlWithSecret({ gapMs: 20 });
+    expect(r.child.status, r.child.stderr).toBe(0);
+    expect(r.received, "the server received the secret as X-Relay-Secret").toBe(r.secret);
+    expect(r.sampler.heldSamples, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
+    expect(r.sampler.leaked, "no argv held the secret").toBe("");
+  }, 60_000);
+
+  it("the same, with a SLOW sampler (300 ms between samples, a slow runner): coverage still holds (> 3 samples while curl is alive)", async () => {
+    const r = await curlWithSecret({ gapMs: 300 });
+    expect(r.child.status, r.child.stderr).toBe(0);
+    expect(r.sampler.heldSamples, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
+    expect(r.sampler.leaked, "no argv held the secret").toBe("");
+  }, 60_000);
+
+  it("a PLANTED leak (the secret on curl's argv) is CAUGHT once coverage is guaranteed, even with a slow sampler", async () => {
+    const r = await curlWithSecret({ gapMs: 300, plantLeak: true });
+    expect(r.sampler.heldSamples, "the ps sampler ran while curl was alive").toBeGreaterThan(3);
+    expect(r.sampler.leaked, "the planted argv leak is caught").toContain(r.secret);
+  }, 60_000);
 
   it("a symlinked or malformed secret file sends NOTHING (the server then refuses, loudly)", () => {
     const helpers = path.resolve("hooks/_vault-helpers.sh");
