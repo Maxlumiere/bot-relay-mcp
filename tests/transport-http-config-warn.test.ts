@@ -22,6 +22,7 @@
  */
 import { describe, it, expect, beforeAll } from "vitest";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -85,14 +86,15 @@ describe("transport:http-from-config warning", () => {
         RELAY_SKIP_TTY_CHECK: "1",
       },
     }) as ChildProcessWithoutNullStreams;
+    fs.closeSync(devNull); // the child holds its own copy
 
     const { matched, stderr } = await collectStderr(child, WARN_RE, 6000);
-    child.kill("SIGTERM");
+    // The daemon keeps writing into tmpDir while it shuts down: it must EXIT before tmpDir is removed.
+    await stopAndRemove(child, tmpDir);
     expect(matched, `expected the config-file transport:http warning; stderr was:\n${stderr}`).toBe(true);
     // It must be ACTIONABLE — name the fix (remove the key) and the daemon's env path.
     expect(stderr).toMatch(/remove "transport" from the config file/i);
     expect(stderr).toMatch(/RELAY_TRANSPORT/);
-    fs.rmSync(tmpDir, { recursive: true, force: true });
   }, 15_000);
 
   it("(W2) ENV sets transport:http (the daemon / deliberate HTTP) → NO warning", async () => {
@@ -113,12 +115,13 @@ describe("transport:http-from-config warning", () => {
         RELAY_SKIP_TTY_CHECK: "1",
       },
     }) as ChildProcessWithoutNullStreams;
+    fs.closeSync(devNull); // the child holds its own copy
 
     // Wait for the server to come up (listening) and give the warning a chance to
     // appear; then assert it did NOT.
     const { stderr } = await collectStderr(child, /HTTP server listening/, 6000);
-    child.kill("SIGTERM");
+    // "listening" is logged BEFORE the daemon writes its owner endpoint record into tmpDir: it must EXIT first.
+    await stopAndRemove(child, tmpDir);
     expect(stderr).not.toMatch(WARN_RE);
-    fs.rmSync(tmpDir, { recursive: true, force: true });
   }, 15_000);
 });
