@@ -7,6 +7,7 @@
 // The SELF-TEST (and its DRIFT labels, printed verbatim) is for the private canonical copy: never run it in a public context.
 // CALLERS: treat EVERY outcome except a scan-mode exit 0 with the output "PASS" as a refusal (exit 1, exit 2, a
 // signal, a timeout, a spawn failure, any other output).
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -19,8 +20,11 @@ import { fileURLToPath } from "node:url";
  * with a list that carries the canary (the quotes and commas keep normalisation from rejoining it).
  */
 export const CANARY = ["zq", "canary", "7f3e9a1d"].join("-");
-/** Optional, beside this file: "<label><TAB><path>" lines naming copies whose bytes must equal this file's. */
+/** Optional, beside this file: "<label><TAB><path>" lines naming copies whose bytes must equal this file's. Its presence
+ * makes this the PRIVATE canonical copy: only then does --self-test check copies and the secret's hash. */
 const COPIES_FILE = "copies.tsv";
+/** Beside the --list file (private self-test): line 1 = the SHA-256 of the list as flattened when the CI secret was set. */
+const SECRET_HASH_FILE = "public-denylist.secret.sha256";
 /** The field labels a caller may pass: a CLOSED set, so a label can never carry derived (leaking) text. */
 export const FIELDS = new Set([
   "pr-title", "pr-body", "pr-comment", "pr-review", "commit-msg", "branch", "added-lines", "issue-title", "issue-body",
@@ -164,7 +168,53 @@ function loadList(args) {
   return terms;
 }
 
-/** The labels of listed copies whose bytes differ from this file's (absent copies count as drift). */
+/**
+ * PRIVATE self-test: has the list drifted from the CI secret? The list is re-flattened exactly as the secret was
+ * (parseList's terms, joined by "\n", plus a final "\n") and its SHA-256 compared with line 1 of SECRET_HASH_FILE
+ * beside the --list file. A missing or unreadable hash file, or an environment list (no file to sit beside), is STALE.
+ * Never prints the hash, a term or a path.
+ */
+export function secretStale(terms, listPath) {
+  if (!listPath) return true;
+  let recorded;
+  try {
+    recorded = fs.readFileSync(path.join(path.dirname(fs.realpathSync(listPath)), SECRET_HASH_FILE), "utf-8").split(/\r?\n/)[0].trim();
+  } catch {
+    return true;
+  }
+  const now = crypto.createHash("sha256").update(`${terms.join("\n")}\n`).digest("hex");
+  return recorded !== now;
+}
+
+const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+/**
+ * The PUBLISHED bytes of a copy that lives in a git repo: `git fetch`, then `git show origin/main:<path>` (never the
+ * working tree: a local checkout may be a deploy tree, deliberately behind). Returns undefined when the copy is not
+ * in a git repo (its file is read instead), null when origin/main does not hold it (drift). A fetch that fails is
+ * CannotEvaluate: an unverifiable copy never passes.
+ */
+function publishedBytes(target) {
+  const dir = path.dirname(target);
+  let root;
+  try {
+    root = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], env: GIT_ENV, timeout: 30_000 }).trim();
+  } catch {
+    return undefined; // not in a git repo (or its directory is absent)
+  }
+  try {
+    execFileSync("git", ["-C", root, "fetch", "--quiet", "origin"], { stdio: ["ignore", "ignore", "ignore"], env: GIT_ENV, timeout: 120_000 });
+  } catch {
+    throw new CannotEvaluate("a copy's published branch could not be fetched");
+  }
+  const rel = path.relative(fs.realpathSync(root), path.join(fs.realpathSync(dir), path.basename(target))).split(path.sep).join("/");
+  try {
+    return execFileSync("git", ["-C", root, "show", `origin/main:${rel}`], { stdio: ["ignore", "pipe", "ignore"], env: GIT_ENV, timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
+  } catch {
+    return null; // absent from origin/main
+  }
+}
+
+/** The labels of listed copies whose PUBLISHED bytes differ from this file's (absent copies count as drift). */
 export function copyDrift(here = fileURLToPath(import.meta.url)) {
   let listing;
   try {
@@ -181,10 +231,15 @@ export function copyDrift(here = fileURLToPath(import.meta.url)) {
     if (!label || !p) continue;
     const target = p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
     let theirs = null;
-    try {
-      theirs = crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex");
-    } catch {
-      /* absent: drift */
+    const published = publishedBytes(target);
+    if (published === undefined) {
+      try {
+        theirs = crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex");
+      } catch {
+        /* absent: drift */
+      }
+    } else if (published !== null) {
+      theirs = crypto.createHash("sha256").update(published).digest("hex");
     }
     if (theirs !== mine) drift.push(label);
   }
@@ -213,12 +268,20 @@ function main() {
     const terms = loadList(args);
     if (args.selfTest) {
       if (findTerms(`a canary ${CANARY} here`, terms).length === 0) throw new CannotEvaluate("the canary did not go red");
+      // PRIVATE checks (only the canonical copy carries a copies file): the secret's hash, then the published copies.
+      const isPrivate = fs.existsSync(path.join(path.dirname(fileURLToPath(import.meta.url)), COPIES_FILE));
+      let failed = false;
+      if (isPrivate && secretStale(terms, args.list)) {
+        process.stdout.write("SECRET STALE: re-flatten and re-set PUBLIC_DENYLIST\n");
+        failed = true;
+      }
       const drift = copyDrift();
       for (const label of drift) process.stdout.write(`DRIFT: ${label}\n`);
       if (drift.length > 0) {
         process.stderr.write(`public-leak-scan: ${drift.length} cop${drift.length === 1 ? "y differs" : "ies differ"} from this file; re-run the sync script\n`);
-        return 2;
+        failed = true;
       }
+      if (failed) return 2;
       process.stdout.write("self-test: PASS\n");
       return 0;
     }
