@@ -1172,13 +1172,28 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the o
     // directly (outside the hook budget tripwire's scope); PostToolUse/Stop through runHookRealBudgetAsync, whose
     // cut is the line below (timed out / no time budget / could not be read).
     // COVERAGE (the observer needs the hook to REACH the hung step): on a SLOW runner the steps before the owner door
-    // must not spend its budget share, so the row runs as one (FAKE_NODE_SLOW: every real start of those steps costs 2 s).
-    const run = (extra: Record<string, string>) => runHook(c, hook, { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "owner peek", FAKE_NODE_SLOW: "2", ...extra }, inputFor(hook), REAL_BUDGET_HOOKS);
+    // must not spend its budget share, so the row runs as one (FAKE_NODE_SLOW: every real start of those steps costs 2 s)
+    // and those steps are answered INSTANTLY with their REAL answers, captured here, from THIS case, just before the
+    // timed run: the resolver's `where --fields` (served from a file) and `relay pending`'s exit code (a wasm DB has one
+    // opener, its owner). Only the hung peek spends real time, on the real clock and the real budget.
+    const where = whereFields(c, { RELAY_AGENT_TOKEN: token });
+    expect(where.status, `precondition: the real resolver answered\n${where.stderr}`).toBe(0);
+    expect(where.lines[1], "precondition: the captured answer is THIS case's (its DB)").toBe(c.db);
+    expect(where.lines[6], "precondition: THIS case's owner endpoint record is valid (line 7 http)").toBe("http");
+    const whereFile = path.join(c.home, `where-captured-${crypto.randomBytes(4).toString("hex")}.txt`);
+    fs.writeFileSync(whereFile, where.raw);
+    const pending = spawnSync(process.execPath, [RELAY, "pending", AGENT, "--json"], { encoding: "utf-8", env: baseEnv(c, { RELAY_AGENT_TOKEN: token }) });
+    expect([0, 3, null], `precondition: the real mail read fails as on a wasm DB (exit ${pending.status})\n${pending.stderr}`).not.toContain(pending.status);
+    const instant = { FAKE_WHERE_FILE: whereFile, FAKE_PENDING_RC: String(pending.status) };
+    const run = (extra: Record<string, string>) =>
+      runHook(c, hook, { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "owner peek", FAKE_NODE_SLOW: "2", ...instant, ...extra }, inputFor(hook), REAL_BUDGET_HOOKS);
     const r =
       hook === "check-relay.sh"
         ? await run({ RELAY_TEST_CLOCK: "" })
         : await runHookRealBudgetAsync({ label: `${hook} hung owner peek`, hooksDir: REAL_BUDGET_HOOKS, env: {}, clock: "real", assertsCut: /timed out|no time budget|could not be read/i, run });
-    expect(r.argv, "precondition: the hung step ran").toContain("owner peek");
+    expect(r.argv, `precondition: the hung step ran\n${r.out}`).toContain("owner peek");
+    expect(r.out, "precondition: no step up to the owner door was skipped for time").not.toMatch(/no time budget left for (the mail read|the resolver|the owner door read)/);
+    expect(fs.readFileSync(whereFile, "utf-8"), "the served answer is the one captured for this case").toBe(where.raw);
     expect(r.status, "the hook exited by itself").not.toBeNull();
     expect(r.ms, `the stub sleeps 30s: the hook must end inside its budget\n${r.out}`).toBeLessThan(hook === "check-relay.sh" ? 10_000 : 5_000);
     expect(r.out).toMatch(/timed out|no time budget|could not be read/i);
