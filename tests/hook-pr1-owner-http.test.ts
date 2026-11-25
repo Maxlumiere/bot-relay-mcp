@@ -29,16 +29,27 @@ import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { sandboxEnv } from "./_helpers/sandbox-env.js";
+import { runHookRealBudgetAsync, REAL_BUDGET_OPTIN } from "./_helpers/hook-real-budget.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_INDEX = path.join(REPO, "dist", "index.js");
 const DIST_DB = pathToFileURL(path.join(REPO, "dist", "db.js")).href;
 const RELAY = path.join(REPO, "bin", "relay");
-const HOOKS = path.join(REPO, "hooks");
+/** The REAL hooks: only ever a copy source or a text read (tests/_setup/hook-budget-tripwire.ts refuses spawning them). */
+const REAL_HOOKS_SRC = path.join(REPO, "hooks");
 /** The bash hooks do not run on native Windows (src/cli/generate-hooks.ts; WSL runs them as Linux). */
 const WIN_NO_BASH_HOOKS = process.platform === "win32";
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "hookpr1-")));
+/**
+ * The hook-runners' DEFAULT: a budgetTree copy with a RAISED declared budget (and the fixed clock every run passes), so a
+ * behaviour row never depends on the runner's speed: on the real 5 s budget a step that starts after 2 s is skipped.
+ */
+const HOOKS = budgetTree(path.join(ROOT, "hooks-seamed"), REAL_HOOKS_SRC, path.join(REPO, "bin"), {
+  declaredBudget: { "post-tool-use-check.sh": 30, "stop-check.sh": 30 }, // SessionStart keeps its own (a timing row bounds it)
+});
+/** A budgetTree copy at the hooks' REAL declared budgets: for the rows that measure the real budget (via the opt-in). */
+const REAL_BUDGET_HOOKS = budgetTree(path.join(ROOT, "hooks-real-budget"), REAL_HOOKS_SRC, path.join(REPO, "bin"), { declaredBudget: "real" });
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 const AGENT = "pr1-agent";
 const KEY_RE = /^[0-9a-f]{32}$/;
@@ -417,7 +428,7 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
   it("the closed verdict set is pinned EXACTLY (TS), and the hooks' gate names each", async () => {
     const { HOOK_DB_VERDICTS } = (await import("../src/hook-db-verdict.js")) as { HOOK_DB_VERDICTS: readonly string[] };
     expect([...HOOK_DB_VERDICTS]).toEqual(["sqlite3", "skip-declared-wasm", "skip-rlyw", "skip-unreadable", "skip-owner-locked", "skip-no-endpoint", "http"]);
-    const src = fs.readFileSync(path.join(HOOKS, "_vault-helpers.sh"), "utf-8");
+    const src = fs.readFileSync(path.join(REAL_HOOKS_SRC, "_vault-helpers.sh"), "utf-8");
     for (const v of HOOK_DB_VERDICTS) expect(src, `the hooks know ${v}`).toMatch(new RegExp(`\\b${v.replace(/-/g, "\\-")}\\)`));
   });
 });
@@ -987,7 +998,8 @@ fs.writeFileSync(path.join(STUBS, "sqlite3"), `#!/bin/sh\nprintf '%s\\n' "$*" >>
 /** The hook, run ASYNCHRONOUSLY (a spy in this process must not be starved by a spawnSync). */
 async function runHook(c: Case, hook: string, extra: Record<string, string>, input = "", hooksDir = HOOKS, flat = false) {
   for (const f of [SQLITE_LOG, ARGV_LOG, ENV_LOG, RM_CAPTURE]) fs.rmSync(f, { force: true });
-  const env = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_AGENT_NAME: AGENT, RELAY_TEST_CLOCK: "0", ...extra });
+  // A FIXED clock unless runHookRealBudget's real-clock opt-in (or a row's explicit RELAY_TEST_CLOCK) says otherwise.
+  const env = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_AGENT_NAME: AGENT, ...(extra[REAL_BUDGET_OPTIN] === "1" ? {} : { RELAY_TEST_CLOCK: "0" }), ...extra });
   // flat: NO DB or config override at all: the instance is AUTO-DISCOVERED (HOME/.bot-relay/relay.db), as on a user's machine.
   if (flat) for (const k of ["RELAY_DB_PATH", "RELAY_CONFIG_PATH", "RELAY_INSTANCE_ID", "RELAY_HOME"]) delete env[k];
   const child = spawn("bash", [path.join(hooksDir, hook)], { env, stdio: ["pipe", "pipe", "pipe"] });
@@ -1153,7 +1165,14 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the o
     const token = seedWasmDb(c, "pr1 hang mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const r = await runHook(c, hook, { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "owner peek" }, inputFor(hook));
+    // The REAL budget, on the REAL clock (the hung step must actually start, so no starved variant): SessionStart
+    // directly (outside the hook budget tripwire's scope); PostToolUse/Stop through runHookRealBudgetAsync, whose
+    // cut is the line below (timed out / no time budget / could not be read).
+    const run = (extra: Record<string, string>) => runHook(c, hook, { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "owner peek", ...extra }, inputFor(hook), REAL_BUDGET_HOOKS);
+    const r =
+      hook === "check-relay.sh"
+        ? await run({ RELAY_TEST_CLOCK: "" })
+        : await runHookRealBudgetAsync({ label: `${hook} hung owner peek`, hooksDir: REAL_BUDGET_HOOKS, env: {}, clock: "real", assertsCut: /timed out|no time budget|could not be read/i, run });
     expect(r.argv, "precondition: the hung step ran").toContain("owner peek");
     expect(r.status, "the hook exited by itself").not.toBeNull();
     expect(r.ms, `the stub sleeps 30s: the hook must end inside its budget\n${r.out}`).toBeLessThan(hook === "check-relay.sh" ? 10_000 : 5_000);
@@ -1166,7 +1185,9 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the o
     const token = seedWasmDb(c, "pr1 render mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "Pending messages for" });
+    // SessionStart's REAL budget on the REAL clock (a fixed clock never shrinks the later steps' caps): outside the hook
+    // budget tripwire's scope, so directly.
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "Pending messages for", RELAY_TEST_CLOCK: "" }, "", REAL_BUDGET_HOOKS);
     expect(r.argv, "precondition: the renderer ran").toContain("Pending messages for");
     expect(r.ms, r.out).toBeLessThan(10_000);
     expect(r.out).toMatch(/timed out|could not be (read|shown|rendered)/i);
@@ -1215,7 +1236,8 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     const token = seedWasmDb(c, "pr1 ps mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), FAKE_PS_HANG: "1" });
+    // SessionStart's REAL budget on the REAL clock, directly (outside the tripwire's scope).
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), FAKE_PS_HANG: "1", RELAY_TEST_CLOCK: "" }, "", REAL_BUDGET_HOOKS);
     expect(r.argv, "precondition: the hung ps ran").toContain("ps ");
     expect(r.status, "the hook exited by itself").not.toBeNull();
     expect(r.ms, `the stub sleeps 30s: the hook must end inside its 10s budget\n${r.out}`).toBeLessThan(10_000);
@@ -1231,7 +1253,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     const token = seedWasmDb(c, "pr1 ps budget mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const tree = budgetTree(path.join(c.home, "tree"), HOOKS, path.join(REPO, "bin"));
+    const tree = budgetTree(path.join(c.home, "tree"), REAL_HOOKS_SRC, path.join(REPO, "bin"));
     const count = path.join(c.home, "starve.count");
     const r = await runHook(
       c,
@@ -1453,6 +1475,21 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 3 (as ruled): EVERY local credential
     expect((await agentRow(c, AGENT))?.agent_pid, "the anchor landed").not.toBeNull();
   }, 120_000);
 
+  it("the SAME row with 2 s already spent on the hook's own clock (SECONDS seeded to 2): the behaviour row still restamps, so it can never depend on the runner's speed", async () => {
+    // Bash seeds SECONDS from the environment, so SECONDS=2 makes a hook read 2 s spent at its start: on the REAL
+    // 5 s hook that leaves nothing past the 3 s margin and the restamp is skipped. A behaviour row must run on a
+    // seamed copy (its clock is RELAY_TEST_CLOCK, never SECONDS), so it still restamps however slow the machine is.
+    const c = newCase("p3-ptu-live-starved");
+    const token = seedNativeDb(c);
+    const d = await startOwnerDaemon(c);
+    const spy = await recorder();
+    const r = await runHook(c, "post-tool-use-check.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(spy.port), SECONDS: "2" }, inputFor("post-tool-use-check.sh"));
+    noCredential(spy, token);
+    expect(r.out, "no budget skip in a behaviour row").not.toMatch(/no time budget left for the liveness restamp/);
+    expect(r.argv, `the restamp went through the door\n${r.out}`).toMatch(/owner tool report_liveness|owner liveness/);
+    await stopDaemon(d.child);
+  }, 120_000);
+
   it.each([["the SAME session (launch-bound)", true], ["a DIFFERENT session", false]] as const)("codex-session-start.sh on the door route, a launch marker naming %s: the handoff check asks the door (/owner/v1/session), and the register is %s", async (_what, same) => {
     const c = newCase(`p3-codex-handoff-${same ? "same" : "diff"}`);
     const token = seedNativeDb(c);
@@ -1520,6 +1557,7 @@ function pinnedRemoteHooks(): string {
   if (PINNED_HOOKS) return PINNED_HOOKS;
   const root = path.join(ROOT, "pinned-remote");
   fs.rmSync(root, { recursive: true, force: true }); // a failed earlier build leaves nothing half-made behind
+  // From the SEAMED copy (its fixed clock, raised budget and marker), never the real hooks.
   fs.cpSync(HOOKS, path.join(root, "hooks"), { recursive: true });
   // A REAL bin dir (a symlinked one would send `bin/../hooks` to the REAL hooks): the launcher copied, `relay` linked
   // (node follows the link to the real dist).
@@ -1606,7 +1644,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the de
       fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
       const e = baseEnv(c, { PATH: `${STUBS}:${process.env.PATH ?? ""}`, RELAY_TEST_CLOCK: "0", RELAY_CODEX_LAUNCHER: stub, ...env });
       delete e.RELAY_AGENT_NAME;
-      const binDir = hooksDir === HOOKS ? path.join(REPO, "bin") : path.join(path.dirname(hooksDir), "bin");
+      const binDir = path.join(path.dirname(hooksDir), "bin"); // a budgetTree copy carries bin/ beside it
       // ASYNC: the spies live in THIS process; spawnSync would starve them (the request never recorded).
       return await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
         const child = spawn("bash", [path.join(binDir, "codex-relay"), AGENT], { env: e, stdio: ["ignore", "pipe", "pipe"] });
