@@ -22,6 +22,7 @@ import { fileURLToPath } from "url";
 import { openWindow, within, type TestWindow, type WindowRun } from "../helpers/watch-window.js";
 import { startToken } from "../helpers/start-token.js";
 import { budgetTree } from "../_helpers/hook-budget-tree.js";
+import { assertProductionBudget } from "../_helpers/hook-real-budget.js";
 import { systemBinarySeamPath } from "../_helpers/system-binary-seam-env.js";
 
 // Launched ONLY by tests/m7/run-m7.sh (its refusals run first): any other launcher (the full config, a bare vitest)
@@ -49,7 +50,10 @@ delete process.env.RELAY_HOME;
 delete process.env.RELAY_INSTANCE_ID;
 
 const SEAMED_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "m7-seamed-"));
-const STOP_HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO, "hooks"), path.join(REPO, "bin")), "stop-check.sh");
+// M7 measures PRODUCTION: the Stop hook keeps its REAL declared budget (not the behaviour default), and that is
+// ASSERTED before anything is measured (the same check runHookRealBudget runs on its copy).
+const STOP_HOOK = path.join(budgetTree(SEAMED_ROOT, path.join(REPO, "hooks"), path.join(REPO, "bin"), { declaredBudget: "real" }), "stop-check.sh");
+assertProductionBudget(path.dirname(STOP_HOOK), "m7");
 
 const W = await import("../../src/watch-wake.js");
 const db = await import("../../src/db.js");
