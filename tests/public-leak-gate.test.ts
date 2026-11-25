@@ -11,7 +11,8 @@ import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
+import http from "node:http";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 
@@ -188,6 +189,62 @@ describe("the public scanner copy", () => {
     expect(r.stdout).toMatch(/^DRIFT: fixture-repo$/m);
     fs.rmSync(p.dir, { recursive: true, force: true });
   });
+
+  /** The private self-test, ASYNC (a fixture server in this process keeps answering while it runs). */
+  const privateSelfTestAsync = (p: { dir: string; list: string }, env: Record<string, string>) =>
+    new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+      const c = spawn(process.execPath, [path.join(p.dir, "scan.mjs"), "--self-test", "--list", p.list], { env, stdio: ["ignore", "pipe", "pipe"] });
+      let out = "";
+      let err = "";
+      c.stdout.on("data", (d: Buffer) => (out += d));
+      c.stderr.on("data", (d: Buffer) => (err += d));
+      c.on("close", (status) => resolve({ status, stdout: out, stderr: err }));
+    });
+
+  it.skipIf(process.platform === "win32")("git's environment is an ALLOWLIST: an inherited GIT_ASKPASS is never invoked, even by a remote that asks for credentials", async () => {
+    const p = privateCopyWithRepo();
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(401, { "WWW-Authenticate": 'Basic realm="fixture"' });
+      res.end();
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    const work = path.dirname(path.dirname(path.dirname(p.copy)));
+    p.git(work, "remote", "set-url", "origin", `http://127.0.0.1:${(srv.address() as { port: number }).port}/x.git`);
+    const marker = path.join(p.dir, "askpass-called");
+    const askpass = path.join(p.dir, "askpass.sh");
+    fs.writeFileSync(askpass, `#!/bin/sh\necho called >> ${JSON.stringify(marker)}\necho fixture-secret\n`, { mode: 0o755 });
+    const r = await privateSelfTestAsync(p, { PATH: process.env.PATH ?? "", GIT_ASKPASS: askpass, SSH_ASKPASS: askpass, LEAK_SCAN_GIT_TIMEOUT_MS: "10000" });
+    srv.close();
+    expect(r.status, r.stdout + r.stderr).toBe(2);
+    expect(fs.existsSync(marker), "the inherited askpass helper must never run").toBe(false);
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  }, 30_000);
+
+  it.skipIf(process.platform === "win32")("a stub ssh that hangs past the fetch timeout leaves NO survivor: git's whole process group is killed (asserted by pid)", async () => {
+    const p = privateCopyWithRepo();
+    p.git(path.dirname(path.dirname(path.dirname(p.copy))), "remote", "set-url", "origin", "ssh://stub-host/x.git");
+    const stubDir = path.join(p.dir, "stub-bin");
+    fs.mkdirSync(stubDir);
+    const pidFile = path.join(p.dir, "ssh.pid");
+    fs.writeFileSync(path.join(stubDir, "ssh"), `#!/bin/sh\necho $$ > ${JSON.stringify(pidFile)}\nexec sleep 30\n`, { mode: 0o755 });
+    const t0 = Date.now();
+    const r = await privateSelfTestAsync(p, { PATH: `${stubDir}:${process.env.PATH ?? ""}`, LEAK_SCAN_GIT_TIMEOUT_MS: "1500" });
+    expect(r.status, r.stdout + r.stderr).toBe(2);
+    // Bounded by the fetch timeout (1.5 s here), not by the stub's own 30 s sleep (which would end it unaided).
+    expect(Date.now() - t0, "the fetch is killed at its timeout").toBeLessThan(15_000);
+    const pid = Number(fs.readFileSync(pidFile, "utf-8").trim());
+    expect(pid, "the stub ssh ran").toBeGreaterThan(1);
+    await new Promise((res) => setTimeout(res, 300));
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    if (alive) process.kill(pid, "SIGKILL"); // never leave it behind, even when the row fails
+    expect(alive, `the stub ssh ${pid} must not survive the group kill`).toBe(false);
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  }, 60_000);
 
   it("a FETCH that fails → cannot evaluate (exit 2), never a pass", () => {
     const p = privateCopyWithRepo();
