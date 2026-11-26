@@ -20,6 +20,10 @@
  * design a native process does not probe (an RLYW header refuses it), so that probe is not in the module.
  * The racers run from FILES (an eval'd module breaks worker pools), under a SANDBOX HOME; every recorded child is
  * checked exited at the end.
+ * KNOWN BLIND SPOT of the single-owner round (stated): a REAL overlap followed by the first owner CRASHING before its
+ * RELEASE reads NOT_EVALUATED, not FAIL. Its hold is unprovable once it exited on its own (a crash frees the lock), so
+ * the overlap cannot be told from a legitimate hand-over. It is never a false PASS (a round with a crashed owner cannot
+ * pass), and the re-run policy then gets an evaluable round.
  */
 import { describe, it, expect, afterAll, vi } from "vitest";
 import fs from "fs";
