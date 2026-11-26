@@ -14,7 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { startArgvSampler, argvVerdict, sanitizeDiagnostic, witnesses, argvSamplerProbe } from "./_helpers/argv-sampler.js";
+import { startArgvSampler, argvVerdict, sanitizeDiagnostic, witnesses, argvSamplerProbe, killObserverTree } from "./_helpers/argv-sampler.js";
 
 const WIN = process.platform === "win32";
 const W = "the-witness-marker"; // the target's non-secret argv marker
@@ -248,6 +248,33 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
     expect(s.failures.some((x) => /timed out/.test(x)), JSON.stringify(s.failures)).toBe(true);
   }, 15_000);
 
+  it("a kill the observer SURVIVES is retried: the handle is RETAINED, killed again and its exit CONFIRMED (asserted by pid)", async () => {
+    const f = fake("stuck", "survive-once");
+    const calls: number[] = [];
+    // The FIRST kill attempt on each observer is ignored (the process survives it); later attempts are real.
+    const s = startArgvSampler("SECRET", W, { gapMs: 10, sampleTimeoutMs: 300, framed: f.framed, killer: (p, attempt) => (calls.push(attempt), attempt >= 2 && killObserverTree(p)) });
+    await new Promise((r) => setTimeout(r, 700));
+    await s.stop();
+    for (const pid of pids(f.pidFile)) recorded.push(pid);
+    // Observers retire concurrently, so attempts interleave: what matters is that a SURVIVED kill is attempted again.
+    expect(calls, "a survived kill is attempted AGAIN").toContain(2);
+    await new Promise((r) => setTimeout(r, 200));
+    for (const pid of pids(f.pidFile)) expect(alive(pid), `observer ${pid} confirmed gone`).toBe(false);
+    expect(s.failures.some((x) => /survived/.test(x)), "a retried, confirmed kill is not a survivor").toBe(false);
+  }, 30_000);
+
+  it("an observer that survives EVERY kill is REPORTED by stop() (a visible failure naming it), never lost", async () => {
+    const f = fake("stuck", "survive-all");
+    const s = startArgvSampler("SECRET", W, { gapMs: 10, sampleTimeoutMs: 300, framed: f.framed, killer: () => false });
+    await new Promise((r) => setTimeout(r, 500));
+    await s.stop();
+    const left = pids(f.pidFile);
+    for (const pid of left) recorded.push(pid); // killed by pid in afterEach
+    expect(left.length).toBeGreaterThan(0);
+    expect(s.failures.some((x) => /survived its tree kill/.test(x)), JSON.stringify(s.failures)).toBe(true);
+    expect(left.some((pid) => s.failures.some((x) => x.includes(String(pid)))), "the survivor is named by its pid").toBe(true);
+  }, 60_000);
+
   it("a frame that stop() ENDS (in flight) is neither a sample nor a failure", async () => {
     for (let i = 0; i < 5; i++) {
       const f = fake("slow200", `stop-${i}`);
@@ -289,6 +316,7 @@ describe.skipIf(!WIN)("the WINDOWS observer (PowerShell, Win32_Process CommandLi
       await s.stop();
       expect(s.failures, JSON.stringify(s.failures)).toEqual([]);
       expect(ok, "two frames witnessed the child").toBe(true);
+      // A failing assertion here may print the secret: it is SYNTHETIC (made for this row), never a real credential.
       expect(s.leaked, "the planted secret is caught").toContain(secret);
       expect(s.leaked.split("\n").some((l) => Number(/^\s*(\d+)/.exec(l)?.[1]) === child.pid), "on the child's own pid").toBe(true);
     } finally {
