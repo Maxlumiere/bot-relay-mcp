@@ -35,6 +35,7 @@ import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -127,10 +128,8 @@ async function startHarness(label: string): Promise<Harness> {
   return { port, root, dbPath, daemon };
 }
 
-function stopHarness(h: Harness): void {
-  try { h.daemon.kill("SIGTERM"); } catch { /* */ }
-  try { h.daemon.kill("SIGKILL"); } catch { /* */ }
-  try { fs.rmSync(h.root, { recursive: true, force: true }); } catch { /* */ }
+async function stopHarness(h: Harness): Promise<void> {
+  await stopAndRemove(h.daemon, h.root);
 }
 
 /** Register an agent over HTTP, mint + return its token (creates the row). */
@@ -207,7 +206,7 @@ describe("v2.11.0 GAP 1 — check-relay.sh liveness-scoped SKIP_REGISTER (shippe
       expect(sql(h.dbPath, `SELECT host_shell_pids FROM agents WHERE name='${name}';`)).toBe(SEED_PIDS);
       expect(sql(h.dbPath, `SELECT host_id FROM agents WHERE name='${name}';`)).toBe(SEED_HOSTID);
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -242,7 +241,7 @@ describe("v2.11.0 GAP 1 — check-relay.sh liveness-scoped SKIP_REGISTER (shippe
         console.warn("[L2] machine GUID unavailable on this host — host_id refresh sub-assertion skipped (session_id + host_shell_pids assertions still prove register ran)");
       }
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -276,7 +275,7 @@ describe("v2.11.0 GAP 1 — check-relay.sh liveness-scoped SKIP_REGISTER (shippe
         console.warn("[L3] machine GUID unavailable on this host — host_id refresh sub-assertion skipped");
       }
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 });

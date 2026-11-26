@@ -46,6 +46,7 @@ import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REAL_HOOKS = path.join(REPO_ROOT, "hooks");
@@ -165,10 +166,8 @@ async function startHarness(label: string): Promise<Harness> {
   return { port, root, dbPath, daemon };
 }
 
-function stopHarness(h: Harness): void {
-  try { h.daemon.kill("SIGTERM"); } catch { /* */ }
-  try { h.daemon.kill("SIGKILL"); } catch { /* */ }
-  try { fs.rmSync(h.root, { recursive: true, force: true }); } catch { /* */ }
+async function stopHarness(h: Harness): Promise<void> {
+  await stopAndRemove(h.daemon, h.root);
 }
 
 /** Register an agent over HTTP so it holds the name live. */
@@ -249,7 +248,7 @@ describe("ADR-0036 S1 (D7) — a register or token check that failed never reads
       const r = runHook({ home: h.root, dbPath: h.dbPath, port: h.port, name: "s1-held" });
       expect(verdictOf(r.stdout), r.stdout + r.stderr).toBe("REGISTER_FAILED");
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 30_000);
 
@@ -269,7 +268,7 @@ describe("ADR-0036 S1 (D7) — a register or token check that failed never reads
       expect(r.status, "the stale-token path still exits 1").toBe(1);
       expect(verdictOf(r.stdout), r.stdout + r.stderr).toBe("AUTH_FAILED");
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 30_000);
 });
@@ -282,7 +281,7 @@ describe("ADR-0036 S1 (D7) — innocent twins", () => {
       const r = runHook({ home: h.root, dbPath: h.dbPath, port: h.port, name: "s1-unique" });
       expect(verdictOf(r.stdout), r.stdout + r.stderr).toBe("HEALTHY");
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 30_000);
 

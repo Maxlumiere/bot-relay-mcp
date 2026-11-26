@@ -35,6 +35,7 @@ import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { machineGuid as tsMachineGuid, type HostPlatform } from "../extensions/vscode/src/host-identity.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -130,10 +131,8 @@ async function startHarness(label: string): Promise<Harness> {
   return { port, root, dbPath, daemon };
 }
 
-function stopHarness(h: Harness): void {
-  try { h.daemon.kill("SIGTERM"); } catch { /* */ }
-  try { h.daemon.kill("SIGKILL"); } catch { /* */ }
-  try { fs.rmSync(h.root, { recursive: true, force: true }); } catch { /* */ }
+async function stopHarness(h: Harness): Promise<void> {
+  await stopAndRemove(h.daemon, h.root);
 }
 
 /** Invoke a SessionStart hook (Claude or Codex) for `name` — first register,
@@ -185,7 +184,7 @@ describe("v2.16.3 P0 — Codex SessionStart hook sends the Tether PID-handshake"
       const title = sql(h.dbPath, `SELECT IFNULL(terminal_title_ref,'') FROM agents WHERE name='${name}';`);
       expect(title).toBe("codex-hs-agent");
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -214,7 +213,7 @@ describe("v2.16.3 P0 — Codex SessionStart hook sends the Tether PID-handshake"
         console.warn("[C2] machine GUID unavailable — parity holds trivially (both empty)");
       }
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 30_000);
 
@@ -244,7 +243,7 @@ describe("v2.16.3 P0 — Codex SessionStart hook sends the Tether PID-handshake"
       expect(rg.status, `codex hook stderr: ${rg.stderr}`).toBe(0);
       expect(sql(h.dbPath, `SELECT IFNULL(terminal_title_ref,'') FROM agents WHERE name='codex-good-title';`)).toBe(good);
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 30_000);
 
