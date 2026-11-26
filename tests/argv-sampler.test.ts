@@ -13,7 +13,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { startArgvSampler, argvVerdict, sanitizeDiagnostic, witnesses, argvSamplerProbe, killObserverTree } from "./_helpers/argv-sampler.js";
 
 const WIN = process.platform === "win32";
@@ -309,6 +309,33 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
     for (const pid of [...pids(`${f.pidFile}.grand`), ...pids(f.pidFile)]) recorded.push(pid); // killed by pid in afterEach
     const observers = pids(f.pidFile);
     expect(s.failures.some((x) => observers.some((pid) => x === `possible surviving observer process: ${pid}`)), JSON.stringify(s.failures)).toBe(true);
+  }, 60_000);
+
+  it("a kill that reaps only the PARENT leaves a grandchild: the by-PID check sees it, and stop() reports the possible survivor", async () => {
+    const f = fake("stuck-child", "parent-only");
+    // A kill that ends the observer itself but not its group: a close event would read as success; the tree is alive.
+    const parentOnly = (p: ChildProcess) => {
+      try {
+        process.kill(p.pid!, "SIGKILL");
+      } catch {
+        /* gone */
+      }
+      return true;
+    };
+    const s = startArgvSampler("SECRET", W, { gapMs: 10, sampleTimeoutMs: 300, framed: f.framed, killer: parentOnly });
+    await new Promise((r) => setTimeout(r, 500));
+    await s.stop();
+    for (const pid of [...pids(`${f.pidFile}.grand`), ...pids(f.pidFile)]) recorded.push(pid); // killed by pid in afterEach
+    expect(s.failures.some((x) => /^possible surviving observer process: \d+$/.test(x)), JSON.stringify(s.failures)).toBe(true);
+  }, 60_000);
+
+  it("a killer that REPORTS failure is an unconfirmed attempt even if the tree did die (its result is checked, never assumed)", async () => {
+    const f = fake("stuck", "reports-failure");
+    const s = startArgvSampler("SECRET", W, { gapMs: 10, sampleTimeoutMs: 300, framed: f.framed, killer: (p) => (killObserverTree(p), false) });
+    await new Promise((r) => setTimeout(r, 500));
+    await s.stop();
+    for (const pid of pids(f.pidFile)) recorded.push(pid);
+    expect(s.failures.some((x) => /^possible surviving observer process: \d+$/.test(x)), JSON.stringify(s.failures)).toBe(true);
   }, 60_000);
 
   it("a frame that stop() ENDS (in flight) is neither a sample nor a failure", async () => {

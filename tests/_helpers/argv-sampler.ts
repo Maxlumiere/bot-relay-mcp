@@ -14,7 +14,8 @@
  * target's non-secret argv marker (an exit-0 empty or restricted table is a BLIND sample, never a sample). A FAILED
  * observation (spawn error, non-zero exit, timeout) is recorded in `failures`. `argvVerdict` turns a run into PASS,
  * FAIL or NOT_EVALUATED; every wait is bounded, and each observer runs in its own process group, killed and reaped as a
- * GROUP on timeout.
+ * GROUP on timeout. A FRAMED observer's tree is killed and its death CONFIRMED BY PID before it is replaced (PowerShell
+ * itself spawns no children: that is context, not the guarantee).
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 
@@ -69,14 +70,61 @@ export function killObserverTree(p: ChildProcess): boolean {
   if (!p.pid) return false;
   try {
     if (process.platform === "win32") {
+      // The observer (if alive) and its tree; then any child it left that names it as parent (Windows does not reparent
+      // orphans, and `taskkill /T` cannot walk the tree of a parent that is already gone).
       const r = spawnSync("taskkill", ["/T", "/F", "/PID", String(p.pid)], { stdio: "ignore", timeout: 10_000, windowsHide: true });
-      return !r.error && r.status === 0;
+      let ok = !r.error && (r.status === 0 || r.status === 128); // 128: no such process (the parent had already exited)
+      for (const child of windowsChildren(p.pid, STARTED.get(p) ?? 0) ?? []) {
+        const k = spawnSync("taskkill", ["/T", "/F", "/PID", String(child)], { stdio: "ignore", timeout: 10_000, windowsHide: true });
+        ok = ok && !k.error && k.status === 0;
+      }
+      return ok;
     }
-    process.kill(-p.pid, "SIGKILL");
+    process.kill(-p.pid, "SIGKILL"); // the whole process group (the observer was spawned detached: its pgid is its pid)
     return true;
-  } catch {
-    return false; // already gone, or not ours to kill: the close confirmation decides
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "ESRCH"; // the group is already empty: nothing left to kill
   }
+}
+
+/** When each framed observer started (the Windows pid-reuse check: a child created before it is not its child). */
+const STARTED = new WeakMap<ChildProcess, number>();
+
+/** Windows: the pids naming `pid` as their parent and created since `since` (ms epoch); null when the query fails. */
+function windowsChildren(pid: number, since: number): number[] | null {
+  const q = `Get-CimInstance -ClassName Win32_Process -Filter 'ParentProcessId=${pid}' | ForEach-Object { [string]$_.ProcessId + ' ' + $_.CreationDate.ToUniversalTime().ToString('o') }`;
+  const r = spawnSync("powershell.exe", psArgs(q), { encoding: "utf-8", timeout: 20_000, windowsHide: true });
+  if (r.error || r.status !== 0) return null;
+  return (r.stdout ?? "")
+    .split("\n")
+    .map((l) => /^(\d+) (\S+)/.exec(l.trim()))
+    .filter((m): m is RegExpExecArray => m !== null && Date.parse(m[2]!) >= since - 2_000)
+    .map((m) => Number(m[1]));
+}
+
+/**
+ * Is an observer's whole TREE gone, confirmed BY PID (a `close` event confirms only the parent)? POSIX: its process
+ * group has no member (kill(-pgid, 0) → ESRCH). Windows: the observer pid is gone AND no process created since it
+ * started names it as parent (a failed query is NOT a confirmation).
+ */
+function treeGone(p: ChildProcess): boolean {
+  if (!p.pid) return true; // never started: nothing to reap
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-p.pid, 0);
+      return false; // a member of its group is still alive
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  }
+  try {
+    process.kill(p.pid, 0);
+    return false;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ESRCH") return false;
+  }
+  const kids = windowsChildren(p.pid, STARTED.get(p) ?? 0);
+  return kids !== null && kids.length === 0;
 }
 
 /** The Windows probe: a marker child must appear in a PowerShell table with its pid AND its full command line. */
@@ -245,20 +293,34 @@ export function startArgvSampler(
   const retiring: Promise<void>[] = [];
   const retained: Observer[] = [];
   const kill = opts.killer ?? ((p: ChildProcess) => killObserverTree(p));
-  const closedWithin = (o: Observer, ms: number) => Promise.race([o.closedP.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), ms))]);
+  /** Polls the tree's death by pid until `ms` passes (each wait settles: no timer outlives this). */
+  const treeGoneWithin = async (p: ChildProcess, ms: number): Promise<boolean> => {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      if (treeGone(p)) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+  /**
+   * RETIRING an observer: the tree kill is ALWAYS issued (even when its parent already closed: a grandchild may live
+   * on), the killer's result is CHECKED (a failed kill is an unconfirmed attempt), and the tree's death is CONFIRMED BY
+   * PID within a bound; up to 3 attempts. An observer never confirmed gone is RETAINED: stop() reports it.
+   */
   const retire = (o: Observer): void => {
     retiring.push(
       (async () => {
-        for (let attempt = 1; attempt <= 3 && !o.closed; attempt++) {
-          kill(o.p, attempt);
-          if (await closedWithin(o, 2_000)) return;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          const issued = kill(o.p, attempt) !== false;
+          if (issued && (await treeGoneWithin(o.p, 2_000))) return;
         }
-        if (!o.closed) retained.push(o);
+        retained.push(o);
       })()
     );
   };
   const startObserver = (cmd: string, args: string[]): Observer => {
     const p = spawn(cmd, args, { stdio: ["pipe", "pipe", "ignore"], detached: process.platform !== "win32", windowsHide: true });
+    STARTED.set(p, Date.now());
     let markClosed!: () => void;
     const o: Observer = { p, buf: "", dead: null, closed: false, closedP: new Promise<void>((r) => (markClosed = r)), onLine: null, onExit: null };
     p.on("close", () => {
@@ -291,7 +353,11 @@ export function startArgvSampler(
   };
   const framedSample = (cmd: string, args: string[]): Promise<{ out: string } | { failed: string } | { stopped: true }> =>
     new Promise((resolve) => {
-      if (!observer || observer.dead) observer = startObserver(cmd, args);
+      if (observer && observer.dead) {
+        retire(observer); // it exited between frames: its tree (a grandchild may live on) is killed and confirmed
+        observer = null;
+      }
+      if (!observer) observer = startObserver(cmd, args);
       const o = observer;
       const my = String(++seq);
       const lines: string[] = [];
@@ -404,8 +470,8 @@ export function startArgvSampler(
       }
       await Promise.all(retiring);
       for (const r of retained.splice(0)) {
-        kill(r.p, 4); // one more attempt; a survivor is then REPORTED, never silent
-        if (!(await closedWithin(r, 2_000))) failures.push(`observer ${r.p.pid} survived its tree kill (termination not confirmed)`);
+        const issued = kill(r.p, 4) !== false; // one more attempt; a survivor is then REPORTED, never silent
+        if (!issued || !(await treeGoneWithin(r.p, 2_000))) failures.push(`possible surviving observer process: ${r.p.pid}`);
       }
     },
   };
