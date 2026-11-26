@@ -374,14 +374,14 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     await stopDaemon(d.child);
   }, 90_000);
 
-  it("`relay where --fields`: a valid record → 8 lines, line 7 `http`, line 8 the URL ONLY (the key is never in where's answer); every OS (the pid is not part of validity, as ruled)", async () => {
+  it("`relay where --fields`: a valid record → 9 lines, line 7 `http`, line 8 the URL ONLY (the key is never in where's answer); every OS (the pid is not part of validity, as ruled)", async () => {
     const c = newCase("where-http");
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
     const { key } = readRecord(c);
     const w = whereFields(c);
-    expect(w.lines.length, w.raw).toBe(8);
+    expect(w.lines.length, w.raw).toBe(9); // line 9: the instance directory
     expect(w.lines[6]).toBe("http");
     expect(w.lines[7]).toBe(`http://127.0.0.1:${d.port}`);
     expect(w.raw + w.stderr, "the key is in no part of where's answer").not.toContain(key);
@@ -396,7 +396,7 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     await stopDaemon(d.child);
     expect(fs.existsSync(c.record), "precondition: the record is left behind").toBe(true);
     const w = whereFields(c);
-    expect(w.lines.length, w.raw).toBe(8);
+    expect(w.lines.length, w.raw).toBe(9); // line 9: the instance directory
     expect(w.lines[6]).not.toBe("http");
     expect(w.lines[7]).toBe("");
     const { ownerEndpointVerdict } = (await import("../src/owner-endpoint.js")) as { ownerEndpointVerdict: (db: string) => { ok: boolean; reason?: string } };
@@ -416,11 +416,11 @@ describe("hook PR 1: the owner record and the owner door (every OS)", () => {
     await stopDaemon(d.child);
   }, 90_000);
 
-  it("twin: a NATIVE instance → 8 lines, line 7 `sqlite3`, line 8 empty (unchanged reads)", () => {
+  it("twin: a NATIVE instance → 9 lines, line 7 `sqlite3`, line 8 empty (unchanged reads)", () => {
     const c = newCase("where-native");
     seedNativeDb(c);
     const w = whereFields(c);
-    expect(w.lines.length, w.raw).toBe(8);
+    expect(w.lines.length, w.raw).toBe(9); // line 9: the instance directory
     expect(w.lines[6]).toBe("sqlite3");
     expect(w.lines[7]).toBe("");
   }, 60_000);
@@ -971,6 +971,9 @@ fs.writeFileSync(
     `if [ -n "$FAKE_NODE_HANG" ]; then case "$*" in *"$FAKE_NODE_HANG"*) exec sleep 30 ;; esac; fi\n` +
     `case "$2 $3" in "where --fields") if [ -n "$FAKE_WHERE_FILE" ]; then cat "$FAKE_WHERE_FILE"; exit 0; fi ;; esac\n` +
     `if [ -n "$FAKE_PENDING_RC" ] && [ "$2" = pending ]; then exit "$FAKE_PENDING_RC"; fi\n` +
+    // A SLOW RUNNER: each REAL start of the steps before the owner door (the mail read, the resolver) costs this many
+    // seconds; an answer served above (FAKE_WHERE_FILE / FAKE_PENDING_RC) costs nothing.
+    `case "$2 $3" in "pending "*|"where --fields") if [ -n "$FAKE_NODE_SLOW" ]; then sleep "$FAKE_NODE_SLOW"; fi ;; esac\n` +
     `exec "${process.execPath}" "$@"\n`,
   { mode: 0o755 }
 );
@@ -1025,7 +1028,9 @@ async function runHook(c: Case, hook: string, extra: Record<string, string>, inp
 }
 function fakeWhere(c: Case, line7: string, line8: string | null): string {
   const f = path.join(c.home, `where-${crypto.randomBytes(4).toString("hex")}.txt`);
-  const lines = ["explicit-db", c.db, "true", "", "", path.join(c.dir, "agents"), line7, ...(line8 === null ? [] : [line8])];
+  // A current CLI's 9 lines (line 9, the instance directory, is empty: an explicit DB outside the layout); line8 null → an
+  // older CLI's 7-line answer.
+  const lines = ["explicit-db", c.db, "true", "", "", path.join(c.dir, "agents"), line7, ...(line8 === null ? [] : [line8, ""])];
   fs.writeFileSync(f, lines.join("\n") + "\n");
   return f;
 }
@@ -1168,12 +1173,29 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1: the hooks read mail through the o
     // The REAL budget, on the REAL clock (the hung step must actually start, so no starved variant): SessionStart
     // directly (outside the hook budget tripwire's scope); PostToolUse/Stop through runHookRealBudgetAsync, whose
     // cut is the line below (timed out / no time budget / could not be read).
-    const run = (extra: Record<string, string>) => runHook(c, hook, { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "owner peek", ...extra }, inputFor(hook), REAL_BUDGET_HOOKS);
+    // COVERAGE (the observer needs the hook to REACH the hung step): on a SLOW runner the steps before the owner door
+    // must not spend its budget share, so the row runs as one (FAKE_NODE_SLOW: every real start of those steps costs 2 s)
+    // and those steps are answered INSTANTLY with their REAL answers, captured here, from THIS case, just before the
+    // timed run: the resolver's `where --fields` (served from a file) and `relay pending`'s exit code (a wasm DB has one
+    // opener, its owner). Only the hung peek spends real time, on the real clock and the real budget.
+    const where = whereFields(c, { RELAY_AGENT_TOKEN: token });
+    expect(where.status, `precondition: the real resolver answered\n${where.stderr}`).toBe(0);
+    expect(where.lines[1], "precondition: the captured answer is THIS case's (its DB)").toBe(c.db);
+    expect(where.lines[6], "precondition: THIS case's owner endpoint record is valid (line 7 http)").toBe("http");
+    const whereFile = path.join(c.home, `where-captured-${crypto.randomBytes(4).toString("hex")}.txt`);
+    fs.writeFileSync(whereFile, where.raw);
+    const pending = spawnSync(process.execPath, [RELAY, "pending", AGENT, "--json"], { encoding: "utf-8", env: baseEnv(c, { RELAY_AGENT_TOKEN: token }) });
+    expect([0, 3, null], `precondition: the real mail read fails as on a wasm DB (exit ${pending.status})\n${pending.stderr}`).not.toContain(pending.status);
+    const instant = { FAKE_WHERE_FILE: whereFile, FAKE_PENDING_RC: String(pending.status) };
+    const run = (extra: Record<string, string>) =>
+      runHook(c, hook, { RELAY_AGENT_TOKEN: token, FAKE_NODE_HANG: "owner peek", FAKE_NODE_SLOW: "2", ...instant, ...extra }, inputFor(hook), REAL_BUDGET_HOOKS);
     const r =
       hook === "check-relay.sh"
         ? await run({ RELAY_TEST_CLOCK: "" })
         : await runHookRealBudgetAsync({ label: `${hook} hung owner peek`, hooksDir: REAL_BUDGET_HOOKS, env: {}, clock: "real", assertsCut: /timed out|no time budget|could not be read/i, run });
-    expect(r.argv, "precondition: the hung step ran").toContain("owner peek");
+    expect(r.argv, `precondition: the hung step ran\n${r.out}`).toContain("owner peek");
+    expect(r.out, "precondition: no step up to the owner door was skipped for time").not.toMatch(/no time budget left for (the mail read|the resolver|the owner door read)/);
+    expect(fs.readFileSync(whereFile, "utf-8"), "the served answer is the one captured for this case").toBe(where.raw);
     expect(r.status, "the hook exited by itself").not.toBeNull();
     expect(r.ms, `the stub sleeps 30s: the hook must end inside its budget\n${r.out}`).toBeLessThan(hook === "check-relay.sh" ? 10_000 : 5_000);
     expect(r.out).toMatch(/timed out|no time budget|could not be read/i);

@@ -216,6 +216,31 @@ describe("Stop hook — read-only wake, HTTP path (preferred)", () => {
     expect(pendingCount("stop-recv-1")).toBe(1);
   });
 
+  it("(1b) pending mail + a payload CUT by its deadline (a writer that dribbles, never closes) → the named cut: exit 0, empty stdout, mail STILL PENDING", async () => {
+    const senderTok = await registerWithToken("stop-sender-cut", []);
+    const recvTok = await registerWithToken("stop-recv-cut", []);
+    await sendMessage("stop-sender-cut", "stop-recv-cut", "mail behind a cut payload", senderTok);
+    expect(pendingCount("stop-recv-cut")).toBe(1);
+    // Row (1) is the control: the same setup with a closed payload BLOCKS. Here the payload never completes.
+    const child = cp.spawn("bash", [HOOK_SCRIPT], {
+      env: { PATH: process.env.PATH ?? "", HOME: TEST_HOME, RELAY_STOP_WAKE_DAMPER_SECS: "0", RELAY_TEST_CLOCK: "1", RELAY_AGENT_NAME: "stop-recv-cut", RELAY_AGENT_TOKEN: recvTok, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(port), RELAY_DB_PATH: TEST_DB_PATH },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.stdin.on("error", () => {});
+    const drip = setInterval(() => { if (!child.stdin.destroyed) child.stdin.write('{"session_id":"s1"}\n'); }, 300);
+    const code = await new Promise<number | null>((res) => child.on("close", (c) => res(c)));
+    clearInterval(drip);
+    expect(code).toBe(0);
+    expect(stdout, "no block decision").toBe("");
+    expect(stderr.split("\n").filter((l) => l.startsWith("[RELAY] VERDICT="))).toEqual([
+      '[RELAY] VERDICT=CANNOT-JUDGE reason="hook stdin not complete within its time budget: stop check skipped (mail left pending)" agent="stop-recv-cut"',
+    ]);
+    expect(pendingCount("stop-recv-cut"), "the cut consumed nothing").toBe(1);
+  }, 30_000);
+
   it("(2) empty mailbox → truly empty stdout, exit 0", async () => {
     const tok = await registerWithToken("stop-empty", []);
     const r = await runHook({
