@@ -51,6 +51,7 @@ import { serializeConfigForArchive, scanCiphertextKeyIds, classifyWebhookSecrets
 import { getKeyringInfo } from "./encryption.js";
 import { canonicalReplaceTarget, lockKey, type OwnerLock } from "./db-owner-lock.js";
 import { ERROR_CODES } from "./error-codes.js";
+import { renameReplacingWithWindowsRetry } from "./fs-replace.js";
 
 /**
  * v2.1 Phase 4g: Error with a stable machine-readable code attached. The
@@ -884,17 +885,11 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // INV-DB-01 slice 4 (the #377 ruling, Codex #401 R2 walk): the swap is the atomic rename ONLY. On Windows a rename
     // onto a file another process holds open fails; a short retry, then a NAMED refusal: never a copy over the live
     // DB (a crash mid-copy would leave it torn, recoverable only by hand from the safety backup).
-    const waits = process.platform === "win32" ? [25, 50, 100, 200] : [];
-    for (let i = 0; ; i++) {
+    {
       try {
-        fs.renameSync(newPath, target);
-        break;
+        renameReplacingWithWindowsRetry(newPath, target); // src/fs-replace.ts: the ONE Windows-only bounded retry
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code ?? "";
-        if (process.platform === "win32" && ["EPERM", "EBUSY", "EACCES"].includes(code) && i < waits.length) {
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waits[i]);
-          continue;
-        }
         fs.rmSync(newPath, { force: true }); // this restore's own staged copy (never a DB-family name)
         throw new Error(
           `restore refused: the staged copy could not be replaced onto ${target} (${code || (err as Error).message})` +
