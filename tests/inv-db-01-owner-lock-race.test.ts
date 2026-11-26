@@ -84,13 +84,15 @@ fs.writeFileSync(
 const RACER_HS = path.join(ROOT, "racer-handshake.mjs");
 fs.writeFileSync(
   RACER_HS,
-  `const [db, dir, id, slowImport, slowAttempt] = process.argv.slice(2);\n` +
+  `const [db, dir, id, slowImport, slowAttempt, fault] = process.argv.slice(2);\n` +
     `const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n` +
     `if (Number(slowImport)) await sleep(Number(slowImport));\n` +
     `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
     `const fs = await import("fs");\n` +
     `const log = (line) => fs.appendFileSync(dir + "/events.log", line + "\\n");\n` +
     `fs.writeFileSync(dir + "/ready-" + id, "");\n` +
+    // A FAULT for the row's own tests: crash after READY, before any attempt.
+    `if (fault === "crash-after-ready") process.exit(3);\n` +
     `while (!fs.existsSync(dir + "/go")) await sleep(2);\n` +
     `if (Number(slowAttempt)) await sleep(Number(slowAttempt));\n` +
     `let lock;\n` +
@@ -192,6 +194,55 @@ async function oneTry(db: string): Promise<string> {
   return run(RACER, [db, go, "0"]).out;
 }
 
+type RoundResult = { kind: "observed"; owners: number; peak: number } | { kind: "not_evaluated"; why: string };
+type RoundsVerdict = { kind: "PASS" } | { kind: "FAIL"; why: string } | { kind: "NOT_EVALUATED"; why: string };
+
+/** One round of the single-owner race (in `${tag}-${r}`); `fault(i)` is racer i's fault knob ("" = none). */
+async function raceRound(db: string, tag: string, r: number, fault: (i: number) => string = () => ""): Promise<RoundResult> {
+  const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+  const h = await holding(db);
+  await h.kill();
+  const dir = path.join(ROOT, `${tag}-${r}`);
+  fs.mkdirSync(dir);
+  const racers = Array.from({ length: RACERS }, (_, i) => run(RACER_HS, [db, dir, String(i), i === 0 ? "800" : "0", i === 1 ? "800" : "0", fault(i)]));
+  const exited = racers.map(() => false);
+  racers.forEach((x, i) => x.child.once("exit", () => (exited[i] = true)));
+  const has = (f: string) => fs.existsSync(path.join(dir, f));
+  const readyBy = Date.now() + 60_000;
+  while (Date.now() < readyBy && !racers.every((_, i) => has(`ready-${i}`))) await sleep(10);
+  if (!racers.every((_, i) => has(`ready-${i}`))) {
+    for (const x of racers) if (x.child.exitCode === null && x.child.signalCode === null) x.child.kill("SIGKILL");
+    await Promise.all(racers.map((x) => x.out));
+    return { kind: "not_evaluated", why: `round ${r}: ${racers.filter((_, i) => !has(`ready-${i}`)).length} racer(s) never got ready within 60 s` };
+  }
+  fs.writeFileSync(path.join(dir, "go"), "");
+  // The winner HOLDS until every racer has lost (exited) or holds: only then is it released.
+  const settled = () => racers.every((_, i) => exited[i] || has(`owner-${i}`));
+  const settleBy = Date.now() + 60_000;
+  while (Date.now() < settleBy && !settled()) await sleep(10);
+  if (!settled()) throw new Error(`round ${r}: every racer contended (lost, or holds) within 60 s of GO`);
+  fs.writeFileSync(path.join(dir, "release"), "");
+  await Promise.all(racers.map((x) => x.out));
+  const events = has("events.log") ? fs.readFileSync(path.join(dir, "events.log"), "utf-8").split("\n").filter(Boolean) : [];
+  const o = ownership(events);
+  return { kind: "observed", owners: o.owners, peak: o.peak };
+}
+
+/** Runs `n` rounds and judges them. */
+async function runRounds(n: number, round: (r: number) => Promise<RoundResult>): Promise<RoundsVerdict> {
+  const owners: number[] = [];
+  const peaks: number[] = [];
+  for (let r = 0; r < n; r++) {
+    const res = await round(r);
+    if (res.kind === "not_evaluated") return { kind: "NOT_EVALUATED", why: res.why };
+    owners.push(res.owners);
+    peaks.push(res.peak);
+  }
+  if (peaks.some((p) => p >= 2)) return { kind: "FAIL", why: `two CONCURRENT owners (peaks ${JSON.stringify(peaks)})` };
+  if (owners.some((o) => o !== 1)) return { kind: "FAIL", why: `not exactly one owner per round (${JSON.stringify(owners)})` };
+  return { kind: "PASS" };
+}
+
 describe("the ordinals tell SEQUENCE from OVERLAP (pure)", () => {
   it("OWNER, RELEASE, OWNER, RELEASE: two owners, never at once (peak 1); OWNER, OWNER: two at once (peak 2)", () => {
     expect(ownership(["OWNER 0", "RELEASE 0", "OWNER 1", "RELEASE 1"])).toEqual({ owners: 2, peak: 1 });
@@ -211,43 +262,23 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
    */
   it(`exactly ONE owner in each of ${ROUNDS} rounds of ${RACERS} racers, each round after a SIGKILLed holder`, async (ctx) => {
     const db = path.join(ROOT, "race.db");
-    const owners: number[] = [];
-    const concurrent: number[] = [];
-    const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
-    for (let r = 0; r < ROUNDS; r++) {
-      const h = await holding(db);
-      await h.kill();
-      const dir = path.join(ROOT, `round-${r}`);
-      fs.mkdirSync(dir);
-      const racers = Array.from({ length: RACERS }, (_, i) => run(RACER_HS, [db, dir, String(i), i === 0 ? "800" : "0", i === 1 ? "800" : "0"]));
-      const exited = racers.map(() => false);
-      racers.forEach((x, i) => x.child.once("exit", () => (exited[i] = true)));
-      const has = (f: string) => fs.existsSync(path.join(dir, f));
-      const readyBy = Date.now() + 60_000;
-      while (Date.now() < readyBy && !racers.every((_, i) => has(`ready-${i}`))) await sleep(10);
-      if (!racers.every((_, i) => has(`ready-${i}`))) {
-        for (const x of racers) if (x.child.exitCode === null && x.child.signalCode === null) x.child.kill("SIGKILL");
-        await Promise.all(racers.map((x) => x.out));
-        const why = `round ${r}: ${racers.filter((_, i) => !has(`ready-${i}`)).length} racer(s) never got ready within 60 s`;
-        reportCoverageGap("inv-db-01 single-owner race", why, "re-run on the same SHA (a coverage failure, not a verdict)");
-        ctx.skip(why);
-      }
-      fs.writeFileSync(path.join(dir, "go"), "");
-      // The winner HOLDS until every racer has lost (exited) or holds: only then is it released.
-      const settled = () => racers.every((_, i) => exited[i] || has(`owner-${i}`));
-      const settleBy = Date.now() + 60_000;
-      while (Date.now() < settleBy && !settled()) await sleep(10);
-      expect(settled(), `round ${r}: every racer contended (lost, or holds) within 60 s of GO`).toBe(true);
-      fs.writeFileSync(path.join(dir, "release"), "");
-      await Promise.all(racers.map((x) => x.out));
-      const events = has("events.log") ? fs.readFileSync(path.join(dir, "events.log"), "utf-8").split("\n").filter(Boolean) : [];
-      const o = ownership(events);
-      owners.push(o.owners);
-      concurrent.push(o.peak);
+    const v = await runRounds(ROUNDS, (r) => raceRound(db, "round", r));
+    if (v.kind === "NOT_EVALUATED") {
+      reportCoverageGap("inv-db-01 single-owner race", v.why, "re-run on the same SHA (a coverage failure, not a verdict)");
+      ctx.skip(v.why);
     }
-    expect(concurrent, "never two CONCURRENT owners (the acquire/release ordinals): a violation is FINAL").toEqual(Array(ROUNDS).fill(1));
-    expect(owners, "exactly ONE owner per round (every racer contended inside the winner's hold)").toEqual(Array(ROUNDS).fill(1));
+    expect(v, "exactly ONE owner per round, never two at once (a violation is FINAL)").toEqual({ kind: "PASS" });
   }, 240_000);
+
+  it("a racer that CRASHES after READY (no attempt) leaves its round NOT_EVALUATED, never an observed pass", async () => {
+    const res = await raceRound(path.join(ROOT, "crash.db"), "crash", 0, (i) => (i === 2 ? "crash-after-ready" : ""));
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+  }, 120_000);
+
+  it("a VIOLATION in round 0 then an unobserved round 1 → FAIL (final), never erased by the later skip", async () => {
+    const v = await runRounds(2, async (r) => (r === 0 ? { kind: "observed", owners: 2, peak: 2 } : { kind: "not_evaluated", why: "round 1: a racer never got ready" }));
+    expect(v.kind, JSON.stringify(v)).toBe("FAIL");
+  });
 
   it.skipIf(process.platform === "win32")("the lock is NEVER inherited by another child of the owner: the owner killed -9, its unrelated child still alive, a racer owns it within 2 s", async () => {
     const db = path.join(ROOT, "no-inherit.db");
