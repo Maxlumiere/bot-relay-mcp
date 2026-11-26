@@ -177,9 +177,10 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
       "  if (mode === \"slow200\") await new Promise((r) => setTimeout(r, 200));",
       "  if (mode === \"malformed\") { w(\"garbage before any frame\\n\"); return; }",
       "  if (mode === \"error\") { w(\"@@ERROR \" + seq + \" the query failed\\n\"); return; }",
-      "  const s = mode === \"badseq\" ? \"999999\" : seq;",
+      "  const begin = mode === \"badseq\" ? \"999999\" : seq;",
+      "  const end = mode === \"badend\" ? \"999999\" : seq;",
       "  const body = mode === \"blind\" ? \"\" : \"  \" + process.pid + \" node target \" + W + \"\\n  43 has-SECRET-inside\\n\";",
-      "  w(\"@@BEGIN \" + s + \"\\n\" + body + \"@@END \" + s + \"\\n\");",
+      "  w(\"@@BEGIN \" + begin + \"\\n\" + body + \"@@END \" + end + \"\\n\");",
       "});",
     ].join("\n")
   );
@@ -215,6 +216,7 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
   for (const [mode, why] of [
     ["malformed", /malformed|out of order/],
     ["badseq", /malformed|out of order/],
+    ["badend", /malformed|out of order/],
     ["error", /the query failed/],
     ["exit", /exited/],
   ] as const) {
