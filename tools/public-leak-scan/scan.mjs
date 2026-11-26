@@ -273,13 +273,23 @@ async function publishedBytes(target, recordedRoot) {
   // PARENT repository (a home directory under git) must never stand in for an absent checkout; an unrecorded or a
   // different root cannot be evaluated, never passes.
   if (!recordedRoot) throw new CannotEvaluate("a copy's checkout root is not recorded (copies.tsv: label, path, checkout root)");
+  // Compared by DIRECTORY IDENTITY (device + inode), not by spelling: robust to case on a case-insensitive filesystem,
+  // to links and to trailing slashes. Any stat error is a refusal.
   let expected;
+  let actual;
   try {
-    expected = fs.realpathSync(recordedRoot);
+    expected = fs.statSync(recordedRoot, { bigint: true });
   } catch {
     throw new CannotEvaluate("a copy's recorded checkout is absent or not a repository");
   }
-  if (fs.realpathSync(root) !== expected) throw new CannotEvaluate("a copy's repository is not its recorded checkout");
+  try {
+    actual = fs.statSync(root, { bigint: true });
+  } catch {
+    throw new CannotEvaluate("a copy's repository could not be determined");
+  }
+  if (!expected.isDirectory() || expected.dev !== actual.dev || expected.ino !== actual.ino) {
+    throw new CannotEvaluate("a copy's repository is not its recorded checkout");
+  }
   const fetched = await runGit(["-C", root, ...FETCH_ARGS], FETCH_TIMEOUT_MS);
   if (fetched.code !== 0) throw new CannotEvaluate("a copy's published branch could not be fetched");
   const rel = path.relative(fs.realpathSync(root), path.join(fs.realpathSync(anchor), path.relative(anchor, dir), path.basename(target))).split(path.sep).join("/");
