@@ -95,12 +95,19 @@ fs.writeFileSync(
     `if (fault === "crash-after-ready") process.exit(3);\n` +
     `while (!fs.existsSync(dir + "/go")) await sleep(2);\n` +
     `if (Number(slowAttempt)) await sleep(Number(slowAttempt));\n` +
+    // FAULTS for the row's own tests: a racer descheduled past the settle deadline; a late crash; a planted, bounded
+    // OWNER/RELEASE pair that overlaps the real owner's hold (then a clean loss); a non-contention error (EIO).
+    `if (fault === "stall-before-attempt") await sleep(5000);\n` +
+    `if (fault === "crash-late") { await sleep(800); process.exit(3); }\n` +
+    `if (fault === "plant-owner") { await sleep(300); log("OWNER plant-" + id); await sleep(100); log("RELEASE plant-" + id); fs.writeFileSync(dir + "/lost-" + id, ""); process.exit(0); }\n` +
     `let lock;\n` +
-    `try { lock = await acquirePrimitive(db, { attempts: 1, initialBytes: new Uint8Array() }); }\n` +
+    `try { lock = fault === "eio" ? await Promise.reject(Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" })) : await acquirePrimitive(db, { attempts: 1, initialBytes: new Uint8Array() }); }\n` +
     // The LOST acknowledgement, written only after a FAILED attempt: an exit without it is not a completed loss.
     `catch (e) { fs.writeFileSync(dir + "/lost-" + id, ""); process.stdout.write("LOST " + (e.name || e.code) + "\\n"); process.exit(fault === "exit-1-after-lost" ? 1 : 0); }\n` +
     `log("OWNER " + id);\n` +
     `fs.writeFileSync(dir + "/owner-" + id, "");\n` +
+    // FAULT: the owner crashes right after taking the lock (before RELEASE).
+    `if (fault === "owner-exit-1") process.exit(1);\n` +
     `process.stdout.write("OWNER\\n");\n` +
     `while (!fs.existsSync(dir + "/release")) await sleep(2);\n` +
     `log("RELEASE " + id);\n` +
@@ -204,7 +211,7 @@ type RoundsVerdict = { kind: "PASS" } | { kind: "FAIL"; why: string } | { kind: 
  * after a failed attempt AND exited 0. Any other exit (a crash after READY, a non-zero exit) leaves the round without
  * 8-way coverage: NOT_EVALUATED. Every wait has its own deadline.
  */
-async function raceRound(db: string, tag: string, r: number, fault: (i: number) => string = () => ""): Promise<RoundResult> {
+async function raceRound(db: string, tag: string, r: number, fault: (i: number) => string = () => "", opts: { settleMs?: number } = {}): Promise<RoundResult> {
   const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
   const h = await holding(db);
   await h.kill();
@@ -230,7 +237,7 @@ async function raceRound(db: string, tag: string, r: number, fault: (i: number) 
   const lost = (i: number) => code[i] === 0 && has(`lost-${i}`);
   const brokeOff = (i: number) => code[i] !== undefined && !owns(i) && !lost(i);
   // The winner HOLDS until every racer has completed its part: only then is it released.
-  const settleBy = Date.now() + 60_000;
+  const settleBy = Date.now() + (opts.settleMs ?? 60_000);
   while (Date.now() < settleBy && !racers.every((_, i) => owns(i) || lost(i)) && !racers.some((_, i) => brokeOff(i))) await sleep(10);
   const broke = racers.map((_, i) => i).filter(brokeOff);
   if (broke.length > 0) {
@@ -303,6 +310,27 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
     const res = await raceRound(path.join(ROOT, "exit1.db"), "exit1", 0, () => "exit-1-after-lost");
     expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
     expect(JSON.stringify(res)).toMatch(/without a LOST acknowledgement \(exit 1/);
+  }, 120_000);
+
+  it("an EIO from the acquire call is not a LOST (only the contention refusal is): the round is NOT_EVALUATED", async () => {
+    const res = await raceRound(path.join(ROOT, "eio.db"), "eio", 0, (i) => (i === 3 ? "eio" : ""));
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+  }, 120_000);
+
+  it("an OWNER that exits 1 before RELEASE did not hold through settlement: the round is NOT_EVALUATED", async () => {
+    const res = await raceRound(path.join(ROOT, "ownerexit.db"), "ownerexit", 0, () => "owner-exit-1");
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+  }, 120_000);
+
+  it("a PLANTED overlap plus another racer crashing → FAIL: violation evidence is judged FIRST, before coverage", async () => {
+    // The plant logs a bounded hold INSIDE the real owner's (300-400 ms after GO); racer 3 then crashes (800 ms after GO).
+    const res = await raceRound(path.join(ROOT, "plant.db"), "plant", 0, (i) => (i === 2 ? "plant-owner" : i === 3 ? "crash-late" : ""));
+    expect(res.kind, JSON.stringify(res)).toBe("failed");
+  }, 120_000);
+
+  it("a racer descheduled past the settle deadline, with no overlap, is NOT_EVALUATED (a deadline is not a verdict)", async () => {
+    const res = await raceRound(path.join(ROOT, "stall.db"), "stall", 0, (i) => (i === 4 ? "stall-before-attempt" : ""), { settleMs: 1500 });
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
   }, 120_000);
 
   it("a VIOLATION in round 0 then an unobserved round 1 → FAIL (final), never erased by the later skip", async () => {
