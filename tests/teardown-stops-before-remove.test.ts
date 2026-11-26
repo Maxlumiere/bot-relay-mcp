@@ -21,6 +21,14 @@
  *
  * EXEMPT, by name, with the reason: a file whose relay-looking entry is a FAKE that only sleeps (EXEMPT below); a row
  * requires that fake to still be a bare timer.
+ * KNOWN LIMITS of a text-level heuristic (stated; an AST rewrite follows only if a real accidental instance slips past):
+ * - an awaited call that RETURNS an emitter, not a promise: `await child.once("exit", f)` (no events.once) reads as an
+ *   awaited exit though it awaits nothing;
+ * - a loop variable reassigned before its kill: `for (const c of all) { … }` then `let c = other; c.kill()` maps `c` to
+ *   `all`;
+ * - RULE 2 judges a helper's FIRST spawn only: `const a = spawn(x); const b = spawn(DIST_INDEX); return { a };` passes;
+ * - a spawnSync whose child leaves a detached grandchild: `spawnSync("sh", ["-c", "node dist/index.js &"])` is not a
+ *   live child to RULE 2 (spawnSync is excluded), yet its grandchild may still write.
  * REMAINING BLIND SPOT (stated): a kill and a removal in DIFFERENT bodies (a kill in one test or helper, the removal
  * in another) with nothing shared between them, which RULE 2 narrows by keeping every spawned writer's handle
  * returnable; a spawn reached through any indirection other than a simple alias (passed as a parameter, re-exported);
@@ -102,12 +110,18 @@ function killedChildren(body: string): string[] {
   return [...out];
 }
 
-/** Is child X stopped before `limit` in `body`: a stopAndRemove that NAMES it, or an awaited exit of X itself? */
+/**
+ * Is child X stopped BEFORE `limit` (the removal) in `body`, and AWAITED there: an awaited stopAndRemove that NAMES it,
+ * an awaited exit of X itself, or an awaited promise built on X's exit/close listener (`const done = new Promise(r =>
+ * X.once("exit", r))` … `await done`). Anything after the removal never counts.
+ */
 function stoppedBefore(body: string, x: string, limit: number): boolean {
   const X = escapeRe(x);
   const head = body.slice(0, limit);
+  const exitPromises = [...head.matchAll(new RegExp(`(?:const|let)\\s+(\\w+)\\s*=\\s*new Promise[^;]*?\\b${X}\\b\\??\\.once\\(\\s*["'](?:exit|close)["']`, "g"))].map((m) => m[1]!);
   return (
-    new RegExp(`\\bstopAndRemove\\(\\s*(?:\\[[^\\]]*\\b${X}\\b[^\\]]*\\]|${X}\\b)`).test(body) ||
+    new RegExp(`\\bawait\\s+stopAndRemove\\(\\s*(?:\\[[^\\]]*\\b${X}\\b[^\\]]*\\]|${X}\\b)`).test(head) ||
+    exitPromises.some((d) => new RegExp(`\\bawait\\b[^;]*\\b${escapeRe(d)}\\b`).test(head)) ||
     new RegExp(`await[^;]*?\\b${X}\\b\\??\\.(?:once\\(\\s*["'](?:exit|close)["']|out\\b|exited\\b)`).test(head) ||
     new RegExp(`await[^;]*?\\b(?:waitExit|awaitExit|waitForExit)\\(\\s*${X}\\b`).test(head) ||
     new RegExp(`await[^;]*?\\b${X}\\.map\\(\\s*(?:waitExit|awaitExit|waitForExit)\\b`).test(head)
