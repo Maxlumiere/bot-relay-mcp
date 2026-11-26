@@ -246,7 +246,7 @@ describe("ADR-0048 PR C — `relay where --fields`: the resolver's answer for ba
       encoding: "utf-8",
       env: { PATH: process.env.PATH ?? "", HOME, ...env },
     });
-  it("an instance → kind, db_path, exists, reason, warning, vault_dir, hook_db, owner_endpoint (8 lines since hook PR 1), exit 0", () => {
+  it("an instance → kind, db_path, exists, reason, warning, vault_dir, hook_db, owner_endpoint, instance_dir (9 lines), exit 0", () => {
     seedDb(path.join(RH, "instances", "work", "relay.db"), false);
     fs.symlinkSync("work", path.join(RH, "active-instance"));
     const r = where({});
@@ -259,6 +259,9 @@ describe("ADR-0048 PR C — `relay where --fields`: the resolver's answer for ba
       "",
       path.join(RH, "instances", "work", "agents"),
     ]);
+    const f = r.stdout.split("\n");
+    expect(f.length, "9 lines + the final newline").toBe(10);
+    expect(f[8], "line 9: the instance directory, spelled under the instances root").toBe(path.join(RH, "instances", "work"));
   });
   it("an error → kind error, the reason on line 4, no path, exit 1", () => {
     const r = where({ RELAY_INSTANCE_ID: ".." });
@@ -275,7 +278,7 @@ describe("ADR-0048 PR C — `relay where --fields`: the resolver's answer for ba
     const f = r.stdout.split("\n");
     expect(f[0]).toBe("error");
     expect(f[3]).toMatch(/line break/);
-    expect(r.stdout.split("\n").length, "exactly 8 lines (7: the hooks' DB verdict; 8: the owner endpoint) + the final newline").toBe(9);
+    expect(r.stdout.split("\n").length, "exactly 9 lines (7: the hooks' DB verdict; 8: the owner endpoint; 9: the instance directory) + the final newline").toBe(10);
   });
 });
 
