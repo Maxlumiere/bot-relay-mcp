@@ -60,14 +60,22 @@ export function windowsObserver(powershell = "powershell.exe"): [string, string[
   return [powershell, psArgs(PS_LOOP)];
 }
 
-/** Kill an observer's whole TREE: its process group (POSIX, spawned detached) or `taskkill /T /F` (Windows). */
-function killTree(p: ChildProcess): void {
-  if (!p.pid) return;
+/**
+ * REQUEST the kill of an observer's whole TREE: its process group (POSIX, spawned detached) or `taskkill /T /F`
+ * (Windows). Returns whether the request was accepted (taskkill's status checked); termination itself is CONFIRMED only
+ * by the process closing, which the caller awaits (bounded).
+ */
+export function killObserverTree(p: ChildProcess): boolean {
+  if (!p.pid) return false;
   try {
-    if (process.platform === "win32") spawnSync("taskkill", ["/T", "/F", "/PID", String(p.pid)], { stdio: "ignore", timeout: 10_000, windowsHide: true });
-    else process.kill(-p.pid, "SIGKILL");
+    if (process.platform === "win32") {
+      const r = spawnSync("taskkill", ["/T", "/F", "/PID", String(p.pid)], { stdio: "ignore", timeout: 10_000, windowsHide: true });
+      return !r.error && r.status === 0;
+    }
+    process.kill(-p.pid, "SIGKILL");
+    return true;
   } catch {
-    /* already gone */
+    return false; // already gone, or not ours to kill: the close confirmation decides
   }
 }
 
@@ -159,7 +167,14 @@ function killGroup(p: ChildProcess): void {
 export function startArgvSampler(
   secret: string,
   witness: string,
-  opts: { gapMs?: number; sampleTimeoutMs?: number; ps?: [string, string[]]; framed?: [string, string[]] } = {},
+  opts: {
+    gapMs?: number;
+    sampleTimeoutMs?: number;
+    ps?: [string, string[]];
+    framed?: [string, string[]];
+    /** The kill used on a framed observer (attempt 1, 2, …); the sampler's own tests inject one that fails. */
+    killer?: (p: ChildProcess, attempt: number) => unknown;
+  } = {},
 ): ArgvSampler {
   let sampled = 0;
   let heldSamples = 0;
@@ -214,15 +229,42 @@ export function startArgvSampler(
     p: ChildProcess;
     buf: string;
     dead: string | null;
+    closed: boolean;
+    closedP: Promise<void>;
     onLine: ((line: string) => void) | null;
     onExit: ((why: string) => void) | null;
   }
   let observer: Observer | null = null;
   let seq = 0;
   let stopFrame: (() => void) | null = null;
+  /**
+   * RETIRING an observer: request the tree kill, then CONFIRM by its close (bounded); a kill it survives is attempted
+   * again (up to 3). An observer never confirmed gone is RETAINED (never dropped): stop() tries once more and reports
+   * any survivor as a failure naming its pid.
+   */
+  const retiring: Promise<void>[] = [];
+  const retained: Observer[] = [];
+  const kill = opts.killer ?? ((p: ChildProcess) => killObserverTree(p));
+  const closedWithin = (o: Observer, ms: number) => Promise.race([o.closedP.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), ms))]);
+  const retire = (o: Observer): void => {
+    retiring.push(
+      (async () => {
+        for (let attempt = 1; attempt <= 3 && !o.closed; attempt++) {
+          kill(o.p, attempt);
+          if (await closedWithin(o, 2_000)) return;
+        }
+        if (!o.closed) retained.push(o);
+      })()
+    );
+  };
   const startObserver = (cmd: string, args: string[]): Observer => {
     const p = spawn(cmd, args, { stdio: ["pipe", "pipe", "ignore"], detached: process.platform !== "win32", windowsHide: true });
-    const o: Observer = { p, buf: "", dead: null, onLine: null, onExit: null };
+    let markClosed!: () => void;
+    const o: Observer = { p, buf: "", dead: null, closed: false, closedP: new Promise<void>((r) => (markClosed = r)), onLine: null, onExit: null };
+    p.on("close", () => {
+      o.closed = true;
+      markClosed();
+    });
     p.stdout!.on("data", (d: Buffer) => {
       o.buf += d.toString("utf-8");
       for (let i = o.buf.indexOf("\n"); i >= 0; i = o.buf.indexOf("\n")) {
@@ -236,7 +278,13 @@ export function startArgvSampler(
       o.dead = why;
       o.onExit?.(why);
     };
-    p.on("error", (e) => gone(`observer could not spawn (${e.message})`));
+    p.on("error", (e) => {
+      gone(`observer could not spawn (${e.message})`);
+      if (!p.pid) {
+        o.closed = true; // never started: nothing to reap
+        markClosed();
+      }
+    });
     p.on("exit", (code, signal) => gone(`observer exited ${code ?? signal}`));
     p.stdin!.on("error", () => {}); // a write to an observer that just died: its exit is the failure
     return o;
@@ -258,7 +306,7 @@ export function startArgvSampler(
         o.onExit = null;
         stopFrame = null;
         if (broken) {
-          killTree(o.p);
+          retire(o); // the tree kill is CONFIRMED (or the handle retained), never fire-and-forget
           if (observer === o) observer = null;
         }
         resolve(r);
@@ -350,9 +398,14 @@ export function startArgvSampler(
         const o = observer as Observer | null;
         if (o) {
           o.onExit = null;
-          killTree(o.p); // the framed observer between frames
+          retire(o); // the framed observer between frames
           observer = null;
         }
+      }
+      await Promise.all(retiring);
+      for (const r of retained.splice(0)) {
+        kill(r.p, 4); // one more attempt; a survivor is then REPORTED, never silent
+        if (!(await closedWithin(r, 2_000))) failures.push(`observer ${r.p.pid} survived its tree kill (termination not confirmed)`);
       }
     },
   };
