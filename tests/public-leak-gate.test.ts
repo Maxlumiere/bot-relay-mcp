@@ -248,6 +248,46 @@ describe("the public scanner copy", () => {
     fs.rmSync(p.dir, { recursive: true, force: true });
   });
 
+  /** Is the filesystem under `dir` case-insensitive? (measured: a name created in lower case, looked up in upper case) */
+  const caseInsensitiveAt = (dir: string): boolean => {
+    const probe = path.join(dir, "case-probe-x");
+    fs.mkdirSync(probe);
+    const insensitive = fs.existsSync(path.join(dir, "CASE-PROBE-X"));
+    fs.rmdirSync(probe);
+    return insensitive;
+  };
+
+  it("REPO IDENTITY: the recorded root spelled in another CASE (a case-insensitive filesystem) is the same checkout → PASS", (ctx) => {
+    const p = privateCopyWithRepo();
+    const work = path.dirname(path.dirname(path.dirname(p.copy)));
+    if (!caseInsensitiveAt(p.dir)) {
+      console.log("skipped: this filesystem is case-sensitive (a case alias names another directory)");
+      fs.rmSync(p.dir, { recursive: true, force: true });
+      ctx.skip("case-sensitive filesystem");
+    }
+    const alias = path.join(path.dirname(work), path.basename(work).toUpperCase());
+    expect(alias, "precondition: the alias is spelled differently").not.toBe(work);
+    fs.writeFileSync(path.join(p.dir, "copies.tsv"), `fixture-repo\t${p.copy}\t${alias}\n`);
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout.trim()).toBe("self-test: PASS");
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  });
+
+  it("REPO IDENTITY: ANOTHER checkout whose path is spelled the same below a different parent (a second clone) still REFUSES", () => {
+    const p = privateCopyWithRepo();
+    const work = path.dirname(path.dirname(path.dirname(p.copy)));
+    const otherParent = path.join(p.dir, "elsewhere");
+    fs.mkdirSync(otherParent);
+    const twin = path.join(otherParent, path.basename(work));
+    p.git(otherParent, "clone", "-q", p.bare, twin);
+    fs.writeFileSync(path.join(p.dir, "copies.tsv"), `fixture-repo\t${p.copy}\t${twin}\n`);
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(2);
+    expect(r.stderr).toMatch(/cannot evaluate \(a copy's repository is not its recorded checkout/);
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  });
+
   /** The private self-test, ASYNC (a fixture server in this process keeps answering while it runs). */
   const privateSelfTestAsync = (p: { dir: string; list: string }, env: Record<string, string>) =>
     new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
