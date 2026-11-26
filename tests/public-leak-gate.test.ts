@@ -168,7 +168,7 @@ describe("the public scanner copy", () => {
     git(work, "add", "-A");
     git(work, "commit", "-q", "-m", "publish");
     git(work, "push", "-q", "origin", "HEAD:main");
-    fs.writeFileSync(path.join(dir, "copies.tsv"), `fixture-repo\t${copy}\n`);
+    fs.writeFileSync(path.join(dir, "copies.tsv"), `fixture-repo\t${copy}\t${work}\n`);
     return { dir, list, copy, git, bare };
   }
   const privateSelfTest = (p: { dir: string; list: string }) =>
@@ -225,6 +225,26 @@ describe("the public scanner copy", () => {
     const r = privateSelfTest(p);
     expect(r.status, r.stdout + r.stderr).toBe(2);
     expect(r.stdout).toMatch(/^DRIFT: fixture-repo$/m);
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  });
+
+  it("REPO IDENTITY: the recorded checkout ABSENT while a PARENT repository holds identical bytes at the path → cannot evaluate, never a pass", () => {
+    const p = privateCopyWithRepo();
+    const work = path.dirname(path.dirname(path.dirname(p.copy)));
+    // The fixture repo plays a PARENT (a home directory under git) publishing identical bytes at checkout/tools/…; the
+    // intended checkout (checkout/) is absent locally, so a walk up from the copy reaches the parent.
+    const inner = path.join(work, "checkout", "tools", "public-leak-scan", "scan.mjs");
+    fs.mkdirSync(path.dirname(inner), { recursive: true });
+    fs.copyFileSync(SCAN, inner);
+    p.git(work, "add", "-A");
+    p.git(work, "commit", "-q", "-m", "a parent repo holds the bytes too");
+    p.git(work, "push", "-q", "origin", "HEAD:main");
+    fs.rmSync(path.join(work, "checkout"), { recursive: true, force: true });
+    fs.writeFileSync(path.join(p.dir, "copies.tsv"), `intended\t${inner}\t${path.join(work, "checkout")}\n`);
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(2);
+    expect(r.stdout).not.toContain("self-test: PASS");
+    expect(r.stderr).toMatch(/cannot evaluate \(a copy's recorded checkout/);
     fs.rmSync(p.dir, { recursive: true, force: true });
   });
 
