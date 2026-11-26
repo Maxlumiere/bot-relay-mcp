@@ -233,6 +233,12 @@ describe("the guard's own rows (fixtures)", () => {
     expect(teardownViolations(one(`${src}afterAll(async () => {\n  await stopAndRemove(other, OTHER);\n  daemon.kill("SIGKILL");\n  fs.rmSync(ROOT, { recursive: true, force: true });\n});\n`))).toEqual(["tests/x.test.ts:3"]);
     expect(teardownViolations(one(`${src}afterAll(async () => {\n  await other.out;\n  daemon.kill("SIGKILL");\n  fs.rmSync(ROOT, { recursive: true, force: true });\n});\n`))).toEqual(["tests/x.test.ts:3"]);
   });
+  it("RULE 1 ORDERING: a stop that comes AFTER the removal does not count (kill, rm, then stopAndRemove FAILS)", () => {
+    expect(teardownViolations(one(`${SPAWN}afterAll(async () => {\n  daemon.kill("SIGKILL");\n  fs.rmSync(ROOT, { recursive: true, force: true });\n  await stopAndRemove(daemon, ROOT);\n});\n`))).toEqual(["tests/x.test.ts:2"]);
+  });
+  it("RULE 1 accepts an awaited promise wrapping the child's exit listener, created BEFORE the kill", () => {
+    expect(teardownViolations(one(`${SPAWN}afterAll(async () => {\n  const done = new Promise((r) => daemon.once("exit", r));\n  daemon.kill("SIGTERM");\n  await done;\n  fs.rmSync(ROOT, { recursive: true, force: true });\n});\n`))).toEqual([]);
+  });
   it("a spawn ALIAS (const launch = spawn; a destructured or renamed import) is still a spawn: both rules see it", () => {
     const alias = `const launch = spawn;\nconst d = launch(process.execPath, [DIST_INDEX], {});\n`;
     expect(teardownViolations(one(`${alias}afterAll(() => {\n  d.kill("SIGKILL");\n  fs.rmSync(ROOT, { recursive: true, force: true });\n});\n`))).toEqual(["tests/x.test.ts:3"]);
