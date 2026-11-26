@@ -169,6 +169,7 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
       "fs.appendFileSync(pidFile, process.pid + \"\\n\");",
       "if (mode === \"exit\") process.exit(3);",
       "if (mode === \"stuck-child\") { const c = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 1000)\"], { stdio: \"ignore\" }); fs.appendFileSync(pidFile + \".grand\", c.pid + \"\\n\"); }",
+      "let answered = 0;",
       "const w = (t) => process.stdout.write(t);",
       "readline.createInterface({ input: process.stdin }).on(\"line\", async (line) => {",
       "  const seq = line.trim();",
@@ -181,6 +182,7 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
       "  const end = mode === \"badend\" ? \"999999\" : seq;",
       "  const body = mode === \"blind\" ? \"\" : \"  \" + process.pid + \" node target \" + W + \"\\n  43 has-SECRET-inside\\n\";",
       "  w(\"@@BEGIN \" + begin + \"\\n\" + body + \"@@END \" + end + \"\\n\");",
+      "  if (mode === \"exit-leave-child\" && ++answered === 1) { const c = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 1000)\"], { stdio: \"ignore\" }); fs.appendFileSync(pidFile + \".grand\", c.pid + \"\\n\"); setTimeout(() => process.exit(0), 30); }",
       "});",
     ].join("\n")
   );
@@ -260,7 +262,7 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
     expect(calls, "a survived kill is attempted AGAIN").toContain(2);
     await new Promise((r) => setTimeout(r, 200));
     for (const pid of pids(f.pidFile)) expect(alive(pid), `observer ${pid} confirmed gone`).toBe(false);
-    expect(s.failures.some((x) => /survived/.test(x)), "a retried, confirmed kill is not a survivor").toBe(false);
+    expect(s.failures.some((x) => /possible surviving observer process/.test(x)), "a retried, confirmed kill is not a survivor").toBe(false);
   }, 30_000);
 
   it("an observer that survives EVERY kill is REPORTED by stop() (a visible failure naming it), never lost", async () => {
@@ -271,8 +273,42 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
     const left = pids(f.pidFile);
     for (const pid of left) recorded.push(pid); // killed by pid in afterEach
     expect(left.length).toBeGreaterThan(0);
-    expect(s.failures.some((x) => /survived its tree kill/.test(x)), JSON.stringify(s.failures)).toBe(true);
+    expect(s.failures.some((x) => /possible surviving observer process: \d+/.test(x)), JSON.stringify(s.failures)).toBe(true);
     expect(left.some((pid) => s.failures.some((x) => x.includes(String(pid)))), "the survivor is named by its pid").toBe(true);
+  }, 60_000);
+
+  it("an observer that EXITS between frames, leaving a grandchild with its own stdio, is RETIRED (its tree killed) before it is replaced; the grandchild is confirmed dead", async () => {
+    const f = fake("exit-leave-child", "leave-child");
+    const s = startArgvSampler("SECRET", W, { gapMs: 100, framed: f.framed });
+    await new Promise((r) => setTimeout(r, 900)); // the first observer answered, left its grandchild and exited; later ones too
+    await s.stop();
+    const grands = pids(`${f.pidFile}.grand`);
+    for (const pid of [...grands, ...pids(f.pidFile)]) recorded.push(pid);
+    expect(grands.length, "precondition: an observer left a grandchild").toBeGreaterThan(0);
+    await new Promise((r) => setTimeout(r, 200));
+    for (const pid of grands) expect(alive(pid), `the grandchild ${pid} of an exited observer must not survive`).toBe(false);
+    expect(s.failures.some((x) => /possible surviving/.test(x)), JSON.stringify(s.failures)).toBe(false);
+  }, 30_000);
+
+  it("an observer whose parent has ALREADY closed still gets its TREE kill issued", async () => {
+    const f = fake("exit-leave-child", "closed-parent");
+    const killed: number[] = [];
+    const s = startArgvSampler("SECRET", W, { gapMs: 100, framed: f.framed, killer: (p) => (killed.push(p.pid ?? -1), killObserverTree(p)) });
+    await new Promise((r) => setTimeout(r, 900));
+    await s.stop();
+    for (const pid of [...pids(`${f.pidFile}.grand`), ...pids(f.pidFile)]) recorded.push(pid);
+    const first = pids(f.pidFile)[0]!;
+    expect(killed, `the exited observer ${first} still had its tree kill issued`).toContain(first);
+  }, 30_000);
+
+  it("a killer that FAILS (its result checked) leaves the tree unconfirmed: stop() REPORTS the possible survivor by pid", async () => {
+    const f = fake("stuck-child", "killer-fails");
+    const s = startArgvSampler("SECRET", W, { gapMs: 10, sampleTimeoutMs: 300, framed: f.framed, killer: () => false });
+    await new Promise((r) => setTimeout(r, 500));
+    await s.stop();
+    for (const pid of [...pids(`${f.pidFile}.grand`), ...pids(f.pidFile)]) recorded.push(pid); // killed by pid in afterEach
+    const observers = pids(f.pidFile);
+    expect(s.failures.some((x) => observers.some((pid) => x === `possible surviving observer process: ${pid}`)), JSON.stringify(s.failures)).toBe(true);
   }, 60_000);
 
   it("a frame that stop() ENDS (in flight) is neither a sample nor a failure", async () => {
