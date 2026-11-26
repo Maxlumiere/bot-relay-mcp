@@ -65,7 +65,9 @@ afterAll(async () => {
 const RACER = path.join(ROOT, "racer.mjs");
 fs.writeFileSync(
   RACER,
-  `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
+  // argv[5] (optional): a SLOW IMPORT, in ms, before the lock module loads (a slow runner's start, made deterministic).
+  `const __slowImport = Number(process.argv[5] || 0); if (__slowImport) await new Promise((r) => setTimeout(r, __slowImport));\n` +
+    `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
     `const fs = await import("fs");\n` +
     `const [db, go, hold] = process.argv.slice(2);\n` +
     `while (!fs.existsSync(go)) await new Promise((r) => setTimeout(r, 2));\n` +
@@ -155,7 +157,8 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
       const h = await holding(db);
       await h.kill();
       const go = path.join(ROOT, `go-${r}`);
-      const racers = Array.from({ length: RACERS }, () => run(RACER, [db, go, "400"]));
+      // One racer per round has a SLOW IMPORT (a slow runner): it must still contend inside the winner's hold.
+      const racers = Array.from({ length: RACERS }, (_, i) => run(RACER, [db, go, "400", i === 0 ? "800" : "0"]));
       await new Promise((res) => setTimeout(res, 150));
       fs.writeFileSync(go, "");
       const outs = await Promise.all(racers.map((x) => x.out));
