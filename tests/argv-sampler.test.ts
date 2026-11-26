@@ -158,6 +158,9 @@ describe.skipIf(WIN)("the argv sampler", () => {
 // ---------------------------------------------------------------------------------------------------------------------
 describe("the FRAMED observer (one long-lived process, one frame per request)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sampler-framed-"));
+  // The fake's grandchild: on POSIX it stays in the observer's process group (what the group kill reaches); on WINDOWS it
+  // is spawned detached, outside the kill-on-close job a non-detached child shares with its parent, so a parent that
+  // dies leaves a TRUE orphan (what the by-parent-pid confirmation must find).
   const FAKE = path.join(dir, "fake-observer.mjs");
   fs.writeFileSync(
     FAKE,
@@ -168,7 +171,7 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
       "const [mode, pidFile, W] = process.argv.slice(2);",
       "fs.appendFileSync(pidFile, process.pid + \"\\n\");",
       "if (mode === \"exit\") process.exit(3);",
-      "if (mode === \"stuck-child\") { const c = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 1000)\"], { stdio: \"ignore\" }); fs.appendFileSync(pidFile + \".grand\", c.pid + \"\\n\"); }",
+      "if (mode === \"stuck-child\") { const c = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 1000)\"], { stdio: \"ignore\", detached: process.platform === \"win32\" }); fs.appendFileSync(pidFile + \".grand\", c.pid + \"\\n\"); }",
       "let answered = 0;",
       "const w = (t) => process.stdout.write(t);",
       "readline.createInterface({ input: process.stdin }).on(\"line\", async (line) => {",
@@ -182,7 +185,7 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
       "  const end = mode === \"badend\" ? \"999999\" : seq;",
       "  const body = mode === \"blind\" ? \"\" : \"  \" + process.pid + \" node target \" + W + \"\\n  43 has-SECRET-inside\\n\";",
       "  w(\"@@BEGIN \" + begin + \"\\n\" + body + \"@@END \" + end + \"\\n\");",
-      "  if (mode === \"exit-leave-child\" && ++answered === 1) { const c = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 1000)\"], { stdio: \"ignore\" }); fs.appendFileSync(pidFile + \".grand\", c.pid + \"\\n\"); setTimeout(() => process.exit(0), 30); }",
+      "  if (mode === \"exit-leave-child\" && ++answered === 1) { const c = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 1000)\"], { stdio: \"ignore\", detached: process.platform === \"win32\" }); fs.appendFileSync(pidFile + \".grand\", c.pid + \"\\n\"); setTimeout(() => process.exit(0), 30); }",
       "});",
     ].join("\n")
   );
