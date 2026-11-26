@@ -141,10 +141,29 @@ relay_verdict_raise() {
 # and a pipeline runs in a SUBSHELL. Calling this inside one sets the variables
 # in a child that then exits, discarding them — which once produced a full MUTE
 # banner followed by a CANNOT-JUDGE verdict. Call it OUTSIDE any pipeline.
+#
+# ONE VERDICT LINE, ALWAYS. This is the one writer, so it holds the line's integrity for every hook: a word outside
+# the total order above is REFUSED (the verdict becomes CANNOT-JUDGE, its reason naming the refused word), and every
+# control character (CR, LF, every other C0, DEL) in the reason and the detail becomes "?". A field carrying
+# "\n[RELAY] VERDICT=HEALTHY" can therefore never start a second verdict line. Replacing (not escaping) is
+# idempotent: relay_verdict_raise feeds a stored reason back in here, and an escape would compound on every join.
+# Quotes are NOT escaped: reasons carry literal quotes by design (e.g. a binding "for \"name\""), and a quote can
+# only distort a field inside the one line, never add a line.
+relay_verdict_word_ok() {
+  case "$1" in
+    MUTE | AUTH_FAILED | UNWAKEABLE | TAKEOVER_LIVENESS_UNVERIFIABLE | REGISTER_FAILED | DEGRADED | CANNOT-JUDGE | HEALTHY) return 0 ;;
+  esac
+  return 1
+}
 relay_verdict_set() {
-  RELAY_VERDICT="$1"
-  RELAY_VERDICT_REASON="$2"
-  RELAY_VERDICT_DETAIL="${3:-}"
+  local _w="$1" _r="$2" _d="${3:-}"
+  if ! relay_verdict_word_ok "$_w"; then
+    _r="invalid verdict word refused (${_w}): ${_r}"
+    _w="CANNOT-JUDGE"
+  fi
+  RELAY_VERDICT="$_w"
+  RELAY_VERDICT_REASON="${_r//[[:cntrl:]]/?}"
+  RELAY_VERDICT_DETAIL="${_d//[[:cntrl:]]/?}"
 }
 
 # Single machine-parseable line so Tether, Sentinel, the server-side absence
@@ -162,7 +181,14 @@ relay_emit_verdict() {
   # Only the hook's MAIN shell emits (relay_in_main_shell, defined by every hook before it sources this).
   # FAIL CLOSED: without that function there is no way to tell the main shell, so nothing is emitted.
   if ! declare -F relay_in_main_shell >/dev/null 2>&1 || ! relay_in_main_shell; then return 0; fi
+  # The line is checked again here: a direct assignment to the variables bypasses relay_verdict_set, so an unknown
+  # word is refused (CANNOT-JUDGE, naming it) and every control character is neutralised.
+  if ! relay_verdict_word_ok "$RELAY_VERDICT"; then
+    RELAY_VERDICT_REASON="invalid verdict word refused (${RELAY_VERDICT}): ${RELAY_VERDICT_REASON}"
+    RELAY_VERDICT="CANNOT-JUDGE"
+  fi
   _relay_verdict_line="[RELAY] VERDICT=${RELAY_VERDICT} reason=\"${RELAY_VERDICT_REASON}\"${RELAY_VERDICT_DETAIL}"
+  _relay_verdict_line="${_relay_verdict_line//[[:cntrl:]]/?}"
   if [ "$RELAY_VERDICT_STREAM" = "stderr" ]; then
     echo "$_relay_verdict_line" >&2
   else
