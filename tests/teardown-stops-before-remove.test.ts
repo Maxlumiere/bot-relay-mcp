@@ -34,6 +34,11 @@ export const EXEMPT: Record<string, string> = {
   "tests/adr-0047-fleet-verdicts.test.ts": "its children run a fake dist/index.js that only sleeps (setInterval); they write nothing",
 };
 
+/** Does an EXEMPT file's fake relay entry still only SLEEP? (not yet checked: the rows below go red) */
+export function exemptFakeSleeps(_src: string): boolean {
+  return false;
+}
+
 /** Does this source spawn a relay entry or a SQLite writer? */
 export function spawnsWriter(src: string): boolean {
   return /\bspawn(Sync)?\(/.test(src) && /(DIST_INDEX|\bENTRY\b|dist\/index\.js|["']dist["'],\s*["']index\.js["']|better-sqlite3)/.test(src);
@@ -131,6 +136,7 @@ describe("teardown order: a writing child is stopped before its directory is rem
     for (const f of Object.keys(EXEMPT)) {
       expect(files.has(f), `${f} exists`).toBe(true);
       expect(spawnsWriter(files.get(f)!), `${f} still spawns what it is exempt for`).toBe(true);
+      expect(exemptFakeSleeps(files.get(f)!), `${f}'s fake entry still only SLEEPS (writes nothing)`).toBe(true);
     }
   });
 });
@@ -162,6 +168,26 @@ describe("the guard's own rows (fixtures)", () => {
   });
   it("RULE 1 ignores a file that spawns no relay entry or SQLite writer (a sleeper)", () => {
     expect(teardownViolations(one(`const m = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"]);\nafterEach(() => {\n  m.kill("SIGKILL");\n  fs.rmSync(ROOT, { recursive: true, force: true });\n});\n`))).toEqual([]);
+  });
+  it("RULE 1 matches the SPECIFIC child: an unrelated child's stopAndRemove or awaited exit does not excuse killing ANOTHER child and removing its dir", () => {
+    const src = `${SPAWN}const other = spawn(process.execPath, [DIST_INDEX], {});\n`;
+    expect(teardownViolations(one(`${src}afterAll(async () => {\n  await stopAndRemove(other, OTHER);\n  daemon.kill("SIGKILL");\n  fs.rmSync(ROOT, { recursive: true, force: true });\n});\n`))).toEqual(["tests/x.test.ts:3"]);
+    expect(teardownViolations(one(`${src}afterAll(async () => {\n  await other.out;\n  daemon.kill("SIGKILL");\n  fs.rmSync(ROOT, { recursive: true, force: true });\n});\n`))).toEqual(["tests/x.test.ts:3"]);
+  });
+  it("a spawn ALIAS (const launch = spawn; a destructured or renamed import) is still a spawn: both rules see it", () => {
+    const alias = `const launch = spawn;\nconst d = launch(process.execPath, [DIST_INDEX], {});\n`;
+    expect(teardownViolations(one(`${alias}afterAll(() => {\n  d.kill("SIGKILL");\n  fs.rmSync(ROOT, { recursive: true, force: true });\n});\n`))).toEqual(["tests/x.test.ts:3"]);
+    expect(helperViolations(one(`import { spawn as run } from "node:child_process";\nfunction startHidden(): void {\n  const child = run(process.execPath, [DIST_INDEX], {});\n  procs.push(child);\n}\n`))).toEqual(["tests/x.test.ts:startHidden"]);
+  });
+  it("RULE 2 covers a SQLite WRITER too: a helper spawning a better-sqlite3 script without returning the child is flagged", () => {
+    expect(helperViolations(one(`function startWriter(): void {\n  const w = spawn(process.execPath, ["-e", "const D = require('better-sqlite3'); new D(process.argv[1]).exec('x')"], {});\n  procs.push(w);\n}\n`))).toEqual(["tests/x.test.ts:startWriter"]);
+  });
+  it("rimraf.sync is a removal too", () => {
+    expect(teardownViolations(one(`${SPAWN}afterAll(() => {\n  daemon.kill("SIGKILL");\n  rimraf.sync(ROOT);\n});\n`))).toEqual(["tests/x.test.ts:2"]);
+  });
+  it("an EXEMPT file's fake must still be a SLEEPER: a fake that writes is no longer exempt", () => {
+    expect(exemptFakeSleeps(`fs.writeFileSync(path.join(install, "dist", "index.js"), "setInterval(() => {}, 1000);\\n");`)).toBe(true);
+    expect(exemptFakeSleeps(`fs.writeFileSync(path.join(install, "dist", "index.js"), "require('fs').writeFileSync('x', '1'); setInterval(() => {}, 1000);\\n");`)).toBe(false);
   });
   it("RULE 2 flags a helper that spawns the relay entry without returning the child, and passes one that returns it", () => {
     expect(helperViolations(one(`async function startHidden(): Promise<void> {\n  const child = spawn(process.execPath, [DIST_INDEX], {});\n  procs.push(child);\n}\n`))).toEqual(["tests/x.test.ts:startHidden"]);
