@@ -97,7 +97,8 @@ fs.writeFileSync(
     `if (Number(slowAttempt)) await sleep(Number(slowAttempt));\n` +
     `let lock;\n` +
     `try { lock = await acquirePrimitive(db, { attempts: 1, initialBytes: new Uint8Array() }); }\n` +
-    `catch (e) { process.stdout.write("LOST " + (e.name || e.code) + "\\n"); process.exit(0); }\n` +
+    // The LOST acknowledgement, written only after a FAILED attempt: an exit without it is not a completed loss.
+    `catch (e) { fs.writeFileSync(dir + "/lost-" + id, ""); process.stdout.write("LOST " + (e.name || e.code) + "\\n"); process.exit(fault === "exit-1-after-lost" ? 1 : 0); }\n` +
     `log("OWNER " + id);\n` +
     `fs.writeFileSync(dir + "/owner-" + id, "");\n` +
     `process.stdout.write("OWNER\\n");\n` +
@@ -194,10 +195,15 @@ async function oneTry(db: string): Promise<string> {
   return run(RACER, [db, go, "0"]).out;
 }
 
-type RoundResult = { kind: "observed"; owners: number; peak: number } | { kind: "not_evaluated"; why: string };
+type RoundResult = { kind: "observed"; owners: number; peak: number } | { kind: "not_evaluated"; why: string } | { kind: "failed"; why: string };
 type RoundsVerdict = { kind: "PASS" } | { kind: "FAIL"; why: string } | { kind: "NOT_EVALUATED"; why: string };
 
-/** One round of the single-owner race (in `${tag}-${r}`); `fault(i)` is racer i's fault knob ("" = none). */
+/**
+ * One round of the single-owner race (in `${tag}-${r}`); `fault(i)` is racer i's fault knob ("" = none). A racer
+ * COMPLETES its part only as the owner (it holds, and logged OWNER) or as a loser that wrote its LOST acknowledgement
+ * after a failed attempt AND exited 0. Any other exit (a crash after READY, a non-zero exit) leaves the round without
+ * 8-way coverage: NOT_EVALUATED. Every wait has its own deadline.
+ */
 async function raceRound(db: string, tag: string, r: number, fault: (i: number) => string = () => ""): Promise<RoundResult> {
   const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
   const h = await holding(db);
@@ -205,41 +211,58 @@ async function raceRound(db: string, tag: string, r: number, fault: (i: number) 
   const dir = path.join(ROOT, `${tag}-${r}`);
   fs.mkdirSync(dir);
   const racers = Array.from({ length: RACERS }, (_, i) => run(RACER_HS, [db, dir, String(i), i === 0 ? "800" : "0", i === 1 ? "800" : "0", fault(i)]));
-  const exited = racers.map(() => false);
-  racers.forEach((x, i) => x.child.once("exit", () => (exited[i] = true)));
+  const code: Array<number | null | undefined> = racers.map(() => undefined); // undefined: still running
+  racers.forEach((x, i) => x.child.once("exit", (c) => (code[i] = c)));
   const has = (f: string) => fs.existsSync(path.join(dir, f));
+  const allExitedWithin = (ms: number) => Promise.race([Promise.all(racers.map((x) => x.out)).then(() => true), sleep(ms).then(() => false)]);
+  const killAll = async (): Promise<void> => {
+    for (const x of racers) if (x.child.exitCode === null && x.child.signalCode === null) x.child.kill("SIGKILL");
+    await allExitedWithin(10_000);
+  };
   const readyBy = Date.now() + 60_000;
   while (Date.now() < readyBy && !racers.every((_, i) => has(`ready-${i}`))) await sleep(10);
   if (!racers.every((_, i) => has(`ready-${i}`))) {
-    for (const x of racers) if (x.child.exitCode === null && x.child.signalCode === null) x.child.kill("SIGKILL");
-    await Promise.all(racers.map((x) => x.out));
+    await killAll();
     return { kind: "not_evaluated", why: `round ${r}: ${racers.filter((_, i) => !has(`ready-${i}`)).length} racer(s) never got ready within 60 s` };
   }
   fs.writeFileSync(path.join(dir, "go"), "");
-  // The winner HOLDS until every racer has lost (exited) or holds: only then is it released.
-  const settled = () => racers.every((_, i) => exited[i] || has(`owner-${i}`));
+  const owns = (i: number) => has(`owner-${i}`);
+  const lost = (i: number) => code[i] === 0 && has(`lost-${i}`);
+  const brokeOff = (i: number) => code[i] !== undefined && !owns(i) && !lost(i);
+  // The winner HOLDS until every racer has completed its part: only then is it released.
   const settleBy = Date.now() + 60_000;
-  while (Date.now() < settleBy && !settled()) await sleep(10);
-  if (!settled()) throw new Error(`round ${r}: every racer contended (lost, or holds) within 60 s of GO`);
+  while (Date.now() < settleBy && !racers.every((_, i) => owns(i) || lost(i)) && !racers.some((_, i) => brokeOff(i))) await sleep(10);
+  const broke = racers.map((_, i) => i).filter(brokeOff);
+  if (broke.length > 0) {
+    await killAll();
+    return { kind: "not_evaluated", why: `round ${r}: racer(s) ${broke.join(",")} exited without a LOST acknowledgement (exit ${broke.map((i) => code[i]).join(",")})` };
+  }
+  if (!racers.every((_, i) => owns(i) || lost(i))) {
+    await killAll();
+    return { kind: "failed", why: `round ${r}: not every racer completed its attempt within 60 s of GO` };
+  }
   fs.writeFileSync(path.join(dir, "release"), "");
-  await Promise.all(racers.map((x) => x.out));
+  if (!(await allExitedWithin(30_000))) {
+    await killAll();
+    return { kind: "failed", why: `round ${r}: a racer did not exit within 30 s of RELEASE` };
+  }
   const events = has("events.log") ? fs.readFileSync(path.join(dir, "events.log"), "utf-8").split("\n").filter(Boolean) : [];
   const o = ownership(events);
   return { kind: "observed", owners: o.owners, peak: o.peak };
 }
 
-/** Runs `n` rounds and judges them. */
+/**
+ * Runs `n` rounds, judging EACH round as it ends: a violation (two concurrent owners, or not exactly one owner) or a
+ * failed round is FAIL at once (final: no later round can erase it); an unobserved round ends the run NOT_EVALUATED.
+ */
 async function runRounds(n: number, round: (r: number) => Promise<RoundResult>): Promise<RoundsVerdict> {
-  const owners: number[] = [];
-  const peaks: number[] = [];
   for (let r = 0; r < n; r++) {
     const res = await round(r);
+    if (res.kind === "failed") return { kind: "FAIL", why: res.why };
     if (res.kind === "not_evaluated") return { kind: "NOT_EVALUATED", why: res.why };
-    owners.push(res.owners);
-    peaks.push(res.peak);
+    if (res.peak >= 2) return { kind: "FAIL", why: `round ${r}: two CONCURRENT owners (peak ${res.peak})` };
+    if (res.owners !== 1) return { kind: "FAIL", why: `round ${r}: ${res.owners} owner(s), not exactly one` };
   }
-  if (peaks.some((p) => p >= 2)) return { kind: "FAIL", why: `two CONCURRENT owners (peaks ${JSON.stringify(peaks)})` };
-  if (owners.some((o) => o !== 1)) return { kind: "FAIL", why: `not exactly one owner per round (${JSON.stringify(owners)})` };
   return { kind: "PASS" };
 }
 
@@ -273,6 +296,13 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
   it("a racer that CRASHES after READY (no attempt) leaves its round NOT_EVALUATED, never an observed pass", async () => {
     const res = await raceRound(path.join(ROOT, "crash.db"), "crash", 0, (i) => (i === 2 ? "crash-after-ready" : ""));
     expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+  }, 120_000);
+
+  it("a racer that writes LOST but exits NON-ZERO did not complete its part: the round is NOT_EVALUATED", async () => {
+    // Every racer but the winner loses; each carries the fault, so the losers all exit 1 after their acknowledgement.
+    const res = await raceRound(path.join(ROOT, "exit1.db"), "exit1", 0, () => "exit-1-after-lost");
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+    expect(JSON.stringify(res)).toMatch(/without a LOST acknowledgement \(exit 1/);
   }, 120_000);
 
   it("a VIOLATION in round 0 then an unobserved round 1 → FAIL (final), never erased by the later skip", async () => {
