@@ -159,8 +159,12 @@ describe.skipIf(WIN)("the argv sampler", () => {
 describe("the FRAMED observer (one long-lived process, one frame per request)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sampler-framed-"));
   // The fake's grandchild: on POSIX it stays in the observer's process group (what the group kill reaches); on WINDOWS it
-  // is spawned detached, outside the kill-on-close job a non-detached child shares with its parent, so a parent that
-  // dies leaves a TRUE orphan (what the by-parent-pid confirmation must find).
+  // is spawned detached, so a parent that dies leaves a TRUE orphan (what the by-parent-pid confirmation must find).
+  // MEASURED on the Windows runner: a NON-detached grandchild died with its parent, so a parent-only kill left nothing to
+  // find. The cause, REPORTED (not verified): libuv puts a non-detached child in a kill-on-close job with its parent.
+  // TOPOLOGY modelled: the production observer itself is spawned NON-detached on Windows (tests/_helpers/argv-sampler.ts,
+  // the framed observer's spawn); what this models is a CHILD of that observer, which PowerShell (not libuv) would
+  // create outside any such job, so it would outlive a dying observer, as this detached grandchild does.
   const FAKE = path.join(dir, "fake-observer.mjs");
   fs.writeFileSync(
     FAKE,
