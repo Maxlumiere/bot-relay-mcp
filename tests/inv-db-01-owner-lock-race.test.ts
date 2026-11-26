@@ -27,6 +27,7 @@ import os from "os";
 import path from "path";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
+import { reportCoverageGap } from "./_helpers/coverage-gap.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LOCK_JS = pathToFileURL(path.join(REPO, "dist", "db-owner-lock.js")).href;
@@ -75,6 +76,48 @@ fs.writeFileSync(
     `catch (e) { process.stdout.write("LOST " + (e.name || e.code) + " " + String(e && e.message || "").split("\\n")[0].slice(0, 1000) + "\\n"); }\n` +
     `process.exit(0);\n`
 );
+// The HANDSHAKE racer (the single-owner row): coverage by handshake, never by timing. It signals READY once its lock
+// module has loaded, contends only on the parent's GO, and as the winner HOLDS until the parent RELEASES it (written
+// only after every other racer has lost). OWNER/RELEASE go to one append-only log in order (the acquire/release
+// ordinals): two OWNER lines with no RELEASE between them are two CONCURRENT owners. argv: db dir id slowImportMs
+// slowAttemptMs (a slow runner's start, and a slow attempt after GO, made deterministic).
+const RACER_HS = path.join(ROOT, "racer-handshake.mjs");
+fs.writeFileSync(
+  RACER_HS,
+  `const [db, dir, id, slowImport, slowAttempt] = process.argv.slice(2);\n` +
+    `const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n` +
+    `if (Number(slowImport)) await sleep(Number(slowImport));\n` +
+    `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
+    `const fs = await import("fs");\n` +
+    `const log = (line) => fs.appendFileSync(dir + "/events.log", line + "\\n");\n` +
+    `fs.writeFileSync(dir + "/ready-" + id, "");\n` +
+    `while (!fs.existsSync(dir + "/go")) await sleep(2);\n` +
+    `if (Number(slowAttempt)) await sleep(Number(slowAttempt));\n` +
+    `let lock;\n` +
+    `try { lock = await acquirePrimitive(db, { attempts: 1, initialBytes: new Uint8Array() }); }\n` +
+    `catch (e) { process.stdout.write("LOST " + (e.name || e.code) + "\\n"); process.exit(0); }\n` +
+    `log("OWNER " + id);\n` +
+    `fs.writeFileSync(dir + "/owner-" + id, "");\n` +
+    `process.stdout.write("OWNER\\n");\n` +
+    `while (!fs.existsSync(dir + "/release")) await sleep(2);\n` +
+    `log("RELEASE " + id);\n` +
+    `lock.release();\n` +
+    `process.exit(0);\n`
+);
+/** The acquire/release ordinals of one round: how many owners, and the most holding AT ONCE (2+ = concurrent). */
+export function ownership(events: readonly string[]): { owners: number; peak: number } {
+  let now = 0;
+  let peak = 0;
+  let owners = 0;
+  for (const e of events) {
+    if (e.startsWith("OWNER ")) {
+      owners++;
+      now++;
+      peak = Math.max(peak, now);
+    } else if (e.startsWith("RELEASE ")) now--;
+  }
+  return { owners, peak };
+}
 const HOLDER = path.join(ROOT, "holder.mjs");
 fs.writeFileSync(
   HOLDER,
@@ -149,22 +192,61 @@ async function oneTry(db: string): Promise<string> {
   return run(RACER, [db, go, "0"]).out;
 }
 
+describe("the ordinals tell SEQUENCE from OVERLAP (pure)", () => {
+  it("OWNER, RELEASE, OWNER, RELEASE: two owners, never at once (peak 1); OWNER, OWNER: two at once (peak 2)", () => {
+    expect(ownership(["OWNER 0", "RELEASE 0", "OWNER 1", "RELEASE 1"])).toEqual({ owners: 2, peak: 1 });
+    expect(ownership(["OWNER 0", "OWNER 1", "RELEASE 0", "RELEASE 1"])).toEqual({ owners: 2, peak: 2 });
+    expect(ownership(["OWNER 3", "RELEASE 3"])).toEqual({ owners: 1, peak: 1 });
+    expect(ownership([])).toEqual({ owners: 0, peak: 0 });
+  });
+});
+
 describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measured on ${process.platform}`, () => {
-  it(`exactly ONE owner in each of ${ROUNDS} rounds of ${RACERS} racers, each round after a SIGKILLed holder`, async () => {
+  /**
+   * COVERAGE BY HANDSHAKE (the standing rule for observer tests): every racer is READY (its lock module loaded) before
+   * GO, and the winner holds until every other racer has LOST, so each attempt provably falls inside the hold. Two
+   * OWNER lines without a RELEASE between them are two CONCURRENT owners: an INV-DB-01 violation, FINAL for the SHA. A
+   * racer that never gets ready leaves the round unobserved: NOT_EVALUATED (a visible coverage gap), never a pass.
+   * Each round has one racer with a SLOW IMPORT and one with a SLOW ATTEMPT after GO (a slow runner, deterministic).
+   */
+  it(`exactly ONE owner in each of ${ROUNDS} rounds of ${RACERS} racers, each round after a SIGKILLed holder`, async (ctx) => {
     const db = path.join(ROOT, "race.db");
     const owners: number[] = [];
+    const concurrent: number[] = [];
+    const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
     for (let r = 0; r < ROUNDS; r++) {
       const h = await holding(db);
       await h.kill();
-      const go = path.join(ROOT, `go-${r}`);
-      // One racer per round has a SLOW IMPORT (a slow runner): it must still contend inside the winner's hold.
-      const racers = Array.from({ length: RACERS }, (_, i) => run(RACER, [db, go, "400", i === 0 ? "800" : "0"]));
-      await new Promise((res) => setTimeout(res, 150));
-      fs.writeFileSync(go, "");
-      const outs = await Promise.all(racers.map((x) => x.out));
-      owners.push(outs.filter((o) => o.includes("OWNER")).length);
+      const dir = path.join(ROOT, `round-${r}`);
+      fs.mkdirSync(dir);
+      const racers = Array.from({ length: RACERS }, (_, i) => run(RACER_HS, [db, dir, String(i), i === 0 ? "800" : "0", i === 1 ? "800" : "0"]));
+      const exited = racers.map(() => false);
+      racers.forEach((x, i) => x.child.once("exit", () => (exited[i] = true)));
+      const has = (f: string) => fs.existsSync(path.join(dir, f));
+      const readyBy = Date.now() + 60_000;
+      while (Date.now() < readyBy && !racers.every((_, i) => has(`ready-${i}`))) await sleep(10);
+      if (!racers.every((_, i) => has(`ready-${i}`))) {
+        for (const x of racers) if (x.child.exitCode === null && x.child.signalCode === null) x.child.kill("SIGKILL");
+        await Promise.all(racers.map((x) => x.out));
+        const why = `round ${r}: ${racers.filter((_, i) => !has(`ready-${i}`)).length} racer(s) never got ready within 60 s`;
+        reportCoverageGap("inv-db-01 single-owner race", why, "re-run on the same SHA (a coverage failure, not a verdict)");
+        ctx.skip(why);
+      }
+      fs.writeFileSync(path.join(dir, "go"), "");
+      // The winner HOLDS until every racer has lost (exited) or holds: only then is it released.
+      const settled = () => racers.every((_, i) => exited[i] || has(`owner-${i}`));
+      const settleBy = Date.now() + 60_000;
+      while (Date.now() < settleBy && !settled()) await sleep(10);
+      expect(settled(), `round ${r}: every racer contended (lost, or holds) within 60 s of GO`).toBe(true);
+      fs.writeFileSync(path.join(dir, "release"), "");
+      await Promise.all(racers.map((x) => x.out));
+      const events = has("events.log") ? fs.readFileSync(path.join(dir, "events.log"), "utf-8").split("\n").filter(Boolean) : [];
+      const o = ownership(events);
+      owners.push(o.owners);
+      concurrent.push(o.peak);
     }
-    expect(owners, "owners per round").toEqual(Array(ROUNDS).fill(1));
+    expect(concurrent, "never two CONCURRENT owners (the acquire/release ordinals): a violation is FINAL").toEqual(Array(ROUNDS).fill(1));
+    expect(owners, "exactly ONE owner per round (every racer contended inside the winner's hold)").toEqual(Array(ROUNDS).fill(1));
   }, 240_000);
 
   it.skipIf(process.platform === "win32")("the lock is NEVER inherited by another child of the owner: the owner killed -9, its unrelated child still alive, a racer owns it within 2 s", async () => {

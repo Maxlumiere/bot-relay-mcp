@@ -795,9 +795,11 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopbac
     const rec = readRecord(c);
     expect(rec.host).toBe("127.0.0.1");
     expect(distinctListener({ host: rec.host, port: rec.port }, { host, port: d.port }), "the record names the peek listener, not the main one").toBe(true);
+    // POSITIVELY: the record's (host, port) IS the peek door (door() reaches 127.0.0.1, the record's host): it serves the
+    // sealed peek, opened with the record's key.
     const r = await door(rec.port, rec.key, PEEK, { with_content: 5 });
-    expect(r.status, r.text).toBe(200);
-    expect(r.sealedOk).toBe(true);
+    expect(r.status, `the record's listener is the peek door\n${r.text}`).toBe(200);
+    expect(r.sealedOk, "its answer is sealed with the record's key").toBe(true);
     expect(r.text).toContain("pr1 peek-listener mail");
     if (host === LAN_V4) {
       const off = await fetch(`http://${LAN_V4}:${rec.port}${PEEK}`, { method: "POST", body: "{}" }).then((x) => x.status, () => "refused");
@@ -842,7 +844,8 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopbac
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    expect(readRecord(c).port).toBe(d.port);
+    const twin = readRecord(c);
+    expect(distinctListener({ host: twin.host, port: twin.port }, { host: "127.0.0.1", port: d.port }), "the record names the MAIN listener").toBe(false);
     await stopDaemon(d.child);
   }, 90_000);
 
@@ -852,7 +855,7 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopbac
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c, "127.0.0.1", { RELAY_HTTP_ALLOWED_HOSTS: "relay.example.internal" });
     const rec = readRecord(c);
-    expect(rec.port).not.toBe(d.port);
+    expect(distinctListener({ host: rec.host, port: rec.port }, { host: "127.0.0.1", port: d.port }), "the record names the peek listener").toBe(true);
     expect((await door(rec.port, rec.key, PEEK, {})).status).toBe(200);
     expect((await door(d.port, rec.key, PEEK, {})).status, "the main door is Host-checked").toBe(421);
     await stopDaemon(d.child);
@@ -1026,9 +1029,14 @@ async function runHook(c: Case, hook: string, extra: Record<string, string>, inp
   const read = (f: string) => (fs.existsSync(f) ? fs.readFileSync(f, "utf-8") : "");
   return { status, out: `${stdout}\n${stderr}`, sqliteCalls: read(SQLITE_LOG).split("\n").filter(Boolean), argv: read(ARGV_LOG), env: read(ENV_LOG), removed: read(RM_CAPTURE), ms: Date.now() - t0 };
 }
-/** Is listener `a` a DIFFERENT listener from `b`? */
+/**
+ * Is listener `a` a DIFFERENT listener from `b`? A listener is its (host, port) PAIR: the kernel may hand the same port
+ * NUMBER to listeners on different addresses, so the port alone never identifies one. A bracketed IPv6 literal is the
+ * same address as the bare one.
+ */
 export function distinctListener(a: { host: string; port: number }, b: { host: string; port: number }): boolean {
-  return a.port !== b.port;
+  const addr = (h: string) => h.replace(/^\[(.*)\]$/, "$1").toLowerCase();
+  return addr(a.host) !== addr(b.host) || a.port !== b.port;
 }
 function fakeWhere(c: Case, line7: string, line8: string | null): string {
   const f = path.join(c.home, `where-${crypto.randomBytes(4).toString("hex")}.txt`);
