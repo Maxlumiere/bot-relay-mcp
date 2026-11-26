@@ -13,7 +13,8 @@ import { describe, it, expect, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startArgvSampler, argvVerdict, sanitizeDiagnostic, witnesses } from "./_helpers/argv-sampler.js";
+import { spawn } from "node:child_process";
+import { startArgvSampler, argvVerdict, sanitizeDiagnostic, witnesses, argvSamplerProbe } from "./_helpers/argv-sampler.js";
 
 const WIN = process.platform === "win32";
 const W = "the-witness-marker"; // the target's non-secret argv marker
@@ -148,4 +149,154 @@ describe.skipIf(WIN)("the argv sampler", () => {
     await s.stop();
     expect(await pending).toBe(false);
   }, 10_000);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// THE FRAMED OBSERVER: ONE long-lived process answers one request with one frame (`@@BEGIN <seq>`, `<pid> <argv>` lines,
+// `@@END <seq>`). On Windows it is a PowerShell loop over Win32_Process CommandLine; here a FAKE (node) drives the same
+// contract on every OS: a sample STARTS when its request is written and COMPLETES at its frame's end.
+// ---------------------------------------------------------------------------------------------------------------------
+describe("the FRAMED observer (one long-lived process, one frame per request)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sampler-framed-"));
+  const FAKE = path.join(dir, "fake-observer.mjs");
+  fs.writeFileSync(
+    FAKE,
+    [
+      "import fs from \"node:fs\";",
+      "import readline from \"node:readline\";",
+      "import { spawn } from \"node:child_process\";",
+      "const [mode, pidFile, W] = process.argv.slice(2);",
+      "fs.appendFileSync(pidFile, process.pid + \"\\n\");",
+      "if (mode === \"exit\") process.exit(3);",
+      "if (mode === \"stuck-child\") { const c = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 1000)\"], { stdio: \"ignore\" }); fs.appendFileSync(pidFile + \".grand\", c.pid + \"\\n\"); }",
+      "const w = (t) => process.stdout.write(t);",
+      "readline.createInterface({ input: process.stdin }).on(\"line\", async (line) => {",
+      "  const seq = line.trim();",
+      "  if (mode === \"stuck\" || mode === \"stuck-child\") return;",
+      "  if (mode === \"slow\") await new Promise((r) => setTimeout(r, 700));",
+      "  if (mode === \"slow200\") await new Promise((r) => setTimeout(r, 200));",
+      "  if (mode === \"malformed\") { w(\"garbage before any frame\\n\"); return; }",
+      "  if (mode === \"error\") { w(\"@@ERROR \" + seq + \" the query failed\\n\"); return; }",
+      "  const s = mode === \"badseq\" ? \"999999\" : seq;",
+      "  const body = mode === \"blind\" ? \"\" : \"  \" + process.pid + \" node target \" + W + \"\\n  43 has-SECRET-inside\\n\";",
+      "  w(\"@@BEGIN \" + s + \"\\n\" + body + \"@@END \" + s + \"\\n\");",
+      "});",
+    ].join("\n")
+  );
+  const pids = (f: string): number[] => (fs.existsSync(f) ? fs.readFileSync(f, "utf-8").split("\n").filter(Boolean).map(Number) : []);
+  const fake = (mode: string, tag: string) => {
+    const pidFile = path.join(dir, `${tag}.pids`);
+    return { pidFile, framed: [process.execPath, [FAKE, mode, pidFile, W]] as [string, string[]] };
+  };
+
+  it("ONE observer process serves many samples: each frame that witnesses the target is a sample; a held hold settles TRUE", async () => {
+    const f = fake("witness", "one");
+    const s = startArgvSampler("SECRET", W, { gapMs: 5, framed: f.framed });
+    const ok = await s.waitForSamples(5, 10_000);
+    await s.stop();
+    expect(ok).toBe(true);
+    expect(s.heldSamples).toBeGreaterThanOrEqual(5);
+    expect(s.leaked).toBe("  43 has-SECRET-inside");
+    expect(s.failures).toEqual([]);
+    expect(pids(f.pidFile), "one long-lived observer, not one per sample").toHaveLength(1);
+  }, 15_000);
+
+  it("a frame WITHOUT the target is a BLIND sample: the hold is never satisfied, the verdict is NOT_EVALUATED", async () => {
+    const f = fake("blind", "blind");
+    const s = startArgvSampler("SECRET", W, { gapMs: 5, framed: f.framed });
+    const ok = await s.waitForSamples(1, 1_000);
+    await s.stop();
+    expect(ok).toBe(false);
+    expect(s.sampled).toBe(0);
+    expect(s.blindSamples).toBeGreaterThan(0);
+    expect(argvVerdict([ok], s).kind).toBe("NOT_EVALUATED");
+  }, 10_000);
+
+  for (const [mode, why] of [
+    ["malformed", /malformed|out of order/],
+    ["badseq", /malformed|out of order/],
+    ["error", /the query failed/],
+    ["exit", /exited/],
+  ] as const) {
+    it(`a ${mode.toUpperCase()} observer is a FAILURE, never a sample; the next sample gets a FRESH observer`, async () => {
+      const f = fake(mode, `fail-${mode}`);
+      const s = startArgvSampler("SECRET", W, { gapMs: 20, framed: f.framed });
+      await new Promise((r) => setTimeout(r, 1_200));
+      await s.stop();
+      expect(s.sampled).toBe(0);
+      expect(s.failures.length, JSON.stringify(s.failures)).toBeGreaterThan(0);
+      expect(s.failures.some((x) => why.test(x)), JSON.stringify(s.failures)).toBe(true);
+      expect(pids(f.pidFile).length, "a broken observer is replaced, not reused").toBeGreaterThanOrEqual(2);
+    }, 15_000);
+  }
+
+  it("a STUCK observer: the sample times out (a failure) and the observer's whole TREE is killed (asserted by pid)", async () => {
+    const f = fake("stuck-child", "stuck");
+    const s = startArgvSampler("SECRET", W, { gapMs: 10, sampleTimeoutMs: 300, framed: f.framed });
+    await new Promise((r) => setTimeout(r, 900));
+    await s.stop();
+    const observer = pids(f.pidFile)[0]!;
+    const grand = pids(`${f.pidFile}.grand`)[0]!;
+    recorded.push(grand);
+    expect(observer).toBeGreaterThan(1);
+    expect(grand).toBeGreaterThan(1);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(alive(observer), `the observer ${observer} must not survive`).toBe(false);
+    expect(alive(grand), `its child ${grand} must not survive (the tree is killed)`).toBe(false);
+    expect(s.failures.some((x) => /timed out/.test(x)), JSON.stringify(s.failures)).toBe(true);
+  }, 15_000);
+
+  it("a frame that stop() ENDS (in flight) is neither a sample nor a failure", async () => {
+    for (let i = 0; i < 5; i++) {
+      const f = fake("slow200", `stop-${i}`);
+      const s = startArgvSampler("SECRET", W, { gapMs: 1, framed: f.framed });
+      await new Promise((r) => setTimeout(r, 50 + i * 30));
+      await s.stop();
+      expect(s.failures, `run ${i}: stop()'s own kill is not a failure`).toEqual([]);
+    }
+  }, 20_000);
+
+  it("a frame that STARTED inside a hold but COMPLETED after its release never counts", async () => {
+    const f = fake("slow", "late");
+    const s = startArgvSampler("SECRET", W, { gapMs: 10, framed: f.framed });
+    await new Promise((r) => setTimeout(r, 100));
+    const ok = await s.waitForSamples(1, 1_000);
+    await new Promise((r) => setTimeout(r, 700));
+    await s.stop();
+    expect(ok).toBe(false);
+    expect(s.sampled, "the frames did complete").toBeGreaterThanOrEqual(2);
+    expect(s.heldSamples, "a frame completing after the release is not held").toBe(0);
+  }, 10_000);
+});
+
+describe.skipIf(!WIN)("the WINDOWS observer (PowerShell, Win32_Process CommandLine), measured on the runner", () => {
+  it("the probe SEES a child's pid and full argv (own-user CommandLine readable without elevation)", () => {
+    const p = argvSamplerProbe();
+    console.log(`[argv-sampler] windows probe: ${p.visible ? "visible" : "NOT visible"}: ${p.why}`);
+    expect(p, p.why).toMatchObject({ visible: true });
+  }, 60_000);
+
+  it("a PLANTED argv (the secret on a child's command line) is CAUGHT, on the child's witnessed pid", async () => {
+    const secret = `win-planted-${process.pid}-${Date.now()}`;
+    const marker = `win-witness-${process.pid}-${Date.now()}`;
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", marker, secret], { stdio: "ignore" });
+    recorded.push(child.pid!);
+    try {
+      const s = startArgvSampler(secret, marker, { gapMs: 20, sampleTimeoutMs: 20_000 });
+      const ok = await s.waitForSamples(2, 45_000);
+      await s.stop();
+      expect(s.failures, JSON.stringify(s.failures)).toEqual([]);
+      expect(ok, "two frames witnessed the child").toBe(true);
+      expect(s.leaked, "the planted secret is caught").toContain(secret);
+      expect(s.leaked.split("\n").some((l) => Number(/^\s*(\d+)/.exec(l)?.[1]) === child.pid), "on the child's own pid").toBe(true);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  }, 90_000);
+
+  it("PowerShell that cannot start → the probe is NOT visible, with the reason (the rows then report a coverage gap)", () => {
+    const p = argvSamplerProbe({ powershell: "definitely-not-powershell-xyz.exe" });
+    expect(p.visible).toBe(false);
+    expect(p.why).toMatch(/PowerShell could not (start|run)/);
+  }, 30_000);
 });

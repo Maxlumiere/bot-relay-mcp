@@ -389,6 +389,15 @@ jobs:
       - name: "#433 R2 P1-2: that row PASSED (not skipped, not filtered away)"
         if: ${{ !cancelled() }}
         run: node -e "const j=require('./r2-p1-2.json');const rows=j.testResults.flatMap(f=>f.assertionResults).filter(a=>a.fullName.includes('directory chain is private and verified BEFORE'));console.log(rows.map(r=>r.status+' | '+r.fullName).join(' ; '));if(rows.length!==1||rows[0].status!=='passed'){console.error('the R2 P1-2 row did not PASS on Windows');process.exit(1)}"
+      # Argv non-exposure on WINDOWS: the argv sampler's framed observer (a PowerShell loop over Win32_Process
+      # CommandLine) and the mint-gate argv rows run HERE, and the next step fails unless the named rows PASSED (a skip,
+      # or a NOT_EVALUATED that skips at run time, would otherwise read as green).
+      - name: "Argv non-exposure: the Windows observer"
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/argv-sampler.test.ts tests/pr-d-mint-gate.test.ts --reporter=verbose --reporter=json --outputFile.json=argv-win.json
+      - name: "Argv non-exposure: the Windows rows PASSED (not skipped, not filtered away)"
+        if: ${{ !cancelled() }}
+        run: node tools/ci/require-rows-passed.mjs argv-win.json "the probe SEES a child's pid and full argv" "a PLANTED argv (the secret on a child's command line) is CAUGHT" "the argv sampler can SEE a planted argv on macOS, Linux and Windows" "NO process's argv ever holds the secret" "the same, with a SLOW sampler" "a PLANTED leak (the secret on curl's argv) is CAUGHT"
       # PR 4: the CLI's credential clients (the door for a local relay; the hardened bearer for a remote) are claimed on
       # EVERY OS. This job runs a fixed list, so the file runs HERE, and the next step fails unless every row outside the
       # LAN describes PASSED (the LAN rows may skip, by name, on a runner with no LAN address).
