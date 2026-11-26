@@ -190,6 +190,44 @@ describe("the public scanner copy", () => {
     fs.rmSync(p.dir, { recursive: true, force: true });
   });
 
+  /** The fixture repo's working tree becomes a DEPLOY TREE that predates the copy: an older branch with no tools/ at all. */
+  function behindWorkingTree(p: { copy: string; git: (cwd: string, ...a: string[]) => void }): string {
+    const work = path.dirname(path.dirname(path.dirname(p.copy)));
+    p.git(work, "checkout", "-q", "--orphan", "deploy-tree");
+    p.git(work, "rm", "-rq", "--cached", ".");
+    fs.rmSync(path.join(work, "tools"), { recursive: true, force: true });
+    fs.writeFileSync(path.join(work, "README.md"), "a deploy tree from before the scanner existed\n");
+    p.git(work, "add", "README.md");
+    p.git(work, "commit", "-q", "-m", "an older deploy tree");
+    expect(fs.existsSync(path.dirname(p.copy)), "precondition: the copy's directory is absent from the working tree").toBe(false);
+    return work;
+  }
+
+  it("the WORKING TREE never decides: a copy whose directory is absent locally, published IDENTICAL on main → PASS (main fetched)", () => {
+    const p = privateCopyWithRepo();
+    const work = behindWorkingTree(p);
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout.trim()).toBe("self-test: PASS");
+    const ref = spawnSync("git", ["-C", work, "rev-parse", "--verify", "-q", "refs/leak-scan/published-main"], { encoding: "utf-8" });
+    expect(ref.status, "the published main was fetched (the comparison used it)").toBe(0);
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  });
+
+  it("the twin: the copy's directory absent locally AND absent from the published main → DRIFT (exit 2)", () => {
+    const p = privateCopyWithRepo();
+    const other = path.join(p.dir, "other");
+    p.git(p.dir, "clone", "-q", p.bare, other);
+    p.git(other, "rm", "-rq", "tools");
+    p.git(other, "commit", "-q", "-m", "unpublish the copy");
+    p.git(other, "push", "-q", "origin", "HEAD:main");
+    behindWorkingTree(p);
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(2);
+    expect(r.stdout).toMatch(/^DRIFT: fixture-repo$/m);
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  });
+
   /** The private self-test, ASYNC (a fixture server in this process keeps answering while it runs). */
   const privateSelfTestAsync = (p: { dir: string; list: string }, env: Record<string, string>) =>
     new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
