@@ -242,8 +242,28 @@ describe("path-walk: below a file is not-a-directory", () => {
   });
 });
 
+/**
+ * One "link target ending in a separator" row: build the links in a fresh dir, then judge `l`. `stat` is the kernel's
+ * answer (a seam: the rows pass fs.statSync; the row's own test passes a kernel that ACCEPTS).
+ */
+function separatorRow(make: (dir: string) => void, stat: (p: string) => unknown = fs.statSync): { kernel: string; product: string } {
+  const dir = fs.mkdtempSync(path.join(base, "tsep-"));
+  make(dir);
+  const l = path.join(dir, "l");
+  expect(() => stat(l), "the kernel refuses it").toThrow(/ENOTDIR/);
+  return { kernel: "ENOTDIR", product: reason(() => walkPath(l, { allowMissing: true })) };
+}
+
 describe.skipIf(WIN)("path-walk: a link target ending in a separator must reach a directory (POSIX ENOTDIR; Codex #357 R1 #4)", () => {
   const file = () => path.join(real, "x");
+  it("the PRODUCT's refusal is checked even when the KERNEL accepts the path (a kernel that answers success)", () => {
+    const accepts = () => ({}); // a kernel that resolves `l` without ENOTDIR (seen once on a macOS runner)
+    const r = separatorRow((dir) => {
+      fs.symlinkSync(file(), path.join(dir, "m"));
+      fs.symlinkSync("m/", path.join(dir, "l"));
+    }, accepts);
+    expect(r.product, "the product refuses whatever the kernel answered").toBe("not-a-directory");
+  });
   it.each([
     ["an absolute target", (dir: string) => fs.symlinkSync(`${file()}/`, path.join(dir, "l"))],
     ["a relative target", (dir: string) => fs.symlinkSync(`${path.relative(dir, file())}/`, path.join(dir, "l"))],
@@ -255,11 +275,7 @@ describe.skipIf(WIN)("path-walk: a link target ending in a separator must reach 
       },
     ],
   ])("%s", (_label, make) => {
-    const dir = fs.mkdtempSync(path.join(base, "tsep-"));
-    make(dir);
-    const l = path.join(dir, "l");
-    expect(() => fs.statSync(l), "the kernel refuses it").toThrow(/ENOTDIR/);
-    expect(reason(() => walkPath(l, { allowMissing: true }))).toBe("not-a-directory");
+    expect(separatorRow(make).product).toBe("not-a-directory");
   });
   it("known-good twin: a target `dir/` reaching a directory resolves", () => {
     const dir = fs.mkdtempSync(path.join(base, "tsep-"));
