@@ -162,10 +162,18 @@ describe("ci.yml keeps the safety properties", () => {
     expect(shards).toEqual(["1", "2", "3", "4"]);
     expect(J.shard).toMatch(/--shard=\$\{\{ matrix\.shard \}\}\/4 /);
     expect(J.shard).toMatch(/--outputFile\.json=\.vitest-shard\/shard-\$\{\{ matrix\.shard \}\}\.json/);
-    expect(J.test).toMatch(/node scripts\/ci-shard-parity\.mjs 4 \.vitest-shard/);
-    // vitest 5's blob reporter writes .vitest/blob/ (the path --merge-reports reads by default).
+    // vitest 5's blob reporter writes .vitest/blob/.
     expect(J.shard).toMatch(/^\s+\.vitest\/blob\/$/m);
-    expect(J.test).toMatch(/npx vitest --merge-reports --reporter=default/);
+    // EVERY Node in the matrix (22 and 24: the live daemon runs 24) has its OWN artifacts, its OWN parity check and
+    // its OWN merge: each Node's shards must be the whole suite on their own, never mixed with the other's.
+    const nodes = (J.shard.match(/node: \[([^\]]*)\]/) ?? [])[1]?.split(",").map((s) => s.trim().replace(/'/g, ""));
+    expect(nodes).toEqual(expect.arrayContaining(["22", "24"]));
+    expect(J.shard).toMatch(/name: vitest-shard-node\$\{\{ matrix\.node \}\}-\$\{\{ matrix\.shard \}\}/);
+    for (const n of nodes ?? []) {
+      expect(J.test, `Node ${n}: its own download`).toMatch(new RegExp(`pattern: vitest-shard-node${n}-\\*\\n\\s+path: node${n}\\n`));
+      expect(J.test, `Node ${n}: its own parity check`).toMatch(new RegExp(`node scripts/ci-shard-parity\\.mjs 4 node${n}/\\.vitest-shard`));
+      expect(J.test, `Node ${n}: its own merge`).toMatch(new RegExp(`npx vitest --merge-reports=node${n}/\\.vitest/blob --reporter=default`));
+    }
   });
   it("a READY pull request cancels its superseded run; drafts, main and nightly never cancel", () => {
     expect(CI).toMatch(/cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' && !github\.event\.pull_request\.draft \}\}/);

@@ -59,8 +59,9 @@ jobs:
           CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
         run: node scripts/ci-scope.mjs >> "$GITHUB_OUTPUT"
 
-  # The Linux suite, split by FILE across 4 runners. "Test (Node 22)" below merges the blob reports and proves
-  # the shards cover the whole suite (no file dropped, none run twice).
+  # The Linux suite, split by FILE across 4 runners, on EACH Node major in the matrix. "Test (Node 22)" below
+  # merges each Node's blob reports and proves, per Node, that the shards cover the whole suite (no file dropped,
+  # none run twice).
   shard:
     name: Test shard ${{ matrix.shard }}/4 (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
@@ -70,7 +71,10 @@ jobs:
         # #182 (2026-09): Node 20 dropped. It went EOL 2026-04-30, and better-sqlite3 13 (a native module)
         # requires Node >=22; engines.node is ">=22.0.0". Testing a runtime we no longer support would make
         # green meaningless.
-        node: ['22']
+        # Node 24: the live daemon runs it (its /health reports v24), so the suite runs on it too. A measured
+        # difference: fs.rmSync on a DANGLING symlink returns without error and leaves the link on v24.13.0.
+        # Node 22 stays until the supported-versions policy is decided (engines.node is ">=22.0.0").
+        node: ['22', '24']
         shard: [1, 2, 3, 4]
     steps:
       - name: Checkout
@@ -111,7 +115,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: vitest-shard-${{ matrix.shard }}
+          name: vitest-shard-node${{ matrix.node }}-${{ matrix.shard }}
           path: |
             .vitest/blob/
             .vitest-shard/
@@ -294,8 +298,9 @@ jobs:
       - name: Timing bars, serial and isolated (failed-auth loop + availability)
         run: node scripts/run-timing-bars.mjs
 
-  # REQUIRED CHECK (branch protection names it). The Linux verdict: every shard green, the checks green, the
-  # timing bars green or skipped by scope, AND the shards together ran exactly the suite. `always()`: a job whose
+  # REQUIRED CHECK (branch protection names it, so the name stays "Test (Node 22)"). The Linux verdict: every
+  # shard green on every Node in the matrix, the checks green, the timing bars green or skipped by scope, AND, per
+  # Node, the shards together ran exactly the suite. `always()`: a job whose
   # `needs` failed is otherwise SKIPPED, and a skipped job reports Success to a required check.
   test:
     name: Test (Node 22)
@@ -317,16 +322,27 @@ jobs:
           cache: 'npm'
       - name: Install dependencies
         run: npm ci
-      - name: Download the shards' reports
+      # One directory per Node: the two runs' reports never mix (each must be the whole suite on its own).
+      - name: Download the shards' reports (Node 22)
         uses: actions/download-artifact@v4
         with:
-          pattern: vitest-shard-*
-          path: .
+          pattern: vitest-shard-node22-*
+          path: node22
           merge-multiple: true
-      - name: The 4 shards are disjoint and together are the whole suite
-        run: node scripts/ci-shard-parity.mjs 4 .vitest-shard
-      - name: Merge the shard reports (the suite's totals)
-        run: npx vitest --merge-reports --reporter=default
+      - name: Download the shards' reports (Node 24)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vitest-shard-node24-*
+          path: node24
+          merge-multiple: true
+      - name: The 4 shards are disjoint and together are the whole suite (Node 22)
+        run: node scripts/ci-shard-parity.mjs 4 node22/.vitest-shard
+      - name: The 4 shards are disjoint and together are the whole suite (Node 24)
+        run: node scripts/ci-shard-parity.mjs 4 node24/.vitest-shard
+      - name: Merge the shard reports (the suite's totals, Node 22)
+        run: npx vitest --merge-reports=node22/.vitest/blob --reporter=default
+      - name: Merge the shard reports (the suite's totals, Node 24)
+        run: npx vitest --merge-reports=node24/.vitest/blob --reporter=default
 
   # Windows parity for the registration secret and the relay's private files (ruling efb48600 Q12). SCOPED to
   # the registration-secret tests plus the owner-only ACL check, which is checked by SID (icacls output and
