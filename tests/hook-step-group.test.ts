@@ -154,7 +154,8 @@ describe("the budgeted step's process group: the deadline holds for a forking wr
       "#!/bin/bash",
       'H="$1"; D="$2"',
       '. "$H" 2>/dev/null',
-      'PATH="$D:$PATH"',
+      // A Windows path (C:/...) in PATH splits at its drive colon: the shell's own form (cygpath -u) is prepended.
+      'PATH="$(cygpath -u "$D" 2>/dev/null || printf "%s" "$D"):$PATH"',
       '( out=$(relay_run_streamed 1 fakecmd 2>"$D/sup.err"); echo "rc=$? out=$out" > "$D/res" ) &',
       "w=$!",
       "i=0",
@@ -176,7 +177,10 @@ describe("the budgeted step's process group: the deadline holds for a forking wr
         fs.writeFileSync(path.join(d, "diag.sh"), script + "\n", { mode: 0o755 });
         fs.writeFileSync(path.join(d, "fakecmd"), `#!/bin/sh\nsleep 30 & echo $! > "${D}/pid"\nps > "${D}/ps-start" 2>&1\necho done\nexit 0\n`, { mode: 0o755 });
         const r = spawnSync(BASH, [`${D}/diag.sh`, fwd(helper), D], { encoding: "utf8", timeout: 15_000 });
-        outcomes.push(`#${i + 1} signal=${r.signal} ${(r.stdout ?? "").trim()}${r.stderr ? `\nstderr: ${r.stderr.trim().slice(0, 400)}` : ""}`);
+        const o = `#${i + 1} signal=${r.signal} ${(r.stdout ?? "").trim()}${r.stderr ? `\nstderr: ${r.stderr.trim().slice(0, 400)}` : ""}`;
+        // NEVER VACUOUS: a run counts only if the wrapper RAN (its sleeper's pid recorded); else the row fails, named.
+        expect(o, `run #${i + 1}: the wrapper never ran (the measurement would be vacuous): ${o}`).toMatch(/the wrapper's sleeper \d+ alive/);
+        outcomes.push(o);
       } finally {
         fs.rmSync(d, { recursive: true, force: true });
       }
