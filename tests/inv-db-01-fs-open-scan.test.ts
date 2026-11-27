@@ -123,6 +123,7 @@ const INVENTORY: Record<string, Entry> = {
   "src/doorbell-log.ts::replaceStateFile::openSync": { n: 1, source: "a temp state file in the doorbell state dir" },
   "src/watch-wake.ts::advanceGen::openSync": { n: 1, source: "a generation file in the watch state dir" },
   "src/watch-wake.ts::readJson::openSync": { n: 1, source: "a watch state JSON file" },
+  "src/wake-policy.ts::readWakePolicy::openSync": { n: 1, source: "the doorbell wake policy file in the resolved instance dir (O_NOFOLLOW, read-only)" },
   "src/watch-wake.ts::readJson::readFileSync": { n: 1, source: "the same descriptor" },
   "src/watch-wake.ts::writeJsonAtomic::openSync": { n: 1, source: "a temp file in the watch state dir" },
   "src/filesystem-marker.ts::touchMarker::openSync": { n: 1, source: "an agent's marker file in the marker directory" },
