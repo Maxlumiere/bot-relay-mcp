@@ -246,25 +246,53 @@ const FETCH_ARGS = [
   "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", "origin", `+refs/heads/main:${PUBLISHED_REF}`,
 ];
 /**
- * The PUBLISHED bytes of a copy that lives in a git repo: `git fetch`, then `git show origin/main:<path>` (never the
- * working tree: a local checkout may be a deploy tree, deliberately behind). Returns undefined when the copy is not
+ * The PUBLISHED bytes of a copy that lives in a git repo (which must be its RECORDED checkout root): `git fetch`, then `git show origin/main:<path>` (never the
+ * working tree: a local checkout may be a deploy tree, deliberately behind, even one without the copy's directory). Returns undefined when the copy is not
  * in a git repo (its file is read instead), null when origin/main does not hold it (drift). A fetch that fails is
  * CannotEvaluate: an unverifiable copy never passes.
  */
-async function publishedBytes(target) {
+async function publishedBytes(target, recordedRoot) {
   const dir = path.dirname(target);
-  if (!fs.existsSync(dir)) return null; // the copy's directory is absent: drift
-  const found = await runGit(["-C", dir, "rev-parse", "--show-toplevel"], 30_000);
+  // The repository is found from the copy's NEAREST EXISTING ancestor: a directory absent from the WORKING TREE (a
+  // deploy tree from before the copy existed) never decides; only the published main does.
+  let anchor = dir;
+  while (!fs.existsSync(anchor) && path.dirname(anchor) !== anchor) anchor = path.dirname(anchor);
+  const found = await runGit(["-C", anchor, "rev-parse", "--show-toplevel"], 30_000);
   if (found.code !== 0) {
     // Only a CONFIRMED non-repository is read from disk; any other discovery failure (no git, a timeout, a broken
     // repo) cannot be told apart from a stale published copy, so it cannot evaluate.
-    if (!found.spawnError && !found.timedOut && found.code === 128 && /not a git repository/i.test(found.stderr)) return undefined;
+    if (!found.spawnError && !found.timedOut && found.code === 128 && /not a git repository/i.test(found.stderr)) {
+      // A copy that RECORDS a checkout must be found in it: no repository at all means that checkout is gone.
+      if (recordedRoot) throw new CannotEvaluate("a copy's recorded checkout is absent or not a repository");
+      return undefined;
+    }
     throw new CannotEvaluate("a copy's repository could not be determined");
   }
   const root = found.stdout.toString("utf-8").trim();
+  // REPO IDENTITY: the repository found must be the checkout RECORDED for this copy (copies.tsv, third column). A
+  // PARENT repository (a home directory under git) must never stand in for an absent checkout; an unrecorded or a
+  // different root cannot be evaluated, never passes.
+  if (!recordedRoot) throw new CannotEvaluate("a copy's checkout root is not recorded (copies.tsv: label, path, checkout root)");
+  // Compared by DIRECTORY IDENTITY (device + inode), not by spelling: robust to case on a case-insensitive filesystem,
+  // to links and to trailing slashes. Any stat error is a refusal.
+  let expected;
+  let actual;
+  try {
+    expected = fs.statSync(recordedRoot, { bigint: true });
+  } catch {
+    throw new CannotEvaluate("a copy's recorded checkout is absent or not a repository");
+  }
+  try {
+    actual = fs.statSync(root, { bigint: true });
+  } catch {
+    throw new CannotEvaluate("a copy's repository could not be determined");
+  }
+  if (!expected.isDirectory() || expected.dev !== actual.dev || expected.ino !== actual.ino) {
+    throw new CannotEvaluate("a copy's repository is not its recorded checkout");
+  }
   const fetched = await runGit(["-C", root, ...FETCH_ARGS], FETCH_TIMEOUT_MS);
   if (fetched.code !== 0) throw new CannotEvaluate("a copy's published branch could not be fetched");
-  const rel = path.relative(fs.realpathSync(root), path.join(fs.realpathSync(dir), path.basename(target))).split(path.sep).join("/");
+  const rel = path.relative(fs.realpathSync(root), path.join(fs.realpathSync(anchor), path.relative(anchor, dir), path.basename(target))).split(path.sep).join("/");
   const shown = await runGit(["-C", root, "show", `${PUBLISHED_REF}:${rel}`], 30_000);
   return shown.code === 0 ? shown.stdout : null; // absent from the published main → null (drift)
 }
@@ -282,11 +310,12 @@ export async function copyDrift(here = fileURLToPath(import.meta.url)) {
   for (const raw of listing.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
-    const [label, p] = line.split("\t");
+    const [label, p, r] = line.split("\t");
     if (!label || !p) continue;
-    const target = p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
+    const home = (x) => (x.startsWith("~/") ? path.join(os.homedir(), x.slice(2)) : x);
+    const target = home(p);
     let theirs = null;
-    const published = await publishedBytes(target);
+    const published = await publishedBytes(target, r ? home(r) : null);
     if (published === undefined) {
       try {
         theirs = crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex");
