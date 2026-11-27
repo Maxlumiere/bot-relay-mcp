@@ -1056,22 +1056,32 @@ relay_ps() {
 }
 
 relay_agent_pid() {
-  local pid ppid comm exe args depth=0 pat
+  local pid ppid comm exe args depth=0 pat linux=0 rc
   pat='claude|codex|node|bun|deno'
   [ -n "${RELAY_AGENT_PROCESS_PATTERN:-}" ] && pat="${pat}|${RELAY_AGENT_PROCESS_PATTERN}"
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*) return ;;
+    Linux) linux=1 ;;
   esac
   pid=$(relay_ps -o ppid= -p $$ | tr -d ' ')
   # Each ps takes the seamed budget (relay_ps): a hung or slow chain ends where the budget does, named.
   while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
-    comm=$(relay_ps -o comm= -p "$pid"); comm="${comm##*/}"
-    # The KERNEL's executable first (Linux): Node 24 names its main thread "MainThread", and comm IS that name
-    # there (MEASURED). macOS has no /proc: the readlink fails and ps's comm (the executable path) stands.
-    exe=$(readlink "/proc/$pid/exe" 2>/dev/null); exe="${exe% (deleted)}"
-    [ -n "$exe" ] && comm="${exe##*/}"
+    # A lookup that is REFUSED or CUT (the budget gone, the read failed) STOPS the walk: no pid, never a guess.
+    comm=$(relay_ps -o comm= -p "$pid") || return
+    comm="${comm##*/}"
+    # Linux only: the KERNEL's executable first. Node 24 names its main thread "MainThread", and comm IS that name
+    # there (MEASURED). Through the SAME budgeted runner as every ps (a stalled readlink, a PATH wrapper included, is
+    # bounded). Unreadable (another user's process) → ps's comm stands; cut by the budget → stop. macOS: unchanged.
+    if [ "$linux" = 1 ]; then
+      exe=$(relay_ps_run readlink "/proc/$pid/exe"); rc=$?
+      [ "$rc" -eq 124 ] && return
+      exe="${exe% (deleted)}"
+      [ -n "$exe" ] && comm="${exe##*/}"
+    fi
     if printf '%s' "$comm" | grep -qiE "^(${pat})$"; then
-      args=$(relay_ps -o args= -p "$pid")
+      args=$(relay_ps -o args= -p "$pid") || return
+      # An UNREAD command line never passes the relay-entrypoint exclusion.
+      [ -n "$args" ] || return
       case "$args" in *dist/index.js*) ;; *) printf '%s' "$pid"; return ;; esac
     fi
     ppid=$(relay_ps -o ppid= -p "$pid" | tr -d ' ')
