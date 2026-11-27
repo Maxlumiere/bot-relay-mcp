@@ -457,43 +457,55 @@ describe("the relay OBSERVES the profile (ruling cc9f2199; 9d0bb9e6: the nearest
       _resetStdioObserverForTests();
     }
   });
-  it("the HTTP path with a HANGING ps: registration succeeds at once, the observed profile is NULL, and stays NULL after the probe's bound (one log line)", async () => {
-    const { _setAsyncPsRunnerForTests, PROFILE_PROBE_TIMEOUT_MS } = await L();
+  /**
+   * "Registration never waits on the probe" is an ORDERING property, proven by ordering (never by elapsed time: a
+   * loaded runner read 511 ms against a 500 ms proxy). The ps stub answers only through a GATE the test opens AFTER
+   * handleRegisterAgent has returned: at that point the probe has started (the stub was called) and is unanswered.
+   * The probe's bound then passes (its ONE timeout line; 10 s is a hang guard only), and the gate opens with a LATE
+   * answer that must write nothing. `stallMs` blocks this thread after registration returned, as a loaded host does:
+   * the property must not depend on it.
+   */
+  async function hangingPsRow(name: string, stallMs: number): Promise<void> {
+    const { _setAsyncPsRunnerForTests } = await L();
     const { handleRegisterAgent } = await import("../src/tools/identity.js");
     const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
-    _setAsyncPsRunnerForTests(() => new Promise<string>(() => {}));
+    let calls = 0;
+    let open!: () => void;
+    const gate = new Promise<void>((res) => (open = res));
+    // Once the gate opens, a COHERENT answer (the command read and the comm read agree on codex, same start): a late
+    // answer that landed would really write codex.
+    _setAsyncPsRunnerForTests((args: string[]) => {
+      calls++;
+      return gate.then(() => (args.includes("pid=,lstart=,comm=") ? `${process.pid} Mon Nov 24 10:00:00 2026 /usr/local/bin/codex` : `${process.pid} Mon Nov 24 10:00:00 2026 /usr/local/bin/codex --flag`));
+    });
+    const observed = () => db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = ?").get(name);
+    const timeoutLines = () => warn.mock.calls.flat().map(String).filter((l) => l.includes("was not observed") && l.includes("timed out")).length;
     try {
-      const t0 = Date.now();
-      const r = handleRegisterAgent({ name: "s-http", role: "r", capabilities: [], agent_pid: process.pid, agent_pid_start: "Mon Nov 24 10:00:00 2026 UTC" } as never) as { isError?: boolean };
-      expect(r.isError).toBeFalsy();
-      expect(Date.now() - t0, "registration never waits on the probe").toBeLessThan(500);
-      expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-http'").get()).toEqual({ cli_profile_observed: null });
-      await new Promise((res) => setTimeout(res, PROFILE_PROBE_TIMEOUT_MS + 300));
-      expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-http'").get()).toEqual({ cli_profile_observed: null });
-      expect(warn.mock.calls.flat().map(String).filter((l) => l.includes("was not observed") && l.includes("timed out")).length).toBe(1);
+      const r = handleRegisterAgent({ name, role: "r", capabilities: [], agent_pid: process.pid, agent_pid_start: "Mon Nov 24 10:00:00 2026 UTC" } as never) as unknown;
+      // ORDERING: registration has RETURNED (synchronously: a value, not a promise) while the probe is unanswered.
+      expect(r instanceof Promise, "registration returns a value, not a promise").toBe(false);
+      expect((r as { isError?: boolean }).isError).toBeFalsy();
+      expect(calls, "the probe STARTED before registration returned (else this row proves nothing)").toBeGreaterThan(0);
+      for (const end = Date.now() + stallMs; Date.now() < end; ); // the host stall: changes no ordering
+      expect(observed()).toEqual({ cli_profile_observed: null });
+      // The probe's bound passes with the gate still closed: its ONE timeout line (10 s: a hang guard, not the property).
+      for (const end = Date.now() + 10_000; Date.now() < end && timeoutLines() === 0; ) await new Promise((res) => setTimeout(res, 20));
+      expect(timeoutLines(), "the probe timed out, once").toBe(1);
+      // The LATE answer (it would read codex): it writes nothing.
+      open();
+      await settle();
+      expect(observed()).toEqual({ cli_profile_observed: null });
+      expect(timeoutLines()).toBe(1);
     } finally {
       _setAsyncPsRunnerForTests(null);
       warn.mockRestore();
     }
+  }
+  it("the HTTP path with a HANGING ps: registration returns BEFORE its probe answers, the observed profile is NULL, and a LATE answer after the probe's bound writes nothing (one log line)", async () => {
+    await hangingPsRow("s-http", 0);
   }, 15_000);
   it("the SAME property under a HOST STALL (a 600 ms block of this thread after registration returned, as a loaded runner does): the row still holds", async () => {
-    const { _setAsyncPsRunnerForTests, PROFILE_PROBE_TIMEOUT_MS } = await L();
-    const { handleRegisterAgent } = await import("../src/tools/identity.js");
-    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
-    _setAsyncPsRunnerForTests(() => new Promise<string>(() => {}));
-    try {
-      const t0 = Date.now();
-      const r = handleRegisterAgent({ name: "s-http-stall", role: "r", capabilities: [], agent_pid: process.pid, agent_pid_start: "Mon Nov 24 10:00:00 2026 UTC" } as never) as { isError?: boolean };
-      for (const end = Date.now() + 600; Date.now() < end; ); // the host stall: this thread does not run for 600 ms
-      expect(r.isError).toBeFalsy();
-      expect(Date.now() - t0, "registration never waits on the probe").toBeLessThan(500);
-      expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-http-stall'").get()).toEqual({ cli_profile_observed: null });
-      await new Promise((res) => setTimeout(res, PROFILE_PROBE_TIMEOUT_MS + 300));
-      expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-http-stall'").get()).toEqual({ cli_profile_observed: null });
-    } finally {
-      _setAsyncPsRunnerForTests(null);
-      warn.mockRestore();
-    }
+    await hangingPsRow("s-http-stall", 600);
   }, 15_000);
   it("P2: a late probe never overwrites a NEWER registration's value, even within the SAME millisecond (the CAS token is a per-registration generation)", () => {
     const sameMs = "2026-11-24T10:00:00.000Z";
