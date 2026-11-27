@@ -24,6 +24,7 @@ import { fileURLToPath } from "url";
 import { openWindow, within, type TestWindow } from "./helpers/watch-window.js";
 import { startToken } from "./helpers/start-token.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { installOpenPolicy } from "./_helpers/wake-policy-file.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
@@ -80,6 +81,7 @@ describe.skipIf(!OWN)("PR 7: the Stop hook's watch re-arm heal (the real hook)",
     db.getDb();
     db.registerAgent("h-alice", "s", []);
     db.registerAgent("h-bob", "r", []);
+    installOpenPolicy(path.join(ROOT, "inst"), ["h-alice", "h-bob"]); // PR 8a: no policy means no wakes
     win = openWindow(path.join(ROOT, `win-${Date.now()}`), env());
     windows.push(win);
     db.upsertAgentBinding(db.getDb(), { hostId: OWN as string, windowPid: win.pid, windowPidStart: startToken(win.pid), agentName: "h-bob", agentClass: null, conversationId: `conv-${win.pid}`, conversationTitle: null, cwd: ROOT, boundVia: "launch-intent" });

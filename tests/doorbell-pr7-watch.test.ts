@@ -21,6 +21,8 @@ import { openWindow, within, type TestWindow } from "./helpers/watch-window.js";
 import { startToken } from "./helpers/start-token.js";
 import { parentPidOf } from "./_helpers/recorded-pid.js";
 import { systemBinarySeamPath } from "./_helpers/system-binary-seam-env.js";
+import { ALLOW_ALL_POLICY } from "./_helpers/allow-all-policy.js";
+import { installOpenPolicy } from "./_helpers/wake-policy-file.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RELAY_BIN = path.join(REPO, "bin", "relay");
@@ -47,38 +49,38 @@ const read = (ids: string[], rs: string | null = RS1, from: Record<string, strin
 
 describe("the trigger (pure): each id wakes a session at most ONCE", () => {
   it("nothing woken yet → every pending id wakes, in canonical order", () => {
-    expect(W.decideWake(read(["m2", "m1"]), "bob", null, 0).wake).toEqual(["m1", "m2"]);
+    expect(W.decideWake(read(["m2", "m1"]), "bob", null, 0, ALLOW_ALL_POLICY).wake).toEqual(["m1", "m2"]);
   });
   it("HARM (the spin trap): ids already woken for in THIS session never wake it again; only new mail does", () => {
     const woken = W.recordWake(null, RS1, ["m1", "m2"], ["m1", "m2"], ["alice"], 0);
-    expect(W.decideWake(read(["m1", "m2"]), "bob", woken, 1).wake).toEqual([]);
-    expect(W.decideWake(read(["m1", "m2", "m3"]), "bob", woken, 1).wake).toEqual(["m3"]);
+    expect(W.decideWake(read(["m1", "m2"]), "bob", woken, 1, ALLOW_ALL_POLICY).wake).toEqual([]);
+    expect(W.decideWake(read(["m1", "m2", "m3"]), "bob", woken, 1, ALLOW_ALL_POLICY).wake).toEqual(["m3"]);
   });
   it("V4: a NEW reading session is woken ONCE for its re-pended backlog (the old session's woken set does not apply)", () => {
     const woken = W.recordWake(null, RS1, ["m1"], ["m1"], ["alice"], 0);
-    expect(W.decideWake(read(["m1"], RS2), "bob", woken, 1).wake).toEqual(["m1"]);
+    expect(W.decideWake(read(["m1"], RS2), "bob", woken, 1, ALLOW_ALL_POLICY).wake).toEqual(["m1"]);
   });
   it("a NULL reading session is a HOLD: no wake YET (the watch keeps waiting)", () => {
-    expect(W.decideWake(read(["m1"], null), "bob", null, 0)).toMatchObject({ wake: [], hold: true });
+    expect(W.decideWake(read(["m1"], null), "bob", null, 0, ALLOW_ALL_POLICY)).toMatchObject({ wake: [], hold: true });
   });
   it("an unregistered agent wakes nobody", () => {
-    expect(W.decideWake({ registered: false, reading_session: RS1, ids: ["m1"] }, "bob", null, 0).wake).toEqual([]);
+    expect(W.decideWake({ registered: false, reading_session: RS1, ids: ["m1"] }, "bob", null, 0, ALLOW_ALL_POLICY).wake).toEqual([]);
   });
-  it("STANDING: a refused sender's mail never wakes (it stays pending), counted by kind; the default allows all", () => {
+  it("STANDING: a refused sender's mail never wakes (it stays pending), counted by kind; an explicit allow-all (tests only) allows all", () => {
     const standing: import("../src/watch-wake.js").StandingCheck = (x) => (x.sender === "mallory" ? { refused: "no_standing" } : "allowed");
-    const d = W.decideWake(read(["m1", "m2"], RS1, { m1: "mallory", m2: "alice" }), "bob", null, 0, { standing });
+    const d = W.decideWake(read(["m1", "m2"], RS1, { m1: "mallory", m2: "alice" }), "bob", null, 0, { standing, pairWakesPerHour: W.DEFAULT_PAIR_WAKES_PER_HOUR });
     expect(d.wake).toEqual(["m2"]);
     expect(d.refused).toEqual({ no_standing: 1 });
-    expect(W.decideWake(read(["m1"], RS1, { m1: "mallory" }), "bob", null, 0).wake).toEqual(["m1"]);
+    expect(W.decideWake(read(["m1"], RS1, { m1: "mallory" }), "bob", null, 0, ALLOW_ALL_POLICY).wake).toEqual(["m1"]);
   });
   it("THE PER-PAIR RATE: a sender that already woke this recipient N times this hour is capped; ANOTHER pair is not (the control)", () => {
     let woken: import("../src/watch-wake.js").WokenState | null = null;
     for (let k = 0; k < W.DEFAULT_PAIR_WAKES_PER_HOUR; k++) woken = W.recordWake(woken, RS1, [`f${k}`], [`f${k}`], ["flooder"], k * 1000);
-    const d = W.decideWake(read(["flood-next", "calm"], RS1, { "flood-next": "flooder", calm: "carol" }), "bob", woken, 10_000);
+    const d = W.decideWake(read(["flood-next", "calm"], RS1, { "flood-next": "flooder", calm: "carol" }), "bob", woken, 10_000, ALLOW_ALL_POLICY);
     expect(d.wake).toEqual(["calm"]);
     expect(d.pairCapped).toBe(1);
     // an hour later the pair is free again
-    expect(W.decideWake(read(["flood-next"], RS1, { "flood-next": "flooder" }), "bob", woken, W.PAIR_WINDOW_MS + 10_000).wake).toEqual(["flood-next"]);
+    expect(W.decideWake(read(["flood-next"], RS1, { "flood-next": "flooder" }), "bob", woken, W.PAIR_WINDOW_MS + 10_000, ALLOW_ALL_POLICY).wake).toEqual(["flood-next"]);
   });
   it("an all-dot agent name (valid, but a path escape) has NO watch dir; a normal name maps under <db dir>/watch/", () => {
     for (const bad of [".", "..", "...", "a/b", ""]) expect(() => W.watchAgentDir("/i/relay.db", bad)).toThrow(/no watch for this agent name/);
@@ -465,6 +467,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
     db.getDb();
     db.registerAgent("w-alice", "s", []);
     db.registerAgent("w-bob", "r", []);
+    installOpenPolicy(path.join(ROOT, "inst"), ["w-alice", "w-bob"]); // PR 8a: no policy means no wakes
     win = openWin();
   });
   afterAll(async () => {
