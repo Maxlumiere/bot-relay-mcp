@@ -69,9 +69,32 @@ export interface ClassifyFs {
   realpath(p: string): string | null;
   /** The `name` in DIR/package.json; null when there is none; {error} when it cannot be read. */
   packageName(dir: string): string | null | { error: string };
+  /**
+   * Does the process run THIS relay's own node binary (so this node's option table applies to it)? Linux: the same
+   * file identity (dev, ino) through /proc/<pid>/exe (a replaced, "(deleted)" binary is a different file); elsewhere:
+   * the same resolved path (an in-place replacement there is a stated limit). Unknown → false.
+   */
+  sameNodeBinary?(p: ProcessView): boolean;
+}
+
+/** The relay's own node binary vs the process's (see ClassifyFs.sameNodeBinary). */
+export function sameNodeBinaryReal(p: ProcessView): boolean {
+  try {
+    if (process.platform === "linux") {
+      const a = fs.statSync(`/proc/${p.pid}/exe`, { bigint: true });
+      const b = fs.statSync(process.execPath, { bigint: true });
+      return a.dev === b.dev && a.ino === b.ino;
+    }
+    const exe = p.exe ?? p.comm;
+    if (!exe || !path.isAbsolute(exe)) return false;
+    return fs.realpathSync(exe) === fs.realpathSync(process.execPath);
+  } catch {
+    return false;
+  }
 }
 
 export const realClassifyFs: ClassifyFs = {
+  sameNodeBinary: sameNodeBinaryReal,
   isFile: (p) => {
     try {
       return fs.statSync(p).isFile();
@@ -322,7 +345,17 @@ export function classifyProcess(p: ProcessView, listeners: ReadonlySet<number>, 
   if (!evidence) return { kind: "not-relay", why: "its argv names no relay entrypoint" };
 
   // The option table is derived only when needed (a plain `node <script>` never reads it).
-  const opts = table ?? (args.some((a) => a.startsWith("-") && a !== "-") ? nodeOptionTable() : ({ ok: true, withValue: new Set(), flags: new Set() } as NodeOptionTable));
+  // Arity is CONSULTED only when an option token comes BEFORE the script: the first argument is an option other than
+  // `--` (it ends the options: the next argument is the script) and `-` (the script is stdin). Both are fixed by
+  // node's own grammar, and tokens AFTER the script are the script's own arguments (ruling 5b626a15).
+  const hasOptions = args.length > 0 && args[0]!.startsWith("-") && args[0] !== "-" && args[0] !== "--";
+  const derived = table ?? (hasOptions ? nodeOptionTable() : ({ ok: true, withValue: new Set(), flags: new Set() } as NodeOptionTable));
+  // Ruling 617c5d69 P2: a FAILED derivation always ends here, UNKNOWN with its why (no one-reading path first).
+  if (!derived.ok && hasOptions) return { kind: "unknown", reason: `its argv names the relay entrypoint ${evidence}, but node's option table could not be derived (${derived.why}), so its options cannot be read` };
+  // The table describes THIS node: for a process running another node binary, every SPACE-form option is read both
+  // ways (an empty table); the `=` form stays exact.
+  const own = !hasOptions || (fsx.sameNodeBinary ? fsx.sameNodeBinary(p) : true);
+  const opts: NodeOptionTable = own ? derived : { ok: true, withValue: new Set(), flags: new Set() };
   const { readings, unknownOptions } = readNodeOptions(args, opts);
   const results = readings.map((r): Classification => ("none" in r ? { kind: "not-relay", why: r.none } : classifyScript(args, r.index, exact, absolute, fsx)));
   const first = results[0];

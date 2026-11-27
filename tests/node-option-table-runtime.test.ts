@@ -164,6 +164,16 @@ describe("review R1 (ruling 617c5d69)", () => {
     const eqForm = classifyProcess(view(["node", `--require=${DECOY}/dist/index.js`, `${INSTALL}/dist/index.js`]) as never, new Set(), { ...base, sameNodeBinary: () => false } as never, table);
     expect(eqForm, "the `=` form is exact whatever the binary").toEqual({ kind: "connector", script: `${INSTALL}/dist/index.js`, installDir: INSTALL });
   });
+  it("ruling 5b626a15: with a FAILED derivation, only an option token BEFORE the script consults arity: `--` and `-` are fixed by node's grammar, and tokens after the script are its own arguments", () => {
+    const INSTALL = "/opt/relay";
+    const fsx = { isFile: (p: string) => p === `${INSTALL}/dist/index.js`, realpath: (p: string) => p, packageName: (d: string) => (d === INSTALL ? "bot-relay-mcp" : null), sameNodeBinary: () => true };
+    const failed: NodeOptionTable = { ok: false, why: "spawn failed" };
+    const cls = (argv: string[]) => classifyProcess({ pid: 77, ppid: 1, start: "s", command: argv.join(" "), comm: "node", cwd: "/", argv } as never, new Set(), fsx as never, failed);
+    expect(cls(["node", "--", `${INSTALL}/dist/index.js`]), "`node -- <script>`: the script is the next argument (deterministic)").toEqual({ kind: "connector", script: `${INSTALL}/dist/index.js`, installDir: INSTALL });
+    expect(cls(["node", "-", `${INSTALL}/dist/index.js`]).kind, "`node - …`: the script is stdin, so the relay path is only an argument: never a connector").not.toBe("connector");
+    expect(cls(["node", `${INSTALL}/dist/index.js`, "--port", "3777"]), "options AFTER the script are its own arguments: no arity consulted").toEqual({ kind: "connector", script: `${INSTALL}/dist/index.js`, installDir: INSTALL });
+    expect(cls(["node", "--require", "/x/hook.js", `${INSTALL}/dist/index.js`]).kind, "an option BEFORE the script: arity consulted, the derivation failed → UNKNOWN").toBe("unknown");
+  });
   it("Cache: keyed on the binary's FILE identity (dev, ino, size, mtime), not on process.version: the same path rewritten is a new key", () => {
     const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "key-")), "node-stand-in");
     fs.writeFileSync(f, "one");
