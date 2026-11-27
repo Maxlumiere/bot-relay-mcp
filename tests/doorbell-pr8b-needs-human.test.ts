@@ -315,6 +315,8 @@ describe("the relay OBSERVES the profile (ruling cc9f2199; 9d0bb9e6: the nearest
     const timed = await probeAgentProfile(4242, `${START} UTC`, { run: hang, timeoutMs: 80 });
     expect(timed.profile).toBeNull();
     expect(timed.why).toMatch(/timed out/);
+    // A LIVENESS guard on the product's probe timeout (timeoutMs 80 here): the 2000 ms ceiling is a 25× margin, so a
+    // slow runner cannot turn it into a flake. The property itself (a hanging ps is cut) is the `timed out` why above.
     expect(Date.now() - t0).toBeLessThan(2000);
     expect((await probeAgentProfile(4242, `${START} UTC`, { run: async () => { throw new Error("ps failed"); } })).profile).toBeNull();
     expect((await probeAgentProfile(undefined, `${START} UTC`)).why).toBe("no agent pid");
