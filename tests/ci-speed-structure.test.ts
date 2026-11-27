@@ -171,27 +171,52 @@ describe("ci.yml keeps the safety properties", () => {
     expect(J.shard).toMatch(/--outputFile\.json=\.vitest-shard\/shard-\$\{\{ matrix\.shard \}\}\.json/);
     // vitest 5's blob reporter writes .vitest/blob/.
     expect(J.shard).toMatch(/^\s+\.vitest\/blob\/$/m);
-    // EVERY Node in the matrix (22 and 24: the live daemon runs 24) has its OWN artifacts, its OWN parity check and
-    // its OWN merge: each Node's shards must be the whole suite on their own, never mixed with the other's.
-    const nodes = (J.shard.match(/node: \[([^\]]*)\]/) ?? [])[1]?.split(",").map((s) => s.trim().replace(/'/g, ""));
-    // 22; 24.13.0, EXACTLY the live daemon's Node; the latest 24.
-    expect(nodes).toEqual(expect.arrayContaining(["22", "24.13.0", "24"]));
+    // The REQUIRED legs (rulings 617c5d69, 7fc79f57): 22 and 24.13.0, EXACTLY the live daemon's Node. Each has its OWN
+    // artifacts, parity check and merge in the required job (never mixed with another leg's).
+    const legsOf = (job: string) => (J[job]!.match(/node: \[([^\]]*)\]/) ?? [])[1]?.split(",").map((s) => s.trim().replace(/'/g, ""));
+    expect(legsOf("shard")).toEqual(["22", "24.13.0"]);
     expect(J.shard).toMatch(/name: vitest-shard-node\$\{\{ matrix\.node \}\}-\$\{\{ matrix\.shard \}\}/);
-    for (const n0 of nodes ?? []) {
-      const n = n0.replace(/\./g, "\\.");
-      expect(J.test, `Node ${n}: its own download`).toMatch(new RegExp(`pattern: vitest-shard-node${n}-\\*\\n\\s+path: node${n}\\n`));
-      expect(J.test, `Node ${n}: its own parity check`).toMatch(new RegExp(`node scripts/ci-shard-parity\\.mjs 4 node${n}/\\.vitest-shard`));
-      expect(J.test, `Node ${n}: its own merge`).toMatch(new RegExp(`npx vitest --merge-reports=node${n}/\\.vitest/blob --reporter=default`));
-    }
-    // Ruling 617c5d69: the floating leg resolves the newest 24 (check-latest); the timing bars run on 22 and 24.13.0
-    // on every run and the latest 24 on the nightly only; the smoke runs on 22 and 24.13.0; the checks stay 22-only.
-    expect(J.shard).toMatch(/check-latest: \$\{\{ matrix\.node == '24' \}\}/);
-    expect(J["timing-bars"]).toMatch(/node: \$\{\{ fromJSON\(github\.event_name == 'schedule' && '\["22", "24\.13\.0", "24"\]' \|\| '\["22", "24\.13\.0"\]'\) \}\}/);
+    const aggregateCovers = (job: string, legs: string[]) => {
+      for (const n0 of legs) {
+        const n = n0.replace(/\./g, "\\.");
+        expect(J[job], `${job}, Node ${n0}: its own download`).toMatch(new RegExp(`pattern: vitest-shard-node${n}-\\*\\n\\s+path: node${n}\\n`));
+        expect(J[job], `${job}, Node ${n0}: its own parity check`).toMatch(new RegExp(`node scripts/ci-shard-parity\\.mjs 4 node${n}/\\.vitest-shard`));
+        expect(J[job], `${job}, Node ${n0}: its own merge`).toMatch(new RegExp(`npx vitest --merge-reports=node${n}/\\.vitest/blob --reporter=default`));
+      }
+    };
+    aggregateCovers("test", ["22", "24.13.0"]);
+    // The FLOATING latest 24 (check-latest) runs the same 4 shards in its OWN jobs, with its own parity and merge:
+    // never in a required job's needs (a floating version must never block a merge), nor in ci-ok's.
+    expect(J["shard-latest"]).toMatch(/node-version: '24'\n\s+check-latest: true/);
+    expect(J["shard-latest"]).toMatch(/--shard=\$\{\{ matrix\.shard \}\}\/4 /);
+    expect(J["shard-latest"]).toMatch(/name: vitest-shard-node24-\$\{\{ matrix\.shard \}\}/);
+    aggregateCovers("test-latest", ["24"]);
+    // The timing bars: 22 + 24.13.0 on every run (required through the required job's needs); the latest 24 on the
+    // NIGHTLY only, in its own job.
+    expect(legsOf("timing-bars")).toEqual(["22", "24.13.0"]);
     expect(J["timing-bars"]).toMatch(/name: Timing bars \(Node \$\{\{ matrix\.node \}\}\)/);
-    expect(J.smoke).toMatch(/node: \['22', '24\.13\.0'\]/);
+    expect(J["timing-bars-latest"]).toMatch(/if: github\.event_name == 'schedule'/);
+    expect(J["timing-bars-latest"]).toMatch(/node-version: '24'\n\s+check-latest: true/);
+    // The smoke: 22 + 24.13.0, and GitHub itself blocks on it: it is in the required job's needs, and the Linux
+    // verdict requires it. The checks stay 22-only.
+    expect(legsOf("smoke")).toEqual(["22", "24.13.0"]);
     expect(J.checks).toMatch(/node-version: '22'/);
+    const needsOf = (job: string) => (J[job]!.match(/^    needs: \[([^\]]*)\]/m) ?? [])[1]?.split(",").map((s) => s.trim()) ?? [];
+    expect(needsOf("test")).toEqual(expect.arrayContaining(["shard", "checks", "timing-bars", "smoke"]));
+    for (const floating of ["shard-latest", "test-latest", "timing-bars-latest"]) {
+      expect(needsOf("test"), `${floating} never in the required job's needs`).not.toContain(floating);
+      expect(needsOf("ci-ok"), `${floating} never in ci-ok's needs`).not.toContain(floating);
+    }
     // The required job's name still says Node 22 (branch protection names it): its run summary says what it covers.
-    expect(J.test).toMatch(/covers Node 22, 24\.13\.0 and the latest 24\." >> "\$GITHUB_STEP_SUMMARY"/);
+    expect(J.test).toMatch(/covers Node 22 and 24\.13\.0 \(the latest 24 runs in its own, non-required jobs\)\." >> "\$GITHUB_STEP_SUMMARY"/);
+  });
+  it("the Linux verdict (the required job) requires the smoke: a failed or missing smoke fails it", async () => {
+    const { verdict } = (await import("../scripts/ci-verdict.mjs")) as { verdict: (n: Record<string, { result: string; outputs?: Record<string, string> }>, w: string) => { ok: boolean; problems: string[] } };
+    const ok = { result: "success" };
+    const base = { changes: { result: "success", outputs: { full: "true" } }, shard: ok, checks: ok, "timing-bars": ok };
+    expect(verdict({ ...base, smoke: ok }, "linux").ok).toBe(true);
+    expect(verdict({ ...base, smoke: { result: "failure" } }, "linux").problems).toEqual([expect.stringMatching(/^smoke=failure/)]);
+    expect(verdict(base, "linux").problems).toEqual([expect.stringMatching(/^smoke=missing/)]);
   });
   it("a READY pull request cancels its superseded run; drafts, main and nightly never cancel", () => {
     expect(CI).toMatch(/cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' && !github\.event\.pull_request\.draft \}\}/);
