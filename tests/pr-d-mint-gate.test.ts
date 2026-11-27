@@ -309,7 +309,7 @@ describe("the hooks send the secret without exposing it (Q2)", () => {
   console.log(`[argv-sampler] probe: ${PROBE.visible ? "visible" : `NOT_EVALUATED: ${PROBE.why}`}`);
   // A gap proven at runtime is VISIBLE: one "coverage gaps: …" line in the log and the CI job's step summary.
   if (argvNotEvaluated) reportCoverageGap("pr-d-mint-gate argv non-exposure (3 rows)", PROBE.why, "a Windows argv sampler (Get-CimInstance Win32_Process CommandLine) behind the same probe and handshake");
-  it.skipIf(process.platform === "win32")("the argv sampler can SEE a planted argv on macOS and Linux (the leak rows below are never vacuous there)", () => {
+  it("the argv sampler can SEE a planted argv on macOS, Linux and Windows (the leak rows below are never vacuous)", () => {
     expect(PROBE, PROBE.why).toMatchObject({ visible: true });
   });
   /**

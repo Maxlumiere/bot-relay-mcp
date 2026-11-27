@@ -32,6 +32,7 @@ import bcrypt from "bcryptjs";
 import Database from "better-sqlite3";
 import { getFreePort } from "./_helpers/port.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -174,10 +175,7 @@ describe("v2.16.0 — fresh-install smoke (adoption acceptance bar)", () => {
       }
       expect(bcrypt.compareSync(vaultToken, hash), "vault token must authenticate against the DB hash").toBe(true);
     } finally {
-      if (daemon) {
-        try { daemon.kill("SIGKILL"); } catch { /* */ }
-      }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove([daemon], ROOT); // a daemon never started is skipped; ROOT is removed after its exit
     }
   }, 40_000);
 });

@@ -34,6 +34,7 @@ export const MACOS_PR_PATTERNS = [
 /** OS-dependent integration tests a source read misses: add here when one is found. */
 export const MACOS_PR_ALWAYS = [
   "tests/doorbell-pr7-supervisor.test.ts", // real host/process identity through liveness.ts (ioreg on darwin)
+  "tests/public-leak-gate.test.ts", // a recorded root spelled in another case: needs a case-insensitive filesystem (APFS)
 ];
 
 const matches = (src) => MACOS_PR_PATTERNS.some((re) => re.test(src));

@@ -30,6 +30,7 @@ import http from "http";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -201,9 +202,7 @@ describe("v2.24.2 — relay send survives operator-auth (ADR-0006 P1)", () => {
       expect(cookieOnlyPost.status, "cookie-only POST without CSRF must stay refused").toBe(403);
       expect(cookieOnlyPost.body).toContain("CSRF");
     } finally {
-      child.kill("SIGTERM");
-      setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* ignore */ } }, 500);
-      try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch { /* ignore */ }
+      await stopAndRemove(child, ROOT);
     }
   }, 30000);
 });

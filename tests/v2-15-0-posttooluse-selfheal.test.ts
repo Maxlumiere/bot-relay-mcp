@@ -23,6 +23,7 @@ import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(__filename), "..");
@@ -64,10 +65,8 @@ async function startHarness(): Promise<Harness> {
   await waitForHealth(port, 8000);
   return { port, root, dbPath, daemon };
 }
-function stopHarness(h: Harness): void {
-  try { h.daemon.kill("SIGTERM"); } catch { /* */ }
-  try { h.daemon.kill("SIGKILL"); } catch { /* */ }
-  try { fs.rmSync(h.root, { recursive: true, force: true }); } catch { /* */ }
+async function stopHarness(h: Harness): Promise<void> {
+  await stopAndRemove(h.daemon, h.root);
 }
 async function registerAndToken(port: number, name: string, dbPath: string): Promise<string> {
   const resp = await fetch(`http://127.0.0.1:${port}/mcp`, {
@@ -127,7 +126,7 @@ describe("v2.15.0 — PostToolUse self-heal gates on the FULL (agent_pid, agent_
       expect(startAfter).toBe(start0); // back to the real current start
       expect(sidAfter).toBe(sid0); // report_liveness NEVER rotates session_id (no read reflood)
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 30_000);
 
@@ -169,7 +168,7 @@ describe("v2.15.0 — PostToolUse self-heal gates on the FULL (agent_pid, agent_
       expect(sidAfter).toBe(sidBefore); // session_id unchanged → read cursor intact
       expect(msgsAfter).toBe(msgsBefore); // message/read plane byte-identical → NO reflood
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 30_000);
 
@@ -184,7 +183,7 @@ describe("v2.15.0 — PostToolUse self-heal gates on the FULL (agent_pid, agent_
       const snap2 = sql(h.dbPath, `SELECT agent_pid||'|'||IFNULL(agent_pid_start,'')||'|'||IFNULL(session_id,'') FROM agents WHERE name='${name}';`);
       expect(snap2).toBe(snap1); // no restamp, no session rotation — zero churn
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 30_000);
 });

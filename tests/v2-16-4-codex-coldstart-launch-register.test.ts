@@ -37,6 +37,7 @@ import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -118,10 +119,8 @@ async function pointRecordAt(h: Harness, port: number): Promise<void> {
   fs.renameSync(tmp, rec);
 }
 
-function stopHarness(h: Harness): void {
-  try { h.daemon.kill("SIGTERM"); } catch { /* */ }
-  try { h.daemon.kill("SIGKILL"); } catch { /* */ }
-  try { fs.rmSync(h.root, { recursive: true, force: true }); } catch { /* */ }
+async function stopHarness(h: Harness): Promise<void> {
+  await stopAndRemove(h.daemon, h.root);
 }
 
 /** Register an agent over HTTP; returns its token + fresh session_id + row state. */
@@ -234,7 +233,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       // Launcher was exec'd (Codex would have started here).
       expect(fs.existsSync(argvFile)).toBe(true);
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -251,7 +250,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       expect(sid(h, name)).toBe(session_id);
       expect(pids(h, name)).toBe("[4242,111]");
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -269,7 +268,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       expect(sid(h, name)).not.toBe(session_id);
       expect(pids(h, name)).toMatch(/^\[\d+(,\d+)*\]$/);
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -282,7 +281,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       expect(pids(h, name)).toMatch(/^\[\d+(,\d+)*\]$/);
       expect(sid(h, name).length).toBeGreaterThan(0);
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -299,7 +298,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       expect(r.status, `hook stderr: ${r.stderr}`).toBe(0);
       expect(sid(h, "codex-a")).not.toBe(a.session_id); // A registered (rotated), did not skip on B's session
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -322,7 +321,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       // The live row was NOT clobbered by the (correctly-rejected) non-force register.
       expect(sid(h, name)).toBe(session_id);
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -345,7 +344,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       expect(elapsed, "connection-refused fast-fail — no long delay").toBeLessThan(8000); // ANTI-HANG ceiling, not an SLA (#210) — a real hang blows any ceiling; widen-safe, do NOT tighten
       expect(fs.readFileSync(envFile, "utf-8")).toContain("RELAY_LAUNCH_SESSION=<none>"); // no marker
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -370,7 +369,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       expect(fs.readFileSync(envFile, "utf-8")).toContain("RELAY_LAUNCH_SESSION=<none>");
     } finally {
       hung.close();
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -402,7 +401,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       expect(fs.readFileSync(envFile, "utf-8")).toContain("RELAY_LAUNCH_SESSION=<none>");
     } finally {
       srv.close();
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -419,7 +418,7 @@ describe("v2.16.4 — cold-start launcher + wrapper→hook handoff", () => {
       expect(argv).toContain("--sandbox");
       expect(argv).toContain("read-only");
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 });

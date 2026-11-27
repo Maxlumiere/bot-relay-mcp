@@ -30,6 +30,7 @@ import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
@@ -70,10 +71,8 @@ async function startHarness(label: string): Promise<Harness> {
   return { port, root, dbPath, daemon };
 }
 
-function stopHarness(h: Harness): void {
-  try { h.daemon.kill("SIGTERM"); } catch { /* */ }
-  try { h.daemon.kill("SIGKILL"); } catch { /* */ }
-  try { fs.rmSync(h.root, { recursive: true, force: true }); } catch { /* */ }
+async function stopHarness(h: Harness): Promise<void> {
+  await stopAndRemove(h.daemon, h.root);
 }
 
 /** Register an agent over HTTP so it holds the name live (creates the row + a session). */
@@ -125,7 +124,7 @@ describe("first-spawn registration failure must announce itself (NAME_COLLISION)
       expect(run.out, "a swallowed NAME_COLLISION left the agent mute with NO announcement")
         .toMatch(/CANNOT SEND|registration failed|not able to send/i);
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 30_000);
 
@@ -136,7 +135,7 @@ describe("first-spawn registration failure must announce itself (NAME_COLLISION)
       // No collision → token minted → no failure banner.
       expect(run.out).not.toMatch(/CANNOT SEND|registration failed/i);
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 30_000);
 });

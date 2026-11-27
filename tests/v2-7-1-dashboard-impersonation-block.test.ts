@@ -41,6 +41,7 @@ import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { OPERATOR_SECRET, operatorPost } from "./_helpers/operator-auth.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -103,10 +104,7 @@ async function startDaemon(): Promise<DaemonHandle> {
     port, proc, root,
     stderr: () => stderrBuf,
     kill: async () => {
-      proc.kill("SIGTERM");
-      await new Promise((r) => setTimeout(r, 200));
-      try { proc.kill("SIGKILL"); } catch { /* */ }
-      fs.rmSync(root, { recursive: true, force: true });
+      await stopAndRemove(proc, root);
     },
   };
 }
