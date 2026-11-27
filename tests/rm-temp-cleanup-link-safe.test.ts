@@ -10,7 +10,7 @@
  * removes the link itself. These rows DISCRIMINATE only on Node 24.13.0 (this Mac, or the 24.13.0 CI leg); on a Node
  * that removes the link either way they pass before and after the fix.
  */
-import { describe, it, expect, afterAll } from "vitest";
+import { describe, it, expect, afterAll, vi } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -50,5 +50,23 @@ describe.skipIf(process.platform === "win32")("a refused temp leaves NOTHING at 
     }
     expect(leftovers(dir, /\.tmp$/), "no temp name left behind").toEqual([]);
     expect(fs.existsSync(path.join(dir, "mint.secret")), "no secret published").toBe(false);
+  });
+});
+
+describe("review R2 P3 (ruling 276d0f4b): the temp's cleanup covers its WHOLE post-create lifetime", () => {
+  it("cli/remote: the RENAME into place fails (EIO) → the write throws, and its temp is removed (every Node)", async () => {
+    const m = (await import("../src/cli/remote.js")) as unknown as { writeRemoteMintSecret: (dir: string, secret: string) => string };
+    const dir = path.join(fs.mkdtempSync(path.join(ROOT, "remote-rn-")), "scope");
+    const real = fs.renameSync;
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation(((a: fs.PathLike, b: fs.PathLike) => {
+      if (String(a).endsWith(".tmp") && String(b).endsWith("mint.secret")) throw Object.assign(new Error("EIO: i/o error, rename (injected)"), { code: "EIO" });
+      return real(a, b);
+    }) as typeof fs.renameSync);
+    try {
+      expect(() => m.writeRemoteMintSecret(dir, "a-secret-for-the-test")).toThrow(/EIO/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(leftovers(dir, /\.tmp$/), "the temp does not outlive a failed rename").toEqual([]);
   });
 });

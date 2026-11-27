@@ -18,7 +18,7 @@ import { describe, it, expect } from "vitest";
 import path from "path";
 import { fileURLToPath } from "url";
 import { srcProgram, virtualProgram } from "./_helpers/ts-binding.js";
-import { rmScan, JUSTIFICATION } from "./_helpers/rm-guard.js";
+import { rmScan, rejectedUses, JUSTIFICATION } from "./_helpers/rm-guard.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const rel = (f: string) => path.relative(REPO, f).split(path.sep).join("/");
@@ -39,16 +39,25 @@ const KNOWN: ReadonlyArray<[string, string]> = [
  * fs named outside a static import, REVIEWED: no rm or rmSync is reached through it (the same site the fs-open
  * inventory lists, tests/inv-db-01-fs-open-scan.test.ts). A new one fails until it is reviewed and named here.
  */
-const REVIEWED_REJECTED: Readonly<Record<string, string>> = {
-  "src/cli/doctor.ts::checkDiskSpace::rejected": "`fs as any` for statfsSync only: no removal reached through it",
+/**
+ * Pinned by its EXACT text, its COUNT and every use made THROUGH it (ruling 276d0f4b): an added `anyFs.rmSync(p)`
+ * (invisible to the checker through `any`) changes the uses and fails.
+ */
+const REVIEWED_REJECTED: Readonly<Record<string, { text: string; uses: string[]; why: string }>> = {
+  "src/cli/doctor.ts::checkDiskSpace::rejected": { text: "anyFs = fs as any", uses: [".statfsSync", ".statfsSync()"], why: "statfsSync only (Node 18.15+, best effort): no removal reached through it" },
 };
 
 describe("src/: every non-recursive rm / rmSync is justified; no value use hides one", () => {
-  const scanned = rmScan(srcProgram(), rel, inSrc);
+  const program = srcProgram();
+  const scanned = rmScan(program, rel, inSrc);
   const sites = scanned.sites;
   const findings = scanned.findings.filter((f) => !(f.key in REVIEWED_REJECTED));
-  it("every REVIEWED rejected site still exists (a stale allowance fails)", () => {
-    for (const k of Object.keys(REVIEWED_REJECTED)) expect(scanned.findings.map((f) => f.key), k).toContain(k);
+  it("every REVIEWED rejected site is pinned: one site, its exact text, and exactly the reviewed uses made through it", () => {
+    for (const [k, pin] of Object.entries(REVIEWED_REJECTED)) {
+      const hits = scanned.findings.filter((f) => f.key === k);
+      expect(hits.map((h) => h.text), `${k}: one site, this exact text`).toEqual([pin.text]);
+      expect(rejectedUses(program, hits[0]!.node), `${k}: the uses made through it`).toEqual(pin.uses);
+    }
   });
   it("the scanner reaches every KNOWN site (a guard that sees nothing proves nothing)", () => {
     const found = sites.map((s) => `${s.file} ${s.firstArg}`);
@@ -89,6 +98,20 @@ describe("Codex #472 R1's four evasions: each is CAUGHT", () => {
   it("two calls on one line under ONE justification: refused (one justification per call)", () => {
     const r = scan(`import fs from "node:fs";\nexport function f(a: string, b: string) { g(fs.rmSync(a), fs.rmSync(b)); } // rm: own regular file\nfunction g(..._x: unknown[]) {}`);
     expect(r.findings.some((f) => /two removal calls on one line/.test(f.problem))).toBe(true);
+  });
+});
+
+describe("review R2 (ruling 276d0f4b)", () => {
+  it("a COMPUTED property (or a spread) in the options literal makes them unreadable: `{recursive: true, [\"recursive\"]: false}` needs the justification", () => {
+    const r = scan(`import fs from "node:fs";\nexport function f(d: string) { fs.rmSync(d, { recursive: true, ["recursive"]: false }); }`);
+    expect(r.findings.map((f) => f.problem)).toEqual([expect.stringMatching(/options the guard cannot read/)]);
+  });
+  it("what is done THROUGH a rejected `fs as any` is read: an added `.rmSync()` shows in its uses (so a pinned allowance fails)", () => {
+    const program = virtualProgram({ ...NODE_FS, "src/x.ts": `import fs from "node:fs";\nexport function f(d: string, p: string) {\n  const anyFs = fs as any;\n  if (typeof anyFs.statfsSync === "function") anyFs.statfsSync(d);\n  anyFs.rmSync(p);\n}` });
+    const r = rmScan(program, vrel, (f) => f === "src/x.ts");
+    const rejected = r.findings.filter((f) => f.key.endsWith("::rejected"));
+    expect(rejected.length).toBe(1);
+    expect(rejectedUses(program, rejected[0]!.node)).toEqual([".statfsSync", ".statfsSync()", ".rmSync()"]);
   });
 });
 

@@ -35,6 +35,8 @@ export interface RmFinding {
   line: number;
   text: string;
   problem: string;
+  /** The finding's node (a reviewed allowance reads what is done THROUGH it: rejectedUses). */
+  node: ts.Node;
 }
 
 /** `true` / `false` when an object-literal options argument says so with a literal; "unreadable" otherwise. */
@@ -88,17 +90,17 @@ export function rmScan(program: ts.Program, rel: (f: string) => string, inFile: 
     const sf = byFile.get(file)!;
     const line = sf.getLineAndCharacterOfPosition(s.node.getStart(sf)).line + 1;
     if (s.api === "rejected") {
-      findings.push({ key: s.key, file, line, text: s.text, problem: `fs named outside a static import (${s.why}): its rm calls would be invisible` });
+      findings.push({ key: s.key, node: s.node, file, line, text: s.text, problem: `fs named outside a static import (${s.why}): its rm calls would be invisible` });
       continue;
     }
     if (s.api.endsWith("(reference)")) {
-      findings.push({ key: s.key, file, line, text: s.text, problem: "a VALUE use of rm/rmSync (an alias, a destructured property, a stored or passed function) hides its calls: call it directly" });
+      findings.push({ key: s.key, node: s.node, file, line, text: s.text, problem: "a VALUE use of rm/rmSync (an alias, a destructured property, a stored or passed function) hides its calls: call it directly" });
       continue;
     }
     const call = s.node as ts.CallExpression;
     const lineKey = `${file}:${line}`;
     perLine.set(lineKey, (perLine.get(lineKey) ?? 0) + 1);
-    if (perLine.get(lineKey) === 2) findings.push({ key: s.key, file, line, text: s.text, problem: "two removal calls on one line: one justification per call" });
+    if (perLine.get(lineKey) === 2) findings.push({ key: s.key, node: s.node, file, line, text: s.text, problem: "two removal calls on one line: one justification per call" });
     const rec = recursiveOf(call);
     if (rec === true) continue;
     const ok = justified(sf, call);
@@ -106,6 +108,7 @@ export function rmScan(program: ts.Program, rel: (f: string) => string, inFile: 
     if (!ok) {
       findings.push({
         key: s.key,
+        node: s.node,
         file,
         line,
         text: s.text,
@@ -116,4 +119,12 @@ export function rmScan(program: ts.Program, rel: (f: string) => string, inFile: 
     }
   }
   return { sites, findings };
+}
+
+/**
+ * What is done THROUGH a rejected fs expression (e.g. `const anyFs = fs as any`): each use, in source order, as
+ * `.member` or `.member()`, or `(value)`. RED STATE: not read yet.
+ */
+export function rejectedUses(_program: ts.Program, _node: ts.Node): string[] {
+  return [];
 }

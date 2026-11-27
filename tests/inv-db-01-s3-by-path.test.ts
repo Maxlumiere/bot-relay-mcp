@@ -595,6 +595,47 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(fs.lstatSync(dbPath).isFile(), "the DB stays a regular file").toBe(true);
   }, 60_000);
 
+  /** A restore staging name beside the DB (.<db name>.<pid>.<hex>.new). */
+  const isStaging = (p: string) => path.basename(p).startsWith(`.${path.basename(dbPath)}.`) && p.endsWith(".new");
+  const stagingLeft = () => fs.readdirSync(path.dirname(dbPath)).filter((n) => isStaging(n));
+
+  it("review R2 (ruling 276d0f4b, an ACCEPTED residual made loud): the staged name REPLACED at the rename → the DB name is checked AFTER the swap: a LOUD refusal naming the safety backup, no rollback", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const real = fs.renameSync;
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation(((a: fs.PathLike, b: fs.PathLike) => {
+      if (isStaging(String(a)) && String(b) === dbPath) {
+        // A directory writer swaps the staged name between the pre-rename check and the rename.
+        fs.writeFileSync(`${String(a)}.swap`, "another file");
+        real(`${String(a)}.swap`, a);
+      }
+      return real(a, b);
+    }) as typeof fs.renameSync);
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/after the swap[\s\S]*safety backup/);
+    } finally {
+      spy.mockRestore();
+    }
+  }, 60_000);
+
+  it("review R2 P3: a failed lstat of the staged copy (EIO) never strands it: the whole post-create lifetime is covered", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const real = fs.lstatSync;
+    let n = 0;
+    const spy = vi.spyOn(fs, "lstatSync").mockImplementation(((p: fs.PathLike, o?: unknown) => {
+      if (isStaging(String(p)) && ++n === 2) throw Object.assign(new Error("EIO: i/o error, lstat (injected)"), { code: "EIO" });
+      return (real as (...a: unknown[]) => unknown)(p, o);
+    }) as typeof fs.lstatSync);
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/EIO/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(n, "precondition: the staged copy's lstat was reached twice").toBeGreaterThanOrEqual(2);
+    expect(stagingLeft(), "no staged copy left behind").toEqual([]);
+  }, 60_000);
+
   // --- Codex #391 R1 P2-3 / P2-4 (one predicate: the DB's own instance declaration AND the caller's) ---
 
   /** Two instances under this test's relay root: A declares `declA` (or has none), B (active) declares native. */
