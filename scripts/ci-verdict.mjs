@@ -9,7 +9,8 @@
  * the Scope job's outputs: a job the Scope required must SUCCEED; a skip is accepted only for a job the Scope
  * excluded (full=false: macOS, Windows, timing bars). A skipped job otherwise reports Success to a required
  * check, so "skipped" is never accepted on its own.
- *   linux  "Test (Node 22)": Scope, the shards and Checks succeeded; the timing bars as the Scope requires.
+ *   linux  "Test (Node 22)": Scope, the shards, Checks and the smoke (22 + 24.13.0) succeeded; the timing bars as the
+ *          Scope requires. The floating latest-24 jobs are never in its needs (they never block a merge).
  *   all    "ci-ok": the same, plus Test (Node 22), the smoke, the secrets scan and the lint gate (never scoped out),
  *          macOS and Windows.
  * usage: echo "$NEEDS" | node scripts/ci-verdict.mjs <linux|all>   (exit 0 = green)
@@ -21,7 +22,7 @@ import { fileURLToPath } from "url";
 /** The jobs the Scope may exclude (full=false); everything else must always succeed. */
 export const SCOPED = ["timing-bars", "test-windows", "test-macos"];
 // The blocking quality gates (secrets, lint) are never scoped out: they run on every change, docs-only included.
-const ALWAYS = { linux: ["changes", "shard", "checks"], all: ["changes", "shard", "checks", "test", "smoke", "secrets", "lint"] };
+const ALWAYS = { linux: ["changes", "shard", "checks", "smoke"], all: ["changes", "shard", "checks", "test", "smoke", "secrets", "lint"] };
 const SCOPED_IN = { linux: ["timing-bars"], all: SCOPED };
 
 /** Pure: { ok, problems } for a needs object ({ <job>: { result, outputs } }). */

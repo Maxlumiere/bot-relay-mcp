@@ -59,8 +59,9 @@ jobs:
           CI_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
         run: node scripts/ci-scope.mjs >> "$GITHUB_OUTPUT"
 
-  # The Linux suite, split by FILE across 4 runners. "Test (Node 22)" below merges the blob reports and proves
-  # the shards cover the whole suite (no file dropped, none run twice).
+  # The Linux suite, split by FILE across 4 runners, on EACH Node major in the matrix. "Test (Node 22)" below
+  # merges each Node's blob reports and proves, per Node, that the shards cover the whole suite (no file dropped,
+  # none run twice).
   shard:
     name: Test shard ${{ matrix.shard }}/4 (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
@@ -70,7 +71,13 @@ jobs:
         # #182 (2026-09): Node 20 dropped. It went EOL 2026-04-30, and better-sqlite3 13 (a native module)
         # requires Node >=22; engines.node is ">=22.0.0". Testing a runtime we no longer support would make
         # green meaningless.
-        node: ['22']
+        # The REQUIRED legs: 22, and 24.13.0, EXACTLY the Node the live daemon runs (its /health). Measured on Linux:
+        # Node 24 names its main thread "MainThread", so a node process's comm is no longer "node". Node 22 stays until
+        # the supported-versions policy is decided (engines.node is ">=22.0.0"). The floating latest 24 runs in its own
+        # jobs below (shard-latest, test-latest), never in a required job's needs.
+        # THE 24.13.0 PIN FOLLOWS PRODUCTION'S NODE: changing the daemon's Node means changing this pin (and the
+        # timing-bars and smoke pins below) in the same step of the Node-upgrade checklist.
+        node: ['22', '24.13.0']
         shard: [1, 2, 3, 4]
     steps:
       - name: Checkout
@@ -111,7 +118,65 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: vitest-shard-${{ matrix.shard }}
+          name: vitest-shard-node${{ matrix.node }}-${{ matrix.shard }}
+          path: |
+            .vitest/blob/
+            .vitest-shard/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  # Linux checks that are not the vitest suite: types, the extension's unit suite, the dashboard's suite, audit.
+  shard-latest:
+    # The FLOATING latest 24: the same 4 shards, NOT required (a floating version never blocks a merge): never in a
+    # required job's needs, nor in ci-ok's. Its own parity and merge: test-latest.
+    name: Test shard ${{ matrix.shard }}/4 (Node 24 latest, not required)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node.js 24 (latest)
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          check-latest: true
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Build
+        run: npm run build
+      # The drift-out guards (tests/v2-6-tether-transport-diagnostics.test.ts, tests/v2-7-tether-reconnection-
+      # options.test.ts) read the SHIPPED extensions/vscode/out/extension.js: build the esbuild bundle first.
+      - name: Build VSCode extension bundle (the drift-out guards read the shipped out/extension.js)
+        run: |
+          cd extensions/vscode
+          npm install
+          npm run bundle
+      - name: Run test shard ${{ matrix.shard }}/4
+        # #235: cap workers so the timing-sensitive spawn tests are not CPU-starved on a 4-vCPU runner (they
+        # each spawn a daemon subprocess).
+        # blob: merged by "Test (Node 22)" into the suite's totals; json: the files this shard RAN, for the
+        # parity check there.
+        run: npx vitest run --shard=${{ matrix.shard }}/4 --maxWorkers=2 --reporter=default --reporter=blob --reporter=json --outputFile.json=.vitest-shard/shard-${{ matrix.shard }}.json
+      # INV-DB-01 2b-ii: the single-owner measurements (racers, real daemons) run SERIAL and alone, once (shard 1).
+      - name: INV-DB-01 single-owner measurements, serial (lock racers + the black-box K-process test)
+        # Runs even when the shard's suite failed (a skipped measurement reads as no evidence, not as a pass).
+        if: ${{ !cancelled() && matrix.shard == 1 }}
+        run: npx vitest run --config vitest.serial.config.ts --reporter=verbose
+      # vitest 5 writes the blob report to .vitest/blob/ (MEASURED: --merge-reports read that default path and
+      # .vitest-reports/ did not exist). Both reports must be there: the step fails otherwise.
+      - name: Check the shard wrote both reports
+        if: ${{ !cancelled() }}
+        run: test -n "$(ls -A .vitest/blob 2>/dev/null)" && ls -l .vitest/blob .vitest-shard/shard-${{ matrix.shard }}.json
+      - name: Upload the shard's reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-shard-node24-${{ matrix.shard }}
           path: |
             .vitest/blob/
             .vitest-shard/
@@ -274,18 +339,24 @@ jobs:
   # Each run calibrates itself: an A/A control that must pass and a sized negative control that must fail.
   # scripts/run-timing-bars.mjs asserts the EXACT set ran and passed (vitest exits 0 when -t matches nothing).
   timing-bars:
-    name: Timing bars (Node 22)
+    name: Timing bars (Node ${{ matrix.node }})
     needs: changes
     # Fail SAFE: if the scope job itself did not succeed, run (a skipped job would report Success).
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true') }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 and 24.13.0 (production's Node, the pin above), required through the required job, which needs this job
+        # (no branch-protection change: the 22 leg keeps its check name). The latest 24: timing-bars-latest, nightly.
+        node: ['22', '24.13.0']
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Setup Node.js 22
+      - name: Setup Node.js ${{ matrix.node }}
         uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node }}
           cache: 'npm'
       - name: Install dependencies
         run: npm ci
@@ -294,12 +365,34 @@ jobs:
       - name: Timing bars, serial and isolated (failed-auth loop + availability)
         run: node scripts/run-timing-bars.mjs
 
-  # REQUIRED CHECK (branch protection names it). The Linux verdict: every shard green, the checks green, the
-  # timing bars green or skipped by scope, AND the shards together ran exactly the suite. `always()`: a job whose
+  # The FLOATING latest 24's timing bars: the NIGHTLY only, NOT required (a breach is a named ticket).
+  timing-bars-latest:
+    name: Timing bars (Node 24 latest, nightly, not required)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node.js 24 (latest)
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          check-latest: true
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Timing bars, serial and isolated (failed-auth loop + availability)
+        run: node scripts/run-timing-bars.mjs
+
+  # REQUIRED CHECK (branch protection names it, so the name stays "Test (Node 22)"). The Linux verdict: every
+  # shard green on every Node in the matrix, the checks green, the timing bars green or skipped by scope, AND, per
+  # Node, the shards together ran exactly the suite. `always()`: a job whose
   # `needs` failed is otherwise SKIPPED, and a skipped job reports Success to a required check.
   test:
     name: Test (Node 22)
-    needs: [changes, shard, checks, timing-bars]
+    needs: [changes, shard, checks, timing-bars, smoke]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -317,21 +410,65 @@ jobs:
           cache: 'npm'
       - name: Install dependencies
         run: npm ci
-      - name: Download the shards' reports
+      # One directory per leg: the legs' reports never mix (each must be the whole suite on its own).
+      - name: Download the shards' reports (Node 22)
         uses: actions/download-artifact@v4
         with:
-          pattern: vitest-shard-*
-          path: .
+          pattern: vitest-shard-node22-*
+          path: node22
           merge-multiple: true
-      - name: The 4 shards are disjoint and together are the whole suite
-        run: node scripts/ci-shard-parity.mjs 4 .vitest-shard
-      - name: Merge the shard reports (the suite's totals)
-        run: npx vitest --merge-reports --reporter=default
+      - name: Download the shards' reports (Node 24.13.0)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vitest-shard-node24.13.0-*
+          path: node24.13.0
+          merge-multiple: true
+      - name: The 4 shards are disjoint and together are the whole suite (Node 22)
+        run: node scripts/ci-shard-parity.mjs 4 node22/.vitest-shard
+      - name: The 4 shards are disjoint and together are the whole suite (Node 24.13.0)
+        run: node scripts/ci-shard-parity.mjs 4 node24.13.0/.vitest-shard
+      - name: Merge the shard reports (the suite's totals, Node 22)
+        run: npx vitest --merge-reports=node22/.vitest/blob --reporter=default
+      - name: Merge the shard reports (the suite's totals, Node 24.13.0)
+        run: npx vitest --merge-reports=node24.13.0/.vitest/blob --reporter=default
+      # The job keeps the name branch protection requires; say what it judges where a reader of the run looks.
+      - name: Say what this check covers
+        if: always()
+        run: echo "This required check (named \"Test (Node 22)\" for branch protection) covers Node 22 and 24.13.0 (the latest 24 runs in its own, non-required jobs)." >> "$GITHUB_STEP_SUMMARY"
 
   # Windows parity for the registration secret and the relay's private files (ruling efb48600 Q12). SCOPED to
   # the registration-secret tests plus the owner-only ACL check, which is checked by SID (icacls output and
   # account names are localized). The rest of the suite has never run on Windows; breakage there is reported,
   # not fixed in this job. Same scoped set on pull requests, main and nightly.
+  # The FLOATING latest 24's verdict: its shards are the whole suite (parity) and its totals (merge). NOT required.
+  test-latest:
+    name: Test (Node 24 latest, not required)
+    needs: [shard-latest]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Every latest-24 shard passed
+        run: test "${{ needs.shard-latest.result }}" = "success"
+      - name: Download the shards' reports (Node 24 latest)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vitest-shard-node24-*
+          path: node24
+          merge-multiple: true
+      - name: The 4 shards are disjoint and together are the whole suite (Node 24 latest)
+        run: node scripts/ci-shard-parity.mjs 4 node24/.vitest-shard
+      - name: Merge the shard reports (the suite's totals, Node 24 latest)
+        run: npx vitest --merge-reports=node24/.vitest/blob --reporter=default
+
   test-windows:
     name: Test (Windows — registration secret + ACLs)
     needs: changes
@@ -535,20 +672,26 @@ jobs:
   # sequential sweep and the bars too. A publish always runs them: the skip is never honoured under
   # prepublishOnly (scripts/pre-publish-check.sh, tests/ci-smoke-skip-suite.test.ts).
   smoke:
-    name: 25-tool smoke (Node 22)
+    name: 25-tool smoke (Node ${{ matrix.node }})
     needs: changes
     # EVERY pull request, docs-only included: the gate holds the README/docs guards (e.g. the masthead and
-    # '(current)' version guard). On a PR it takes ~1-1.5 min.
+    # '(current)' version guard). On a PR it takes ~1-1.5 min. Required through the required job's needs (ruling
+    # 7fc79f57: GitHub itself blocks on the 24.13.0 leg).
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 and 24.13.0 (production's Node, the pin above). The lint and type checks stay 22-only.
+        node: ['22', '24.13.0']
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Node.js 22
+      - name: Setup Node.js ${{ matrix.node }}
         uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node }}
           cache: 'npm'
 
       - name: Install dependencies
