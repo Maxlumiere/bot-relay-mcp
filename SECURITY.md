@@ -92,6 +92,10 @@ When the SessionStart hook runs twice in one window, its second `register_agent`
 
 Those three values are the caller's own claims. This guards against an accidental second holder, which presents its own process and so collides. It is not an authority boundary: a same-user process that holds the name's token can copy a live holder's values and receive a refresh. It gains nothing it did not already have, since the token lets it read and send as that name.
 
+### A restore's swap can install a staged file replaced by a writer in the DB's own directory
+
+A restore copies the archive's DB to a unique, exclusively created staging name beside the live DB. It checks that the staged name is still that regular file (one link, the same inode) right before it renames it onto the DB. A process that can write in the DB's own directory (the same-user boundary in § Threat model) could still replace the staged name between that check and the rename. Such a process can already overwrite the DB itself. After the rename, the restore checks that the DB name is the copy it staged. If not, it refuses loudly and names the safety backup to restore from. It does not roll back: a rollback would race the same writer. A DB path that is itself a link has its referent replaced, as designed (the link stays).
+
 This document describes the threat model bot-relay-mcp defends against, the mechanisms that enforce those defenses, and — crucially — what the project does NOT protect. It closes with the vulnerability-disclosure process.
 
 ---

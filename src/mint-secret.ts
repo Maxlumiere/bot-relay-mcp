@@ -301,7 +301,7 @@ export function ensureMintSecret(instanceDir: string, seed?: string): { path: st
     restrictToOwnerWindows(file, false);
     return { path: file, created: true };
   } finally {
-    fs.rmSync(tmp, { force: true });
+    fs.rmSync(tmp, { force: true }); // rm: own regular file: this call's own temp file
   }
 }
 

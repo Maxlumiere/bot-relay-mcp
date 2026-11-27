@@ -129,7 +129,7 @@ In this order:
    - `PRAGMA integrity_check` on the staged `relay.db`, opened read-only;
    - **the keyring can read it.** The key ids come from the staged DB's own ciphertext, not from the manifest alone. Each must be in this relay's keyring; its key must match the manifest's fingerprint, when the manifest has one; and one staged row under it must decrypt. The decrypt check also covers an archive made before fingerprints existed.
 3. **Safety backup.** A full `exportRelayState` of the *current* DB to `~/.bot-relay/backups/pre-restore-<iso>.tar.gz`. If it fails, the restore aborts and the current DB is never touched.
-4. **Atomic swap.** The new DB is written to `<DB_PATH>.new`, then `fs.renameSync` atomically replaces the live path, and the old WAL and shm files are removed. They regenerate on next open.
+4. **Atomic swap.** The new DB is copied, exclusively (`COPYFILE_EXCL`), to a unique name beside the live DB (`.<db name>.<pid>.<random>.new`); right before the swap that name must still be the same regular file with one link. Then `fs.renameSync` atomically replaces the live path, and the old WAL and shm files are removed. They regenerate on next open.
 
 ## What is NOT in the archive
 

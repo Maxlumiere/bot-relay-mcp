@@ -275,7 +275,7 @@ export function writePrivateConfig(
     ok = true;
   } finally {
     fs.closeSync(fd);
-    if (!ok) fs.rmSync(file, { force: true });
+    if (!ok) fs.rmSync(file, { force: true }); // rm: own regular file: the file this call created exclusively above
   }
 }
 

@@ -235,7 +235,7 @@ function writeDriverDeclaration(configPath: string, to: ConvertTarget): void {
     fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, target);
   } catch (err) {
-    fs.rmSync(tmp, { force: true });
+    fs.rmSync(tmp, { force: true }); // rm: own regular file: this conversion's own temp copy
     throw err;
   }
 }

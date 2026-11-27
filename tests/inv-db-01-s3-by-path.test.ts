@@ -346,13 +346,16 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     makeDb(dbPath, 0, ["row-1"]);
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
     const live = await startLiveOpener(dbPath, "idle");
-    const state = { db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), shm: fileState(`${dbPath}-shm`), dotNew: fileState(`${dbPath}.new`) };
+    // The staging name is UNIQUE (.<db name>.<pid>.<hex>.new, Codex #472 R1): "no .new made" = no such entry beside the DB.
+    const staging = () => fs.readdirSync(path.dirname(dbPath)).filter((n) => n.startsWith(`.${path.basename(dbPath)}.`) && n.endsWith(".new")).sort();
+    const state = { db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), shm: fileState(`${dbPath}-shm`), dotNew: staging() };
     expect(state.wal, "precondition: the live opener's -wal is there").not.toBe("absent");
     await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*-wal[\s\S]*\d+ bytes[\s\S]*external tool's PERSIST\/TRUNCATE or persistent-WAL mode/);
     // The DB and its WAL are byte for byte unchanged, and no .new was made. The -shm is SQLite's shared-memory INDEX
     // (no data): every connection updates it, the safety backup's read-only open and the pre-swap step included, so
     // the row asserts it is still there (never deleted), at its size.
-    expect({ db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), dotNew: fileState(`${dbPath}.new`) }, "the DB, its WAL and the .new state are unchanged").toEqual({ db: state.db, wal: state.wal, dotNew: state.dotNew });
+    expect({ db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), dotNew: staging() }, "the DB, its WAL and the .new state are unchanged").toEqual({ db: state.db, wal: state.wal, dotNew: state.dotNew });
+    expect(state.dotNew, "precondition: no staging name existed before").toEqual([]);
     expect(fs.existsSync(`${dbPath}-shm`) ? fs.statSync(`${dbPath}-shm`).size : -1, "the -shm is left in place, at its size").toBe(Number(state.shm.split(":")[0]));
     // Positive control: the live opener still works, through its own connection, and sees exactly its pre-restore rows.
     expect(await ask(live, "read"), "the live opener reads its own rows after the refused restore").toBe(`ROWS ${JSON.stringify(["row-1"])}`);
@@ -574,6 +577,141 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(staged, "the hook after staging ran").not.toBe("");
     expect(fileState(dbPath), "the DB is untouched").toBe(before);
     expect(fs.existsSync(staged), "the staged .new (this restore's own copy, not a DB name) is removed").toBe(false);
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("Codex #472 R1: a PLANTED `<db>.new` link to an outside file is never written through nor renamed onto the DB: the outside file is untouched, the DB stays a regular file", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const outside = path.join(caseDir, "outside-victim.txt");
+    fs.writeFileSync(outside, "the outside file's own bytes");
+    fs.symlinkSync(outside, `${dbPath}.new`); // planted (or a stale leftover) at the fixed staging name
+    try {
+      await importRelayState(archive, { force: true });
+    } catch {
+      /* a refusal is acceptable; what matters is below */
+    }
+    expect(fs.readFileSync(outside, "utf-8"), "the outside file was not written through the planted link").toBe("the outside file's own bytes");
+    expect(fs.lstatSync(dbPath).isSymbolicLink(), "the DB name is not the planted link").toBe(false);
+    expect(fs.lstatSync(dbPath).isFile(), "the DB stays a regular file").toBe(true);
+  }, 60_000);
+
+  /** A restore staging name beside the DB (.<db name>.<pid>.<hex>.new). */
+  const isStaging = (p: string) => path.basename(p).startsWith(`.${path.basename(dbPath)}.`) && p.endsWith(".new");
+  const stagingLeft = () => fs.readdirSync(path.dirname(dbPath)).filter((n) => isStaging(n));
+
+  it("review R2 (ruling 276d0f4b, an ACCEPTED residual made loud): the staged name REPLACED at the rename → the DB name is checked AFTER the swap: a LOUD refusal naming the safety backup, no rollback", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const real = fs.renameSync;
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation(((a: fs.PathLike, b: fs.PathLike) => {
+      if (isStaging(String(a)) && String(b) === dbPath) {
+        // A directory writer swaps the staged name between the pre-rename check and the rename.
+        fs.writeFileSync(`${String(a)}.swap`, "another file");
+        real(`${String(a)}.swap`, a);
+      }
+      return real(a, b);
+    }) as typeof fs.renameSync);
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/after the swap[\s\S]*safety backup/);
+    } finally {
+      spy.mockRestore();
+    }
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("ruling 81d038ab: a DIRECTORY at the staged name → the restore's own refusal (Nothing was replaced… safety backup at …) is KEPT, and the cleanup failure is attached naming the path left behind", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const before = fileState(dbPath);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    let staged = "";
+    setAfterStage?.((newPath) => {
+      staged = newPath;
+      fs.unlinkSync(newPath);
+      fs.mkdirSync(newPath); // a directory now sits at the staged name: its unlinkSync cleanup fails (EPERM / EISDIR)
+    });
+    let msg = "";
+    try {
+      await importRelayState(archive, { force: true });
+    } catch (err) {
+      msg = (err as Error).message;
+    } finally {
+      setAfterStage?.(null);
+    }
+    expect(staged, "precondition: the stage hook ran").not.toBe("");
+    expect(msg, "the restore's own refusal, not the cleanup's error").not.toMatch(/^(EPERM|EISDIR)/);
+    expect(msg).toMatch(/Nothing was replaced[\s\S]*safety backup is at \S+/);
+    expect(msg, "the path left behind is named").toContain(staged);
+    expect(msg).toMatch(/left behind/);
+    expect(fileState(dbPath), "the DB is untouched").toBe(before);
+    fs.rmdirSync(staged);
+  }, 60_000);
+
+  it("ruling e3ed38e3 (a): the POST-SWAP lstat THROWS (EIO) → the SAME loud refusal as a mismatch: the swap happened, the safety backup named, no rollback, the fs error attached", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const realRename = fs.renameSync;
+    const realLstat = fs.lstatSync;
+    let swapped = false;
+    const rn = vi.spyOn(fs, "renameSync").mockImplementation(((a: fs.PathLike, b: fs.PathLike) => {
+      realRename(a, b);
+      if (isStaging(String(a)) && String(b) === dbPath) swapped = true;
+    }) as typeof fs.renameSync);
+    const ls = vi.spyOn(fs, "lstatSync").mockImplementation(((p: fs.PathLike, o?: unknown) => {
+      if (swapped && String(p) === dbPath) throw Object.assign(new Error("EIO: i/o error, lstat (injected)"), { code: "EIO" });
+      return (realLstat as (...a: unknown[]) => unknown)(p, o);
+    }) as typeof fs.lstatSync);
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/after the swap[\s\S]*rolled back[\s\S]*safety backup at \S+[\s\S]*EIO/);
+    } finally {
+      rn.mockRestore();
+      ls.mockRestore();
+    }
+    expect(swapped, "precondition: the swap happened").toBe(true);
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("ruling e3ed38e3 (b): the staging COPY fails after its create (ENOSPC) AND the cleanup fails (a directory at the name) → the copy's error carries the cleanup failure and the leftover path", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const realCopy = fs.copyFileSync;
+    let leftover = "";
+    const cp = vi.spyOn(fs, "copyFileSync").mockImplementation(((src: fs.PathLike, dst: fs.PathLike, mode?: number) => {
+      if (isStaging(String(dst))) {
+        leftover = String(dst);
+        fs.mkdirSync(dst); // what the copy left at the name cannot be unlinked (EPERM / EISDIR)
+        throw Object.assign(new Error("ENOSPC: no space left on device, copyfile (injected)"), { code: "ENOSPC" });
+      }
+      return realCopy(src, dst, mode);
+    }) as typeof fs.copyFileSync);
+    let msg = "";
+    try {
+      await importRelayState(archive, { force: true });
+    } catch (err) {
+      msg = (err as Error).message;
+    } finally {
+      cp.mockRestore();
+    }
+    expect(leftover, "precondition: the staging copy was attempted").not.toBe("");
+    expect(msg, "the copy's own error stays primary").toMatch(/^ENOSPC/);
+    expect(msg, "the leftover path is named").toContain(leftover);
+    expect(msg).toMatch(/left behind/);
+    fs.rmdirSync(leftover);
+  }, 60_000);
+
+  it("review R2 P3: a failed lstat of the staged copy (EIO) never strands it: the whole post-create lifetime is covered", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const real = fs.lstatSync;
+    let n = 0;
+    const spy = vi.spyOn(fs, "lstatSync").mockImplementation(((p: fs.PathLike, o?: unknown) => {
+      if (isStaging(String(p)) && ++n === 2) throw Object.assign(new Error("EIO: i/o error, lstat (injected)"), { code: "EIO" });
+      return (real as (...a: unknown[]) => unknown)(p, o);
+    }) as typeof fs.lstatSync);
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/EIO/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(n, "precondition: the staged copy's lstat was reached twice").toBeGreaterThanOrEqual(2);
+    expect(stagingLeft(), "no staged copy left behind").toEqual([]);
   }, 60_000);
 
   // --- Codex #391 R1 P2-3 / P2-4 (one predicate: the DB's own instance declaration AND the caller's) ---

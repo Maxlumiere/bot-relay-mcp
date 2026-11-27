@@ -1101,9 +1101,22 @@ function ownerPersist(w: WasmDatabase, data: Buffer): void {
   }
   const tmp = `${target}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
   let wrote: string;
+  // The temp is THIS persist's only once its exclusive create succeeded (a create refused because the name exists
+  // removes nothing: that file is another process's).
+  let tmpOurs = false;
   try {
-    if (ownerTempWriteForTests) ownerTempWriteForTests(tmp, data);
-    else fs.writeFileSync(tmp, data, { mode: 0o600, flag: "wx" });
+    if (ownerTempWriteForTests) {
+      ownerTempWriteForTests(tmp, data);
+      tmpOurs = true;
+    } else {
+      const fd = fs.openSync(tmp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+      tmpOurs = true;
+      try {
+        fs.writeFileSync(fd, data);
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
     // Codex #385 R1 P1-4: the identity of the file THIS persist wrote (a rename keeps its inode, size and mtime), never
     // whatever sits at the name after the rename (another writer's replacement would be adopted as the owner's own).
     // Read after the write is closed (a filesystem may settle timestamps at close).
@@ -1117,7 +1130,19 @@ function ownerPersist(w: WasmDatabase, data: Buffer): void {
     }
     replaceWithRetry(tmp, target);
   } catch (err) {
-    fs.rmSync(tmp, { force: true });
+    if (tmpOurs) {
+      // The temp NAME this persist created (never renamed into place on this path).
+      // A cleanup that fails (a directory at the name: EPERM / EISDIR) never REPLACES the primary refusal: it is
+      // attached to it, naming the path left behind (ruling 81d038ab).
+      try {
+        fs.unlinkSync(tmp);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+          if (!(err instanceof Error)) throw e;
+          err.message += ` (${"the persist temp"} ${tmp} could not be removed: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}; it is left behind)`;
+        }
+      }
+    }
     throw err;
   }
   w.lastIdentity = wrote;

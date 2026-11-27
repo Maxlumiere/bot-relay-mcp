@@ -29,6 +29,7 @@
  *     (won't catch stdio-mode or non-default-port daemons) — documented.
  */
 
+import crypto from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -341,7 +342,7 @@ async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<
       } finally {
         source.release(); // never written back
       }
-      fs.rmSync(snapshotDbPath, { force: true });
+      fs.rmSync(snapshotDbPath, { force: true }); // rm: own regular file: this backup's own snapshot copy
       if (attempt >= 2) {
         throw new Error(
           `backup refused (wasm driver): the DB at '${srcDbPath}' changed while it was being read, on the first read and ` +
@@ -752,7 +753,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     const plainTar = path.join(stagingDir, ".archive.tar");
     await gunzipToFile(resolvedArchive, plainTar);
     const { skipped } = extractBackupTar(plainTar, stagingDir);
-    fs.rmSync(plainTar, { force: true });
+    fs.rmSync(plainTar, { force: true }); // rm: own regular file: this restore's own gunzipped tar
 
     // --- Step 1: VALIDATE COMPLETELY IN STAGING, before ANY live mutation (Codex #342 R2, ruled): the required members,
     // the manifest, the schema and the staged DB's integrity all pass BEFORE the safety backup, initializeDb() or
@@ -871,26 +872,54 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // next open (MEASURED: the pre-restore rows came back, integrity_check ok).
     const target = plannedTarget;
     assertSwapPreconditions(srcDbPath, target, restoreOwner);
-    const newPath = target + ".new";
-    fs.copyFileSync(extractedDbPath, newPath);
+    // Codex #472 R1: a UNIQUE staging name (as materializeDb's `.<base>.<pid>.<hex>.new`), created EXCLUSIVELY: a
+    // planted or stale `<db>.new` link is never written through nor renamed onto the DB name. Its identity is recorded
+    // right after the copy and re-checked immediately before the rename.
+    const newPath = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.new`);
+    const dropStaged = (): void => {
+      // The staged NAME (link-safe), never a DB-family name.
+      try {
+        fs.unlinkSync(newPath);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      }
+    };
     try {
+      fs.copyFileSync(extractedDbPath, newPath, fs.constants.COPYFILE_EXCL);
+    } catch (err) {
+      // EEXIST: the exclusive create was refused, the name is not this restore's. Anything else failed after (or
+      // without) the create: remove what this copy may have left, keeping the copy's own error as the one reported.
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        try {
+          dropStaged();
+        } catch (e) {
+          // The copy's error stays primary; the failed cleanup is attached, naming the leftover (ruling 81d038ab).
+          if (err instanceof Error) err.message += ` (the staged copy ${newPath} could not be removed: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}; it is left behind)`;
+        }
+      }
+      throw err;
+    }
+    // ONE cleanup scope for the staged copy's WHOLE lifetime (review R2 P3): every check, lstat and the rename; only a
+    // completed rename keeps it (as the DB).
+    let staged: fs.BigIntStats;
+    try {
+      staged = fs.lstatSync(newPath, { bigint: true });
       await afterRestoreStageHook?.(newPath, target);
       // Codex #391 R1: the checks again, right before the rename (a side file, a retarget or a new hard link could
       // appear while the archive was being copied into .new).
       assertSwapPreconditions(srcDbPath, target, restoreOwner);
-    } catch (err) {
-      fs.rmSync(newPath, { force: true }); // this restore's own staged copy (never a DB-family name)
-      throw err;
-    }
-    // INV-DB-01 slice 4 (the #377 ruling, Codex #401 R2 walk): the swap is the atomic rename ONLY. On Windows a rename
-    // onto a file another process holds open fails; a short retry, then a NAMED refusal: never a copy over the live
-    // DB (a crash mid-copy would leave it torn, recoverable only by hand from the safety backup).
-    {
+      // INV-DB-01 slice 4 (the #377 ruling, Codex #401 R2 walk): the swap is the atomic rename ONLY. On Windows a
+      // rename onto a file another process holds open fails; a short retry, then a NAMED refusal: never a copy over
+      // the live DB (a crash mid-copy would leave it torn, recoverable only by hand from the safety backup).
+      // The staged name still names THE file this restore copied: a regular file, one link, the same inode.
+      const now = fs.lstatSync(newPath, { bigint: true });
+      if (!now.isFile() || now.nlink !== 1n || now.ino !== staged.ino || now.dev !== staged.dev) {
+        throw new Error(`restore refused: the staged copy at ${newPath} was replaced or linked before the swap. Nothing was replaced: the live DB is unchanged (its safety backup is at ${previousBackupPath}).`);
+      }
       try {
         renameReplacingWithWindowsRetry(newPath, target); // src/fs-replace.ts: the ONE Windows-only bounded retry
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code ?? "";
-        fs.rmSync(newPath, { force: true }); // this restore's own staged copy (never a DB-family name)
         throw new Error(
           `restore refused: the staged copy could not be replaced onto ${target} (${code || (err as Error).message})` +
             (process.platform === "win32" ? `: another process may have the DB open (Windows cannot replace an open file)` : "") +
@@ -898,6 +927,38 @@ export async function importRelayState(archivePath: string, options: ImportOptio
             `process using it, then retry.`
         );
       }
+    } catch (err) {
+      // The staged NAME (link-safe), never a DB-family name.
+      // A cleanup that fails (a directory at the name: EPERM / EISDIR) never REPLACES the primary refusal: it is
+      // attached to it, naming the path left behind (ruling 81d038ab).
+      try {
+        fs.unlinkSync(newPath);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+          if (!(err instanceof Error)) throw e;
+          err.message += ` (${"the staged copy"} ${newPath} could not be removed: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}; it is left behind)`;
+        }
+      }
+      throw err;
+    }
+    // AN ACCEPTED RESIDUAL, MADE LOUD (review R2, ruling 276d0f4b; the ADR-0036 class: a writer inside the DB's
+    // private directory can already overwrite the DB): such a writer could replace the staged name between the check
+    // above and the rename. After the swap the DB name must name the copy this restore staged; if not, a LOUD
+    // refusal naming the safety backup. NO rollback: a rollback would itself race that writer.
+    let after: fs.BigIntStats | null = null;
+    let unreadable = "";
+    try {
+      after = fs.lstatSync(target, { bigint: true });
+    } catch (e) {
+      unreadable = (e as NodeJS.ErrnoException).code ?? (e as Error).message;
+    }
+    if (!after || !after.isFile() || after.ino !== staged!.ino || after.dev !== staged!.dev) {
+      throw new Error(
+        `restore: the DB at ${target} after the swap ${after ? "is NOT the copy this restore staged (it was replaced between the final check and the rename: another writer in its directory?)" : "could not be checked against the copy this restore staged"}. ` +
+          `The swap happened; it is not rolled back (that would race the same writer). Inspect it, and restore from the ` +
+          `safety backup at ${previousBackupPath} if it is not yours.` +
+          (unreadable ? ` (the post-swap check could not read the DB name: ${unreadable})` : "")
+      );
     }
 
     return {

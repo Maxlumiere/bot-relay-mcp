@@ -714,19 +714,26 @@ describe("INV-DB-01 2b-ii: the wasm single owner", () => {
 
   it("P3-8: a first image whose write FAILS after the exclusive create (ENOSPC) leaves no temp file behind", () => {
     const target = path.join(caseDir, "new.db");
-    const real = fs.writeFileSync;
-    const spy = vi.spyOn(fs, "writeFileSync").mockImplementation(((p: fs.PathOrFileDescriptor, d: unknown, o?: unknown) => {
-      if (String(p).endsWith(".new")) {
-        fs.closeSync(fs.openSync(p as string, "wx", 0o600));
-        throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
-      }
-      return (real as (...a: unknown[]) => void)(p, d, o);
+    // The exclusive create SUCCEEDS (the temp is this call's), then the write through its descriptor fails.
+    const realOpen = fs.openSync;
+    const realWrite = fs.writeFileSync;
+    let tempFd = -1;
+    const openSpy = vi.spyOn(fs, "openSync").mockImplementation(((p: fs.PathLike, f?: unknown, m?: unknown) => {
+      const fd = (realOpen as (...a: unknown[]) => number)(p, f, m);
+      if (String(p).endsWith(".new")) tempFd = fd;
+      return fd;
+    }) as typeof fs.openSync);
+    const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementation(((p: fs.PathOrFileDescriptor, d: unknown, o?: unknown) => {
+      if (p === tempFd) throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+      return (realWrite as (...a: unknown[]) => void)(p, d, o);
     }) as typeof fs.writeFileSync);
     try {
       expect(() => lockMod.materializeDb(target, new Uint8Array([1, 2, 3]))).toThrow(/ENOSPC/);
     } finally {
-      spy.mockRestore();
+      openSpy.mockRestore();
+      writeSpy.mockRestore();
     }
+    expect(tempFd, "precondition: the temp was created exclusively (the write failed AFTER it)").toBeGreaterThanOrEqual(0);
     expect(fs.readdirSync(caseDir).filter((f) => f.endsWith(".new")), "no partial temp left").toEqual([]);
   });
 

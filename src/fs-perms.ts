@@ -400,7 +400,7 @@ function windowsDaclSddl(path: string): string {
     if (!sddl) throw new Error(`icacls /save for "${path}" produced no DACL`);
     return sddl;
   } finally {
-    fs.rmSync(tmp, { force: true });
+    fs.rmSync(tmp, { force: true }); // rm: own regular file: the icacls /save output this call created
   }
 }
 

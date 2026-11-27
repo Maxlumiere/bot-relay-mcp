@@ -156,7 +156,17 @@ export function writeOwnerEndpoint(dbPath: string, port: number, transport: Owne
     } catch {
       /* already closed */
     }
-    fs.rmSync(tmp, { force: true }); // this owner's own temp name, never the record
+    // The temp NAME, whatever sits there now (a link included: rmSync leaves a dangling one on Node 24.13.0); never the record.
+    // A cleanup that fails (a directory at the name: EPERM / EISDIR) never REPLACES the primary refusal: it is
+    // attached to it, naming the path left behind (ruling 81d038ab).
+    try {
+      fs.unlinkSync(tmp);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        if (!(err instanceof Error)) throw e;
+        err.message += ` (${"the record's temp"} ${tmp} could not be removed: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}; it is left behind)`;
+      }
+    }
     throw err;
   }
   return file;

@@ -83,6 +83,23 @@ async function openWithTable() {
   return { h, ins };
 }
 
+describe("Codex #472 R1: a persist whose EXCLUSIVE temp create failed removes nothing (the name was not its own)", () => {
+  it("the temp name already exists (another process's file): the create fails, and that file SURVIVES the cleanup", async () => {
+    const { h, ins } = await openWithTable();
+    let planted = "";
+    compat._setWasmPersistWriteForTests((tmp: string) => {
+      planted = tmp;
+      fs.writeFileSync(tmp, "another process's bytes"); // at the name before this persist's exclusive create
+      throw Object.assign(new Error(`EEXIST: file already exists, open '${tmp}' (injected)`), { code: "EEXIST" });
+    });
+    expect(() => ins.run("v"), "the persist is refused").toThrow();
+    compat._setWasmPersistWriteForTests(null);
+    expect(planted, "precondition: the persist reached its temp create").not.toBe("");
+    expect(fs.readFileSync(planted, "utf-8"), "a file this persist did not create is left alone").toBe("another process's bytes");
+    void h;
+  });
+});
+
 describe("the wasm write-back loses no committed write silently", () => {
   it.each(["a single statement", "a transaction"])("a refused write-back (%s) keeps the change, and the NEXT write-back writes it", async (kind) => {
     const { h, ins } = await openWithTable();
