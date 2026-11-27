@@ -312,7 +312,7 @@ describe.skipIf(!HOST)("the doorbell job, a real process (plan v3 PR 1)", () => 
       for (const l of dbFds) expect(l.split(/\s+/)[3], l).toMatch(/^\d+r/);
       const e = realSystemDeps.processTable().get(pid);
       expect(e, "the job is in the process table").toBeTruthy();
-      const view = { pid, ppid: e!.ppid, start: e!.startedAt, command: e!.command, comm: e!.comm, cwd: realSystemDeps.cwds([pid]).get(pid) ?? null, argv: realSystemDeps.exactArgv(pid) };
+      const view = { pid, ppid: e!.ppid, start: e!.startedAt, command: e!.command, comm: e!.comm, exe: e!.exe, /* the kernel's executable, as toProcessViews carries it (Linux Node 24: comm reads MainThread) */ cwd: realSystemDeps.cwds([pid]).get(pid) ?? null, argv: realSystemDeps.exactArgv(pid) };
       expect(classifyProcess(view, new Set())).toMatchObject({ kind: "not-relay" });
     } finally {
       child.kill("SIGTERM");

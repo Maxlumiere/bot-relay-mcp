@@ -44,6 +44,7 @@ import fs from "node:fs";
 import { execSystem, execSystemAsync, type SystemBinaryName } from "./system-binary.js";
 import { log } from "./logger.js";
 import { profileProcessPatternSource, AGENT_CLI_PROFILES } from "./agent-cli-profiles.js";
+import { executableIdentity, type ExeOpts } from "./proc-exe.js";
 
 export type HostPlatform = "darwin" | "linux" | "win32" | string;
 
@@ -251,6 +252,11 @@ export interface ProcEntry {
    * the parse-from-`command` path leave it unset → we fall back to argv[0].
    */
   comm?: string;
+  /**
+   * The kernel's executable (src/proc-exe.ts: Linux /proc/<pid>/exe), set by buildProcessTable on Linux. Judged
+   * BEFORE comm: on Linux, Node 24's comm is its main thread's name ("MainThread"), not the executable.
+   */
+  exe?: string;
 }
 
 export interface AgentProcess {
@@ -406,7 +412,7 @@ export function parseProcessTable(psStdout: string): ProcessTable {
   return table;
 }
 
-export function buildProcessTable(run: CommandRunner = defaultRunner): ProcessTable {
+export function buildProcessTable(run: CommandRunner = defaultRunner, exeOpts: ExeOpts = {}): ProcessTable {
   // POSIX only here (macOS/Linux). Windows capture is a documented follow-on
   // (the daemon there falls back to age-based, same as cross-host).
   const table = parseProcessTable(run("ps", ["-axo", "pid=,ppid=,lstart=,command="], { startTokenForm: "utc" }));
@@ -422,6 +428,12 @@ export function buildProcessTable(run: CommandRunner = defaultRunner): ProcessTa
     if (!m) continue;
     const entry = table.get(Number(m[1]));
     if (entry) entry.comm = m[2].trim();
+  }
+  // The kernel's executable for EVERY row (Linux; undefined elsewhere): comm is exactly the field Node 24 makes a
+  // thread name there (src/proc-exe.ts). Same exposure as the comm pass: a separate read after the ps snapshot.
+  for (const entry of table.values()) {
+    const exe = executableIdentity(entry.pid, exeOpts);
+    if (exe !== undefined) entry.exe = exe;
   }
   return table;
 }
@@ -449,10 +461,10 @@ export function findAgentProcess(
     if (!parent) break;
     if (
       !selfExcludePattern.test(parent.command) &&
-      processIdentityIsAgent(parent.command, parent.comm, agentPattern)
+      processIdentityIsAgent(parent.command, parent.exe ?? parent.comm, agentPattern)
     ) {
       // The NEAREST agent decides (ruling 9d0bb9e6): a Codex session run inside a Claude one is codex.
-      return { pid: parent.pid, startedAt: parent.startedAt, profile: observedProfileOf(parent.command, parent.comm) };
+      return { pid: parent.pid, startedAt: parent.startedAt, profile: observedProfileOf(parent.command, parent.exe ?? parent.comm) };
     }
     cur = parent;
     depth++;
@@ -687,11 +699,31 @@ export function observedProfileOf(command: string, comm: string | undefined): st
  * line (argv0, or a runtime's script); the comm judge reads the kernel's executable name. A truncated command line
  * (".../codex" for ".../codex-helper"), or the two naming different CLIs, gives null: the alarm, the safe side.
  */
-export function agreedProfileOf(command: string, comm: string | undefined): string | null {
-  if (!comm || !comm.trim()) return null;
+export function agreedProfileOf(command: string, executable: string | undefined): string | null {
+  if (!executable || !executable.trim()) return null;
   const byCommand = observedProfileOf(command, undefined);
-  const byComm = observedProfileOf(command, comm);
-  return byCommand !== null && byCommand === byComm ? byCommand : null;
+  if (byCommand === null) return null;
+  const profile = AGENT_CLI_PROFILES.find((p) => p.id === byCommand);
+  if (!profile) return null;
+  // Ruling adf82e6b: the executable judge names a NATIVE CLI or a RUNTIME. They agree iff the executable IS this CLI,
+  // or is a runtime the registry lists as a host of THIS CLI. Anything else (another CLI, an unlisted runtime, a
+  // thread name such as Linux Node 24's "MainThread") reads NULL: the safe side.
+  const base = pathBasename(executable.trim()).replace(/\.exe$/i, "");
+  if (new RegExp(`^(${profile.processPattern})$`, "i").test(base)) return byCommand;
+  return profile.runtimeHosts.some((h) => h.toLowerCase() === base.toLowerCase()) ? byCommand : null;
+}
+
+/**
+ * 8b's second judge for `pid`: the kernel's executable (Linux /proc/<pid>/exe), BRACKETED by the instance's start
+ * (the caller read `start`; it is read again AFTER the exe, and must be equal: else another process now owns the pid
+ * → null). Independent of argv. Where the exe is unreadable (or not Linux), the comm read with the same start.
+ */
+export async function executableJudgeOf(run: AsyncPsRunner, pid: number, start: string, timeoutMs: number, exeOpts: ExeOpts = {}): Promise<string | null> {
+  const exe = executableIdentity(pid, exeOpts);
+  if (exe === undefined) return commOf(run, pid, start, timeoutMs);
+  const out = (await run(["-o", "pid=,lstart=", "-p", String(pid)], { startTokenForm: "utc", timeoutMs })).trim();
+  const m = out.match(/^(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)$/);
+  return m && Number(m[1]) === pid && m[2]!.trim() === start ? exe : null;
 }
 
 /**
@@ -782,8 +814,8 @@ export async function probeAgentProfile(
       const m = out.match(/^(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(.*)$/);
       if (!m || Number(m[1]) !== pid || !RAW_START_TOKEN_RE.test(m[2]!)) return { profile: null, why: "no coherent process record for the agent pid" };
       if (m[2]! + START_TOKEN_UTC_SUFFIX !== claimedStart) return { profile: null, why: "the agent pid is another process now (start token differs)" };
-      const comm = await commOf(run, pid, m[2]!.trim(), timeoutMs);
-      const profile = agreedProfileOf(m[3]!.trim(), comm ?? undefined);
+      const judge = await executableJudgeOf(run, pid, m[2]!.trim(), timeoutMs);
+      const profile = agreedProfileOf(m[3]!.trim(), judge ?? undefined);
       return profile === null ? { profile: null, why: "the command line and the executable name do not agree on one CLI" } : { profile };
     })(),
     timeoutMs,
@@ -805,8 +837,8 @@ export async function probeOwnAncestryProfile(opts: { run?: AsyncPsRunner; timeo
       if (!agent) return { profile: null, why: "no agent process above this relay" };
       // R2 P2-b: the nearest agent's comm, read with its start, must corroborate its full-width command line.
       const entry = table.get(agent.pid);
-      const comm = entry ? await commOf(run, agent.pid, entry.startedAt, timeoutMs) : null;
-      const profile = entry ? agreedProfileOf(entry.command, comm ?? undefined) : null;
+      const judge = entry ? await executableJudgeOf(run, agent.pid, entry.startedAt, timeoutMs) : null;
+      const profile = entry ? agreedProfileOf(entry.command, judge ?? undefined) : null;
       return profile === null ? { profile: null, why: "the command line and the executable name do not agree on one CLI" } : { profile };
     })(),
     timeoutMs,

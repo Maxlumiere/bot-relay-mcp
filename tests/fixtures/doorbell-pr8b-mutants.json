@@ -163,15 +163,15 @@
  {
   "name": "r2-command-judge-only",
   "file": "src/liveness.ts",
-  "find": "  return byCommand !== null && byCommand === byComm ? byCommand : null;",
+  "find": "  return profile.runtimeHosts.some((h) => h.toLowerCase() === base.toLowerCase()) ? byCommand : null;",
   "replace": "  return byCommand;",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
  },
  {
   "name": "r2-comm-judge-only",
   "file": "src/liveness.ts",
-  "find": "  return byCommand !== null && byCommand === byComm ? byCommand : null;",
-  "replace": "  return byComm;",
+  "find": "  if (!executable || !executable.trim()) return null;",
+  "replace": "  if (!executable || !executable.trim()) return null;\n  return observedProfileOf(command, executable);",
   "test": "tests/doorbell-pr8b-needs-human.test.ts"
  },
  {
