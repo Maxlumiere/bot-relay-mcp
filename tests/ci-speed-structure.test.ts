@@ -227,10 +227,13 @@ describe("ci.yml keeps the safety properties", () => {
     expect(J.test).toMatch(/node scripts\/ci-verdict\.mjs linux/);
     expect(J["ci-ok"]).toMatch(/node scripts\/ci-verdict\.mjs all/);
     const needs = (J["ci-ok"].match(/^    needs: \[([^\]]*)\]/m) ?? [])[1]?.split(",").map((s) => s.trim()).sort();
-    // Every job except ci-ok itself and the REPORT-ONLY jobs, which never gate (continue-on-error) and stay out of it.
+    // Every job except ci-ok itself, the REPORT-ONLY jobs (continue-on-error: they never gate), and the FLOATING
+    // latest-24 jobs (ruling 7fc79f57: a floating version never blocks a merge), each named here.
     const reportOnly = Object.keys(J).filter((k) => /^    continue-on-error: true$/m.test(J[k]));
     expect(reportOnly).toEqual(["quality-report"]);
-    expect(needs).toEqual(Object.keys(J).filter((k) => k !== "ci-ok" && !reportOnly.includes(k)).sort());
+    const floating = Object.keys(J).filter((k) => /^    name: [^\n]*latest, (?:nightly, )?not required\)$/m.test(J[k])).sort();
+    expect(floating).toEqual(["shard-latest", "test-latest", "timing-bars-latest"]);
+    expect(needs).toEqual(Object.keys(J).filter((k) => k !== "ci-ok" && !reportOnly.includes(k) && !floating.includes(k)).sort());
   });
   it("no scoped job can be skipped by a FAILED scope job (it fails safe and runs)", () => {
     for (const id of ["timing-bars", "test-windows", "test-macos"]) expect(J[id], id).toMatch(/needs\.changes\.result != 'success' \|\|/);
