@@ -136,25 +136,61 @@ describe("consumer 1: the hooks' relay_agent_pid (real processes)", () => {
     expect(found, `relay_agent_pid answered [${found}] for node parent ${parent}`).toBe(parent);
   });
   /** relay_agent_pid from the budget-SEAMED helpers (a budgetTree copy), run from a bash child of a node parent. */
-  function seamedWalk(env: Record<string, string>): { out: string; status: number | null; signal: string | null } {
+  function seamedWalk(env: Record<string, string>, opts: { edit?: (src: string) => string; script?: string } = {}): { out: string; err: string; status: number | null; signal: string | null } {
     const tree = fs.mkdtempSync(path.join(os.tmpdir(), "exe-walk-"));
     try {
       const hooks = budgetTree(path.join(tree, "t"), path.join(REPO, "hooks"), path.join(REPO, "bin"));
       const helper = path.join(hooks, "_vault-helpers.sh");
-      const r = spawnSync(process.execPath, ["-e", `process.stdout.write(require("child_process").execFileSync("bash", ["-c", '. "$1"; printf "%s|%s" "$(relay_agent_pid)" "$PPID"', "walk", ${JSON.stringify(helper)}], { encoding: "utf8", env: process.env }))`], { encoding: "utf8", env: { ...process.env, RELAY_TEST_CLOCK: "0", ...env }, timeout: 20_000 });
-      return { out: r.stdout ?? "", status: r.status, signal: r.signal };
+      if (opts.edit) fs.writeFileSync(helper, opts.edit(fs.readFileSync(helper, "utf-8")));
+      const script = opts.script ?? '. "$1"; printf "%s|%s" "$(relay_agent_pid)" "$PPID"';
+      // The bash child's stderr is passed through to the node parent's stderr, which this spawn captures.
+      const r = spawnSync(process.execPath, ["-e", `process.stdout.write(require("child_process").execFileSync("bash", ["-c", ${JSON.stringify(script)}, "walk", ${JSON.stringify(helper)}], { encoding: "utf8", env: process.env, stdio: ["ignore", "pipe", "inherit"] }))`], { encoding: "utf8", env: { ...process.env, RELAY_TEST_CLOCK: "0", ...env }, timeout: 20_000 });
+      return { out: r.stdout ?? "", err: r.stderr ?? "", status: r.status, signal: r.signal };
     } finally {
       fs.rmSync(tree, { recursive: true, force: true });
     }
   }
-  it.skipIf(process.platform === "win32")("Codex #470 R1: a STALLED readlink (a PATH wrapper) never blocks the walk past its budget", () => {
-    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "stall-readlink-"));
+  /** PATH wrappers for ps, readlink and env that COUNT their calls and then stall (a hostile or broken PATH). */
+  function stallingWrappers(): { bin: string; count: () => number } {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "stall-wrappers-"));
+    const log = path.join(bin, "calls");
+    for (const t of ["ps", "readlink", "env"]) fs.writeFileSync(path.join(bin, t), `#!/bin/sh\necho ${t} >> "${log}"\nsleep 30\n`, { mode: 0o755 });
+    return { bin, count: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf-8").split("\n").filter(Boolean).length : 0) };
+  }
+  it.skipIf(process.platform === "win32")("ruling 40431fc6 (3): STALLED PATH wrappers for ps/readlink/env are NEVER invoked by the walk or the start-time read (the fixed system binaries are), and the walk COMPLETES", () => {
+    const w = stallingWrappers();
     try {
-      fs.writeFileSync(path.join(bin, "readlink"), "#!/bin/sh\nsleep 30\n", { mode: 0o755 });
       const t0 = Date.now();
-      const r = seamedWalk({ PATH: `${bin}:${process.env.PATH ?? ""}` });
-      expect(r.signal, "the walk finished on its own (the harness did not have to kill it)").toBeNull();
-      expect(Date.now() - t0, "a hang guard only: well under the stalled readlink's 30 s").toBeLessThan(15_000);
+      const r = seamedWalk({ PATH: `${w.bin}:${process.env.PATH ?? ""}` }, { script: '. "$1"; a=$(relay_agent_pid); printf "%s|%s|%s" "$a" "$PPID" "$(relay_pid_start "$PPID")"' });
+      expect(r.signal, `the walk finished on its own: ${r.err}`).toBeNull();
+      expect(Date.now() - t0, "a hang guard only").toBeLessThan(15_000);
+      expect(w.count(), "no PATH wrapper was ever invoked").toBe(0);
+      const [found, parent, start] = r.out.split("|");
+      expect(found, `the walk completed and found its node parent: ${r.err}`).toBe(parent);
+      expect(start, "the start-time read completed through the system ps").toMatch(/ UTC$/);
+    } finally {
+      fs.rmSync(w.bin, { recursive: true, force: true });
+    }
+  }, 30_000);
+  it.skipIf(process.platform === "win32")("ruling 40431fc6 (3): NO qualifying system binary → the PATH binary, SUPERVISED (its own process group), plus ONE loud line", () => {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "nosys-ps-"));
+    try {
+      const log = path.join(bin, "pgids");
+      // The PATH ps records its process group (through the real system ps), then runs the real ps.
+      fs.writeFileSync(path.join(bin, "ps"), `#!/bin/sh\n/bin/ps -o pgid= -p $$ | tr -d ' ' >> "${log}"\nexec /bin/ps "$@"\n`, { mode: 0o755 });
+      const r = seamedWalk({ PATH: `${bin}:${process.env.PATH ?? ""}` }, {
+        edit: (src) => {
+          expect(src, "precondition: the fixed system-binary list").toMatch(/RELAY_SYS_PS_PATHS='[^']*'/);
+          return src.replace(/RELAY_SYS_PS_PATHS='[^']*'/, "RELAY_SYS_PS_PATHS='/nonexistent/ps'");
+        },
+        script: '. "$1"; a=$(relay_agent_pid); printf "%s|%s|%s" "$a" "$PPID" "$(/bin/ps -o pgid= -p $$ | tr -d " ")"',
+      });
+      const [found, parent, shellPgid] = r.out.split("|");
+      expect(found, r.err).toBe(parent);
+      const pgids = fs.readFileSync(log, "utf-8").split("\n").filter(Boolean);
+      expect(pgids.length, "the PATH ps was used").toBeGreaterThan(0);
+      expect(pgids.every((g) => g !== shellPgid), `every PATH ps ran in its own group (supervised): ${pgids.join(",")} vs the shell's ${shellPgid}`).toBe(true);
+      expect(r.err.split("\n").filter((l) => /relay hook: no system ps qualifies/.test(l)), `ONE loud line: ${r.err}`).toHaveLength(1);
     } finally {
       fs.rmSync(bin, { recursive: true, force: true });
     }
