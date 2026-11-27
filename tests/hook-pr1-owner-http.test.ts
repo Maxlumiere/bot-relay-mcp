@@ -794,10 +794,12 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopbac
     const d = await startOwnerDaemon(c, host);
     const rec = readRecord(c);
     expect(rec.host).toBe("127.0.0.1");
-    expect(rec.port, "the record names the peek listener, not the main one").not.toBe(d.port);
+    expect(distinctListener({ host: rec.host, port: rec.port }, { host, port: d.port }), "the record names the peek listener, not the main one").toBe(true);
+    // POSITIVELY: the record's (host, port) IS the peek door (door() reaches 127.0.0.1, the record's host): it serves the
+    // sealed peek, opened with the record's key.
     const r = await door(rec.port, rec.key, PEEK, { with_content: 5 });
-    expect(r.status, r.text).toBe(200);
-    expect(r.sealedOk).toBe(true);
+    expect(r.status, `the record's listener is the peek door\n${r.text}`).toBe(200);
+    expect(r.sealedOk, "its answer is sealed with the record's key").toBe(true);
     expect(r.text).toContain("pr1 peek-listener mail");
     if (host === LAN_V4) {
       const off = await fetch(`http://${LAN_V4}:${rec.port}${PEEK}`, { method: "POST", body: "{}" }).then((x) => x.status, () => "refused");
@@ -842,7 +844,8 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopbac
     seedWasmDb(c);
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    expect(readRecord(c).port).toBe(d.port);
+    const twin = readRecord(c);
+    expect(distinctListener({ host: twin.host, port: twin.port }, { host: "127.0.0.1", port: d.port }), "the record names the MAIN listener").toBe(false);
     await stopDaemon(d.child);
   }, 90_000);
 
@@ -852,7 +855,7 @@ describe("hook PR 1 (Q9): a main listener 127.0.0.1 cannot reach → the loopbac
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c, "127.0.0.1", { RELAY_HTTP_ALLOWED_HOSTS: "relay.example.internal" });
     const rec = readRecord(c);
-    expect(rec.port).not.toBe(d.port);
+    expect(distinctListener({ host: rec.host, port: rec.port }, { host: "127.0.0.1", port: d.port }), "the record names the peek listener").toBe(true);
     expect((await door(rec.port, rec.key, PEEK, {})).status).toBe(200);
     expect((await door(d.port, rec.key, PEEK, {})).status, "the main door is Host-checked").toBe(421);
     await stopDaemon(d.child);
@@ -1025,6 +1028,15 @@ async function runHook(c: Case, hook: string, extra: Record<string, string>, inp
   });
   const read = (f: string) => (fs.existsSync(f) ? fs.readFileSync(f, "utf-8") : "");
   return { status, out: `${stdout}\n${stderr}`, sqliteCalls: read(SQLITE_LOG).split("\n").filter(Boolean), argv: read(ARGV_LOG), env: read(ENV_LOG), removed: read(RM_CAPTURE), ms: Date.now() - t0 };
+}
+/**
+ * Is listener `a` a DIFFERENT listener from `b`? A listener is its (host, port) PAIR: the kernel may hand the same port
+ * NUMBER to listeners on different addresses, so the port alone never identifies one. A bracketed IPv6 literal is the
+ * same address as the bare one.
+ */
+export function distinctListener(a: { host: string; port: number }, b: { host: string; port: number }): boolean {
+  const addr = (h: string) => h.replace(/^\[(.*)\]$/, "$1").toLowerCase();
+  return addr(a.host) !== addr(b.host) || a.port !== b.port;
 }
 function fakeWhere(c: Case, line7: string, line8: string | null): string {
   const f = path.join(c.home, `where-${crypto.randomBytes(4).toString("hex")}.txt`);
@@ -1862,4 +1874,18 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("#433 Codex R1 (POSIX hooks): aliases, the de
     expect(old.requests(), "no exchange with the old daemon").toBe(0);
     expect(r.out).toMatch(/restart the relay daemon/);
   }, 120_000);
+});
+
+describe("a listener is identified by its (host, port) PAIR, never by the port number alone", () => {
+  // The kernel may hand the SAME port number to listeners on DIFFERENT addresses (a daemon on [::1]:P, its loopback
+  // peek listener on 127.0.0.1:P). Measured on CI once: a port-only check then reads two listeners as one.
+  it("[::1]:P and 127.0.0.1:P are TWO listeners (the forced same-number, different-address pair)", () => {
+    expect(distinctListener({ host: "127.0.0.1", port: 39915 }, { host: "::1", port: 39915 })).toBe(true);
+    expect(distinctListener({ host: "127.0.0.1", port: 39915 }, { host: "192.0.2.7", port: 39915 }), "the LAN-v4 twin").toBe(true);
+  });
+  it("the same address and port is ONE listener; a bracketed IPv6 literal is the same address; a different port is another", () => {
+    expect(distinctListener({ host: "127.0.0.1", port: 4000 }, { host: "127.0.0.1", port: 4000 })).toBe(false);
+    expect(distinctListener({ host: "[::1]", port: 4000 }, { host: "::1", port: 4000 })).toBe(false);
+    expect(distinctListener({ host: "127.0.0.1", port: 4000 }, { host: "127.0.0.1", port: 4001 })).toBe(true);
+  });
 });
