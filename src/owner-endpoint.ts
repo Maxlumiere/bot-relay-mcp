@@ -30,6 +30,7 @@ import { readDriverHeader } from "./db-header.js";
 import { processStartedAt, startOrNull } from "./liveness.js";
 import { restrictToOwnerWindows, privacyFaults, windowsForeignWriteSids } from "./fs-perms.js";
 import { sameFileIdentity } from "./file-identity.js";
+import { renameReplacingWithWindowsRetry } from "./fs-replace.js";
 
 /** v3 (#433): the AEAD door. A v1 or v2 record (an older daemon) is "old-record": restart the relay daemon. */
 export const OWNER_ENDPOINT_VERSION = 3;
@@ -148,7 +149,7 @@ export function writeOwnerEndpoint(dbPath: string, port: number, transport: Owne
     fs.writeSync(fd, JSON.stringify(record) + "\n");
     fs.fsyncSync(fd);
     fs.closeSync(fd);
-    fs.renameSync(tmp, file);
+    renameReplacingWithWindowsRetry(tmp, file); // Windows: a reader or scanner holding the record open (src/fs-replace.ts)
   } catch (err) {
     try {
       fs.closeSync(fd);

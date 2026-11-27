@@ -33,6 +33,16 @@
 # whole string.
 relay_whole_match() { [[ "$1" =~ $2 ]]; }
 
+# The resolution cache (RELAY_RES_*, exported so this process's $( ) subshells reuse it) is THIS process's own: one
+# inherited from a parent (another hook, another shell) is discarded when the helpers are first sourced here, and
+# re-resolved on demand. The marker is NOT exported, so a child process discards an inherited cache too; a second
+# source in this same process keeps this process's own resolution.
+if [ "${RELAY_RES_OWNER_PID:-}" != "$$" ]; then
+  unset RELAY_RES_LOADED RELAY_RES_KIND RELAY_RES_DB_PATH RELAY_RES_EXISTS RELAY_RES_REASON RELAY_RES_WARNING \
+    RELAY_RES_HOOK_DB RELAY_RES_OWNER_ENDPOINT RELAY_RES_INSTANCE_DIR RELAY_RES_LAYOUT_KNOWN
+  RELAY_RES_OWNER_PID=$$
+fi
+
 # relay_helpers_cli — the relay CLI beside these hooks (hooks/../bin/relay). A
 # function, not a top-level assignment: this file runs no top-level commands.
 # Inside a function, BASH_SOURCE[0] is the file that defines it (this one).
@@ -48,6 +58,8 @@ relay_helpers_cli() {
 #   RELAY_RES_EXISTS   true | false (empty on error)
 #   RELAY_RES_REASON   why, on error
 #   RELAY_RES_WARNING  the flat-fallback warning (RELAY_ALLOW_LEGACY_FALLBACK=1)
+#   RELAY_RES_INSTANCE_DIR  the instance directory the resolver's layout test finds for the DB ("" outside the layout)
+#   RELAY_RES_LAYOUT_KNOWN  1 when the answer carried that line (a 9-line answer); empty for an older relay CLI
 # Returns 0 when the resolver answered (the answer may be the error kind); 1
 # when it could not be asked (no node, no CLI, no time left, a timeout, no
 # answer), which is also recorded as the error kind with the reason. A path is
@@ -58,8 +70,8 @@ relay_helpers_cli() {
 # bounded by an explicit cap in seconds (the 2nd argument, from the caller's
 # relay_budget_for), or else by relay_budget_for here (the pre-mail budget).
 relay_where_load() {
-  local cli="${1:-$(relay_helpers_cli)}" cap="${2:-}" secs outf errf rc k="" d="" e="" why="" warn="" vault="" hookdb="" nlines=0 nrec=0
-  export RELAY_RES_LOADED=1 RELAY_RES_KIND=error RELAY_RES_DB_PATH="" RELAY_RES_EXISTS="" RELAY_RES_REASON="" RELAY_RES_WARNING="" RELAY_RES_HOOK_DB=""
+  local cli="${1:-$(relay_helpers_cli)}" cap="${2:-}" secs outf errf rc k="" d="" e="" why="" warn="" vault="" hookdb="" ownerep="" instdir="" nlines=0 nrec=0
+  export RELAY_RES_LOADED=1 RELAY_RES_KIND=error RELAY_RES_DB_PATH="" RELAY_RES_EXISTS="" RELAY_RES_REASON="" RELAY_RES_WARNING="" RELAY_RES_HOOK_DB="" RELAY_RES_INSTANCE_DIR="" RELAY_RES_LAYOUT_KNOWN=""
   if ! command -v node >/dev/null 2>&1; then
     export RELAY_RES_REASON="node not found (the relay CLI runs on node)"
     return 1
@@ -94,7 +106,7 @@ relay_where_load() {
   fi
   relay_run_pending "$secs" "$outf" "$errf" node "$cli" where --fields
   rc=$?
-  { IFS= read -r k; IFS= read -r d; IFS= read -r e; IFS= read -r why; IFS= read -r warn; IFS= read -r vault; IFS= read -r hookdb; IFS= read -r ownerep; } < "$outf"
+  { IFS= read -r k; IFS= read -r d; IFS= read -r e; IFS= read -r why; IFS= read -r warn; IFS= read -r vault; IFS= read -r hookdb; IFS= read -r ownerep; IFS= read -r instdir; } < "$outf"
   nlines=$(wc -l < "$outf" 2>/dev/null | tr -d ' ')
   # Codex #391 R1: an EXACT record: every field newline-terminated, nothing after the last one (wc -l counts newlines,
   # awk counts records, so an unterminated trailing field makes them differ).
@@ -110,15 +122,24 @@ relay_where_load() {
     export RELAY_RES_REASON="relay where gave an invalid answer (exit $rc: ${nrec:-0} fields, ${nlines:-0} newline-terminated)"
     return 1
   fi
-  # Hook PR 1: line 8 is the owner endpoint's URL when line 7 is "http", else empty: an EXACT count of 8. A 7- or
-  # 6-line answer is an older relay CLI than these hooks: the resolution stands, and the hooks read no DB (named skew).
+  # Hook PR 1: line 8 is the owner endpoint's URL when line 7 is "http", else empty. Line 9 is the instance directory
+  # (empty outside the layout): an EXACT count of 9. An 8-line answer reads as before, but the writers refuse (they
+  # need line 9; named skew). A 7- or 6-line answer is an older relay CLI: the resolution stands, and the hooks read no
+  # DB (named skew).
   export RELAY_RES_OWNER_ENDPOINT=""
   case "${nlines:-0}" in
+    9)
+      if relay_whole_match "$instdir" '[[:cntrl:]]'; then
+        export RELAY_RES_REASON="relay where gave an instance directory with a control character: refused"
+        return 1
+      fi
+      export RELAY_RES_HOOK_DB="$hookdb" RELAY_RES_OWNER_ENDPOINT="$ownerep" RELAY_RES_INSTANCE_DIR="$instdir" RELAY_RES_LAYOUT_KNOWN=1
+      ;;
     8) export RELAY_RES_HOOK_DB="$hookdb" RELAY_RES_OWNER_ENDPOINT="$ownerep" ;;
     7) export RELAY_RES_HOOK_DB="(7-line answer)" ;;
     6) export RELAY_RES_HOOK_DB="(6-line answer)" ;;
     *)
-      export RELAY_RES_REASON="relay where gave an incomplete answer (exit $rc, ${nlines:-0} of 8 lines)"
+      export RELAY_RES_REASON="relay where gave an incomplete answer (exit $rc, ${nlines:-0} of 9 lines)"
       return 1
       ;;
   esac
@@ -702,25 +723,22 @@ write_relay_spawn_manifest() {
     echo "[bot-relay hook] refusing to write manifest with malformed role \"$role\"" >&2
     return 1
   fi
+  # Load the resolver HERE, in this shell: its answer is exported, so the $( ) subshells below inherit it (loaded inside
+  # one of them, it would die with it, and the writer would see no instance-directory line).
+  [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
   local manifest_path
   manifest_path=$(resolve_relay_spawn_manifest_path "$name") || return 1
   local dir
   dir=$(dirname "$manifest_path")
-  mkdir -p "$dir" 2>/dev/null || true
-  chmod 0700 "$dir" 2>/dev/null || true
+  local manifest_db_path
+  manifest_db_path=$(resolve_relay_db_path) || return 1
+  # Re-verified at write time; the file goes under the directory it prints (the resolver's instance directory).
+  dir=$(relay_ensure_instance_subdir "$manifest_db_path" "$dir") || return 1
   local now
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  local tmp="${manifest_path}.tmp.$$"
-  {
-    umask 0177
-    printf 'name=%s\nrole=%s\nspawn_pid=%s\nspawned_at=%s\n' \
-      "$name" "$role" "$$" "$now" > "$tmp"
-  } || return 1
-  chmod 0600 "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$manifest_path" || {
-    rm -f "$tmp" 2>/dev/null
-    return 1
-  }
+  local body
+  body=$(printf 'name=%s\nrole=%s\nspawn_pid=%s\nspawned_at=%s\n_' "$name" "$role" "$$" "$now") # "_" keeps the last newline
+  relay_write_private_file "$dir" "$(basename "$manifest_path")" "${body%_}" || return 1
   return 0
 }
 
@@ -863,6 +881,122 @@ delete_relay_spawn_manifest() {
   return 0
 }
 
+# relay_ensure_instance_subdir <db_path> <dir> — RE-VERIFIED AT WRITE TIME (#442 review P2-2) under the ONE rule below
+# the relay home (every component real, for read AND write): the path was resolved earlier, and the instance may be
+# gone or replaced now. The layout is the RESOLVER's (`relay where --fields` line 9: RELAY_RES_INSTANCE_DIR, real paths
+# and case-folding), never a bash re-derivation, and so is the provisioned verdict (it parses instance.json; every
+# writer resolves first). At write time, for an instance in the layout: instances/ and instances/<id> must be real
+# directories (a link gets the relay's link refusal) and the record (instance.json) or relay.db a real file, never a
+# link. Then only the components of <dir> BELOW the instance (or, outside the layout, below the DB's existing
+# directory) are created, one at a time, mode 0700, never through a link: never `mkdir -p`. On success it prints the
+# directory to write into (under the resolver's instance directory) and returns 0; else 1 with one stderr line.
+relay_ensure_instance_subdir() {
+  local db_path="$1" dir="$2" base inst root rel cur part made
+  if [ "${RELAY_RES_LAYOUT_KNOWN:-}" != 1 ]; then
+    echo "[bot-relay hook] the relay CLI is older than these hooks (its \`relay where\` has no instance-directory line): update the relay. Nothing was written." >&2
+    return 1
+  fi
+  base=$(dirname "$db_path")
+  case "$dir" in
+    "$base"/*) rel="${dir#"$base"/}" ;;
+    *) echo "[bot-relay hook] refusing to write outside the relay DB's directory" >&2; return 1 ;;
+  esac
+  inst="${RELAY_RES_INSTANCE_DIR:-}"
+  if [ -n "$inst" ]; then
+    local instances_dir id
+    instances_dir=$(dirname "$inst")
+    id=$(basename "$inst")
+    if [ -L "$instances_dir" ]; then
+      echo "relay: the instance directory instances/ is a symbolic link, which is not allowed below the relay home. To keep the relay on other storage, move or link the WHOLE relay home (RELAY_HOME / ~/.bot-relay) instead." >&2
+      return 1
+    fi
+    if [ -L "$inst" ]; then
+      echo "relay: the instance directory instances/$id is a symbolic link, which is not allowed below the relay home. To keep the relay on other storage, move or link the WHOLE relay home (RELAY_HOME / ~/.bot-relay) instead." >&2
+      return 1
+    fi
+    if [ ! -d "$instances_dir" ] || [ ! -d "$inst" ] || ! { { [ -f "$inst/instance.json" ] && [ ! -L "$inst/instance.json" ]; } || { [ -f "$inst/relay.db" ] && [ ! -L "$inst/relay.db" ]; }; }; then
+      echo "[bot-relay hook] the relay instance \"$id\" is not provisioned (removed or never created): nothing written" >&2
+      return 1
+    fi
+    # BOUND to the resolution: the DB path's directory must BE the cached instance directory (both canonicalised the
+    # same way, through the real file system), so a cache naming one DB and another directory writes nothing.
+    local base_real inst_real
+    base_real=$(cd "$base" 2>/dev/null && pwd -P) || base_real=""
+    inst_real=$(cd "$inst" 2>/dev/null && pwd -P) || inst_real=""
+    if [ -z "$base_real" ] || [ "$base_real" != "$inst_real" ]; then
+      echo "[bot-relay hook] the resolved relay DB does not belong to the resolved instance directory: nothing written" >&2
+      return 1
+    fi
+    root="$inst"
+  else
+    # Outside the layout (the legacy flat home, an explicit DB elsewhere): no instance to re-create, but still no
+    # `mkdir -p`: the DB's directory must exist (the relay opened the DB there).
+    if [ ! -d "$base" ]; then
+      echo "[bot-relay hook] the relay DB's directory does not exist: nothing written" >&2
+      return 1
+    fi
+    root="$base"
+  fi
+  cur="$root"
+  # A read loop over the components (never word-splitting, so never a glob); "", "." and ".." are refused.
+  while IFS= read -r part; do
+    case "$part" in
+      ''|.|..) echo "[bot-relay hook] refusing a write path with an empty, '.' or '..' component" >&2; return 1 ;;
+    esac
+    cur="$cur/$part"
+    if [ -L "$cur" ]; then
+      echo "[bot-relay hook] refusing to write through a link in the instance directory ($part)" >&2
+      return 1
+    fi
+    made=""
+    if [ ! -d "$cur" ]; then
+      ( umask 077 && mkdir "$cur" ) 2>/dev/null || { echo "[bot-relay hook] could not create $part under the instance" >&2; return 1; }
+      made=1
+    fi
+    if [ -L "$cur" ] || [ ! -d "$cur" ]; then
+      echo "[bot-relay hook] refusing to write through a link in the instance directory ($part)" >&2
+      return 1
+    fi
+    if [ -n "$made" ] && ! chmod 0700 "$cur" 2>/dev/null; then
+      echo "[bot-relay hook] could not make $part private (mode 0700): nothing written" >&2
+      return 1
+    fi
+  done <<RELAY_PARTS
+$(printf '%s\n' "$rel" | tr '/' '\n')
+RELAY_PARTS
+  printf '%s\n' "$cur"
+  return 0
+}
+
+# relay_write_private_file <dir> <file> <content> — write <content> to <dir>/<file> atomically: a temp name is
+# generated, then CREATED AND WRITTEN in ONE redirection under `set -C` (noclobber: O_CREAT|O_EXCL, so a file or a
+# link planted at that name fails the create; any existing name is refused first), umask 077, inside the directory
+# already verified private; then a checked chmod 0600 and the rename over the target. 0, or 1 with one stderr line and
+# no temp file left. Residual (ADR-0036): a same-user process can still replace the file between the steps.
+relay_write_private_file() {
+  local dir="$1" file="$2" content="$3" tmp
+  tmp="$dir/.${file}.$$.${RANDOM}${RANDOM}"
+  if [ -e "$tmp" ] || [ -L "$tmp" ]; then
+    echo "[bot-relay hook] refusing: something already exists at the temp name for $file" >&2
+    return 1
+  fi
+  if ! ( set -C; umask 077; printf '%s' "$content" > "$tmp" ) 2>/dev/null; then
+    echo "[bot-relay hook] could not create a private temp file for $file (refused an existing name)" >&2
+    return 1
+  fi
+  if ! chmod 0600 "$tmp" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    echo "[bot-relay hook] could not make the temp file for $file private (mode 0600)" >&2
+    return 1
+  fi
+  mv -f "$tmp" "$dir/$file" 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null
+    echo "[bot-relay hook] could not put $file in place" >&2
+    return 1
+  }
+  return 0
+}
+
 # write_relay_token_to_vault <name> <token> — atomic tmp+rename, chmod
 # 0o600. Returns 0 on success; on bad shape / IO failure, stderr + return 1.
 write_relay_token_to_vault() {
@@ -872,23 +1006,19 @@ write_relay_token_to_vault() {
     echo "[bot-relay hook] refusing to write malformed token to vault for \"$name\"" >&2
     return 1
   fi
+  # Load the resolver HERE, in this shell (see write_relay_spawn_manifest).
+  [ "${RELAY_RES_LOADED:-}" = 1 ] || relay_where_load || true
   local token_path
   token_path=$(resolve_relay_token_path "$name") || return 1
   local dir
   dir=$(dirname "$token_path")
-  mkdir -p "$dir" 2>/dev/null || true
-  chmod 0700 "$dir" 2>/dev/null || true   # POSIX; no-op on Windows
-  # Atomic write: tmp file in same dir, chmod, rename.
-  local tmp="${token_path}.tmp.$$"
-  {
-    umask 0177  # restrict file to 0600 even before chmod
-    printf '%s\n' "$token" > "$tmp"
-  } || return 1
-  chmod 0600 "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$token_path" || {
-    rm -f "$tmp" 2>/dev/null
-    return 1
-  }
+  local vault_db_path
+  vault_db_path=$(resolve_relay_db_path) || return 1
+  # Re-verified at write time; the token goes under the directory it prints (the resolver's instance directory), through
+  # an exclusively created 0600 temp file renamed into place.
+  dir=$(relay_ensure_instance_subdir "$vault_db_path" "$dir") || return 1
+  relay_write_private_file "$dir" "$(basename "$token_path")" "$token
+" || return 1
   return 0
 }
 

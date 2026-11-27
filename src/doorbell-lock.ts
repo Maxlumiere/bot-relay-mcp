@@ -45,6 +45,7 @@ import path from "path";
 import Database from "better-sqlite3";
 import { ensurePrivateDir } from "./doorbell-log.js";
 import { isInClaimedFamily, readDriverHeader } from "./db-header.js";
+import { renameReplacingWithWindowsRetry } from "./fs-replace.js";
 
 export const LOCK_DB_FILENAME = "doorbell.lock.db";
 /** PR 7 (§v6, ruling ffcaf608 D2): a watch generation's lock file name (src/watch-wake.ts: watchLockFile). */
@@ -171,7 +172,7 @@ function writeHolderSidecar(stateDir: string, info: HolderInfo, holderFile: stri
     } finally {
       fs.closeSync(fd);
     }
-    fs.renameSync(tmp, path.join(stateDir, holderFile));
+    renameReplacingWithWindowsRetry(tmp, path.join(stateDir, holderFile)); // src/fs-replace.ts
   } catch {
     try {
       fs.unlinkSync(tmp); // ours: created exclusively above

@@ -7,6 +7,7 @@
 // The SELF-TEST (and its DRIFT labels, printed verbatim) is for the private canonical copy: never run it in a public context.
 // CALLERS: treat EVERY outcome except a scan-mode exit 0 with the output "PASS" as a refusal (exit 1, exit 2, a
 // signal, a timeout, a spawn failure, any other output).
+import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -19,8 +20,15 @@ import { fileURLToPath } from "node:url";
  * with a list that carries the canary (the quotes and commas keep normalisation from rejoining it).
  */
 export const CANARY = ["zq", "canary", "7f3e9a1d"].join("-");
-/** Optional, beside this file: "<label><TAB><path>" lines naming copies whose bytes must equal this file's. */
+/** Optional, beside this file: "<label><TAB><path>" lines naming copies whose bytes must equal this file's (the private
+ * canonical copy's DRIFT check; a public copy has none). */
 const COPIES_FILE = "copies.tsv";
+/**
+ * Beside a --list FILE: line 1 = the SHA-256 of the list as flattened when the CI secret was set. A FILE list is private
+ * by definition (the CI form is --list-env), so a --self-test with a FILE list ALWAYS checks it: privacy is decided by
+ * how the list arrives, never by a file that could silently disappear.
+ */
+const SECRET_HASH_FILE = "public-denylist.secret.sha256";
 /** The field labels a caller may pass: a CLOSED set, so a label can never carry derived (leaking) text. */
 export const FIELDS = new Set([
   "pr-title", "pr-body", "pr-comment", "pr-review", "commit-msg", "branch", "added-lines", "issue-title", "issue-body",
@@ -164,8 +172,105 @@ function loadList(args) {
   return terms;
 }
 
-/** The labels of listed copies whose bytes differ from this file's (absent copies count as drift). */
-export function copyDrift(here = fileURLToPath(import.meta.url)) {
+/**
+ * PRIVATE self-test: has the list drifted from the CI secret? The list is re-flattened exactly as the secret was
+ * (parseList's terms, joined by "\n", plus a final "\n") and its SHA-256 compared with line 1 of SECRET_HASH_FILE
+ * beside the --list file. A missing or unreadable hash file, or an environment list (no file to sit beside), is STALE.
+ * Never prints the hash, a term or a path.
+ */
+export function secretStale(terms, listPath) {
+  if (!listPath) return true;
+  let recorded;
+  try {
+    // The EXACT first line: only its line ending is stripped (a trailing space is a different line).
+    recorded = fs.readFileSync(path.join(path.dirname(fs.realpathSync(listPath)), SECRET_HASH_FILE), "utf-8").split(/\r?\n/)[0];
+  } catch {
+    return true;
+  }
+  const now = crypto.createHash("sha256").update(`${terms.join("\n")}\n`).digest("hex");
+  return recorded !== now;
+}
+
+/**
+ * git's environment is built from an ALLOWLIST, never inherited and patched: nothing else (GIT_ASKPASS, SSH_ASKPASS,
+ * GIT_SSH, a credential helper's variables, GIT_DIR, …) can reach it by construction. Prompts are off everywhere.
+ */
+function gitEnv() {
+  const env = { LANG: "C", LC_ALL: "C", GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: "ssh -o BatchMode=yes", GCM_INTERACTIVE: "never" };
+  const keep = ["PATH", "HOME", "TMPDIR"];
+  if (process.platform === "win32") keep.push("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "TEMP", "TMP");
+  for (const k of keep) if (typeof process.env[k] === "string") env[k] = process.env[k];
+  return env;
+}
+/** git's own timeout for a fetch (milliseconds); LEAK_SCAN_GIT_TIMEOUT_MS may only SHORTEN it (a test hook). */
+const FETCH_TIMEOUT_MS = Math.min(120_000, Number(process.env.LEAK_SCAN_GIT_TIMEOUT_MS) > 0 ? Number(process.env.LEAK_SCAN_GIT_TIMEOUT_MS) : 120_000);
+
+/**
+ * Run git, bounded: in its OWN process group (POSIX), so a timeout kills and reaps the WHOLE group (an ssh or a
+ * credential helper it started can never survive it). Resolves { code, stdout, stderr, timedOut, spawnError }.
+ */
+function runGit(args, timeoutMs) {
+  return new Promise((resolve) => {
+    const p = spawn("git", args, { env: gitEnv(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+    const out = [];
+    let err = "";
+    let timedOut = false;
+    let spawnError = null;
+    p.stdout.on("data", (d) => out.push(d));
+    p.stderr.on("data", (d) => (err += d.toString()));
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        if (process.platform !== "win32" && p.pid) process.kill(-p.pid, "SIGKILL");
+        else p.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }, timeoutMs);
+    p.on("error", (e) => (spawnError = e));
+    p.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout: Buffer.concat(out), stderr: err, timedOut, spawnError });
+    });
+  });
+}
+/** The private ref the published main is fetched into (fully qualified: no ref-name ambiguity, no refspec dependence). */
+const PUBLISHED_REF = "refs/leak-scan/published-main";
+/**
+ * The fetch's hardening: no inherited credential helper (the copies live in PUBLIC repos), no interactive ssh, no
+ * submodule recursion, no tags, no FETCH_HEAD; main is fetched EXPLICITLY (a narrowed refspec or a single-branch
+ * checkout cannot leave a stale origin/main standing in for it).
+ */
+const FETCH_ARGS = [
+  "-c", "credential.helper=", "-c", "protocol.ext.allow=never",
+  "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", "origin", `+refs/heads/main:${PUBLISHED_REF}`,
+];
+/**
+ * The PUBLISHED bytes of a copy that lives in a git repo: `git fetch`, then `git show origin/main:<path>` (never the
+ * working tree: a local checkout may be a deploy tree, deliberately behind). Returns undefined when the copy is not
+ * in a git repo (its file is read instead), null when origin/main does not hold it (drift). A fetch that fails is
+ * CannotEvaluate: an unverifiable copy never passes.
+ */
+async function publishedBytes(target) {
+  const dir = path.dirname(target);
+  if (!fs.existsSync(dir)) return null; // the copy's directory is absent: drift
+  const found = await runGit(["-C", dir, "rev-parse", "--show-toplevel"], 30_000);
+  if (found.code !== 0) {
+    // Only a CONFIRMED non-repository is read from disk; any other discovery failure (no git, a timeout, a broken
+    // repo) cannot be told apart from a stale published copy, so it cannot evaluate.
+    if (!found.spawnError && !found.timedOut && found.code === 128 && /not a git repository/i.test(found.stderr)) return undefined;
+    throw new CannotEvaluate("a copy's repository could not be determined");
+  }
+  const root = found.stdout.toString("utf-8").trim();
+  const fetched = await runGit(["-C", root, ...FETCH_ARGS], FETCH_TIMEOUT_MS);
+  if (fetched.code !== 0) throw new CannotEvaluate("a copy's published branch could not be fetched");
+  const rel = path.relative(fs.realpathSync(root), path.join(fs.realpathSync(dir), path.basename(target))).split(path.sep).join("/");
+  const shown = await runGit(["-C", root, "show", `${PUBLISHED_REF}:${rel}`], 30_000);
+  return shown.code === 0 ? shown.stdout : null; // absent from the published main → null (drift)
+}
+
+/** The labels of listed copies whose PUBLISHED bytes differ from this file's (absent copies count as drift). */
+export async function copyDrift(here = fileURLToPath(import.meta.url)) {
   let listing;
   try {
     listing = fs.readFileSync(path.join(path.dirname(here), COPIES_FILE), "utf-8");
@@ -181,10 +286,15 @@ export function copyDrift(here = fileURLToPath(import.meta.url)) {
     if (!label || !p) continue;
     const target = p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
     let theirs = null;
-    try {
-      theirs = crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex");
-    } catch {
-      /* absent: drift */
+    const published = await publishedBytes(target);
+    if (published === undefined) {
+      try {
+        theirs = crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex");
+      } catch {
+        /* absent: drift */
+      }
+    } else if (published !== null) {
+      theirs = crypto.createHash("sha256").update(published).digest("hex");
     }
     if (theirs !== mine) drift.push(label);
   }
@@ -207,18 +317,25 @@ function parseArgs(argv) {
   return a;
 }
 
-function main() {
+async function main() {
   try {
     const args = parseArgs(process.argv.slice(2));
     const terms = loadList(args);
     if (args.selfTest) {
       if (findTerms(`a canary ${CANARY} here`, terms).length === 0) throw new CannotEvaluate("the canary did not go red");
-      const drift = copyDrift();
+      // PRIVATE checks: a FILE list (never CI's --list-env) checks the secret's hash; a copies file checks the copies.
+      let failed = false;
+      if (args.list && secretStale(terms, args.list)) {
+        process.stdout.write("SECRET STALE: re-flatten and re-set PUBLIC_DENYLIST\n");
+        failed = true;
+      }
+      const drift = await copyDrift();
       for (const label of drift) process.stdout.write(`DRIFT: ${label}\n`);
       if (drift.length > 0) {
         process.stderr.write(`public-leak-scan: ${drift.length} cop${drift.length === 1 ? "y differs" : "ies differ"} from this file; re-run the sync script\n`);
-        return 2;
+        failed = true;
       }
+      if (failed) return 2;
       process.stdout.write("self-test: PASS\n");
       return 0;
     }
@@ -238,4 +355,4 @@ function main() {
   }
 }
 
-process.exitCode = main();
+process.exitCode = await main();
