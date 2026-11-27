@@ -168,6 +168,59 @@ describe("consumer 1: the hooks' relay_agent_pid (real processes)", () => {
     expect(Number(fs.readFileSync(count, "utf-8").trim()), "precondition: the walk reached a starved lookup").toBeGreaterThan(2);
     expect(found, "a cut walk returns no pid").toBe("");
   });
+  /**
+   * relay_run_streamed's deadline (ruling 231a8b8f): the budgeted step runs as its own PROCESS-GROUP leader, and the
+   * GROUP is killed at the deadline and right after the step exits, so a forking wrapper's children cannot hold the
+   * command substitution's pipe past the budget. Each row: `$(relay_run_streamed 1 <wrapper>)` from the real helpers.
+   */
+  function streamedRun(wrapperBody: string, env: Record<string, string> = {}): { ms: number; signal: string | null; out: string; err: string } {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "streamed-"));
+    try {
+      fs.writeFileSync(path.join(bin, "fakecmd"), `#!/bin/sh\n${wrapperBody}\n`, { mode: 0o755 });
+      const helper = path.join(REPO, "hooks", "_vault-helpers.sh");
+      const t0 = Date.now();
+      const r = spawnSync("/bin/bash", ["-c", '. "$1"; out=$(relay_run_streamed 1 fakecmd); printf "rc=%s out=%s" "$?" "$out"', "run", helper], { encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, ...env }, timeout: 25_000 });
+      return { ms: Date.now() - t0, signal: r.signal, out: r.stdout ?? "", err: r.stderr ?? "" };
+    } finally {
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  }
+  it.skipIf(process.platform === "win32")("ruling 231a8b8f (1): a FORKING wrapper (its child holds the pipe) → the 1 s deadline holds", () => {
+    const r = streamedRun("sleep 30 &\nwait");
+    expect(r.signal, "finished on its own").toBeNull();
+    expect(r.out).toMatch(/^rc=124 /);
+    expect(r.ms, "a hang guard only: well under the wrapper's 30 s").toBeLessThan(10_000);
+  }, 30_000);
+  it.skipIf(process.platform === "win32")("ruling 231a8b8f (2): a wrapper that BACKGROUNDS a sleeper and EXITS → no hang (the finished step's strays are killed)", () => {
+    const r = streamedRun("sleep 30 &\necho done\nexit 0");
+    expect(r.signal, "finished on its own").toBeNull();
+    expect(r.out).toBe("rc=0 out=done");
+    expect(r.ms, "a hang guard only").toBeLessThan(10_000);
+  }, 30_000);
+  it.skipIf(process.platform === "win32")("ruling 231a8b8f (3): perl ABSENT → ONE loud line, and the old direct-child bound is kept (a non-forking stall is still cut)", () => {
+    // A PATH holding only what the helper and the row need, without perl.
+    const tools = fs.mkdtempSync(path.join(os.tmpdir(), "noperl-"));
+    try {
+      for (const t of ["sh", "sleep", "cat", "grep", "sed", "tr", "uname", "head", "date"]) {
+        const real = spawnSync("/bin/sh", ["-c", `command -v ${t}`], { encoding: "utf8" }).stdout.trim();
+        if (real) fs.symlinkSync(real, path.join(tools, t));
+      }
+      const r2 = (() => {
+        const bin = fs.mkdtempSync(path.join(os.tmpdir(), "streamed-np-"));
+        fs.writeFileSync(path.join(bin, "fakecmd"), "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
+        const t0 = Date.now();
+        const x = spawnSync("/bin/bash", ["-c", '. "$1"; out=$(relay_run_streamed 1 fakecmd); printf "rc=%s" "$?"', "run", path.join(REPO, "hooks", "_vault-helpers.sh")], { encoding: "utf8", env: { HOME: process.env.HOME ?? "", PATH: `${bin}:${tools}` }, timeout: 25_000 });
+        fs.rmSync(bin, { recursive: true, force: true });
+        return { ms: Date.now() - t0, signal: x.signal, out: x.stdout ?? "", err: x.stderr ?? "" };
+      })();
+      expect(r2.signal).toBeNull();
+      expect(r2.out).toBe("rc=124");
+      expect(r2.ms).toBeLessThan(10_000);
+      expect(r2.err.split("\n").filter((l) => /step budget covers the direct child only: perl not found/.test(l)), "ONE loud line").toHaveLength(1);
+    } finally {
+      fs.rmSync(tools, { recursive: true, force: true });
+    }
+  }, 30_000);
   it.skipIf(process.platform !== "linux")("MEASURED, report only (ruling Q2): the cost of reading /proc/<pid>/exe for EVERY row of a real process table", () => {
     const t0 = performance.now();
     const table = buildProcessTable();
