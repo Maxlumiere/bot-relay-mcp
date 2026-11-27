@@ -289,7 +289,7 @@ describe("classifyProcess (D3 + D9)", () => {
         const table = realSystemDeps.processTable();
         const e = table.get(pid);
         if (e && e.command.includes("index.js")) {
-          return { pid, ppid: e.ppid, start: e.startedAt, command: e.command, comm: e.comm, cwd: realSystemDeps.cwds([pid]).get(pid) ?? null, argv: null };
+          return { pid, ppid: e.ppid, start: e.startedAt, command: e.command, comm: e.comm, exe: e.exe, /* the kernel's executable, as toProcessViews carries it (Linux Node 24: comm reads MainThread) */ cwd: realSystemDeps.cwds([pid]).get(pid) ?? null, argv: null };
         }
         spawnSync("sleep", ["0.1"]);
       }
