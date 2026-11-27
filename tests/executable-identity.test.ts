@@ -16,12 +16,14 @@
  */
 import { describe, it, expect } from "vitest";
 import fs from "fs";
+import os from "os";
 import path from "path";
-import { execFileSync } from "child_process";
+import { execFileSync, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { executableIdentity, isRuntimeThreadName } from "../src/proc-exe.js";
 import { buildProcessTable, findAgentProcess, agreedProfileOf, executableJudgeOf } from "../src/liveness.js";
 import { classifyProcess } from "../src/fleet-verdicts.js";
+import { budgetTree } from "./_helpers/hook-budget-tree.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const START = "Mon Nov 24 10:00:00 2026";
@@ -132,6 +134,39 @@ describe("consumer 1: the hooks' relay_agent_pid (real processes)", () => {
     const out = execFileSync(process.execPath, ["-e", `process.stdout.write(require("child_process").execFileSync("bash", ["-c", '. "$1"; printf "%s|%s" "$(relay_agent_pid)" "$PPID"', "walk", ${JSON.stringify(helper)}], { encoding: "utf8" }))`], { encoding: "utf8" });
     const [found, parent] = out.split("|");
     expect(found, `relay_agent_pid answered [${found}] for node parent ${parent}`).toBe(parent);
+  });
+  /** relay_agent_pid from the budget-SEAMED helpers (a budgetTree copy), run from a bash child of a node parent. */
+  function seamedWalk(env: Record<string, string>): { out: string; status: number | null; signal: string | null } {
+    const tree = fs.mkdtempSync(path.join(os.tmpdir(), "exe-walk-"));
+    try {
+      const hooks = budgetTree(path.join(tree, "t"), path.join(REPO, "hooks"), path.join(REPO, "bin"));
+      const helper = path.join(hooks, "_vault-helpers.sh");
+      const r = spawnSync(process.execPath, ["-e", `process.stdout.write(require("child_process").execFileSync("bash", ["-c", '. "$1"; printf "%s|%s" "$(relay_agent_pid)" "$PPID"', "walk", ${JSON.stringify(helper)}], { encoding: "utf8", env: process.env }))`], { encoding: "utf8", env: { ...process.env, RELAY_TEST_CLOCK: "0", ...env }, timeout: 20_000 });
+      return { out: r.stdout ?? "", status: r.status, signal: r.signal };
+    } finally {
+      fs.rmSync(tree, { recursive: true, force: true });
+    }
+  }
+  it.skipIf(process.platform === "win32")("Codex #470 R1: a STALLED readlink (a PATH wrapper) never blocks the walk past its budget", () => {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "stall-readlink-"));
+    try {
+      fs.writeFileSync(path.join(bin, "readlink"), "#!/bin/sh\nsleep 30\n", { mode: 0o755 });
+      const t0 = Date.now();
+      const r = seamedWalk({ PATH: `${bin}:${process.env.PATH ?? ""}` });
+      expect(r.signal, "the walk finished on its own (the harness did not have to kill it)").toBeNull();
+      expect(Date.now() - t0, "a hang guard only: well under the stalled readlink's 30 s").toBeLessThan(15_000);
+    } finally {
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  }, 30_000);
+  it.skipIf(process.platform === "win32")("Codex #470 R1: the budget EXPIRES mid-walk (after the agent's comm matched) → NO pid, never one whose command line was not read", () => {
+    const count = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "starve-count-")), "n");
+    // Lookups 1-2 run (this shell's ppid, then the node parent's comm, which matches); every later lookup is starved.
+    const r = seamedWalk({ RELAY_TEST_STARVE: "a process lookup*", RELAY_TEST_STARVE_AFTER: "2", RELAY_TEST_STARVE_COUNT: count });
+    const [found] = r.out.split("|");
+    expect(r.status, r.out).toBe(0);
+    expect(Number(fs.readFileSync(count, "utf-8").trim()), "precondition: the walk reached a starved lookup").toBeGreaterThan(2);
+    expect(found, "a cut walk returns no pid").toBe("");
   });
   it.skipIf(process.platform !== "linux")("MEASURED, report only (ruling Q2): the cost of reading /proc/<pid>/exe for EVERY row of a real process table", () => {
     const t0 = performance.now();
