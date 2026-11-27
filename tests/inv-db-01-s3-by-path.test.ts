@@ -645,6 +645,57 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     fs.rmdirSync(staged);
   }, 60_000);
 
+  it("ruling e3ed38e3 (a): the POST-SWAP lstat THROWS (EIO) → the SAME loud refusal as a mismatch: the swap happened, the safety backup named, no rollback, the fs error attached", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const realRename = fs.renameSync;
+    const realLstat = fs.lstatSync;
+    let swapped = false;
+    const rn = vi.spyOn(fs, "renameSync").mockImplementation(((a: fs.PathLike, b: fs.PathLike) => {
+      realRename(a, b);
+      if (isStaging(String(a)) && String(b) === dbPath) swapped = true;
+    }) as typeof fs.renameSync);
+    const ls = vi.spyOn(fs, "lstatSync").mockImplementation(((p: fs.PathLike, o?: unknown) => {
+      if (swapped && String(p) === dbPath) throw Object.assign(new Error("EIO: i/o error, lstat (injected)"), { code: "EIO" });
+      return (realLstat as (...a: unknown[]) => unknown)(p, o);
+    }) as typeof fs.lstatSync);
+    try {
+      await expect(importRelayState(archive, { force: true })).rejects.toThrow(/after the swap[\s\S]*rolled back[\s\S]*safety backup at \S+[\s\S]*EIO/);
+    } finally {
+      rn.mockRestore();
+      ls.mockRestore();
+    }
+    expect(swapped, "precondition: the swap happened").toBe(true);
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")("ruling e3ed38e3 (b): the staging COPY fails after its create (ENOSPC) AND the cleanup fails (a directory at the name) → the copy's error carries the cleanup failure and the leftover path", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const realCopy = fs.copyFileSync;
+    let leftover = "";
+    const cp = vi.spyOn(fs, "copyFileSync").mockImplementation(((src: fs.PathLike, dst: fs.PathLike, mode?: number) => {
+      if (isStaging(String(dst))) {
+        leftover = String(dst);
+        fs.mkdirSync(dst); // what the copy left at the name cannot be unlinked (EPERM / EISDIR)
+        throw Object.assign(new Error("ENOSPC: no space left on device, copyfile (injected)"), { code: "ENOSPC" });
+      }
+      return realCopy(src, dst, mode);
+    }) as typeof fs.copyFileSync);
+    let msg = "";
+    try {
+      await importRelayState(archive, { force: true });
+    } catch (err) {
+      msg = (err as Error).message;
+    } finally {
+      cp.mockRestore();
+    }
+    expect(leftover, "precondition: the staging copy was attempted").not.toBe("");
+    expect(msg, "the copy's own error stays primary").toMatch(/^ENOSPC/);
+    expect(msg, "the leftover path is named").toContain(leftover);
+    expect(msg).toMatch(/left behind/);
+    fs.rmdirSync(leftover);
+  }, 60_000);
+
   it("review R2 P3: a failed lstat of the staged copy (EIO) never strands it: the whole post-create lifetime is covered", async () => {
     makeDb(dbPath, 0, ["row-1"]);
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
