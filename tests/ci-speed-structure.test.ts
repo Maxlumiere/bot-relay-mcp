@@ -138,7 +138,14 @@ describe("the aggregate verdicts check every skip against the Scope", () => {
 
 describe("ci.yml keeps the safety properties", () => {
   it("the three REQUIRED checks keep their exact names", () => {
-    const names = Object.values(J).map(nameOf);
+    // A matrix job's check runs are named per leg (`Node ${{ matrix.node }}` → `Node 22`, `Node 24.13.0`): each
+    // leg's expanded name counts, so a required name kept by the 22 leg needs no branch-protection change.
+    const names = Object.values(J).flatMap((body) => {
+      const n = nameOf(body);
+      if (!n.includes("${{ matrix.node }}")) return [n];
+      const legs = [...body.matchAll(/'(\d+(?:\.\d+)*)'/g)].map((m) => m[1]!).filter((v) => /^\d+(\.\d+){0,2}$/.test(v));
+      return legs.map((leg) => n.replace("${{ matrix.node }}", leg));
+    });
     for (const n of ["Test (Node 22)", "25-tool smoke (Node 22)", "Test (macOS — launchd side-effect guard)"]) expect(names, n).toContain(n);
   });
   it("the smoke no longer waits for the tests, and skips the gate's suite steps ONLY on pull requests", () => {
@@ -164,20 +171,52 @@ describe("ci.yml keeps the safety properties", () => {
     expect(J.shard).toMatch(/--outputFile\.json=\.vitest-shard\/shard-\$\{\{ matrix\.shard \}\}\.json/);
     // vitest 5's blob reporter writes .vitest/blob/.
     expect(J.shard).toMatch(/^\s+\.vitest\/blob\/$/m);
-    // EVERY Node in the matrix (22 and 24: the live daemon runs 24) has its OWN artifacts, its OWN parity check and
-    // its OWN merge: each Node's shards must be the whole suite on their own, never mixed with the other's.
-    const nodes = (J.shard.match(/node: \[([^\]]*)\]/) ?? [])[1]?.split(",").map((s) => s.trim().replace(/'/g, ""));
-    // 22; 24.13.0, EXACTLY the live daemon's Node; the latest 24.
-    expect(nodes).toEqual(expect.arrayContaining(["22", "24.13.0", "24"]));
+    // The REQUIRED legs (rulings 617c5d69, 7fc79f57): 22 and 24.13.0, EXACTLY the live daemon's Node. Each has its OWN
+    // artifacts, parity check and merge in the required job (never mixed with another leg's).
+    const legsOf = (job: string) => (J[job]!.match(/node: \[([^\]]*)\]/) ?? [])[1]?.split(",").map((s) => s.trim().replace(/'/g, ""));
+    expect(legsOf("shard")).toEqual(["22", "24.13.0"]);
     expect(J.shard).toMatch(/name: vitest-shard-node\$\{\{ matrix\.node \}\}-\$\{\{ matrix\.shard \}\}/);
-    for (const n0 of nodes ?? []) {
-      const n = n0.replace(/\./g, "\\.");
-      expect(J.test, `Node ${n}: its own download`).toMatch(new RegExp(`pattern: vitest-shard-node${n}-\\*\\n\\s+path: node${n}\\n`));
-      expect(J.test, `Node ${n}: its own parity check`).toMatch(new RegExp(`node scripts/ci-shard-parity\\.mjs 4 node${n}/\\.vitest-shard`));
-      expect(J.test, `Node ${n}: its own merge`).toMatch(new RegExp(`npx vitest --merge-reports=node${n}/\\.vitest/blob --reporter=default`));
+    const aggregateCovers = (job: string, legs: string[]) => {
+      for (const n0 of legs) {
+        const n = n0.replace(/\./g, "\\.");
+        expect(J[job], `${job}, Node ${n0}: its own download`).toMatch(new RegExp(`pattern: vitest-shard-node${n}-\\*\\n\\s+path: node${n}\\n`));
+        expect(J[job], `${job}, Node ${n0}: its own parity check`).toMatch(new RegExp(`node scripts/ci-shard-parity\\.mjs 4 node${n}/\\.vitest-shard`));
+        expect(J[job], `${job}, Node ${n0}: its own merge`).toMatch(new RegExp(`npx vitest --merge-reports=node${n}/\\.vitest/blob --reporter=default`));
+      }
+    };
+    aggregateCovers("test", ["22", "24.13.0"]);
+    // The FLOATING latest 24 (check-latest) runs the same 4 shards in its OWN jobs, with its own parity and merge:
+    // never in a required job's needs (a floating version must never block a merge), nor in ci-ok's.
+    expect(J["shard-latest"]).toMatch(/node-version: '24'\n\s+check-latest: true/);
+    expect(J["shard-latest"]).toMatch(/--shard=\$\{\{ matrix\.shard \}\}\/4 /);
+    expect(J["shard-latest"]).toMatch(/name: vitest-shard-node24-\$\{\{ matrix\.shard \}\}/);
+    aggregateCovers("test-latest", ["24"]);
+    // The timing bars: 22 + 24.13.0 on every run (required through the required job's needs); the latest 24 on the
+    // NIGHTLY only, in its own job.
+    expect(legsOf("timing-bars")).toEqual(["22", "24.13.0"]);
+    expect(J["timing-bars"]).toMatch(/name: Timing bars \(Node \$\{\{ matrix\.node \}\}\)/);
+    expect(J["timing-bars-latest"]).toMatch(/if: github\.event_name == 'schedule'/);
+    expect(J["timing-bars-latest"]).toMatch(/node-version: '24'\n\s+check-latest: true/);
+    // The smoke: 22 + 24.13.0, and GitHub itself blocks on it: it is in the required job's needs, and the Linux
+    // verdict requires it. The checks stay 22-only.
+    expect(legsOf("smoke")).toEqual(["22", "24.13.0"]);
+    expect(J.checks).toMatch(/node-version: '22'/);
+    const needsOf = (job: string) => (J[job]!.match(/^    needs: \[([^\]]*)\]/m) ?? [])[1]?.split(",").map((s) => s.trim()) ?? [];
+    expect(needsOf("test")).toEqual(expect.arrayContaining(["shard", "checks", "timing-bars", "smoke"]));
+    for (const floating of ["shard-latest", "test-latest", "timing-bars-latest"]) {
+      expect(needsOf("test"), `${floating} never in the required job's needs`).not.toContain(floating);
+      expect(needsOf("ci-ok"), `${floating} never in ci-ok's needs`).not.toContain(floating);
     }
     // The required job's name still says Node 22 (branch protection names it): its run summary says what it covers.
-    expect(J.test).toMatch(/covers Node 22, 24\.13\.0 and the latest 24\." >> "\$GITHUB_STEP_SUMMARY"/);
+    expect(J.test).toMatch(/covers Node 22 and 24\.13\.0 \(the latest 24 runs in its own, non-required jobs\)\." >> "\$GITHUB_STEP_SUMMARY"/);
+  });
+  it("the Linux verdict (the required job) requires the smoke: a failed or missing smoke fails it", async () => {
+    const { verdict } = (await import("../scripts/ci-verdict.mjs")) as { verdict: (n: Record<string, { result: string; outputs?: Record<string, string> }>, w: string) => { ok: boolean; problems: string[] } };
+    const ok = { result: "success" };
+    const base = { changes: { result: "success", outputs: { full: "true" } }, shard: ok, checks: ok, "timing-bars": ok };
+    expect(verdict({ ...base, smoke: ok }, "linux").ok).toBe(true);
+    expect(verdict({ ...base, smoke: { result: "failure" } }, "linux").problems).toEqual([expect.stringMatching(/^smoke=failure/)]);
+    expect(verdict(base, "linux").problems).toEqual([expect.stringMatching(/^smoke=missing/)]);
   });
   it("a READY pull request cancels its superseded run; drafts, main and nightly never cancel", () => {
     expect(CI).toMatch(/cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' && !github\.event\.pull_request\.draft \}\}/);
@@ -188,10 +227,13 @@ describe("ci.yml keeps the safety properties", () => {
     expect(J.test).toMatch(/node scripts\/ci-verdict\.mjs linux/);
     expect(J["ci-ok"]).toMatch(/node scripts\/ci-verdict\.mjs all/);
     const needs = (J["ci-ok"].match(/^    needs: \[([^\]]*)\]/m) ?? [])[1]?.split(",").map((s) => s.trim()).sort();
-    // Every job except ci-ok itself and the REPORT-ONLY jobs, which never gate (continue-on-error) and stay out of it.
+    // Every job except ci-ok itself, the REPORT-ONLY jobs (continue-on-error: they never gate), and the FLOATING
+    // latest-24 jobs (ruling 7fc79f57: a floating version never blocks a merge), each named here.
     const reportOnly = Object.keys(J).filter((k) => /^    continue-on-error: true$/m.test(J[k]));
     expect(reportOnly).toEqual(["quality-report"]);
-    expect(needs).toEqual(Object.keys(J).filter((k) => k !== "ci-ok" && !reportOnly.includes(k)).sort());
+    const floating = Object.keys(J).filter((k) => /^    name: [^\n]*latest, (?:nightly, )?not required\)$/m.test(J[k])).sort();
+    expect(floating).toEqual(["shard-latest", "test-latest", "timing-bars-latest"]);
+    expect(needs).toEqual(Object.keys(J).filter((k) => k !== "ci-ok" && !reportOnly.includes(k) && !floating.includes(k)).sort());
   });
   it("no scoped job can be skipped by a FAILED scope job (it fails safe and runs)", () => {
     for (const id of ["timing-bars", "test-windows", "test-macos"]) expect(J[id], id).toMatch(/needs\.changes\.result != 'success' \|\|/);
