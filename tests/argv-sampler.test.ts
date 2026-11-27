@@ -92,18 +92,20 @@ describe.skipIf(WIN)("the argv sampler", () => {
     expect(s.failures[0]).toMatch(/could not spawn/);
   }, 10_000);
 
-  it("a hold that misses its deadline resolves FALSE, and a sample that STARTED inside it but COMPLETED after the release never counts", async () => {
-    // Each observation takes ~700 ms. The hold opens during sample 1 (t≈100 ms) with a 1 s deadline; sample 2 STARTS
-    // inside the hold (t≈710 ms) and COMPLETES after the release (t≈1410 > 1100 ms).
-    const s = startArgvSampler("SECRET", W, { gapMs: 10, ps: sh(`sleep 0.7; echo "  42 target ${W}"`) });
+  it.each([["0.7"], ["1.5"]])("a hold that misses its deadline resolves FALSE, and a sample that STARTED inside it but COMPLETED after the release never counts (each observation %s s: a loaded runner is slower)", async (secs) => {
+    // Each observation takes `secs`. The hold opens during sample 1 (t≈100 ms) with a 1 s deadline; sample 2 STARTS
+    // inside the hold or after it, and COMPLETES after the release (> 1100 ms).
+    const s = startArgvSampler("SECRET", W, { gapMs: 10, ps: sh(`sleep ${secs}; echo "  42 target ${W}"`) });
     await new Promise((r) => setTimeout(r, 100));
     const ok = await s.waitForSamples(1, 1_000);
-    await new Promise((r) => setTimeout(r, 700));
+    // The precondition (two samples COMPLETED) is waited for by COUNT, never by a fixed sleep: a loaded runner completes
+    // fewer samples in the same wall time (the fixed 700 ms made this row read the runner's speed). 8 s: a hang guard.
+    for (const end = Date.now() + 8_000; Date.now() < end && s.sampled < 2; ) await new Promise((r) => setTimeout(r, 20));
     await s.stop();
     expect(ok).toBe(false);
     expect(s.sampled, "both samples did complete").toBeGreaterThanOrEqual(2);
     expect(s.heldSamples, "sample 2 completed after the release: not held").toBe(0);
-  }, 10_000);
+  }, 20_000);
 
   it("a hold is satisfied only by WITNESSING samples that started inside it and completed while it was held", async () => {
     const s = startArgvSampler("SECRET", W, { gapMs: 10, ps: sh(`echo "  42 target ${W}"; echo "  43 has-SECRET-inside"`) });
@@ -182,6 +184,7 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
       "  const seq = line.trim();",
       "  if (mode === \"stuck\" || mode === \"stuck-child\") return;",
       "  if (mode === \"slow\") await new Promise((r) => setTimeout(r, 700));",
+      "  if (mode === \"slow1500\") await new Promise((r) => setTimeout(r, 1500));",
       "  if (mode === \"slow200\") await new Promise((r) => setTimeout(r, 200));",
       "  if (mode === \"malformed\") { w(\"garbage before any frame\\n\"); return; }",
       "  if (mode === \"error\") { w(\"@@ERROR \" + seq + \" the query failed\\n\"); return; }",
@@ -355,17 +358,19 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
     }
   }, 20_000);
 
-  it("a frame that STARTED inside a hold but COMPLETED after its release never counts", async () => {
-    const f = fake("slow", "late");
+  it.each([["slow"], ["slow1500"]])("a frame that STARTED inside a hold but COMPLETED after its release never counts (fake %s: a loaded runner is slower)", async (mode) => {
+    const f = fake(mode, `late-${mode}`);
     const s = startArgvSampler("SECRET", W, { gapMs: 10, framed: f.framed });
     await new Promise((r) => setTimeout(r, 100));
     const ok = await s.waitForSamples(1, 1_000);
-    await new Promise((r) => setTimeout(r, 700));
+    // The precondition (two frames COMPLETED) is waited for by COUNT, never by a fixed sleep (MEASURED: a slow Windows
+    // runner completed one frame in the old fixed 1.8 s). 8 s: a hang guard.
+    for (const end = Date.now() + 8_000; Date.now() < end && s.sampled < 2; ) await new Promise((r) => setTimeout(r, 20));
     await s.stop();
     expect(ok).toBe(false);
     expect(s.sampled, "the frames did complete").toBeGreaterThanOrEqual(2);
     expect(s.heldSamples, "a frame completing after the release is not held").toBe(0);
-  }, 10_000);
+  }, 20_000);
 });
 
 describe.skipIf(!WIN)("the WINDOWS observer (PowerShell, Win32_Process CommandLine), measured on the runner", () => {
