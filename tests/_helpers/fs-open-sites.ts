@@ -47,6 +47,8 @@ export interface FsOpenSite {
   /** The site's FULL source text (the never-unlink scan pins it exactly; Codex #391 R1). */
   text: string;
   why?: string;
+  /** The site's node (the call, the reference or the rejected expression), for scanners that read it further. */
+  node: ts.Node;
 }
 
 export function fsOpenSites(
@@ -63,7 +65,7 @@ export function fsOpenSites(
     const file = rel(sf.fileName);
     if (!inFile(file) || sf.isDeclarationFile) continue;
     const site = (n: ts.Node, api: string, why?: string) =>
-      out.push({ key: `${file}::${topLevelName(n)}::${api}`, api, text: n.getText(sf), ...(why ? { why } : {}) });
+      out.push({ key: `${file}::${topLevelName(n)}::${api}`, api, text: n.getText(sf), ...(why ? { why } : {}), node: n });
 
     const isLoaderCall = (c: ts.CallExpression): boolean => {
       if (c.expression.kind === ts.SyntaxKind.ImportKeyword) return true;

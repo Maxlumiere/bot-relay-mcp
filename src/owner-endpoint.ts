@@ -156,8 +156,12 @@ export function writeOwnerEndpoint(dbPath: string, port: number, transport: Owne
     } catch {
       /* already closed */
     }
-    // rm: own regular file
-    fs.rmSync(tmp, { force: true }); // this owner's own temp name, never the record
+    // The temp NAME, whatever sits there now (a link included: rmSync leaves a dangling one on Node 24.13.0); never the record.
+    try {
+      fs.unlinkSync(tmp);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
     throw err;
   }
   return file;

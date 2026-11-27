@@ -100,13 +100,25 @@ function writePrivateFile(file: string, data: string, dirId: fs.BigIntStats): vo
     ok = true;
   } finally {
     fs.closeSync(fd);
-    if (!ok) fs.rmSync(tmp, { force: true }); // rm: own regular file: this call's own temp file
+    if (!ok) {
+      // The temp NAME, whatever sits there now (a link included: rmSync leaves a dangling one on Node 24.13.0).
+      try {
+        fs.unlinkSync(tmp);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      }
+    }
   }
   // The target must not be a symlink (or anything but a regular file): rename never follows one, but refuse loudly.
   try {
     const cur = fs.lstatSync(file);
     if (cur.isSymbolicLink() || !cur.isFile()) {
-      fs.rmSync(tmp, { force: true }); // rm: own regular file: this call's own temp file
+      // This call's own temp NAME (link-safe).
+      try {
+        fs.unlinkSync(tmp);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      }
       throw new Error(`${file} exists and is not a regular file (a symlink?): refusing to replace it`);
     }
   } catch (err) {

@@ -346,13 +346,16 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     makeDb(dbPath, 0, ["row-1"]);
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
     const live = await startLiveOpener(dbPath, "idle");
-    const state = { db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), shm: fileState(`${dbPath}-shm`), dotNew: fileState(`${dbPath}.new`) };
+    // The staging name is UNIQUE (.<db name>.<pid>.<hex>.new, Codex #472 R1): "no .new made" = no such entry beside the DB.
+    const staging = () => fs.readdirSync(path.dirname(dbPath)).filter((n) => n.startsWith(`.${path.basename(dbPath)}.`) && n.endsWith(".new")).sort();
+    const state = { db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), shm: fileState(`${dbPath}-shm`), dotNew: staging() };
     expect(state.wal, "precondition: the live opener's -wal is there").not.toBe("absent");
     await expect(importRelayState(archive, { force: true })).rejects.toThrow(/restore refused[\s\S]*-wal[\s\S]*\d+ bytes[\s\S]*external tool's PERSIST\/TRUNCATE or persistent-WAL mode/);
     // The DB and its WAL are byte for byte unchanged, and no .new was made. The -shm is SQLite's shared-memory INDEX
     // (no data): every connection updates it, the safety backup's read-only open and the pre-swap step included, so
     // the row asserts it is still there (never deleted), at its size.
-    expect({ db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), dotNew: fileState(`${dbPath}.new`) }, "the DB, its WAL and the .new state are unchanged").toEqual({ db: state.db, wal: state.wal, dotNew: state.dotNew });
+    expect({ db: fileState(dbPath), wal: fileState(`${dbPath}-wal`), dotNew: staging() }, "the DB, its WAL and the .new state are unchanged").toEqual({ db: state.db, wal: state.wal, dotNew: state.dotNew });
+    expect(state.dotNew, "precondition: no staging name existed before").toEqual([]);
     expect(fs.existsSync(`${dbPath}-shm`) ? fs.statSync(`${dbPath}-shm`).size : -1, "the -shm is left in place, at its size").toBe(Number(state.shm.split(":")[0]));
     // Positive control: the live opener still works, through its own connection, and sees exactly its pre-restore rows.
     expect(await ask(live, "read"), "the live opener reads its own rows after the refused restore").toBe(`ROWS ${JSON.stringify(["row-1"])}`);

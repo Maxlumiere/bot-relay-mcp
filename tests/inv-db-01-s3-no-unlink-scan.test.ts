@@ -26,15 +26,15 @@ const DB_MODULES = ["src/backup.ts", "src/db-owner-lock.ts", "src/sqlite-compat.
 
 /** `<key> <call text>` → what it removes (never a DB-family file). */
 const ALLOWED: Record<string, string> = {
-  "src/owner-endpoint.ts::writeOwnerEndpoint::rmSync fs.rmSync(tmp, { force: true })": "the owner's own record temp file, when its rename fails (never the record, never a DB-family name)",
+  "src/owner-endpoint.ts::writeOwnerEndpoint::unlinkSync fs.unlinkSync(tmp)": "the owner's record temp NAME, link-safe, when a check or its rename fails (never the record, never a DB-family name)",
   "src/backup.ts::takeSnapshot::rmSync fs.rmSync(snapshotDbPath, { force: true })": "a torn snapshot COPY in the staging directory (never the live DB)",
   "src/backup.ts::exportRelayState::rmSync fs.rmSync(stagingDir, { recursive: true, force: true })": "the export's own staging directory under $TMPDIR",
   "src/backup.ts::importRelayState::rmSync fs.rmSync(plainTar, { force: true })": "the decompressed archive in the staging directory",
-  "src/backup.ts::importRelayState::rmSync fs.rmSync(newPath, { force: true })": "this restore's own staged `.new` copy, when a final check or the swap's rename refuses (not a DB-family name; the Windows copy-over fallback and its unlink are gone, slice 4)",
+  "src/backup.ts::importRelayState::unlinkSync fs.unlinkSync(newPath)": "this restore's own UNIQUELY named staged copy (.<base>.<pid>.<hex>.new, created with COPYFILE_EXCL), link-safe, when a final check, its identity re-check or the swap's rename refuses (not a DB-family name)",
   "src/backup.ts::importRelayState::rmSync fs.rmSync(stagingDir, { recursive: true, force: true })": "the restore's own staging directory under $TMPDIR",
-  "src/db-owner-lock.ts::materializeDb::rmSync fs.rmSync(tmp, { force: true })": "the materialize temp NAME (.<base>.<pid>.<hex>.new); after a link the DB keeps its own name",
+  "src/db-owner-lock.ts::materializeDb::unlinkSync fs.unlinkSync(tmp)": "the materialize temp NAME (.<base>.<pid>.<hex>.new), only once THIS call's exclusive create succeeded; after a link the DB keeps its own name",
   "src/db-owner-lock.ts::removeOwnMaterializeLinks::unlinkSync fs.unlinkSync(p)": "a second NAME of the DB left by a killed materialize (the reserved .<base>.<pid>.<hex>.new pattern, same dev+ino): the DB's own name and data stay",
-  "src/sqlite-compat.ts::ownerPersist::rmSync fs.rmSync(tmp, { force: true })": "the owner's persist temp file (never renamed into place on this path)",
+  "src/sqlite-compat.ts::ownerPersist::unlinkSync fs.unlinkSync(tmp)": "the owner's persist temp NAME, only once THIS persist's exclusive create succeeded (never renamed into place on this path)",
 };
 
 function sitesOf(program: ReturnType<typeof srcProgram>, inFile: (f: string) => boolean, relOf: (f: string) => string = rel): string[] {

@@ -4,130 +4,107 @@
 // See LICENSE for full terms.
 
 /**
- * STRUCTURAL: every NON-recursive fs.rmSync in src/ removes a path the product itself created as a REGULAR file, and
- * says so with `// rm: own regular file` on its line or the line above. WHY: on Node v24.13.0 (the Node the live
- * daemon runs), rmSync on a DANGLING symlink returns without error and LEAVES the link (measured). Anything that may
- * be a link must be removed with fs.unlinkSync, which removes the link itself on every Node.
- *   - A recursive rmSync (a directory tree) is out of scope here.
- *   - The KNOWN sites are listed: the scanner must still reach each (a guard that sees nothing proves nothing).
- *     A NEW site passes only with the justification.
- *   - The async forms (fs.promises.rm, rm from "fs/promises") and a renamed import of rmSync are refused outright:
- *     they would hide a site from this scan.
- * LIMITS (named, not covered): dynamic access (fs["rmSync"]), a removal through a child process (`rm`), and code
- * outside src/.
+ * STRUCTURAL: every non-recursive fs rm / rmSync in src/ removes a path the product itself created as a REGULAR file,
+ * and says so with `// rm: own regular file` (on its statement's line, or directly above it). WHY: on Node v24.13.0
+ * (the Node the live daemon runs), rmSync on a DANGLING symlink returns without error and LEAVES the link (MEASURED on
+ * macOS and on the Linux 24.13.0 CI leg); anything that may be a link is removed with fs.unlinkSync.
+ * Built on the TYPE-CHECKER scanner (tests/_helpers/rm-guard.ts over fs-open-sites.ts), never a regex (ruling bac8abd5,
+ * Codex #472 R1): aliases, namespaces, destructuring and fs/promises resolve through the checker; `recursive` is read
+ * from the options OBJECT LITERAL (a non-literal options argument needs the justification); one justification per
+ * call (two removal calls on one line are refused); a value use of rm/rmSync is refused.
+ * NAMED LIMITS: code outside src/, and a child process running `rm`.
  */
 import { describe, it, expect } from "vitest";
-import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { srcProgram, virtualProgram } from "./_helpers/ts-binding.js";
+import { rmScan, JUSTIFICATION } from "./_helpers/rm-guard.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SRC = path.join(REPO, "src");
-export const JUSTIFICATION = "// rm: own regular file";
+const rel = (f: string) => path.relative(REPO, f).split(path.sep).join("/");
+const inSrc = (f: string) => f.startsWith("src/");
 
-function walk(dir: string): string[] {
-  const out: string[] = [];
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) out.push(...walk(p));
-    else if (e.isFile() && p.endsWith(".ts")) out.push(p);
-  }
-  return out;
-}
-
-export interface RmSite {
-  file: string;
-  line: number;
-  firstArg: string;
-  justified: boolean;
-}
-
-/** Every non-recursive rmSync call in `text` (the full argument list is read, across lines). Pure. */
-export function rmSites(file: string, text: string): RmSite[] {
-  const lines = text.split("\n");
-  const out: RmSite[] = [];
-  const re = /\brmSync\s*\(/g;
-  for (let m = re.exec(text); m; m = re.exec(text)) {
-    let depth = 1;
-    let i = m.index + m[0].length;
-    for (; i < text.length && depth > 0; i++) {
-      if (text[i] === "(") depth++;
-      else if (text[i] === ")") depth--;
-    }
-    const args = text.slice(m.index + m[0].length, i - 1);
-    if (/recursive:\s*true/.test(args)) continue;
-    const line = text.slice(0, m.index).split("\n").length;
-    const here = lines[line - 1] ?? "";
-    const above = lines[line - 2] ?? "";
-    out.push({ file, line, firstArg: args.split(",")[0]!.trim(), justified: here.includes(JUSTIFICATION) || above.trim().startsWith(JUSTIFICATION) });
-  }
-  return out;
-}
-
-const FILES = walk(SRC);
-const SITES = FILES.flatMap((f) => rmSites(path.relative(REPO, f), fs.readFileSync(f, "utf-8")));
-
-/** The 14 sites known when this guard landed: each removes a temp, staged or snapshot file this code created. */
+/** The sites known when the guard was rebuilt: each removes a temp, snapshot or tar file this code created itself. */
 const KNOWN: ReadonlyArray<[string, string]> = [
   ["src/mint-secret.ts", "tmp"],
   ["src/fs-perms.ts", "tmp"],
-  ["src/db-owner-lock.ts", "tmp"],
-  ["src/owner-endpoint.ts", "tmp"],
   ["src/convert-journal.ts", "tmp"],
-  ["src/sqlite-compat.ts", "tmp"],
   ["src/backup.ts", "snapshotDbPath"],
   ["src/backup.ts", "plainTar"],
-  ["src/backup.ts", "newPath"],
-  ["src/backup.ts", "newPath"],
   ["src/instance.ts", "tmp"],
   ["src/cli/pair.ts", "file"],
-  ["src/cli/remote.ts", "tmp"],
-  ["src/cli/remote.ts", "tmp"],
 ];
 
-describe("every non-recursive rmSync in src/ removes the product's OWN regular file, and says so", () => {
+/**
+ * fs named outside a static import, REVIEWED: no rm or rmSync is reached through it (the same site the fs-open
+ * inventory lists, tests/inv-db-01-fs-open-scan.test.ts). A new one fails until it is reviewed and named here.
+ */
+const REVIEWED_REJECTED: Readonly<Record<string, string>> = {
+  "src/cli/doctor.ts::checkDiskSpace::rejected": "`fs as any` for statfsSync only: no removal reached through it",
+};
+
+describe("src/: every non-recursive rm / rmSync is justified; no value use hides one", () => {
+  const scanned = rmScan(srcProgram(), rel, inSrc);
+  const sites = scanned.sites;
+  const findings = scanned.findings.filter((f) => !(f.key in REVIEWED_REJECTED));
+  it("every REVIEWED rejected site still exists (a stale allowance fails)", () => {
+    for (const k of Object.keys(REVIEWED_REJECTED)) expect(scanned.findings.map((f) => f.key), k).toContain(k);
+  });
   it("the scanner reaches every KNOWN site (a guard that sees nothing proves nothing)", () => {
-    const found = SITES.map((s) => `${s.file} ${s.firstArg}`);
-    for (const [file, arg] of KNOWN) {
-      const k = `${file} ${arg}`;
-      const need = KNOWN.filter(([f, a]) => `${f} ${a}` === k).length;
-      expect(found.filter((x) => x === k).length, `${k}: expected ${need} site(s)`).toBeGreaterThanOrEqual(need);
-    }
+    const found = sites.map((s) => `${s.file} ${s.firstArg}`);
+    for (const [file, arg] of KNOWN) expect(found, `${file} rmSync(${arg}, …)`).toContain(`${file} ${arg}`);
   });
-  it(`every site carries "${JUSTIFICATION}" (on its line or the line above); anything that may be a link uses fs.unlinkSync`, () => {
-    const bad = SITES.filter((s) => !s.justified).map((s) => `${s.file}:${s.line} rmSync(${s.firstArg}, …)`);
-    expect(
-      bad,
-      `non-recursive rmSync without "${JUSTIFICATION}". If the path may be a link (or a dangling one), use fs.unlinkSync: ` +
-        `on Node v24.13.0 rmSync on a dangling symlink returns without error and leaves the link. If it is a regular file ` +
-        `this code created itself, add the justification.`,
-    ).toEqual([]);
+  it(`no finding: each site carries "${JUSTIFICATION}"; anything that may be a link uses fs.unlinkSync`, () => {
+    expect(findings.map((f) => `${f.file}:${f.line} ${f.problem}`)).toEqual([]);
   });
-  it("no async rm form and no renamed rmSync import in src/ (either would hide a site from this scan)", () => {
-    const hits: string[] = [];
-    for (const f of FILES) {
-      const t = fs.readFileSync(f, "utf-8");
-      if (/\bpromises\.rm\s*\(/.test(t) || /from\s+["'](node:)?fs\/promises["']/.test(t) && /\brm\b/.test(t.match(/import\s*\{[^}]*\}\s*from\s+["'](node:)?fs\/promises["']/)?.[0] ?? "")) hits.push(`${path.relative(REPO, f)}: async rm`);
-      if (/\brmSync\s+as\s+\w+/.test(t)) hits.push(`${path.relative(REPO, f)}: rmSync renamed on import`);
-    }
-    expect(hits).toEqual([]);
+});
+
+const NODE_FS = {
+  "node_modules/@types/node/fs.d.ts": `declare module "fs" {
+    export function unlinkSync(p: unknown): void;
+    export function rmSync(p: unknown, o?: unknown): void;
+    export * as promises from "fs/promises";
+  }
+  declare module "node:fs" { export * from "fs"; }`,
+  "node_modules/@types/node/fs/promises.d.ts": `declare module "fs/promises" { export function unlink(p: unknown): Promise<void>; export function rm(p: unknown, o?: unknown): Promise<void>; }
+  declare module "node:fs/promises" { export * from "fs/promises"; }`,
+};
+const vrel = (f: string) => f.replace(/\\/g, "/").replace(/^(?:[A-Za-z]:)?\/virtual\//, "");
+const scan = (code: string) => rmScan(virtualProgram({ ...NODE_FS, "src/x.ts": code }), vrel, (f) => f === "src/x.ts");
+
+describe("Codex #472 R1's four evasions: each is CAUGHT", () => {
+  it("a string that SAYS recursive (`note: \"recursive: true\"`) does not make a call recursive: unjustified → a finding", () => {
+    const r = scan(`import fs from "node:fs";\nexport function f(a: string) { fs.rmSync(a, { force: true, note: "recursive: true" }); }`);
+    expect(r.findings.map((f) => f.problem)).toEqual([expect.stringMatching(/non-recursive removal without/)]);
   });
-  it("PURE: the scanner reads multi-line calls, skips recursive ones, and accepts the justification only on the line or the line above", () => {
-    const t = [
-      "fs.rmSync(a, { force: true }); // rm: own regular file",
-      "// rm: own regular file",
-      "fs.rmSync(b);",
-      "fs.rmSync(c,\n  { recursive: true, force: true });",
-      "fs.rmSync(d, { force: true });",
-      "// rm: own regular file",
-      "",
-      "fs.rmSync(e);",
-    ].join("\n");
-    expect(rmSites("x.ts", t).map((s) => [s.firstArg, s.justified])).toEqual([
-      ["a", true],
-      ["b", true],
-      ["d", false],
-      ["e", false],
-    ]);
+  it("fs/promises through a namespace (`fsp.rm(p)`) is seen: unjustified → a finding", () => {
+    const r = scan(`import * as fsp from "node:fs/promises";\nexport async function f(p: string) { await fsp.rm(p); }`);
+    expect(r.findings.length).toBeGreaterThan(0);
+    expect(r.findings.some((f) => /non-recursive removal without/.test(f.problem))).toBe(true);
+  });
+  it("a destructured alias (`const {rmSync: remove} = fs; remove(p)`) is refused as a value use", () => {
+    const r = scan(`import fs from "node:fs";\nconst { rmSync: remove } = fs;\nexport function f(p: string) { remove(p); }`);
+    expect(r.findings.some((f) => /VALUE use of rm\/rmSync/.test(f.problem))).toBe(true);
+  });
+  it("two calls on one line under ONE justification: refused (one justification per call)", () => {
+    const r = scan(`import fs from "node:fs";\nexport function f(a: string, b: string) { g(fs.rmSync(a), fs.rmSync(b)); } // rm: own regular file\nfunction g(..._x: unknown[]) {}`);
+    expect(r.findings.some((f) => /two removal calls on one line/.test(f.problem))).toBe(true);
+  });
+});
+
+describe("the guard's own rules (controls)", () => {
+  it("a justified call (trailing, or on the line directly above) has no finding; two lines above does not count", () => {
+    expect(scan(`import fs from "node:fs";\nexport function f(a: string) { fs.rmSync(a, { force: true }); } // rm: own regular file: its temp`).findings).toEqual([]);
+    expect(scan(`import fs from "node:fs";\nexport function f(a: string) {\n  // rm: own regular file: its temp\n  fs.rmSync(a);\n}`).findings).toEqual([]);
+    expect(scan(`import fs from "node:fs";\nexport function f(a: string) {\n  // rm: own regular file: its temp\n\n  fs.rmSync(a);\n}`).findings.length).toBe(1);
+  });
+  it("a LITERAL `recursive: true` is out of scope; `recursive: false`, a non-literal value or a non-literal options object needs the justification", () => {
+    expect(scan(`import fs from "node:fs";\nexport function f(d: string) { fs.rmSync(d, { recursive: true, force: true }); }`).findings).toEqual([]);
+    expect(scan(`import fs from "node:fs";\nexport function f(d: string) { fs.rmSync(d, { recursive: false }); }`).findings.length).toBe(1);
+    expect(scan(`import fs from "node:fs";\nexport function f(d: string, r: boolean) { fs.rmSync(d, { recursive: r }); }`).findings.map((f) => f.problem)).toEqual([expect.stringMatching(/options the guard cannot read/)]);
+    expect(scan(`import fs from "node:fs";\nexport function f(d: string, o: object) { fs.rmSync(d, o); }`).findings.map((f) => f.problem)).toEqual([expect.stringMatching(/options the guard cannot read/)]);
+  });
+  it("a justification inside a STRING on the line does not count (only a comment does)", () => {
+    expect(scan(`import fs from "node:fs";\nexport function f(a: string) { fs.rmSync(a); const s = "// rm: own regular file"; }`).findings.length).toBe(1);
   });
 });

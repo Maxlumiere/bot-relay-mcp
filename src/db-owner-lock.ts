@@ -104,9 +104,17 @@ export function materializeDb(
   beforeCreate?.(dbPath);
   const tmp = path.join(path.dirname(dbPath), `.${path.basename(dbPath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.new`);
   let created = false;
+  // The temp is THIS call's only once its exclusive create succeeded: a create that fails (the name exists: another
+  // process's file) removes nothing. Then, inside the cleanup scope, a write that fails (ENOSPC) leaves no partial temp.
+  let tmpOurs = false;
   try {
-    // Inside the cleanup scope: a write that fails after the exclusive create (ENOSPC) leaves no partial temp behind.
-    fs.writeFileSync(tmp, initialBytes, { mode: 0o600, flag: "wx" });
+    const fd = fs.openSync(tmp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    tmpOurs = true;
+    try {
+      fs.writeFileSync(fd, initialBytes);
+    } finally {
+      fs.closeSync(fd);
+    }
     try {
       fs.linkSync(tmp, dbPath);
       created = true;
@@ -126,7 +134,14 @@ export function materializeDb(
       throw err;
     }
   } finally {
-    fs.rmSync(tmp, { force: true }); // rm: own regular file: this call's own temp file
+    if (tmpOurs) {
+      // The temp NAME this call created (after a link, the DB keeps its own name).
+      try {
+        fs.unlinkSync(tmp);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      }
+    }
   }
 }
 
