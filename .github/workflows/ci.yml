@@ -538,6 +538,14 @@ jobs:
       # PR 4: the CLI's credential clients (the door for a local relay; the hardened bearer for a remote) are claimed on
       # EVERY OS. This job runs a fixed list, so the file runs HERE, and the next step fails unless every row outside the
       # LAN describes PASSED (the LAN rows may skip, by name, on a runner with no LAN address).
+      # Ruling e6458926 (4): what Git Bash's msys perl does with setpgrp is MEASURED here: the rows assert the mode the
+      # helpers chose (grouped, or the direct-child bound with its ONE loud line), and the step's overhead is printed.
+      - name: "The budgeted step's process group (Windows: measured)"
+        if: ${{ !cancelled() }}
+        run: npx vitest run tests/hook-step-group.test.ts --reporter=verbose --reporter=json --outputFile.json=step-group-win.json
+      - name: "The budgeted step's process group: the Windows rows PASSED (not skipped, not filtered away)"
+        if: ${{ !cancelled() }}
+        run: node tools/ci/require-rows-passed.mjs step-group-win.json "the MODE is decided once per load" "a FORKING wrapper (its child holds the pipe)" "a wrapper that BACKGROUNDS a sleeper and EXITS" "MEASURED, report only (e6458926 3)"
       - name: "PR 4: the CLI's credential clients (Windows)"
         if: ${{ !cancelled() }}
         run: npx vitest run tests/cli-door-clients.test.ts --reporter=verbose --reporter=json --outputFile.json=pr4-cli.json

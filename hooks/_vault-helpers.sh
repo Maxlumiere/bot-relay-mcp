@@ -507,18 +507,72 @@ relay_owner_session() {
   return 0
 }
 
+# The budgeted step's PROCESS GROUP (rulings 231a8b8f, e6458926): with perl (already a hook dependency on macOS and
+# Linux) each step runs under a small perl SUPERVISOR that is the leader of a new process group N (N = its own pid):
+# it forks the step into N and enforces the deadline with alarm(). On the step's exit, the deadline, or a TERM/INT/HUP
+# (the shell's backstop), it moves ITSELF back to the caller's group and kills group N, so a forking wrapper's children
+# (a PATH-provided `ps`, a wrapper that backgrounds a sleeper) cannot hold the command substitution's pipe past the
+# budget.
+# NEVER A RECYCLED ID: group N is killed only by the supervisor while it is alive (pid N held: the kernel never reuses
+# a live pid as a group id); the step is killed before it is reaped (a zombie still holds its pid). The shell's
+# watchdog is a BACKSTOP one second after the deadline: it sends the supervisor TERM (its trap kills the group), and
+# KILL only after a one-second grace; the supervisor's pid is reaped only by the `wait` below, after which the
+# watchdog is stopped (as before this change).
+# The mode is decided ONCE per load: no perl, or a setpgrp that cannot make a group (MEASURED per OS), keeps the
+# direct-child bound, said ONCE, loudly. A wrapper that LEAVES the group (setsid) still escapes: a named limit.
+RELAY_RUN_GROUP_PROBE='exit((eval { setpgrp(0, 0); 1 } && getpgrp(0) == $$) ? 0 : 1)'
+if ! command -v perl >/dev/null 2>&1; then
+  RELAY_RUN_GROUP=0
+  echo "relay hook: step budget covers the direct child only: perl not found" >&2
+elif ! perl -e "$RELAY_RUN_GROUP_PROBE" 2>/dev/null; then
+  RELAY_RUN_GROUP=0
+  echo "relay hook: step budget covers the direct child only: perl cannot start a process group (setpgrp)" >&2
+else
+  RELAY_RUN_GROUP=1
+fi
+RELAY_RUN_GROUP_PL='my $secs = shift @ARGV; shift @ARGV if @ARGV && $ARGV[0] eq "--";
+my $orig = getpgrp(0);
+my $grouped = eval { setpgrp(0, 0); 1 } && getpgrp(0) == $$;
+my ($c, $timed, $signum) = (0, 0, 0);
+my %num = (HUP => 1, INT => 2, TERM => 15);
+for my $s (keys %num) { $SIG{$s} = sub { $signum = $num{$s}; kill "KILL", $c if $c } }
+$c = fork; exit 127 unless defined $c;
+if ($c == 0) { $SIG{$_} = "DEFAULT" for keys %num; exec { $ARGV[0] } @ARGV; exit 127 }
+$SIG{ALRM} = sub { $timed = 1; kill "KILL", $c };
+alarm $secs;
+my $st;
+while (1) { my $w = waitpid($c, 0); if ($w == $c) { $st = $?; last } last if $w == -1 && !$!{EINTR} }
+alarm 0;
+if ($grouped && eval { setpgrp(0, $orig); 1 } && getpgrp(0) != $$) { kill "KILL", -$$ }
+exit 124 if $timed;
+exit 128 + $signum if $signum;
+exit(defined $st ? (($st & 127) ? 128 + ($st & 127) : ($st >> 8)) : 127);'
+
 # relay_run_streamed SECS CMD... — CMD killed at SECS (124 = timed out), its stdin, stdout and stderr this function's
 # OWN (no file): for a step that is fed and read through a pipe (a renderer, a parser) and must stay inside the budget.
 relay_run_streamed() {
-  local secs="$1" pid wd rc wrc
+  local secs="$1" pid wd rc wrc grp="${RELAY_RUN_GROUP:-0}" backstop="$1"
   shift
-  "$@" <&0 &
+  if [ "$grp" = 1 ]; then
+    perl -e "$RELAY_RUN_GROUP_PL" "$secs" -- "$@" <&0 &
+    backstop=$((secs + 1))
+  else
+    "$@" <&0 &
+  fi
   pid=$!
   (
-    trap 'kill "$s" 2>/dev/null; exit 0' TERM
-    sleep "$secs" &
+    f=0
+    trap 'kill "$s" 2>/dev/null; exit "$f"' TERM
+    sleep "$backstop" &
     s=$!
     wait "$s"
+    f=124
+    if [ "$grp" = 1 ]; then
+      kill -TERM "$pid" 2>/dev/null
+      sleep 1 &
+      s=$!
+      wait "$s"
+    fi
     kill -KILL "$pid" 2>/dev/null
     exit 124
   ) >/dev/null 2>&1 &

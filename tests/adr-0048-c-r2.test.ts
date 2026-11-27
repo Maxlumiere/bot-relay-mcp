@@ -61,6 +61,12 @@ const MARGIN = 3;
 
 /** The ONLY bodies allowed a literal: the watchdog's own KILL grace. */
 const SANCTIONED = ["relay_run_bounded"];
+/**
+ * LINE-level sanctions (ruling 2394604b): the exact text, in that function only, at most `count` times. relay_run_streamed
+ * runs every budgeted hook step, so its body is never exempt: only its backstop's KILL grace (TERM to the supervisor,
+ * then KILL after one second, ruling e6458926) is allowed, once. Any other literal there trips.
+ */
+export const LINE_SANCTIONED: ReadonlyArray<{ fn: string; text: string; count: number }> = [{ fn: "relay_run_streamed", text: "sleep 1 &", count: 1 }];
 const STEP = String.raw`"\$(?:RELAY_STEP_SECS|\{RELAY_STEP_SECS\})"`;
 
 interface Violation { file: string; rule: string; line: string }
@@ -69,10 +75,21 @@ interface Violation { file: string; rule: string; line: string }
 function logicalLines(src: string): string[] {
   const out: string[] = [];
   let skip = false;
+  let fn: string | null = null;
+  const used = new Map<string, number>();
   for (const raw of src.replace(/\\\n\s*/g, " ").split("\n")) {
     if (!skip && SANCTIONED.some((f) => new RegExp(`^${f}\\(\\)\\s*\\{`).test(raw))) { skip = true; continue; }
     if (skip) { if (/^\}/.test(raw)) skip = false; continue; }
+    const open = /^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{/.exec(raw);
+    if (open) fn = open[1]!;
+    else if (/^\}/.test(raw)) fn = null;
     if (/^\s*#/.test(raw)) continue;
+    const pin = LINE_SANCTIONED.find((x) => x.fn === fn && x.text === raw.trim());
+    if (pin) {
+      const n = (used.get(pin.fn + "\u0000" + pin.text) ?? 0) + 1;
+      used.set(pin.fn + "\u0000" + pin.text, n);
+      if (n <= pin.count) continue;
+    }
     out.push(raw);
   }
   return out;
@@ -215,6 +232,13 @@ describe("Codex #291 R2 #1 — TRIPWIRE: no literal timeout in any hook; every b
 
   // The Codex CLI hook (hooks/codex/) has no installed-budget declaration yet: its
   // literals are PINNED, so the set can only shrink. A new one fails here.
+  it("ruling 2394604b: relay_run_streamed's ONE pinned grace line passes; a SECOND literal in that function trips (its body is never exempt)", () => {
+    const fnSrc = (extra: string) => `relay_run_streamed() {\n  local secs="$1"\n  sleep 1 &\n${extra}}\n`;
+    expect(scan("x", fnSrc("")), "the pinned grace line, once").toEqual([]);
+    expect(scan("x", fnSrc("  sleep 2\n")).map((v) => v.rule), "a second literal trips").toEqual(["sleep N"]);
+    expect(scan("x", fnSrc("  sleep 1 &\n")).map((v) => v.rule), "the pinned line TWICE: the second trips").toEqual(["sleep N"]);
+    expect(scan("x", "another_fn() {\n  sleep 1 &\n}\n").map((v) => v.rule), "the same text in another function trips").toEqual(["sleep N"]);
+  });
   it("hooks/codex/*.sh: the pinned known literals only (a ratchet, not an allowance to grow)", () => {
     const dir = path.join(HOOKS, "codex");
     const v = fs.readdirSync(dir).filter((f) => f.endsWith(".sh")).flatMap((f) => scan(`codex/${f}`, fs.readFileSync(path.join(dir, f), "utf-8")));

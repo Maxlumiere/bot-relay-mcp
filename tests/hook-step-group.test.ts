@@ -64,7 +64,7 @@ describe("the budgeted step's process group: the deadline holds for a forking wr
   });
   it("(1) a FORKING wrapper (its child holds the pipe) → the deadline holds (grouped), and its child is gone", () => {
     const pidFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "step-group-pid-")), "child");
-    const r = run(`sleep 30 & echo $! > "${pidFile}"\nwait`);
+    const r = run(`sleep 30 & echo $! > "${pidFile.replace(/\\/g, "/")}"\nwait`);
     if (modeOf(r.out) !== "1") return void expect(r.err).toMatch(LOUD); // the direct-child bound, said loudly
     expect(r.signal, "finished on its own").toBeNull();
     expect(r.out).toMatch(/^rc=124 /);
