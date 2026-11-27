@@ -47,6 +47,8 @@ function recursiveOf(call: ts.CallExpression): boolean | "unreadable" {
   let value: boolean | "unreadable" = false;
   for (const p of opts.properties) {
     if (ts.isSpreadAssignment(p)) return "unreadable";
+    // A COMPUTED key may name `recursive` (and override a literal one): the effective options cannot be read.
+    if (p.name && ts.isComputedPropertyName(p.name)) return "unreadable";
     const name = p.name && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) ? p.name.text : null;
     if (name !== "recursive") continue;
     if (!ts.isPropertyAssignment(p)) return "unreadable"; // shorthand `{ recursive }`, a method, an accessor
@@ -121,10 +123,32 @@ export function rmScan(program: ts.Program, rel: (f: string) => string, inFile: 
   return { sites, findings };
 }
 
+/** One use of a value: `.member`, `.member()` when that member is called, or `(value)` for anything else. */
+function useOf(n: ts.Node): string {
+  let outer: ts.Node = n;
+  while (ts.isParenthesizedExpression(outer.parent) || ts.isAsExpression(outer.parent) || ts.isNonNullExpression(outer.parent)) outer = outer.parent;
+  const p = outer.parent;
+  if (ts.isPropertyAccessExpression(p) && p.expression === outer) return ts.isCallExpression(p.parent) && p.parent.expression === p ? `.${p.name.text}()` : `.${p.name.text}`;
+  return "(value)";
+}
+
 /**
  * What is done THROUGH a rejected fs expression (e.g. `const anyFs = fs as any`): each use, in source order, as
- * `.member` or `.member()`, or `(value)`. RED STATE: not read yet.
+ * `.member`, `.member()` or `(value)`. A rejected DECLARATION's uses are every reference to its name (resolved by the
+ * checker); any other rejected expression is its own single use. A reviewed allowance pins this list, so a member
+ * added through `any` (invisible to the type checker) fails.
  */
-export function rejectedUses(_program: ts.Program, _node: ts.Node): string[] {
-  return [];
+export function rejectedUses(program: ts.Program, node: ts.Node): string[] {
+  if (!ts.isVariableDeclaration(node)) return [useOf(node)];
+  if (!ts.isIdentifier(node.name)) return ["(value)"]; // a destructuring of the rejected value: refuse to read it
+  const checker = program.getTypeChecker();
+  const target = checker.getSymbolAtLocation(node.name);
+  const sf = node.getSourceFile();
+  const uses: string[] = [];
+  const visit = (n: ts.Node): void => {
+    if (ts.isIdentifier(n) && n !== node.name && target && checker.getSymbolAtLocation(n) === target) uses.push(useOf(n));
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return uses;
 }

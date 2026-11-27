@@ -107,6 +107,7 @@ export function materializeDb(
   // The temp is THIS call's only once its exclusive create succeeded: a create that fails (the name exists: another
   // process's file) removes nothing. Then, inside the cleanup scope, a write that fails (ENOSPC) leaves no partial temp.
   let tmpOurs = false;
+  let err: unknown = null;
   try {
     const fd = fs.openSync(tmp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
     tmpOurs = true;
@@ -133,13 +134,20 @@ export function materializeDb(
       }
       throw err;
     }
+  } catch (e) {
+    err = e;
+    throw e;
   } finally {
     if (tmpOurs) {
-      // The temp NAME this call created (after a link, the DB keeps its own name).
+      // The temp NAME this call created (after a link, the DB keeps its own name). With no error in flight, a failed
+      // cleanup is the error; with one, it is attached to it (ruling 81d038ab).
       try {
         fs.unlinkSync(tmp);
       } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+          if (!(err instanceof Error)) throw e;
+          err.message += ` (the materialize temp ${tmp} could not be removed: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}; it is left behind)`;
+        }
       }
     }
   }

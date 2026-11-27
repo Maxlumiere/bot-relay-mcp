@@ -1132,10 +1132,15 @@ function ownerPersist(w: WasmDatabase, data: Buffer): void {
   } catch (err) {
     if (tmpOurs) {
       // The temp NAME this persist created (never renamed into place on this path).
+      // A cleanup that fails (a directory at the name: EPERM / EISDIR) never REPLACES the primary refusal: it is
+      // attached to it, naming the path left behind (ruling 81d038ab).
       try {
         fs.unlinkSync(tmp);
       } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+          if (!(err instanceof Error)) throw e;
+          err.message += ` (${"the persist temp"} ${tmp} could not be removed: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}; it is left behind)`;
+        }
       }
     }
     throw err;

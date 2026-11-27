@@ -80,51 +80,51 @@ function writePrivateFile(file: string, data: string, dirId: fs.BigIntStats): vo
   const dir = path.dirname(file);
   const tmp = path.join(dir, `.${path.basename(file)}.${crypto.randomBytes(6).toString("hex")}.tmp`);
   const fd = fs.openSync(tmp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
-  let ok = false;
+  // ONE cleanup scope for the temp's WHOLE post-create lifetime (review R2 P3): a failed check, write, lstat of the
+  // target or rename removes it; only a completed rename keeps it (as the file).
   try {
-    if (createHookForTests) createHookForTests(tmp);
-    // The directory is still the one made private (a replaced directory is refused).
-    if (!sameFileIdentity(fs.lstatSync(dir, { bigint: true }), dirId)) throw new Error(`${dir} was replaced while the secret was being written`);
-    if (process.platform === "win32") {
-      const faults = [...restrictToOwnerWindows(tmp, false), ...privacyFaults(tmp, 0o600)];
-      if (faults.length > 0) throw new Error(`the file could not be made private (${faults.join("; ")})`);
-    } else {
-      fs.fchmodSync(fd, 0o600);
-    }
-    const st = fs.fstatSync(fd, { bigint: true });
-    const named = fs.lstatSync(tmp, { bigint: true });
-    if (!st.isFile() || st.nlink !== 1n || !sameFileIdentity(st, named)) throw new Error("the new file is not the one its name names");
-    if (process.platform !== "win32" && (st.mode & 0o077n) !== 0n) throw new Error("the new file is not private");
-    fs.writeSync(fd, data);
-    fs.fsyncSync(fd);
-    ok = true;
-  } finally {
-    fs.closeSync(fd);
-    if (!ok) {
-      // The temp NAME, whatever sits there now (a link included: rmSync leaves a dangling one on Node 24.13.0).
-      try {
-        fs.unlinkSync(tmp);
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    try {
+      if (createHookForTests) createHookForTests(tmp);
+      // The directory is still the one made private (a replaced directory is refused).
+      if (!sameFileIdentity(fs.lstatSync(dir, { bigint: true }), dirId)) throw new Error(`${dir} was replaced while the secret was being written`);
+      if (process.platform === "win32") {
+        const faults = [...restrictToOwnerWindows(tmp, false), ...privacyFaults(tmp, 0o600)];
+        if (faults.length > 0) throw new Error(`the file could not be made private (${faults.join("; ")})`);
+      } else {
+        fs.fchmodSync(fd, 0o600);
       }
+      const st = fs.fstatSync(fd, { bigint: true });
+      const named = fs.lstatSync(tmp, { bigint: true });
+      if (!st.isFile() || st.nlink !== 1n || !sameFileIdentity(st, named)) throw new Error("the new file is not the one its name names");
+      if (process.platform !== "win32" && (st.mode & 0o077n) !== 0n) throw new Error("the new file is not private");
+      fs.writeSync(fd, data);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
     }
-  }
-  // The target must not be a symlink (or anything but a regular file): rename never follows one, but refuse loudly.
-  try {
-    const cur = fs.lstatSync(file);
-    if (cur.isSymbolicLink() || !cur.isFile()) {
-      // This call's own temp NAME (link-safe).
-      try {
-        fs.unlinkSync(tmp);
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-      }
-      throw new Error(`${file} exists and is not a regular file (a symlink?): refusing to replace it`);
+    // The target must not be a symlink (or anything but a regular file): rename never follows one, but refuse loudly.
+    let cur: fs.Stats | null = null;
+    try {
+      cur = fs.lstatSync(file);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
+    if (cur && (cur.isSymbolicLink() || !cur.isFile())) throw new Error(`${file} exists and is not a regular file (a symlink?): refusing to replace it`);
+    fs.renameSync(tmp, file);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    // The temp NAME, whatever sits there now (a link included: rmSync leaves a dangling one on Node 24.13.0).
+    // A cleanup that fails (a directory at the name: EPERM / EISDIR) never REPLACES the primary refusal: it is
+    // attached to it, naming the path left behind (ruling 81d038ab).
+    try {
+      fs.unlinkSync(tmp);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        if (!(err instanceof Error)) throw e;
+        err.message += ` (${"the temp"} ${tmp} could not be removed: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}; it is left behind)`;
+      }
+    }
+    throw err;
   }
-  fs.renameSync(tmp, file);
 }
 /** Store a remote's registration secret at <dir>/mint.secret: the directory chain private FIRST, then the file. */
 export function writeRemoteMintSecret(dir: string, secret: string, fileName = "mint.secret"): string {
