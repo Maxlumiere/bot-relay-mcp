@@ -22,14 +22,14 @@ import os from "os";
 import path from "path";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { fileURLToPath } from "url";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "adr0047-pr4-")));
 process.env.RELAY_DB_PATH = path.join(ROOT, "relay.db");
 const children: ChildProcess[] = [];
-afterAll(() => {
-  for (const c of children) c.kill("SIGKILL");
-  fs.rmSync(ROOT, { recursive: true, force: true });
+afterAll(async () => {
+  await stopAndRemove(children, ROOT);
 });
 
 const V = await import("../src/fleet-verdicts.js");

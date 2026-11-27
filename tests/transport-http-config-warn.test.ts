@@ -44,9 +44,11 @@ function collectStderr(
   return new Promise((resolve) => {
     let stderr = "";
     let done = false;
+    let timer: NodeJS.Timeout | undefined;
     const finish = (matched: boolean) => {
       if (done) return;
       done = true;
+      clearTimeout(timer); // the match may win: the deadline timer must not hold the loop for timeoutMs
       child.stderr.removeListener("data", onData);
       resolve({ matched, stderr });
     };
@@ -55,7 +57,7 @@ function collectStderr(
       if (pattern.test(stderr)) finish(true);
     };
     child.stderr.on("data", onData);
-    setTimeout(() => finish(pattern.test(stderr)), timeoutMs);
+    timer = setTimeout(() => finish(pattern.test(stderr)), timeoutMs);
   });
 }
 

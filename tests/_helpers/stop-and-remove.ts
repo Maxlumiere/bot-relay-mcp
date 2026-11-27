@@ -27,19 +27,33 @@ async function within(exited: Promise<void>, ms: number): Promise<boolean> {
   }
 }
 
-export async function stopAndRemove(child: ChildProcess, dir: string, opts: { graceMs?: number; killGraceMs?: number } = {}): Promise<void> {
-  if (!isDone(child)) {
-    // The listener goes on BEFORE the signal, and the state is re-read after it: an exit can never be missed.
-    const exited = new Promise<void>((res) => child.once("exit", () => res()));
-    if (!isDone(child)) {
-      child.kill("SIGTERM");
-      if (!(await within(exited, opts.graceMs ?? 5_000))) {
-        child.kill("SIGKILL");
-        if (!(await within(exited, opts.killGraceMs ?? 5_000)) && !isDone(child)) {
-          throw new Error(`stopAndRemove: child ${child.pid ?? "?"} is still alive after SIGKILL; its directory was NOT removed: ${dir}`);
-        }
-      }
-    }
+/** Stops one child (SIGTERM, bounded wait, SIGKILL, bounded wait); resolves its pid if it is STILL alive, else null. */
+async function stopOne(child: ChildProcess, opts: { graceMs?: number; killGraceMs?: number }): Promise<number | string | null> {
+  if (isDone(child)) return null;
+  // The listener goes on BEFORE the signal, and the state is re-read after it: an exit can never be missed.
+  const exited = new Promise<void>((res) => child.once("exit", () => res()));
+  if (isDone(child)) return null;
+  child.kill("SIGTERM");
+  if (await within(exited, opts.graceMs ?? 5_000)) return null;
+  child.kill("SIGKILL");
+  if ((await within(exited, opts.killGraceMs ?? 5_000)) || isDone(child)) return null;
+  return child.pid ?? "?";
+}
+
+/**
+ * `children`: ONE child, or SEVERAL that write into the same directory (a daemon and its connector, a daemon and a
+ * SQLite writer); a null or undefined entry (a child never started) is skipped. ALL are stopped, in parallel, before
+ * the directory is removed; if ANY is still alive after SIGKILL and its bound, this REJECTS and the directory stays.
+ */
+export async function stopAndRemove(
+  children: ChildProcess | ReadonlyArray<ChildProcess | null | undefined>,
+  dir: string,
+  opts: { graceMs?: number; killGraceMs?: number } = {}
+): Promise<void> {
+  const list = (Array.isArray(children) ? children : [children]).filter((c): c is ChildProcess => c != null);
+  const alive = (await Promise.all(list.map((c) => stopOne(c, opts)))).filter((pid) => pid !== null);
+  if (alive.length > 0) {
+    throw new Error(`stopAndRemove: child ${alive.join(", ")} is still alive after SIGKILL; its directory was NOT removed: ${dir}`);
   }
   fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 }

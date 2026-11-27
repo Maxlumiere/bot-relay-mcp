@@ -40,6 +40,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { getFreePort } from "./_helpers/port.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(HERE, "..");
@@ -245,8 +246,7 @@ describe("v2.4.2 — TTY guard", () => {
     child.on("exit", () => { exited = true; });
     await new Promise((r) => setTimeout(r, 2500)); // well past the old window
     expect(exited, "server exited while a client was merely slow to connect").toBe(false);
-    child.kill();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    await stopAndRemove(child, tmpDir);
   }, 15_000);
 
   it("(T7) client sends its first frame LATE — still served (was exit 3)", async () => {
@@ -265,8 +265,7 @@ describe("v2.4.2 — TTY guard", () => {
     }) + "\n");
     await new Promise((r) => setTimeout(r, 600));
     expect(exited, "server died after the late client spoke").toBe(false);
-    child.kill();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    await stopAndRemove(child, tmpDir);
   }, 15_000);
 
   it("(T5) non-stdio transport (http) never engages the guard regardless of stdin", async () => {
