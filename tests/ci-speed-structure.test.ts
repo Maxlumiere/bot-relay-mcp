@@ -138,7 +138,14 @@ describe("the aggregate verdicts check every skip against the Scope", () => {
 
 describe("ci.yml keeps the safety properties", () => {
   it("the three REQUIRED checks keep their exact names", () => {
-    const names = Object.values(J).map(nameOf);
+    // A matrix job's check runs are named per leg (`Node ${{ matrix.node }}` → `Node 22`, `Node 24.13.0`): each
+    // leg's expanded name counts, so a required name kept by the 22 leg needs no branch-protection change.
+    const names = Object.values(J).flatMap((body) => {
+      const n = nameOf(body);
+      if (!n.includes("${{ matrix.node }}")) return [n];
+      const legs = [...body.matchAll(/'(\d+(?:\.\d+)*)'/g)].map((m) => m[1]!).filter((v) => /^\d+(\.\d+){0,2}$/.test(v));
+      return legs.map((leg) => n.replace("${{ matrix.node }}", leg));
+    });
     for (const n of ["Test (Node 22)", "25-tool smoke (Node 22)", "Test (macOS — launchd side-effect guard)"]) expect(names, n).toContain(n);
   });
   it("the smoke no longer waits for the tests, and skips the gate's suite steps ONLY on pull requests", () => {
@@ -176,6 +183,13 @@ describe("ci.yml keeps the safety properties", () => {
       expect(J.test, `Node ${n}: its own parity check`).toMatch(new RegExp(`node scripts/ci-shard-parity\\.mjs 4 node${n}/\\.vitest-shard`));
       expect(J.test, `Node ${n}: its own merge`).toMatch(new RegExp(`npx vitest --merge-reports=node${n}/\\.vitest/blob --reporter=default`));
     }
+    // Ruling 617c5d69: the floating leg resolves the newest 24 (check-latest); the timing bars run on 22 and 24.13.0
+    // on every run and the latest 24 on the nightly only; the smoke runs on 22 and 24.13.0; the checks stay 22-only.
+    expect(J.shard).toMatch(/check-latest: \$\{\{ matrix\.node == '24' \}\}/);
+    expect(J["timing-bars"]).toMatch(/node: \$\{\{ fromJSON\(github\.event_name == 'schedule' && '\["22", "24\.13\.0", "24"\]' \|\| '\["22", "24\.13\.0"\]'\) \}\}/);
+    expect(J["timing-bars"]).toMatch(/name: Timing bars \(Node \$\{\{ matrix\.node \}\}\)/);
+    expect(J.smoke).toMatch(/node: \['22', '24\.13\.0'\]/);
+    expect(J.checks).toMatch(/node-version: '22'/);
     // The required job's name still says Node 22 (branch protection names it): its run summary says what it covers.
     expect(J.test).toMatch(/covers Node 22, 24\.13\.0 and the latest 24\." >> "\$GITHUB_STEP_SUMMARY"/);
   });
