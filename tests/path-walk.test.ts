@@ -243,15 +243,26 @@ describe("path-walk: below a file is not-a-directory", () => {
 });
 
 /**
- * One "link target ending in a separator" row: build the links in a fresh dir, then judge `l`. `stat` is the kernel's
- * answer (a seam: the rows pass fs.statSync; the row's own test passes a kernel that ACCEPTS).
+ * One "link target ending in a separator" row: build the links in a fresh dir, then judge `l`. The PRODUCT's refusal is
+ * the property under test, so it is always computed; the KERNEL's answer is a REPORTED observation, printed, never a
+ * gate: the product walks the components itself (src/path-walk.ts) and does not rely on the kernel refusing. MEASURED
+ * once on a macOS runner: the kernel resolved the nested link without ENOTDIR on an image and SHA where it had refused
+ * earlier that day. `stat` is a seam (the rows pass fs.statSync; the row's own test passes a kernel that ACCEPTS).
  */
 function separatorRow(make: (dir: string) => void, stat: (p: string) => unknown = fs.statSync): { kernel: string; product: string } {
   const dir = fs.mkdtempSync(path.join(base, "tsep-"));
   make(dir);
   const l = path.join(dir, "l");
-  expect(() => stat(l), "the kernel refuses it").toThrow(/ENOTDIR/);
-  return { kernel: "ENOTDIR", product: reason(() => walkPath(l, { allowMissing: true })) };
+  let kernel: string;
+  try {
+    stat(l);
+    kernel = "accepted";
+  } catch (err) {
+    kernel = (err as NodeJS.ErrnoException).code ?? "error";
+  }
+  const product = reason(() => walkPath(l, { allowMissing: true }));
+  console.log(`[path-walk] REPORTED kernel answer for a link target ending in a separator: ${kernel} (the product: ${product})`);
+  return { kernel, product };
 }
 
 describe.skipIf(WIN)("path-walk: a link target ending in a separator must reach a directory (POSIX ENOTDIR; Codex #357 R1 #4)", () => {
