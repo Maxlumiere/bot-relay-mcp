@@ -35,6 +35,7 @@ import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -389,10 +390,7 @@ describe("v2.6.2 — spawn-to-ready integration (vault state matrix)", () => {
         expect(inner.agent_name).toBe("sr-d-agent");
         expect(inner.auth_state).toBe("active");
       } finally {
-        stdioChild.kill("SIGTERM");
-        await new Promise((res) => setTimeout(res, 200));
-        try { stdioChild.kill("SIGKILL"); } catch { /* */ }
-        fs.rmSync(ROOT, { recursive: true, force: true });
+        await stopAndRemove(stdioChild, ROOT);
       }
     },
     20_000,

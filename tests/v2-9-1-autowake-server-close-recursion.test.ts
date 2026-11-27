@@ -63,6 +63,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -218,10 +219,7 @@ describe("v2.9.1 — autowake server-side transport.close() recursion regression
       const healthAfter = await fetch(`http://127.0.0.1:${PORT}/health`);
       expect(healthAfter.ok, "/health stopped responding after close cycle").toBe(true);
     } finally {
-      daemon.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { daemon.kill("SIGKILL"); } catch { /* */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(daemon, ROOT);
     }
   }, 15_000);
 });

@@ -30,6 +30,7 @@ import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
 import { startToken } from "./helpers/start-token.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(__filename), "..");
@@ -72,10 +73,8 @@ async function startHarness(label: string): Promise<Harness> {
   await waitForHealth(port, 8000);
   return { port, root, dbPath, daemon };
 }
-function stopHarness(h: Harness): void {
-  try { h.daemon.kill("SIGTERM"); } catch { /* */ }
-  try { h.daemon.kill("SIGKILL"); } catch { /* */ }
-  try { fs.rmSync(h.root, { recursive: true, force: true }); } catch { /* */ }
+async function stopHarness(h: Harness): Promise<void> {
+  await stopAndRemove(h.daemon, h.root);
 }
 async function mcp(port: number, name: string, args: Record<string, unknown>, token?: string, extra: Record<string, string> = {}): Promise<any> {
   const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...extra };
@@ -132,7 +131,7 @@ describe("v2.14.1 — hook agent_pid capture + spawn-window", () => {
       // the presence derivation reset offline→idle on re-register (comes up available).
       expect(sql(h.dbPath, `SELECT agent_status FROM agents WHERE name='${name}';`)).toBe("idle");
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 
@@ -151,7 +150,7 @@ describe("v2.14.1 — hook agent_pid capture + spawn-window", () => {
       expect(sql(h.dbPath, `SELECT host_shell_pids FROM agents WHERE name='${name}';`)).toBe("[999999]");
       expect(sql(h.dbPath, `SELECT agent_pid FROM agents WHERE name='${name}';`)).toBe("12345");
     } finally {
-      stopHarness(h);
+      await stopHarness(h);
     }
   }, 25_000);
 

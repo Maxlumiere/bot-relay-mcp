@@ -37,6 +37,7 @@ import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -133,10 +134,7 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
       const vaultContent = fs.readFileSync(vaultFile, "utf-8").trim();
       expect(vaultContent).toMatch(/^[A-Za-z0-9_=.-]{8,128}$/);
     } finally {
-      daemon.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { daemon.kill("SIGKILL"); } catch { /* */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(daemon, ROOT);
     }
   }, 20_000);
 
@@ -228,10 +226,7 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
       const after = fs.readFileSync(vaultFile, "utf-8");
       expect(after).toBe(before);
     } finally {
-      daemon.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { daemon.kill("SIGKILL"); } catch { /* */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(daemon, ROOT);
     }
   }, 20_000);
 
@@ -358,10 +353,7 @@ describe("v2.6.4 — check-relay.sh agent_token extraction (real HTTP daemon SSE
       expect(vaultContent).not.toBe(oldToken);
       expect(vaultContent).not.toBe(recoveryToken);
     } finally {
-      daemon.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { daemon.kill("SIGKILL"); } catch { /* */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(daemon, ROOT);
     }
   }, 20_000);
 
