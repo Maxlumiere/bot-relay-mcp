@@ -31,7 +31,7 @@ import fs from "fs";
 import path from "path";
 import { checkInstall, parseStamp, UNBUILT, type InstallCheck } from "./build-id.js";
 import { isUtcStartToken, probePid, type PidState, type ProcEntry, type ProcessStart } from "./liveness.js";
-import { NODE_FLAGS, NODE_NO_SCRIPT, NODE_OPTIONS_WITH_VALUE } from "./node-options.js";
+import { NODE_NO_SCRIPT, nodeOptionTable, type NodeOptionTable } from "./node-options.js";
 import { isRuntimeThreadName } from "./proc-exe.js";
 
 export type ConnectorVerdict = "CURRENT" | "STALE" | "UNKNOWN" | "INSTALL INCONSISTENT";
@@ -104,7 +104,7 @@ export const realClassifyFs: ClassifyFs = {
 };
 
 const NODE_EXECUTABLES = /^node(js)?(\.exe)?$/i;
-export { NODE_OPTIONS_WITH_VALUE, NODE_FLAGS, NODE_NO_SCRIPT };
+export { NODE_NO_SCRIPT };
 
 /** A process, as the snapshot holds it. `argv` is the EXACT argv when the platform gives one (Linux /proc); else null. */
 export interface ProcessView {
@@ -131,7 +131,9 @@ type Reading = { index: number } | { none: string };
  * AFTER the positive-evidence gate (classifyProcess), so it can only choose between
  * CONNECTOR and UNKNOWN, never hide a connector or flag an unrelated process.
  */
-function readNodeOptions(args: string[]): { readings: Reading[]; unknownOptions: string[] } {
+function readNodeOptions(args: string[], table: NodeOptionTable): { readings: Reading[]; unknownOptions: string[] } {
+  const withValue: ReadonlySet<string> = table.ok ? table.withValue : new Set();
+  const flags: ReadonlySet<string> = table.ok ? table.flags : new Set();
   const memo = new Map<number, Reading[]>();
   const unknownOptions: string[] = [];
   const at = (i: number): Reading[] => {
@@ -147,8 +149,8 @@ function readNodeOptions(args: string[]): { readings: Reading[]; unknownOptions:
       const name = eq > 0 ? a.slice(0, eq) : a;
       if (NODE_NO_SCRIPT.has(name)) r = [{ none: `node ${name}: no script` }];
       else if (eq > 0) r = at(i + 1);
-      else if (NODE_OPTIONS_WITH_VALUE.has(a)) r = at(i + 2);
-      else if (NODE_FLAGS.has(a) || a.startsWith("--no-")) r = at(i + 1);
+      else if (withValue.has(a)) r = at(i + 2);
+      else if (flags.has(a) || (table.ok && a.startsWith("--no-"))) r = at(i + 1);
       else {
         unknownOptions.push(a);
         r = [...at(i + 1), ...at(i + 2)];
@@ -287,7 +289,7 @@ function relayEvidence(args: string[], exact: boolean, cwdReadable: boolean, abs
  *      installDir = `<dir>`. Every reading the same connector → CONNECTOR; anything
  *      else → UNKNOWN, never not-relay (the evidence says it may be one).
  */
-export function classifyProcess(p: ProcessView, listeners: ReadonlySet<number>, fsx: ClassifyFs = realClassifyFs): Classification {
+export function classifyProcess(p: ProcessView, listeners: ReadonlySet<number>, fsx: ClassifyFs = realClassifyFs, table?: NodeOptionTable): Classification {
   if (listeners.has(p.pid)) return { kind: "not-relay", why: "it holds a TCP listen socket (the daemon or another server)" };
   const exe = p.exe ?? p.comm ?? (p.argv ? p.argv[0] : p.command.split(" ")[0]);
   if (!NODE_EXECUTABLES.test(path.basename(exe ?? ""))) {
@@ -319,7 +321,9 @@ export function classifyProcess(p: ProcessView, listeners: ReadonlySet<number>, 
   const evidence = relayEvidence(args, exact, p.cwd !== null, absolute, fsx);
   if (!evidence) return { kind: "not-relay", why: "its argv names no relay entrypoint" };
 
-  const { readings, unknownOptions } = readNodeOptions(args);
+  // The option table is derived only when needed (a plain `node <script>` never reads it).
+  const opts = table ?? (args.some((a) => a.startsWith("-") && a !== "-") ? nodeOptionTable() : ({ ok: true, withValue: new Set(), flags: new Set() } as NodeOptionTable));
+  const { readings, unknownOptions } = readNodeOptions(args, opts);
   const results = readings.map((r): Classification => ("none" in r ? { kind: "not-relay", why: r.none } : classifyScript(args, r.index, exact, absolute, fsx)));
   const first = results[0];
   if (results.every((c) => c.kind === "connector" && first.kind === "connector" && c.installDir === first.installDir && c.script === first.script)) return first;
@@ -327,8 +331,9 @@ export function classifyProcess(p: ProcessView, listeners: ReadonlySet<number>, 
     return first.kind === "unknown" ? first : { kind: "unknown", reason: `its argv names the relay entrypoint ${evidence}, but ${first.kind === "not-relay" ? first.why : "it is not the script"}` };
   }
   const inner = results.find((c) => c.kind === "unknown") as { reason: string } | undefined;
-  const options =
-    unknownOptions.length > 0
+  const options = !opts.ok
+    ? `node's option table could not be derived (${opts.why}), so every option is read both ways`
+    : unknownOptions.length > 0
       ? `the node option${unknownOptions.length > 1 ? "s" : ""} ${unknownOptions.join(", ")} ${unknownOptions.length > 1 ? "are" : "is"} not in node's option table (it may take a value)`
       : "its node options";
   return { kind: "unknown", reason: `its argv names the relay entrypoint ${evidence}, but ${options}: ${results.length} readings of its argv disagree${inner ? ` (${inner.reason})` : ""}` };
