@@ -126,7 +126,7 @@ export function materializeDb(
       throw err;
     }
   } finally {
-    fs.rmSync(tmp, { force: true });
+    fs.rmSync(tmp, { force: true }); // rm: own regular file: this call's own temp file
   }
 }
 

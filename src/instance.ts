@@ -395,7 +395,7 @@ function checkedAfterWrites<T>(chain: ComponentIdentity[], work: () => T): T {
 /** Remove a temp file; a failure to remove it (e.g. a swapped ancestor) is never a native, path-bearing error. */
 function removeTempQuietly(tmp: string): void {
   try {
-    fs.rmSync(tmp, { force: true });
+    fs.rmSync(tmp, { force: true }); // rm: own regular file: the caller's own temp file
   } catch {
     /* #449 R2 P3: nothing path-bearing escapes; the caller's role refusal (and the chain check) speak */
   }

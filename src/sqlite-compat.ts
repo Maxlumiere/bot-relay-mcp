@@ -1117,7 +1117,7 @@ function ownerPersist(w: WasmDatabase, data: Buffer): void {
     }
     replaceWithRetry(tmp, target);
   } catch (err) {
-    fs.rmSync(tmp, { force: true });
+    fs.rmSync(tmp, { force: true }); // rm: own regular file: this write's own temp file
     throw err;
   }
   w.lastIdentity = wrote;

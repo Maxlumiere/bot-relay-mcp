@@ -156,6 +156,7 @@ export function writeOwnerEndpoint(dbPath: string, port: number, transport: Owne
     } catch {
       /* already closed */
     }
+    // rm: own regular file
     fs.rmSync(tmp, { force: true }); // this owner's own temp name, never the record
     throw err;
   }

@@ -100,13 +100,13 @@ function writePrivateFile(file: string, data: string, dirId: fs.BigIntStats): vo
     ok = true;
   } finally {
     fs.closeSync(fd);
-    if (!ok) fs.rmSync(tmp, { force: true });
+    if (!ok) fs.rmSync(tmp, { force: true }); // rm: own regular file: this call's own temp file
   }
   // The target must not be a symlink (or anything but a regular file): rename never follows one, but refuse loudly.
   try {
     const cur = fs.lstatSync(file);
     if (cur.isSymbolicLink() || !cur.isFile()) {
-      fs.rmSync(tmp, { force: true });
+      fs.rmSync(tmp, { force: true }); // rm: own regular file: this call's own temp file
       throw new Error(`${file} exists and is not a regular file (a symlink?): refusing to replace it`);
     }
   } catch (err) {

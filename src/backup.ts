@@ -341,7 +341,7 @@ async function takeSnapshot(srcDbPath: string, snapshotDbPath: string): Promise<
       } finally {
         source.release(); // never written back
       }
-      fs.rmSync(snapshotDbPath, { force: true });
+      fs.rmSync(snapshotDbPath, { force: true }); // rm: own regular file: this backup's own snapshot copy
       if (attempt >= 2) {
         throw new Error(
           `backup refused (wasm driver): the DB at '${srcDbPath}' changed while it was being read, on the first read and ` +
@@ -752,7 +752,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     const plainTar = path.join(stagingDir, ".archive.tar");
     await gunzipToFile(resolvedArchive, plainTar);
     const { skipped } = extractBackupTar(plainTar, stagingDir);
-    fs.rmSync(plainTar, { force: true });
+    fs.rmSync(plainTar, { force: true }); // rm: own regular file: this restore's own gunzipped tar
 
     // --- Step 1: VALIDATE COMPLETELY IN STAGING, before ANY live mutation (Codex #342 R2, ruled): the required members,
     // the manifest, the schema and the staged DB's integrity all pass BEFORE the safety backup, initializeDb() or
@@ -879,6 +879,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       // appear while the archive was being copied into .new).
       assertSwapPreconditions(srcDbPath, target, restoreOwner);
     } catch (err) {
+      // rm: own regular file
       fs.rmSync(newPath, { force: true }); // this restore's own staged copy (never a DB-family name)
       throw err;
     }
@@ -890,6 +891,7 @@ export async function importRelayState(archivePath: string, options: ImportOptio
         renameReplacingWithWindowsRetry(newPath, target); // src/fs-replace.ts: the ONE Windows-only bounded retry
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code ?? "";
+        // rm: own regular file
         fs.rmSync(newPath, { force: true }); // this restore's own staged copy (never a DB-family name)
         throw new Error(
           `restore refused: the staged copy could not be replaced onto ${target} (${code || (err as Error).message})` +
