@@ -892,8 +892,9 @@ export async function importRelayState(archivePath: string, options: ImportOptio
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
         try {
           dropStaged();
-        } catch {
-          /* the copy's error is the one reported */
+        } catch (e) {
+          // The copy's error stays primary; the failed cleanup is attached, naming the leftover (ruling 81d038ab).
+          if (err instanceof Error) err.message += ` (the staged copy ${newPath} could not be removed: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}; it is left behind)`;
         }
       }
       throw err;
@@ -944,12 +945,19 @@ export async function importRelayState(archivePath: string, options: ImportOptio
     // private directory can already overwrite the DB): such a writer could replace the staged name between the check
     // above and the rename. After the swap the DB name must name the copy this restore staged; if not, a LOUD
     // refusal naming the safety backup. NO rollback: a rollback would itself race that writer.
-    const after = fs.lstatSync(target, { bigint: true });
-    if (!after.isFile() || after.ino !== staged!.ino || after.dev !== staged!.dev) {
+    let after: fs.BigIntStats | null = null;
+    let unreadable = "";
+    try {
+      after = fs.lstatSync(target, { bigint: true });
+    } catch (e) {
+      unreadable = (e as NodeJS.ErrnoException).code ?? (e as Error).message;
+    }
+    if (!after || !after.isFile() || after.ino !== staged!.ino || after.dev !== staged!.dev) {
       throw new Error(
-        `restore: the DB at ${target} after the swap is NOT the copy this restore staged (it was replaced between the ` +
-          `final check and the rename: another writer in its directory?). Not rolled back (that would race the same ` +
-          `writer). Inspect it, and restore from the safety backup at ${previousBackupPath} if it is not yours.`
+        `restore: the DB at ${target} after the swap ${after ? "is NOT the copy this restore staged (it was replaced between the final check and the rename: another writer in its directory?)" : "could not be checked against the copy this restore staged"}. ` +
+          `The swap happened; it is not rolled back (that would race the same writer). Inspect it, and restore from the ` +
+          `safety backup at ${previousBackupPath} if it is not yours.` +
+          (unreadable ? ` (the post-swap check could not read the DB name: ${unreadable})` : "")
       );
     }
 
