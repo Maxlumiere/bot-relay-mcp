@@ -88,6 +88,17 @@ describe.skipIf(WIN)("stopAndRemove: the child has EXITED before its directory i
     expect(fs.existsSync(dir)).toBe(false);
   }, 15_000);
 
+  it("SEVERAL children writing into one dir (a daemon and its writer) → ALL have EXITED before the dir is removed; a null entry is skipped", async () => {
+    const dir = path.join(ROOT, "two-writers");
+    fs.mkdirSync(dir);
+    const a = writerOnTerm(dir);
+    const b = writerOnTerm(dir);
+    await Promise.all([a.ready, b.ready]);
+    await stopAndRemove([a.child, null, b.child], dir);
+    for (const w of [a, b]) expect(w.child.exitCode !== null || w.child.signalCode !== null, `child ${w.child.pid} exited before the removal`).toBe(true);
+    expect(fs.existsSync(dir), `the directory came back: ${fs.existsSync(dir) ? fs.readdirSync(dir).join(",") : ""}`).toBe(false);
+  }, 20_000);
+
   it("a child that has ALREADY exited → no wait, the dir is removed", async () => {
     const dir = path.join(ROOT, "gone");
     fs.mkdirSync(dir);
