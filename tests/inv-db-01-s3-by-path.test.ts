@@ -576,6 +576,22 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     expect(fs.existsSync(staged), "the staged .new (this restore's own copy, not a DB name) is removed").toBe(false);
   }, 60_000);
 
+  it.skipIf(process.platform === "win32")("Codex #472 R1: a PLANTED `<db>.new` link to an outside file is never written through nor renamed onto the DB: the outside file is untouched, the DB stays a regular file", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    const outside = path.join(caseDir, "outside-victim.txt");
+    fs.writeFileSync(outside, "the outside file's own bytes");
+    fs.symlinkSync(outside, `${dbPath}.new`); // planted (or a stale leftover) at the fixed staging name
+    try {
+      await importRelayState(archive, { force: true });
+    } catch {
+      /* a refusal is acceptable; what matters is below */
+    }
+    expect(fs.readFileSync(outside, "utf-8"), "the outside file was not written through the planted link").toBe("the outside file's own bytes");
+    expect(fs.lstatSync(dbPath).isSymbolicLink(), "the DB name is not the planted link").toBe(false);
+    expect(fs.lstatSync(dbPath).isFile(), "the DB stays a regular file").toBe(true);
+  }, 60_000);
+
   // --- Codex #391 R1 P2-3 / P2-4 (one predicate: the DB's own instance declaration AND the caller's) ---
 
   /** Two instances under this test's relay root: A declares `declA` (or has none), B (active) declares native. */

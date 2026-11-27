@@ -1,0 +1,54 @@
+// bot-relay-mcp
+// Copyright (c) 2026 Lumiere Ventures
+// SPDX-License-Identifier: MIT
+// See LICENSE for full terms.
+
+/**
+ * Codex #472 R1 (ruling bac8abd5): a trusted writer's CLEANUP after it refused a replaced temp must remove whatever
+ * now sits at the temp NAME, a link included. On Node v24.13.0 (the Node the live daemon runs) fs.rmSync on a DANGLING
+ * symlink returns without error and LEAVES it (MEASURED on macOS and on the Linux 24.13.0 CI leg); fs.unlinkSync
+ * removes the link itself. These rows DISCRIMINATE only on Node 24.13.0 (this Mac, or the 24.13.0 CI leg); on a Node
+ * that removes the link either way they pass before and after the fix.
+ */
+import { describe, it, expect, afterAll } from "vitest";
+import fs from "fs";
+import os from "os";
+import path from "path";
+
+const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rm-temp-link-")));
+afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
+
+/** The temp's name now names a DANGLING link (the replaced-temp case the writer refuses). */
+const danglingSwap = (tmp: string) => {
+  fs.unlinkSync(tmp);
+  fs.symlinkSync(path.join(ROOT, "no-such-target"), tmp);
+};
+const leftovers = (dir: string, re: RegExp) => fs.readdirSync(dir).filter((n) => re.test(n));
+
+describe.skipIf(process.platform === "win32")("a refused temp leaves NOTHING at its name, a dangling link included", () => {
+  it("owner-endpoint: the record's temp replaced by a dangling link → the write refuses, and the link is GONE", async () => {
+    const m = await import("../src/owner-endpoint.js");
+    const dir = fs.mkdtempSync(path.join(ROOT, "owner-"));
+    const db = path.join(dir, "relay.db");
+    fs.writeFileSync(db, "");
+    m._setWriterHookForTests(danglingSwap);
+    try {
+      expect(() => m.writeOwnerEndpoint(db, 1234, "http")).toThrow();
+    } finally {
+      m._setWriterHookForTests(null);
+    }
+    expect(leftovers(dir, /\.tmp$/), "no temp name left behind (a dangling link would survive rmSync on Node 24.13.0)").toEqual([]);
+  });
+  it("cli/remote: the secret's temp replaced by a dangling link → the write refuses, and the link is GONE", async () => {
+    const m = (await import("../src/cli/remote.js")) as unknown as { writeRemoteMintSecret: (dir: string, secret: string) => string; _setCreateHookForTests: (fn: ((tmp: string) => void) | null) => void };
+    const dir = path.join(fs.mkdtempSync(path.join(ROOT, "remote-")), "scope");
+    m._setCreateHookForTests(danglingSwap);
+    try {
+      expect(() => m.writeRemoteMintSecret(dir, "a-secret-for-the-test")).toThrow();
+    } finally {
+      m._setCreateHookForTests(null);
+    }
+    expect(leftovers(dir, /\.tmp$/), "no temp name left behind").toEqual([]);
+    expect(fs.existsSync(path.join(dir, "mint.secret")), "no secret published").toBe(false);
+  });
+});
