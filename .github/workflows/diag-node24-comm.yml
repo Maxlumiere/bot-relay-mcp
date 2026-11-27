@@ -1,0 +1,48 @@
+name: DIAG node24 comm (throwaway, never merged)
+
+# READ-ONLY diagnostic for one question: what does a node process look like to `ps` (comm, args), to /proc (comm,
+# exe, thread names) and to the hooks' agent-pid walk, under Node 22, 24.13.0 and 24.22.3, on Linux and macOS?
+on:
+  pull_request:
+    paths: ['.github/workflows/diag-node24-comm.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    name: diag ${{ matrix.os }} node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['22', '24.13.0', '24.22.3']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      - name: The node process as ps and /proc see it
+        run: |
+          node -e '
+          const { execSync } = require("child_process");
+          const pid = process.pid;
+          const sh = (c) => { try { return execSync(c, { encoding: "utf8", shell: "/bin/bash" }).trim(); } catch (e) { return "ERR " + String(e.message).split("\n")[0]; } };
+          console.log("DIAG node", process.version, process.platform, "pid", pid);
+          console.log("DIAG ps comm,args:", JSON.stringify(sh(`ps -o comm=,args= -p ${pid}`)));
+          console.log("DIAG ps -ww comm:", JSON.stringify(sh(`ps -ww -o comm= -p ${pid}`)));
+          if (process.platform === "linux") {
+            console.log("DIAG /proc comm:", JSON.stringify(sh(`cat /proc/${pid}/comm`)));
+            console.log("DIAG /proc exe:", JSON.stringify(sh(`readlink /proc/${pid}/exe`)));
+            console.log("DIAG threads:", JSON.stringify(sh(`for t in /proc/${pid}/task/*; do printf "%s=%s " "$(basename "$t")" "$(cat "$t/comm")"; done`)));
+          }
+          '
+      - name: The hooks' agent-pid walk, run from a bash child of a node parent (as hookAnchor does)
+        run: |
+          node -e '
+          const { execFileSync } = require("child_process");
+          const helper = process.cwd() + "/hooks/_vault-helpers.sh";
+          const walk = "p=$(ps -o ppid= -p $$ | tr -d \" \"); d=0; while [ \"${p:-0}\" -gt 1 ] && [ $d -lt 8 ]; do echo \"DIAG ancestor pid=$p comm=$(ps -o comm= -p $p) args=$(ps -o args= -p $p | cut -c1-80)\"; p=$(ps -o ppid= -p $p | tr -d \" \"); d=$((d+1)); done; . \"$1\"; echo \"DIAG relay_agent_pid=[$(relay_agent_pid)] (node parent pid " + process.pid + ")\"";
+          process.stdout.write(execFileSync("bash", ["-c", walk, "walk", helper], { encoding: "utf8" }));
+          '
