@@ -26,6 +26,7 @@ import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -546,10 +547,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
       // Belt-and-suspenders: confirm no auth_error envelope leaked through.
       expect(inner.auth_error).toBeUndefined();
     } finally {
-      stdioChild.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { stdioChild.kill("SIGKILL"); } catch { /* already dead */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(stdioChild, ROOT);
     }
   }, 20_000);
 
@@ -662,10 +660,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
       expect(Array.isArray(ok.messages)).toBe(true);
       expect(ok.auth_error).toBeUndefined();
     } finally {
-      child.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { child.kill("SIGKILL"); } catch { /* already dead */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(child, ROOT);
     }
   }, 15_000);
 
@@ -820,10 +815,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
       expect(ok.agent_name).toBe("health-oracle-agent");
       expect(ok.auth_state).toBe("active");
     } finally {
-      child.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { child.kill("SIGKILL"); } catch { /* already dead */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(child, ROOT);
     }
   }, 20_000);
 
@@ -979,10 +971,7 @@ describe("v2.6.1 R2 — FIX 2 v2 daemon resolveToken vault fallback (stdio-only)
       expect(Array.isArray(ok.messages)).toBe(true);
       expect(ok.auth_error).toBeUndefined();
     } finally {
-      child.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { child.kill("SIGKILL"); } catch { /* already dead */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(child, ROOT);
     }
   }, 20_000);
 });

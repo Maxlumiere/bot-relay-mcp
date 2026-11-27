@@ -23,6 +23,7 @@ import os from "os";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -262,10 +263,7 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
         expect(replay.success).toBe(false);
       }
     } finally {
-      child.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { child.kill("SIGKILL"); } catch { /* already dead */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(child, ROOT);
     }
   }, 20_000);
 
@@ -360,10 +358,7 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
       expect(stale.auth_error).toBe(true);
       expect(stale.error_code).toBe("AUTH_FAILED");
     } finally {
-      child.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { child.kill("SIGKILL"); } catch { /* */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(child, ROOT);
     }
   }, 15_000);
 
@@ -433,10 +428,7 @@ describe("v2.6.2 — recovery flow integration (register → revoke → recover 
       // Vault still doesn't exist — no half-creation.
       expect(fs.existsSync(VAULT_FILE)).toBe(false);
     } finally {
-      child.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { child.kill("SIGKILL"); } catch { /* */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(child, ROOT);
     }
   }, 15_000);
 });

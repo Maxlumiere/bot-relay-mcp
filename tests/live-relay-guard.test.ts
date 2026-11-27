@@ -32,6 +32,7 @@ import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
 import { spawnNestedRun } from "./_setup/operator-tripwire.js";
 import { fixtureNamesIn, guardAfter, guardBefore, heldByDaemon, liveOffenders, snapshotLiveDb } from "./_setup/live-relay-guard.mjs";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_INDEX = path.join(REPO, "dist", "index.js");
@@ -97,14 +98,7 @@ describe("the live-relay guard, on a stand-in live relay (a real sandbox daemon)
     for (const n of ["fx-probe", "fleet-member"]) expect((await register(port, n, mintHeaders(dbPath))).success, n).toBe(true);
   }, 60_000);
   afterAll(async () => {
-    daemon?.kill("SIGTERM");
-    await new Promise((r) => setTimeout(r, 200));
-    try {
-      daemon?.kill("SIGKILL");
-    } catch {
-      /* gone */
-    }
-    fs.rmSync(root, { recursive: true, force: true });
+    await stopAndRemove([daemon], root);
   });
 
   it("precondition: the daemon HOLDS its DB (-wal, -shm), and the suite's fixture names include \"fx-probe\"", () => {

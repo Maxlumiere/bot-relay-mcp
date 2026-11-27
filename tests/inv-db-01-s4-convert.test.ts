@@ -478,7 +478,9 @@ describe("INV-DB-01 slice 4, Codex #401 R1: the canonical target, the lock bindi
     wasmOnly();
     const retarget = () => {
       fs.renameSync(real, moved); // keeps the inode, the size and the mtime
-      fs.rmSync(dbPath);
+      // unlinkSync, never rmSync: dbPath is now a DANGLING link, and rmSync on one returns without error and leaves
+      // it in place on Node v24.13.0 (measured), so the symlinkSync below would hit EEXIST.
+      fs.unlinkSync(dbPath);
       fs.symlinkSync(moved, dbPath);
     };
     await expect((await convertMod()).convertJournal({ to: "wasm", _beforeReplaceForTests: retarget })).rejects.toThrow(/convert-journal refused/);

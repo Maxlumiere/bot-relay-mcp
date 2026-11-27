@@ -827,6 +827,7 @@ describe.skipIf(!OWN)("the CLI: `relay watch <agent> --until-wake` (zero tokens;
       process.kill(win.pid, "SIGKILL");
       expect(await within(r.exited, 15_000), r.err()).toBe(0); // gone is the KERNEL's answer (ESRCH): no ps needed
       expect(r.out()).toBe("");
+      // A LIVENESS guard (the watch ends within a bound), not an ordering proxy; within(r.exited, 15_000) above already enforces it.
       expect(Date.now() - t0).toBeLessThan(15_000);
     } finally {
       stallPs(false);

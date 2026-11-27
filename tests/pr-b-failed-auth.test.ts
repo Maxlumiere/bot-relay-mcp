@@ -1154,6 +1154,43 @@ export function freezePlantFault(label: string, stallMs: number, plant: PlantSpa
 }
 
 /**
+ * HOST-STALL EVIDENCE on a planted freeze: the idle sentinel's gaps covering at least this much of the freeze's own breach.
+ * An idle sentinel ticks every ~10 ms, so 100 ms is about ten missed ticks: the HOST stalled, not tick jitter.
+ */
+export const HOST_STALL_EVIDENCE_MS = 100;
+/**
+ * A planted freeze's verdict (ruling 11192dbe (b), the classify branch):
+ * - LANDED: freezePlantFault accepts it (its block ran in full, its own breach stays >= the ceiling uncovered);
+ * - HOST STALL: its block ran in FULL (>= the plant - 50 ms) and the sentinel covered >= HOST_STALL_EVIDENCE_MS of its own
+ *   breach, which is what dropped it under the ceiling. The instrument could not judge this attempt: NOT_EVALUATED (a
+ *   coverage gap under the observer rule), re-runnable. The ceiling's own rule reads that breach as NOT_EVALUATED too;
+ * - FAULT: any other plant that did not land (a short block, a block that never ran, no located breach, a covered
+ *   stretch under the evidence threshold): a BLOCKING FIXTURE_FAULT, never re-run.
+ */
+export type FreezePlantVerdict = { kind: "landed" } | { kind: "host_stall"; why: string } | { kind: "fault"; why: string };
+export function freezePlantVerdict(label: string, stallMs: number, plant: PlantSpan, stalled: PlantReading): FreezePlantVerdict {
+  const fault = freezePlantFault(label, stallMs, plant, stalled);
+  if (fault === null) return { kind: "landed" };
+  const floor = stallMs - PLANT_TOLERANCE_MS;
+  const blockMs = plant ? plant.to - plant.from : null;
+  const freeze = plant ? (stalled.breaches ?? []).find((b) => b.kind === "loop-delay" && b.from <= plant.from && b.to >= plant.to) : undefined;
+  const covered = freeze ? unionOverlapMs(freeze, stalled.sentinelGaps ?? []) : 0;
+  if (blockMs !== null && blockMs >= floor && freeze && covered >= HOST_STALL_EVIDENCE_MS) {
+    const len = freeze.to - freeze.from;
+    return {
+      kind: "host_stall",
+      why: `HOST STALL ON THE PLANT (${label}): the planted ${stallMs} ms freeze ran in full (block ${blockMs.toFixed(1)} ms), but the sentinel covered ${covered.toFixed(1)} ms of its ${len.toFixed(1)} ms breach (>= ${HOST_STALL_EVIDENCE_MS} ms: the host stalled on it), leaving ${(len - covered).toFixed(1)} ms uncovered, under the ${CEILING_MS} ms ceiling. The instrument could not judge this attempt: NOT_EVALUATED, re-run.`,
+    };
+  }
+  return { kind: "fault", why: fault };
+}
+/** The gate over a bar's planted freezes: a fault THROWS (the step fails, never re-run); returns the host-stall reasons. */
+export function plantGate(verdicts: readonly FreezePlantVerdict[]): string[] {
+  for (const v of verdicts) if (v.kind === "fault") throw new Error(v.why);
+  return verdicts.flatMap((v) => (v.kind === "host_stall" ? [v.why] : []));
+}
+
+/**
  * THE RETRY SELF-TEST's assertion (ruling R1): what the retry machinery DID, never what a LIVE re-run read. Attempt 1
  * (planted) is a covered NOT_EVALUATED; it was re-run; the decision is the FIRST evaluated attempt (every earlier one
  * NOT_EVALUATED); nothing is kept from attempt 1 (the result is the deciding attempt's own bar). The deciding verdict
@@ -1588,6 +1625,33 @@ describe("the timing-bar decision rule (pure; always runs; not matched by the is
       freezePlantFault("t", 600, plant, fz([{ from: 1300, to: 1600 }], [before, after])),
       "the plant's OWN breach covered 300 ms (it would read NE), beside UNCOVERED unrelated breaches: a fault",
     ).toMatch(/^FIXTURE_FAULT .*its loop-delay breach 600\.5 ms, the sentinel covering 300\.0 ms/);
+  });
+  it("A PLANT COVERED BY A HOST STALL is NOT_EVALUATED (re-runnable), never a blocking FIXTURE_FAULT: the block ran in full and the idle sentinel missed >= 100 ms inside the freeze's own breach", () => {
+    const at = (o: Partial<Reading> = {}) => ({ healthMax: 841.5, eldMax: 669.3, eldHist: 669.5, sentinelMax: 300.3, loadGapMax: 305.3, ...o });
+    // MEASURED on a macOS runner (CI, the auth round 9 plant): block 667.2 ms; its breach 669.3 ms; the sentinel covering
+    // 213.2 ms of it (uncovered 456.1 ms, under the 500 ms ceiling only because the host stalled on it).
+    const fr = { from: 1000, to: 1669.3, kind: "loop-delay" as const };
+    const plant = { from: 1001, to: 1668.2 };
+    const v = freezePlantVerdict("macOS auth round 9", 600, plant, at({ breaches: [fr], sentinelGaps: [{ from: 1300, to: 1513.2 }] }));
+    expect(v.kind, JSON.stringify(v)).toBe("host_stall");
+  });
+  it("A PLANT WITHOUT HOST-STALL EVIDENCE stays a BLOCKING FIXTURE_FAULT (a short block, a block that never ran, no located breach, or a covered stretch under 100 ms)", () => {
+    const at = (o: Partial<Reading> = {}) => ({ healthMax: 600, eldMax: 603, eldHist: 603, sentinelMax: 0, loadGapMax: 630.7, ...o });
+    const fr = { from: 1000, to: 1600.5, kind: "loop-delay" as const };
+    const plant = { from: 1000.4, to: 1600.5 };
+    expect(freezePlantVerdict("t", 600, { from: 1000.4, to: 1549.4 }, at({ breaches: [fr], sentinelGaps: [] })).kind, "a short block").toBe("fault");
+    expect(freezePlantVerdict("t", 600, { from: 1000.4, to: 1549.4 }, at({ breaches: [fr], sentinelGaps: [{ from: 1100, to: 1300 }] })).kind, "a short block, even heavily covered: the plant did not run in full").toBe("fault");
+    expect(freezePlantVerdict("t", 600, null, at({ breaches: [fr], sentinelGaps: [] })).kind, "a block that never ran").toBe("fault");
+    expect(freezePlantVerdict("t", 600, plant, at({ breaches: [], sentinelGaps: [] })).kind, "no located breach").toBe("fault");
+    // A 450 ms breach the sentinel barely touched (90 ms): under the ceiling, and NOT explained by a host stall.
+    const short = { from: 1000, to: 1450, kind: "loop-delay" as const };
+    expect(freezePlantVerdict("t", 400, { from: 1000.4, to: 1449 }, at({ breaches: [short], sentinelGaps: [{ from: 1100, to: 1190 }] })).kind, "covered under 100 ms").toBe("fault");
+    expect(freezePlantVerdict("t", 600, plant, at({ breaches: [fr], sentinelGaps: [] })).kind, "the quiet plant: landed").toBe("landed");
+  });
+  it("THE PLANT GATE: a FIXTURE_FAULT throws (never re-run); a host stall does NOT throw and is reported, so the attempt reads NOT_EVALUATED and is re-run", () => {
+    expect(() => plantGate([{ kind: "landed" }, { kind: "fault", why: "FIXTURE_FAULT (t): x" }])).toThrow(/FIXTURE_FAULT \(t\)/);
+    expect(plantGate([{ kind: "landed" }, { kind: "host_stall", why: "HOST STALL (t): y" }])).toEqual(["HOST STALL (t): y"]);
+    expect(plantGate([{ kind: "landed" }])).toEqual([]);
   });
   it("THE CEILING (6), PER BREACH: a breach is charged its UNCOVERED time (its length - its overlap with the union of the sentinel's gaps), FAIL iff that is >= 500 ms; a matching magnitude at another time, a touch, or an unlocatable breach is a FREEZE; no sentinel stream is an INSTRUMENT FAULT", () => {
     const gap = (from: number, ms: number) => ({ from, to: from + ms });
@@ -2276,10 +2340,9 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
         into[at] = { from, to: absNow() };
       };
       const verified = (label: string, b: BarStats, blocks: PlantSpan[], rounds: number[]) => {
-        for (const k of rounds) {
-          const fault = freezePlantFault(`${label}, auth round ${k + 1}`, STALL_MS, blocks[k] ?? null, b.auth[k]);
-          if (fault) throw new Error(fault);
-        }
+        // A fault throws (blocking, never re-run); a HOST STALL on the plant is reported and the attempt reads
+        // NOT_EVALUATED through the ceiling's own rule (the covered breach), so it is re-run.
+        for (const why of plantGate(rounds.map((k) => freezePlantVerdict(`${label}, auth round ${k + 1}`, STALL_MS, blocks[k] ?? null, b.auth[k])))) announce(why);
         return b;
       };
       let round = 0;
@@ -2301,11 +2364,14 @@ describe.runIf(process.env.RELAY_TIMING_BARS === "1")("BARS (serial CI step, REL
         return verified("every auth round frozen", b, blocks, Array.from({ length: K }, (_, i) => i));
       });
       for (const [x, frozen] of [[one, 1], [every, K]] as const) {
+        expectEvaluated(x.result.label, x); // three host-stalled attempts: a FINAL NOT_EVALUATED (blocks, never a pass)
         const c = ceilingVerdict(x.result.label, x.result.auth);
         expect(c.verdict, `${x.result.label}: the planted freeze must read as a freeze (${c.why || "no breach"})`).toBe("FAIL");
         expect(x.result.auth.filter((r) => r.eldMax >= CEILING_MS).length, `${x.result.label}: the loop breached the ceiling in each frozen round`).toBe(frozen);
         expect(x.final.status, x.final.why.join("; ")).toBe("FAIL");
-        expect(x.attempts, `${x.result.label}: a ceiling breach is never re-run`).toBe(1);
+        // A ceiling breach is never re-run: the deciding attempt is the FAIL, and every earlier one was NOT_EVALUATED (a
+        // host stall on the plant); untilEvaluated stops at the first FAIL by construction.
+        expect(x.history.slice(0, -1).every((h) => h.status === "NOT_EVALUATED"), `${x.result.label}: only NOT_EVALUATED attempts were re-run`).toBe(true);
       }
     });
   }, 300_000);
