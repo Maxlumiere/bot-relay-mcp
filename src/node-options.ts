@@ -81,3 +81,17 @@ export const NODE_FLAGS: ReadonlySet<string> = new Set([
 export const NODE_NO_SCRIPT: ReadonlySet<string> = new Set([
   "-e", "--eval", "-p", "--print", "-v", "--version", "-h", "--help", "-c", "--check", "--run",
 ]);
+
+/**
+ * THE VERSION-AWARE TABLE. RED STATE: today's behaviour (the static table above, whatever node's help says), so the
+ * rows of tests/node-option-table-runtime.test.ts each fail on their own assertion. The implementation follows.
+ */
+export type NodeOptionTable = { ok: true; withValue: ReadonlySet<string>; flags: ReadonlySet<string> } | { ok: false; why: string };
+
+export function parseNodeHelp(_help: string): { withValue: Set<string>; flags: Set<string> } {
+  return { withValue: new Set(NODE_OPTIONS_WITH_VALUE), flags: new Set(NODE_FLAGS) };
+}
+
+export function nodeOptionTable(_opts: { run?: () => string; key?: string } = {}): NodeOptionTable {
+  return { ok: true, withValue: NODE_OPTIONS_WITH_VALUE, flags: NODE_FLAGS };
+}
