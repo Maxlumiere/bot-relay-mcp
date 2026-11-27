@@ -476,6 +476,25 @@ describe("the relay OBSERVES the profile (ruling cc9f2199; 9d0bb9e6: the nearest
       warn.mockRestore();
     }
   }, 15_000);
+  it("the SAME property under a HOST STALL (a 600 ms block of this thread after registration returned, as a loaded runner does): the row still holds", async () => {
+    const { _setAsyncPsRunnerForTests, PROFILE_PROBE_TIMEOUT_MS } = await L();
+    const { handleRegisterAgent } = await import("../src/tools/identity.js");
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    _setAsyncPsRunnerForTests(() => new Promise<string>(() => {}));
+    try {
+      const t0 = Date.now();
+      const r = handleRegisterAgent({ name: "s-http-stall", role: "r", capabilities: [], agent_pid: process.pid, agent_pid_start: "Mon Nov 24 10:00:00 2026 UTC" } as never) as { isError?: boolean };
+      for (const end = Date.now() + 600; Date.now() < end; ); // the host stall: this thread does not run for 600 ms
+      expect(r.isError).toBeFalsy();
+      expect(Date.now() - t0, "registration never waits on the probe").toBeLessThan(500);
+      expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-http-stall'").get()).toEqual({ cli_profile_observed: null });
+      await new Promise((res) => setTimeout(res, PROFILE_PROBE_TIMEOUT_MS + 300));
+      expect(db.getDb().prepare("SELECT cli_profile_observed FROM agents WHERE name = 's-http-stall'").get()).toEqual({ cli_profile_observed: null });
+    } finally {
+      _setAsyncPsRunnerForTests(null);
+      warn.mockRestore();
+    }
+  }, 15_000);
   it("P2: a late probe never overwrites a NEWER registration's value, even within the SAME millisecond (the CAS token is a per-registration generation)", () => {
     const sameMs = "2026-11-24T10:00:00.000Z";
     const r1 = db.registerAgent("s-cas", "r", []);
