@@ -618,6 +618,33 @@ describe("INV-DB-01 slice 3: by-path opens follow the instance", () => {
     }
   }, 60_000);
 
+  it.skipIf(process.platform === "win32")("ruling 81d038ab: a DIRECTORY at the staged name → the restore's own refusal (Nothing was replaced… safety backup at …) is KEPT, and the cleanup failure is attached naming the path left behind", async () => {
+    makeDb(dbPath, 0, ["row-1"]);
+    const before = fileState(dbPath);
+    const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;
+    let staged = "";
+    setAfterStage?.((newPath) => {
+      staged = newPath;
+      fs.unlinkSync(newPath);
+      fs.mkdirSync(newPath); // a directory now sits at the staged name: its unlinkSync cleanup fails (EPERM / EISDIR)
+    });
+    let msg = "";
+    try {
+      await importRelayState(archive, { force: true });
+    } catch (err) {
+      msg = (err as Error).message;
+    } finally {
+      setAfterStage?.(null);
+    }
+    expect(staged, "precondition: the stage hook ran").not.toBe("");
+    expect(msg, "the restore's own refusal, not the cleanup's error").not.toMatch(/^(EPERM|EISDIR)/);
+    expect(msg).toMatch(/Nothing was replaced[\s\S]*safety backup is at \S+/);
+    expect(msg, "the path left behind is named").toContain(staged);
+    expect(msg).toMatch(/left behind/);
+    expect(fileState(dbPath), "the DB is untouched").toBe(before);
+    fs.rmdirSync(staged);
+  }, 60_000);
+
   it("review R2 P3: a failed lstat of the staged copy (EIO) never strands it: the whole post-create lifetime is covered", async () => {
     makeDb(dbPath, 0, ["row-1"]);
     const archive = (await exportRelayState({ destinationPath: path.join(caseDir, "before.tar.gz") })).archive_path;

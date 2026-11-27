@@ -53,6 +53,59 @@ describe.skipIf(process.platform === "win32")("a refused temp leaves NOTHING at 
   });
 });
 
+/** The temp's name now names a DIRECTORY: its cleanup (unlinkSync) fails with EPERM / EISDIR. */
+const dirSwap = (tmp: string) => {
+  fs.unlinkSync(tmp);
+  fs.mkdirSync(tmp);
+};
+
+describe.skipIf(process.platform === "win32")("ruling 81d038ab: a cleanup that FAILS (a directory at the temp name) never replaces the primary refusal; it is ATTACHED, naming the path left behind", () => {
+  it("owner-endpoint: the refusal is still the writer's own, and it names the temp left behind", async () => {
+    const m = await import("../src/owner-endpoint.js");
+    const dir = fs.mkdtempSync(path.join(ROOT, "owner-dir-"));
+    const db = path.join(dir, "relay.db");
+    fs.writeFileSync(db, "");
+    let tmp = "";
+    m._setWriterHookForTests((t) => {
+      tmp = t;
+      dirSwap(t);
+    });
+    let msg = "";
+    try {
+      m.writeOwnerEndpoint(db, 1234, "http");
+    } catch (err) {
+      msg = (err as Error).message;
+    } finally {
+      m._setWriterHookForTests(null);
+    }
+    expect(msg, "the primary refusal, not the cleanup's error").not.toMatch(/^(EPERM|EISDIR)/);
+    expect(msg).toMatch(/record's temp file/);
+    expect(msg, "the path left behind is named").toContain(tmp);
+    expect(msg).toMatch(/left behind/);
+  });
+  it("cli/remote: the refusal is still the writer's own, and it names the temp left behind", async () => {
+    const m = (await import("../src/cli/remote.js")) as unknown as { writeRemoteMintSecret: (dir: string, secret: string) => string; _setCreateHookForTests: (fn: ((tmp: string) => void) | null) => void };
+    const dir = path.join(fs.mkdtempSync(path.join(ROOT, "remote-dir-")), "scope");
+    let tmp = "";
+    m._setCreateHookForTests((t) => {
+      tmp = t;
+      dirSwap(t);
+    });
+    let msg = "";
+    try {
+      m.writeRemoteMintSecret(dir, "a-secret-for-the-test");
+    } catch (err) {
+      msg = (err as Error).message;
+    } finally {
+      m._setCreateHookForTests(null);
+    }
+    expect(msg, "the primary refusal, not the cleanup's error").not.toMatch(/^(EPERM|EISDIR)/);
+    expect(msg).toMatch(/the new file is not the one its name names/);
+    expect(msg, "the path left behind is named").toContain(tmp);
+    expect(msg).toMatch(/left behind/);
+  });
+});
+
 describe("review R2 P3 (ruling 276d0f4b): the temp's cleanup covers its WHOLE post-create lifetime", () => {
   it("cli/remote: the RENAME into place fails (EIO) → the write throws, and its temp is removed (every Node)", async () => {
     const m = (await import("../src/cli/remote.js")) as unknown as { writeRemoteMintSecret: (dir: string, secret: string) => string };
