@@ -92,10 +92,10 @@ describe.skipIf(WIN)("the argv sampler", () => {
     expect(s.failures[0]).toMatch(/could not spawn/);
   }, 10_000);
 
-  it("a hold that misses its deadline resolves FALSE, and a sample that STARTED inside it but COMPLETED after the release never counts", async () => {
-    // Each observation takes ~700 ms. The hold opens during sample 1 (t≈100 ms) with a 1 s deadline; sample 2 STARTS
-    // inside the hold (t≈710 ms) and COMPLETES after the release (t≈1410 > 1100 ms).
-    const s = startArgvSampler("SECRET", W, { gapMs: 10, ps: sh(`sleep 0.7; echo "  42 target ${W}"`) });
+  it.each([["0.7"], ["1.5"]])("a hold that misses its deadline resolves FALSE, and a sample that STARTED inside it but COMPLETED after the release never counts (each observation %s s: a loaded runner is slower)", async (secs) => {
+    // Each observation takes `secs`. The hold opens during sample 1 (t≈100 ms) with a 1 s deadline; sample 2 STARTS
+    // inside the hold or after it, and COMPLETES after the release (> 1100 ms).
+    const s = startArgvSampler("SECRET", W, { gapMs: 10, ps: sh(`sleep ${secs}; echo "  42 target ${W}"`) });
     await new Promise((r) => setTimeout(r, 100));
     const ok = await s.waitForSamples(1, 1_000);
     await new Promise((r) => setTimeout(r, 700));
@@ -182,6 +182,7 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
       "  const seq = line.trim();",
       "  if (mode === \"stuck\" || mode === \"stuck-child\") return;",
       "  if (mode === \"slow\") await new Promise((r) => setTimeout(r, 700));",
+      "  if (mode === \"slow1500\") await new Promise((r) => setTimeout(r, 1500));",
       "  if (mode === \"slow200\") await new Promise((r) => setTimeout(r, 200));",
       "  if (mode === \"malformed\") { w(\"garbage before any frame\\n\"); return; }",
       "  if (mode === \"error\") { w(\"@@ERROR \" + seq + \" the query failed\\n\"); return; }",
@@ -355,8 +356,8 @@ describe("the FRAMED observer (one long-lived process, one frame per request)", 
     }
   }, 20_000);
 
-  it("a frame that STARTED inside a hold but COMPLETED after its release never counts", async () => {
-    const f = fake("slow", "late");
+  it.each([["slow"], ["slow1500"]])("a frame that STARTED inside a hold but COMPLETED after its release never counts (fake %s: a loaded runner is slower)", async (mode) => {
+    const f = fake(mode, `late-${mode}`);
     const s = startArgvSampler("SECRET", W, { gapMs: 10, framed: f.framed });
     await new Promise((r) => setTimeout(r, 100));
     const ok = await s.waitForSamples(1, 1_000);
