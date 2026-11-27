@@ -18,7 +18,8 @@ import fs from "fs";
 import path from "path";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
-import { parseNodeHelp, nodeOptionTable, type NodeOptionTable } from "../src/node-options.js";
+import os from "os";
+import { parseNodeHelp, nodeOptionTable, tableKeyOf, type NodeOptionTable } from "../src/node-options.js";
 import { classifyProcess } from "../src/fleet-verdicts.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -108,5 +109,69 @@ describe("the classifier uses the DERIVED table: a newer patch's value option ne
   it("no options at all: the table is never needed (a failed derivation still classifies a plain `node <script>`)", () => {
     const c = classifyProcess(view(["node", `${INSTALL}/dist/index.js`]) as never, new Set(), fsx as never, { ok: false, why: "spawn failed" });
     expect(c).toEqual({ kind: "connector", script: `${INSTALL}/dist/index.js`, installDir: INSTALL });
+  });
+});
+
+describe("review R1 (ruling 617c5d69)", () => {
+  it("P1: the --help child gets an ALLOWLISTED env, never the inherited one: a NODE_OPTIONS --require hook never runs, and the table is unchanged", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "help-env-"));
+    const marker = path.join(dir, "marker");
+    const hook = path.join(dir, "hook.cjs");
+    fs.writeFileSync(hook, `require("fs").writeFileSync(${JSON.stringify(marker)}, "ran");`);
+    const saved = process.env.NODE_OPTIONS;
+    process.env.NODE_OPTIONS = `--require=${hook}`;
+    try {
+      const t = nodeOptionTable({ key: `env-allowlist-${Date.now()}` });
+      expect(t.ok, "the table still derives").toBe(true);
+      if (t.ok) expect(t.withValue.has("--require")).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = saved;
+    }
+    expect(fs.existsSync(marker), "the inherited NODE_OPTIONS hook never ran in the --help child").toBe(false);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  it("P2: {ok:false} ALWAYS ends in UNKNOWN with its why: the `=` form (one reading) never returns a verdict before the diagnostic", () => {
+    const INSTALL = "/opt/relay";
+    const fsx = { isFile: (p: string) => p === `${INSTALL}/dist/index.js` || p === "/x/hook.js", realpath: (p: string) => p, packageName: (d: string) => (d === INSTALL ? "bot-relay-mcp" : null) };
+    const argv = ["node", "--require=/x/hook.js", `${INSTALL}/dist/index.js`];
+    const c = classifyProcess({ pid: 77, ppid: 1, start: "s", command: argv.join(" "), comm: "node", cwd: "/", argv } as never, new Set(), fsx as never, { ok: false, why: "spawn failed" });
+    expect(c.kind).toBe("unknown");
+    expect(c.kind === "unknown" ? c.reason : "").toMatch(/option table could not be derived \(spawn failed\)/);
+  });
+  it("P2: a help line OFF the clean shapes goes into NEITHER set (it gets the both-ways reading); each recorded snapshot's ambiguous list is PINNED", () => {
+    const t = parseNodeHelp(["  --flag                 a flag", "  --takes=...            a value", "  --opt <file>           a continuation", "  --maybe [...]          another"].join("\n")) as ReturnType<typeof parseNodeHelp> & { ambiguous?: Set<string> };
+    expect([...t.flags]).toEqual(["--flag"]);
+    expect([...t.withValue]).toEqual(["--takes"]);
+    expect([...(t.ambiguous ?? [])].sort()).toEqual(["--maybe", "--opt"]);
+    const PINNED: Record<string, string[]> = { "v24.13.0.txt": ["--print", "-p"] };
+    for (const [f, list] of Object.entries(PINNED)) {
+      const snap = parseNodeHelp(fs.readFileSync(path.join(SNAPSHOTS, f), "utf-8")) as ReturnType<typeof parseNodeHelp> & { ambiguous?: Set<string> };
+      expect([...(snap.ambiguous ?? [])].sort(), f).toEqual(list);
+    }
+  });
+  it("P2: the table is trusted ONLY for a target running the runner's OWN binary; another binary reads every SPACE-form option both ways (the `=` form stays exact)", () => {
+    const INSTALL = "/opt/relay";
+    const DECOY = "/tmp/decoy";
+    const base = { isFile: (p: string) => [`${INSTALL}/dist/index.js`, `${DECOY}/dist/index.js`].includes(p), realpath: (p: string) => p, packageName: (d: string) => (d === INSTALL || d === DECOY ? "bot-relay-mcp" : null) };
+    const table: NodeOptionTable = { ok: true, ...parseNodeHelp(fs.readFileSync(path.join(SNAPSHOTS, "v24.13.0.txt"), "utf-8")) };
+    const view = (argv: string[]) => ({ pid: 77, ppid: 1, start: "s", command: argv.join(" "), comm: "node", cwd: "/", argv });
+    const spaceForm = ["node", "--require", `${DECOY}/dist/index.js`, `${INSTALL}/dist/index.js`];
+    const own = classifyProcess(view(spaceForm) as never, new Set(), { ...base, sameNodeBinary: () => true } as never, table);
+    expect(own, "the runner's own binary: the table decides").toEqual({ kind: "connector", script: `${INSTALL}/dist/index.js`, installDir: INSTALL });
+    const other = classifyProcess(view(spaceForm) as never, new Set(), { ...base, sameNodeBinary: () => false } as never, table);
+    expect(other.kind, "another node binary: both readings, and they disagree → UNKNOWN").toBe("unknown");
+    const eqForm = classifyProcess(view(["node", `--require=${DECOY}/dist/index.js`, `${INSTALL}/dist/index.js`]) as never, new Set(), { ...base, sameNodeBinary: () => false } as never, table);
+    expect(eqForm, "the `=` form is exact whatever the binary").toEqual({ kind: "connector", script: `${INSTALL}/dist/index.js`, installDir: INSTALL });
+  });
+  it("Cache: keyed on the binary's FILE identity (dev, ino, size, mtime), not on process.version: the same path rewritten is a new key", () => {
+    const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "key-")), "node-stand-in");
+    fs.writeFileSync(f, "one");
+    const k1 = tableKeyOf(f);
+    fs.writeFileSync(f, "two, longer");
+    fs.utimesSync(f, new Date(), new Date(Date.now() + 5_000));
+    const k2 = tableKeyOf(f);
+    expect(k1).not.toBe(k2);
+    expect(k1).not.toContain(process.version);
   });
 });

@@ -45,6 +45,11 @@ export function parseNodeHelp(help: string): { withValue: Set<string>; flags: Se
 
 const cache = new Map<string, NodeOptionTable>();
 
+/** The cache key of a node binary. RED STATE: today's key (the path and the running version). */
+export function tableKeyOf(execPath: string): string {
+  return `${execPath}\u0000${process.version}`;
+}
+
 /**
  * The running node's option table, derived once per (binary path, version). `run` and `key` are test seams (the
  * default runs `process.execPath --help`, bounded).
