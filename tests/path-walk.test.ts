@@ -242,8 +242,39 @@ describe("path-walk: below a file is not-a-directory", () => {
   });
 });
 
+/**
+ * One "link target ending in a separator" row: build the links in a fresh dir, then judge `l`. The PRODUCT's refusal is
+ * the property under test, so it is always computed; the KERNEL's answer is a REPORTED observation, printed, never a
+ * gate: the product walks the components itself (src/path-walk.ts) and does not rely on the kernel refusing. MEASURED
+ * once on a macOS runner: the kernel resolved the nested link without ENOTDIR on an image and SHA where it had refused
+ * earlier that day. `stat` is a seam (the rows pass fs.statSync; the row's own test passes a kernel that ACCEPTS).
+ */
+function separatorRow(make: (dir: string) => void, stat: (p: string) => unknown = fs.statSync): { kernel: string; product: string } {
+  const dir = fs.mkdtempSync(path.join(base, "tsep-"));
+  make(dir);
+  const l = path.join(dir, "l");
+  let kernel: string;
+  try {
+    stat(l);
+    kernel = "accepted";
+  } catch (err) {
+    kernel = (err as NodeJS.ErrnoException).code ?? "error";
+  }
+  const product = reason(() => walkPath(l, { allowMissing: true }));
+  console.log(`[path-walk] REPORTED kernel answer for a link target ending in a separator: ${kernel} (the product: ${product})`);
+  return { kernel, product };
+}
+
 describe.skipIf(WIN)("path-walk: a link target ending in a separator must reach a directory (POSIX ENOTDIR; Codex #357 R1 #4)", () => {
   const file = () => path.join(real, "x");
+  it("the PRODUCT's refusal is checked even when the KERNEL accepts the path (a kernel that answers success)", () => {
+    const accepts = () => ({}); // a kernel that resolves `l` without ENOTDIR (seen once on a macOS runner)
+    const r = separatorRow((dir) => {
+      fs.symlinkSync(file(), path.join(dir, "m"));
+      fs.symlinkSync("m/", path.join(dir, "l"));
+    }, accepts);
+    expect(r.product, "the product refuses whatever the kernel answered").toBe("not-a-directory");
+  });
   it.each([
     ["an absolute target", (dir: string) => fs.symlinkSync(`${file()}/`, path.join(dir, "l"))],
     ["a relative target", (dir: string) => fs.symlinkSync(`${path.relative(dir, file())}/`, path.join(dir, "l"))],
@@ -255,11 +286,7 @@ describe.skipIf(WIN)("path-walk: a link target ending in a separator must reach 
       },
     ],
   ])("%s", (_label, make) => {
-    const dir = fs.mkdtempSync(path.join(base, "tsep-"));
-    make(dir);
-    const l = path.join(dir, "l");
-    expect(() => fs.statSync(l), "the kernel refuses it").toThrow(/ENOTDIR/);
-    expect(reason(() => walkPath(l, { allowMissing: true }))).toBe("not-a-directory");
+    expect(separatorRow(make).product).toBe("not-a-directory");
   });
   it("known-good twin: a target `dir/` reaching a directory resolves", () => {
     const dir = fs.mkdtempSync(path.join(base, "tsep-"));
