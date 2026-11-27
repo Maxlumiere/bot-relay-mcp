@@ -518,18 +518,63 @@ relay_owner_session() {
 # watchdog is a BACKSTOP one second after the deadline: it sends the supervisor TERM (its trap kills the group), and
 # KILL only after a one-second grace; the supervisor's pid is reaped only by the `wait` below, after which the
 # watchdog is stopped (as before this change).
-# The mode is decided ONCE per load: no perl, or a setpgrp that cannot make a group (MEASURED per OS), keeps the
-# direct-child bound, said ONCE, loudly. A wrapper that LEAVES the group (setsid) still escapes: a named limit.
+# THE MODE (rulings c9695b22, a6aa5826) is decided once per PERL BINARY (its path and file identity) and CACHED under
+# the relay's hook state, so the probe's perl start is not paid on every hook run and its loud line is printed ONCE,
+# when the cache is created (alarm fatigue), never on every run. The direct-child bound is kept, with its reason, when:
+# perl is missing; setpgrp cannot make a group (the probe, MEASURED); or the host is Windows (Git Bash's msys perl).
+# WINDOWS IS THE NAMED EXCEPTION to "a measured probe, never the OS name" (ruling 73f431af): the probe PASSES there,
+# yet a group-kill row failed once in four CI runs and its cause was never reproduced or named. An unreproduced
+# intermittent is exactly what a runtime probe cannot measure, and a hook that hangs is worse than a coverage gap, so
+# Windows keeps today's direct-child bound (no regression) and CI prints the "[coverage gap]" line. A wrapper that
+# LEAVES the group (setsid) still escapes everywhere: a named limit.
 RELAY_RUN_GROUP_PROBE='exit((eval { setpgrp(0, 0); 1 } && getpgrp(0) == $$) ? 0 : 1)'
-if ! command -v perl >/dev/null 2>&1; then
-  RELAY_RUN_GROUP=0
-  echo "relay hook: step budget covers the direct child only: perl not found" >&2
-elif ! perl -e "$RELAY_RUN_GROUP_PROBE" 2>/dev/null; then
-  RELAY_RUN_GROUP=0
-  echo "relay hook: step budget covers the direct child only: perl cannot start a process group (setpgrp)" >&2
+# stat comes from a FIXED list of system paths, never PATH (ruling 40431fc6): it reads file identities and owners.
+RELAY_SYS_STAT_PATHS='/usr/bin/stat /bin/stat'
+RELAY_SYS_STAT=""
+for RELAY_SYS_P in $RELAY_SYS_STAT_PATHS; do
+  if [ -f "$RELAY_SYS_P" ] && [ -x "$RELAY_SYS_P" ]; then RELAY_SYS_STAT="$RELAY_SYS_P"; break; fi
+done
+unset RELAY_SYS_P
+relay_file_identity() {
+  [ -n "$RELAY_SYS_STAT" ] || return 1
+  "$RELAY_SYS_STAT" -L -c '%d:%i:%s:%Y' "$1" 2>/dev/null || "$RELAY_SYS_STAT" -L -f '%d:%i:%z:%m' "$1" 2>/dev/null
+}
+relay_run_group_decide() {
+  command -v perl >/dev/null 2>&1 || { printf '0 perl not found'; return; }
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) printf '0 the group kill is not proven under msys perl (Windows)'; return ;;
+  esac
+  if perl -e "$RELAY_RUN_GROUP_PROBE" 2>/dev/null; then printf '1'; else printf '0 perl cannot start a process group (setpgrp)'; fi
+}
+RELAY_RUN_GROUP_KEY=""
+if RELAY_RUN_GROUP_P=$(command -v perl 2>/dev/null); then
+  RELAY_RUN_GROUP_ID=$(relay_file_identity "$RELAY_RUN_GROUP_P") && RELAY_RUN_GROUP_KEY="${RELAY_RUN_GROUP_P}:${RELAY_RUN_GROUP_ID}"
 else
-  RELAY_RUN_GROUP=1
+  RELAY_RUN_GROUP_KEY="no-perl"
 fi
+RELAY_RUN_GROUP_CACHE=""
+[ -n "$RELAY_RUN_GROUP_KEY" ] && RELAY_RUN_GROUP_CACHE="${RELAY_HOME:-$HOME/.bot-relay}/hook-state/run-group-${RELAY_RUN_GROUP_KEY//[!A-Za-z0-9]/_}"
+RELAY_RUN_GROUP_DECISION=""
+if [ -n "$RELAY_RUN_GROUP_CACHE" ] && [ -f "$RELAY_RUN_GROUP_CACHE" ]; then
+  IFS= read -r RELAY_RUN_GROUP_DECISION < "$RELAY_RUN_GROUP_CACHE" 2>/dev/null || RELAY_RUN_GROUP_DECISION=""
+fi
+case "$RELAY_RUN_GROUP_DECISION" in
+  1 | "0 "*) ;;
+  *)
+    RELAY_RUN_GROUP_DECISION=$(relay_run_group_decide)
+    case "$RELAY_RUN_GROUP_DECISION" in
+      "0 "*) echo "relay hook: step budget covers the direct child only: ${RELAY_RUN_GROUP_DECISION#0 }" >&2 ;;
+    esac
+    # The relay home is NEVER created here (a hook must not create it: the Stop hook's rule): the cache is kept only
+    # where it already exists; elsewhere the mode is decided on every load.
+    if [ -n "$RELAY_RUN_GROUP_CACHE" ] && [ -d "${RELAY_HOME:-$HOME/.bot-relay}" ]; then
+      (umask 077 && { [ -d "${RELAY_RUN_GROUP_CACHE%/*}" ] || mkdir "${RELAY_RUN_GROUP_CACHE%/*}"; } && printf '%s\n' "$RELAY_RUN_GROUP_DECISION" > "$RELAY_RUN_GROUP_CACHE.$$" \
+        && mv -f "$RELAY_RUN_GROUP_CACHE.$$" "$RELAY_RUN_GROUP_CACHE") 2>/dev/null || rm -f "$RELAY_RUN_GROUP_CACHE.$$" 2>/dev/null
+    fi
+    ;;
+esac
+RELAY_RUN_GROUP="${RELAY_RUN_GROUP_DECISION%% *}"
+unset RELAY_RUN_GROUP_P RELAY_RUN_GROUP_ID
 RELAY_RUN_GROUP_PL='my $secs = shift @ARGV; shift @ARGV if @ARGV && $ARGV[0] eq "--";
 my $orig = getpgrp(0);
 my $grouped = eval { setpgrp(0, 0); 1 } && getpgrp(0) == $$;
@@ -1096,10 +1141,56 @@ write_relay_token_to_vault() {
 # RELAY_PS_BUDGET: margin by default, premail where the mail read keeps its reserve), then runs under
 # relay_run_streamed at that cap. With no time left the call is refused (124) and relay_budget_for NAMES the cut on
 # stderr; a walk ends at its first refused or empty step. Its stdout is the caller's.
+#
+# THE FIXED SYSTEM BINARIES (ruling 40431fc6): ps and readlink are resolved ONCE per hook run (here, at helper load)
+# from a FIXED list of system paths, never PATH, and a path is accepted only if it is a regular file owned by root
+# (uid 0) and not group- or world-writable. Such a lookup keeps the cheap direct-child bound (no supervisor: a system
+# binary does not fork a pipe-holding child). The owner check uses stat from the same kind of fixed list (a PATH stat
+# could lie). No qualifying binary → the PATH one runs SUPERVISED (its own process group), said ONCE, loudly, here.
+RELAY_SYS_PS_PATHS='/bin/ps /usr/bin/ps'
+RELAY_SYS_READLINK_PATHS='/usr/bin/readlink /bin/readlink'
+relay_sys_qualifies() {
+  local p="$1" st="$2" um u m
+  [ -n "$st" ] && [ -f "$p" ] && [ -x "$p" ] || return 1
+  um=$("$st" -L -c '%u %a' "$p" 2>/dev/null) || um=$("$st" -L -f '%u %Lp' "$p" 2>/dev/null) || return 1
+  u="${um%% *}"
+  m="${um#* }"
+  case "$u$m" in ''|*[!0-7]*) return 1 ;; esac
+  [ "$u" = 0 ] && [ $((8#$m & 8#022)) -eq 0 ]
+}
+relay_sys_pick() {
+  local p
+  for p in $1; do
+    if relay_sys_qualifies "$p" "$RELAY_SYS_STAT"; then printf '%s' "$p"; return 0; fi
+  done
+  return 1
+}
+RELAY_SYS_PS=""
+RELAY_SYS_READLINK=""
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) ;;
+  *)
+    RELAY_SYS_PS=$(relay_sys_pick "$RELAY_SYS_PS_PATHS") \
+      || echo "relay hook: no system ps qualifies (root-owned, not group/world-writable: $RELAY_SYS_PS_PATHS): the PATH ps runs supervised" >&2
+    if [ "$(uname -s 2>/dev/null)" = Linux ]; then
+      RELAY_SYS_READLINK=$(relay_sys_pick "$RELAY_SYS_READLINK_PATHS") \
+        || echo "relay hook: no system readlink qualifies (root-owned, not group/world-writable: $RELAY_SYS_READLINK_PATHS): the PATH readlink runs supervised" >&2
+    fi
+    ;;
+esac
 relay_ps_run() {
   relay_budget_for "a process lookup (ps)" 1 "${RELAY_PS_BUDGET:-margin}" || return 124
-  local rc=0
-  relay_run_streamed "$RELAY_STEP_SECS" "$@" 2>/dev/null || rc=$?
+  local rc=0 sys=""
+  case "$1" in
+    ps) sys="$RELAY_SYS_PS" ;;
+    readlink) sys="$RELAY_SYS_READLINK" ;;
+  esac
+  if [ -n "$sys" ]; then
+    shift
+    RELAY_RUN_GROUP=0 relay_run_streamed "$RELAY_STEP_SECS" "$sys" "$@" 2>/dev/null || rc=$?
+  else
+    relay_run_streamed "$RELAY_STEP_SECS" "$@" 2>/dev/null || rc=$?
+  fi
   # A lookup killed by its step deadline is a CUT like a skipped one, and a cut is named: silent, the caller (a pid
   # walk) reads an empty answer and stops as if the chain had ended.
   [ "$rc" -eq 124 ] && echo "[bot-relay] a process lookup (ps) did not finish within ${RELAY_STEP_SECS}s: the process walk stops there." >&2
@@ -1155,10 +1246,23 @@ RELAY_START_TOKEN_UTC_SUFFIX=' UTC'
 # is a wall-clock date, so a locale OR a TZ difference between this user shell
 # and the launchd daemon would make a live agent read dead; the suffix says which
 # zone printed it. Compared as a string, never parsed. Empty on any failure.
+# Windows (ruling 0fceafe7): msys ps prints no lstart, so the start time is NOT READ there, said by name; the anchor
+# check then trusts the pid (its existing safe side for an unreadable start: "alive", never "dead"). The limit: a
+# reused pid reads as the old agent alive.
+relay_start_unread_on_windows() {
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      echo "[bot-relay] the agent's start time is not read on Windows (msys ps has no lstart): a reused pid would read as the old agent alive." >&2
+      return 0 ;;
+  esac
+  return 1
+}
 relay_pid_start() {
   local pid="$1" t
   [ -n "$pid" ] || return
-  t=$(relay_ps_run env TZ=UTC LC_ALL=C ps -o lstart= -p "$pid" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  relay_start_unread_on_windows && return
+  # The pinned environment is EXPORTED in this subshell (never `env`, which would resolve ps through PATH).
+  t=$(export TZ=UTC LC_ALL=C; relay_ps_run ps -o lstart= -p "$pid" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
   [ -n "$t" ] || return
   printf '%s%s' "$t" "$RELAY_START_TOKEN_UTC_SUFFIX"
 }
@@ -1171,7 +1275,8 @@ relay_pid_start() {
 relay_pid_start_legacy() {
   local pid="$1"
   [ -n "$pid" ] || return
-  relay_ps_run env -u TZ LC_ALL=C ps -o lstart= -p "$pid" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+  relay_start_unread_on_windows && return
+  (unset TZ; export LC_ALL=C; relay_ps_run ps -o lstart= -p "$pid") | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
 # Is PID a live process on THIS host? The signal-0 probe. It mirrored the old boolean

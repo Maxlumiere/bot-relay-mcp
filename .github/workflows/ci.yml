@@ -545,7 +545,7 @@ jobs:
         run: npx vitest run tests/hook-step-group.test.ts --reporter=verbose --reporter=json --outputFile.json=step-group-win.json
       - name: "The budgeted step's process group: the Windows rows PASSED (not skipped, not filtered away)"
         if: ${{ !cancelled() }}
-        run: node tools/ci/require-rows-passed.mjs step-group-win.json "the MODE is decided once per load" "a FORKING wrapper (its child holds the pipe)" "a wrapper that BACKGROUNDS a sleeper and EXITS" "MEASURED, report only (e6458926 3)" "MEASURED, report only (ruling 7671d762)" "MEASURED, report only (ruling 40431fc6)"
+        run: node tools/ci/require-rows-passed.mjs step-group-win.json "the MODE: grouped on macOS and Linux" "the loud line is printed ONCE per cache" "a FORKING wrapper (its child holds the pipe)" "a wrapper that BACKGROUNDS a sleeper and EXITS" "MEASURED, report only (e6458926 3)" "MEASURED, report only (ruling 7671d762)" "MEASURED, report only (ruling 40431fc6)"
       - name: "PR 4: the CLI's credential clients (Windows)"
         if: ${{ !cancelled() }}
         run: npx vitest run tests/cli-door-clients.test.ts --reporter=verbose --reporter=json --outputFile.json=pr4-cli.json

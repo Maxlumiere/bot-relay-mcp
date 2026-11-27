@@ -50,6 +50,19 @@ const HOOKS = budgetTree(path.join(ROOT, "hooks-seamed"), REAL_HOOKS_SRC, path.j
 });
 /** A budgetTree copy at the hooks' REAL declared budgets: for the rows that measure the real budget (via the opt-in). */
 const REAL_BUDGET_HOOKS = budgetTree(path.join(ROOT, "hooks-real-budget"), REAL_HOOKS_SRC, path.join(REPO, "bin"), { declaredBudget: "real" });
+/**
+ * A tree whose fixed system-ps list names a MISSING path (ruling 40431fc6): the pid walk then falls back to the PATH ps
+ * (here the fake), SUPERVISED, with its loud line. That fallback is where a slow or hung ps can still come in (a
+ * qualifying system ps is root-owned and is never a test fake), so the budget rows below run there.
+ */
+function fallbackPsTree(dir: string, tree: string): string {
+  const helper = path.join(tree, "_vault-helpers.sh");
+  const src = fs.readFileSync(helper, "utf-8");
+  if (!/RELAY_SYS_PS_PATHS='[^']*'/.test(src)) throw new Error(`precondition: the fixed system-ps list in ${helper}`);
+  fs.writeFileSync(helper, src.replace(/RELAY_SYS_PS_PATHS='[^']*'/, `RELAY_SYS_PS_PATHS='${path.join(dir, "no-such-ps")}'`));
+  return tree;
+}
+const NO_SYS_PS = /relay hook: no system ps qualifies/;
 afterAll(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 const AGENT = "pr1-agent";
 const KEY_RE = /^[0-9a-f]{32}$/;
@@ -1271,7 +1284,9 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
     // SessionStart's REAL budget on the REAL clock, directly (outside the tripwire's scope).
-    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), FAKE_PS_HANG: "1", RELAY_TEST_CLOCK: "" }, "", REAL_BUDGET_HOOKS);
+    const tree = fallbackPsTree(c.home, budgetTree(path.join(c.home, "tree"), REAL_HOOKS_SRC, path.join(REPO, "bin"), { declaredBudget: "real" }));
+    const r = await runHook(c, "check-relay.sh", { RELAY_AGENT_TOKEN: token, RELAY_HTTP_HOST: "127.0.0.1", RELAY_HTTP_PORT: String(d.port), FAKE_PS_HANG: "1", RELAY_TEST_CLOCK: "" }, "", tree);
+    expect(r.out, "precondition: the walk took the PATH-ps fallback").toMatch(NO_SYS_PS);
     expect(r.argv, "precondition: the hung ps ran").toContain("ps ");
     expect(r.status, "the hook exited by itself").not.toBeNull();
     expect(r.ms, `the stub sleeps 30s: the hook must end inside its 10s budget\n${r.out}`).toBeLessThan(10_000);
@@ -1287,7 +1302,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
     const token = seedWasmDb(c, "pr1 ps budget mail");
     fs.writeFileSync(c.cfg, JSON.stringify({ sqlite_driver: "wasm" }), { mode: 0o600 });
     const d = await startOwnerDaemon(c);
-    const tree = budgetTree(path.join(c.home, "tree"), REAL_HOOKS_SRC, path.join(REPO, "bin"));
+    const tree = fallbackPsTree(c.home, budgetTree(path.join(c.home, "tree"), REAL_HOOKS_SRC, path.join(REPO, "bin")));
     const count = path.join(c.home, "starve.count");
     const r = await runHook(
       c,
@@ -1296,6 +1311,7 @@ describe.skipIf(WIN_NO_BASH_HOOKS)("hook PR 1, as ruled (P1-3 as modified): on `
       "",
       tree,
     );
+    expect(r.out, "precondition: the walk took the PATH-ps fallback").toMatch(NO_SYS_PS);
     expect((r.argv.match(/^ps /gm) ?? []).length, `exactly the 3 budgeted ps calls ran, then the budget cut the walk\n${r.out}`).toBe(3);
     expect(r.status, "the hook exited by itself").not.toBeNull();
     expect(r.out, "the cut is named").toMatch(/no time budget left for a process lookup/);

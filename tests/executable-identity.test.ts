@@ -172,6 +172,57 @@ describe("consumer 1: the hooks' relay_agent_pid (real processes)", () => {
       fs.rmSync(w.bin, { recursive: true, force: true });
     }
   }, 30_000);
+  it.skipIf(process.platform === "win32")("ruling e1998638 (2): on the REAL system ps the walk asks the budget per lookup and stops, NAMED, when it runs out (no PATH wrapper is ever run)", () => {
+    const w = stallingWrappers();
+    const count = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "starve-sys-")), "n");
+    try {
+      // The first lookup (this shell's ppid) runs; the second is refused by the budget seam.
+      const r = seamedWalk({ PATH: `${w.bin}:${process.env.PATH ?? ""}`, RELAY_TEST_STARVE: "a process lookup*", RELAY_TEST_STARVE_AFTER: "1", RELAY_TEST_STARVE_COUNT: count });
+      expect(r.status, r.err).toBe(0);
+      expect(w.count(), "the system ps was used: no PATH wrapper ran").toBe(0);
+      expect(Number(fs.readFileSync(count, "utf-8").trim()), "the walk asked the budget again after its first lookup").toBeGreaterThanOrEqual(2);
+      expect(r.out.split("|")[0], "a cut walk returns no pid").toBe("");
+      expect(r.err, "the cut is NAMED").toMatch(/no time budget left for a process lookup/);
+    } finally {
+      fs.rmSync(w.bin, { recursive: true, force: true });
+    }
+  }, 30_000);
+  it.skipIf(process.platform === "win32")("ruling e1998638 (3): THE SEAM can only narrow: a fixed list naming a USER-OWNED ps is rejected by the same check → the fallback (supervised + the line); that ps never runs unsupervised", () => {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "seam-user-ps-"));
+    try {
+      const log = path.join(bin, "pgids");
+      const wrapper = path.join(bin, "ps");
+      fs.writeFileSync(wrapper, `#!/bin/sh\n/bin/ps -o pgid= -p $$ | tr -d ' ' >> "${log}"\nexec /bin/ps "$@"\n`, { mode: 0o755 });
+      const r = seamedWalk({ PATH: `${bin}:${process.env.PATH ?? ""}` }, {
+        edit: (src) => {
+          expect(src, "precondition: the fixed system-binary list").toMatch(/RELAY_SYS_PS_PATHS='[^']*'/);
+          return src.replace(/RELAY_SYS_PS_PATHS='[^']*'/, `RELAY_SYS_PS_PATHS='${wrapper}'`);
+        },
+        script: '. "$1"; a=$(relay_agent_pid); printf "%s|%s|%s|%s" "$a" "$PPID" "$(/bin/ps -o pgid= -p $$ | tr -d " ")" "$RELAY_SYS_PS"',
+      });
+      const [found, parent, shellPgid, chosen] = r.out.split("|");
+      expect(chosen, "the user-owned file was NOT accepted as the system ps").toBe("");
+      expect(found, r.err).toBe(parent);
+      expect(r.err.split("\n").filter((l) => /relay hook: no system ps qualifies/.test(l)), `ONE loud line: ${r.err}`).toHaveLength(1);
+      const pgids = fs.readFileSync(log, "utf-8").split("\n").filter(Boolean);
+      expect(pgids.length, "precondition: the wrapper ran (through the fallback)").toBeGreaterThan(0);
+      expect(pgids.every((g) => g !== shellPgid), `never unsupervised: ${pgids.join(",")} vs the shell's ${shellPgid}`).toBe(true);
+    } finally {
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  }, 30_000);
+  it.skipIf(process.platform === "win32")("ruling 0fceafe7: on Windows (a MINGW uname) the start time is NOT read, said by name, and the anchor check trusts the pid (\"alive\", never \"dead\")", () => {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "mingw-uname-"));
+    try {
+      fs.writeFileSync(path.join(bin, "uname"), "#!/bin/sh\necho MINGW64_NT-10.0-26100\n", { mode: 0o755 });
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "mingw-home-"));
+      const r = spawnSync("bash", ["-c", '. "$1"; s=$(relay_pid_start "$2"); l=$(relay_pid_start_legacy "$2"); v=$(relay_anchor_liveness "$2" "Thu Oct  1 07:37:33 2026 UTC" H H); printf "%s|%s|%s" "$s" "$l" "$v"', "w", path.join(REPO, "hooks", "_vault-helpers.sh"), String(process.pid)], { encoding: "utf8", env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH ?? ""}` }, timeout: 20_000 });
+      expect(r.stdout, r.stderr).toBe("||alive");
+      expect(r.stderr, "the reason is named").toMatch(/the agent's start time is not read on Windows/);
+    } finally {
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  }, 30_000);
   it.skipIf(process.platform === "win32")("ruling 40431fc6 (3): NO qualifying system binary → the PATH binary, SUPERVISED (its own process group), plus ONE loud line", () => {
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), "nosys-ps-"));
     try {
