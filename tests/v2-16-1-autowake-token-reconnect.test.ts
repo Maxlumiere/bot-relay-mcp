@@ -28,6 +28,7 @@ import path from "path";
 import { spawn, type ChildProcess } from "child_process";
 import { fileURLToPath } from "url";
 import { getFreePort } from "./_helpers/port.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -119,9 +120,8 @@ describe("v2.16.1 — autowake token auto-syncs across a rotation (shipped recon
       expect(await tokenAuthenticates(port, T2), "T2 (rotated vault) authenticates on reconnect").toBe(true);
       expect(await tokenAuthenticates(port, T1), "the pre-rotation token no longer authenticates").toBe(false);
     } finally {
-      if (daemon) try { daemon.kill("SIGKILL"); } catch { /* */ }
-      db.closeDb();
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      db.closeDb(); // this process's own handle on the DB, first
+      await stopAndRemove([daemon], ROOT); // then the daemon's exit, awaited, before its root is removed
     }
   }, 40_000);
 });

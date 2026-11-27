@@ -53,6 +53,7 @@ import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/typ
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
 import cp from "child_process";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -146,10 +147,7 @@ async function startDaemon(label: string, pollMs = 50): Promise<DaemonHandle> {
     root: ROOT,
     stderr: () => stderrBuf,
     kill: async () => {
-      proc.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { proc.kill("SIGKILL"); } catch { /* */ }
-      try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch { /* */ }
+      await stopAndRemove(proc, ROOT);
     },
   };
 }

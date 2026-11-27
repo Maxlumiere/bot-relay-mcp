@@ -20,6 +20,10 @@
  * design a native process does not probe (an RLYW header refuses it), so that probe is not in the module.
  * The racers run from FILES (an eval'd module breaks worker pools), under a SANDBOX HOME; every recorded child is
  * checked exited at the end.
+ * KNOWN BLIND SPOT of the single-owner round (stated): a REAL overlap followed by the first owner CRASHING before its
+ * RELEASE reads NOT_EVALUATED, not FAIL. Its hold is unprovable once it exited on its own (a crash frees the lock), so
+ * the overlap cannot be told from a legitimate hand-over. It is never a false PASS (a round with a crashed owner cannot
+ * pass), and the re-run policy then gets an evaluable round.
  */
 import { describe, it, expect, afterAll, vi } from "vitest";
 import fs from "fs";
@@ -27,6 +31,7 @@ import os from "os";
 import path from "path";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
+import { reportCoverageGap } from "./_helpers/coverage-gap.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LOCK_JS = pathToFileURL(path.join(REPO, "dist", "db-owner-lock.js")).href;
@@ -65,7 +70,9 @@ afterAll(async () => {
 const RACER = path.join(ROOT, "racer.mjs");
 fs.writeFileSync(
   RACER,
-  `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
+  // argv[5] (optional): a SLOW IMPORT, in ms, before the lock module loads (a slow runner's start, made deterministic).
+  `const __slowImport = Number(process.argv[5] || 0); if (__slowImport) await new Promise((r) => setTimeout(r, __slowImport));\n` +
+    `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
     `const fs = await import("fs");\n` +
     `const [db, go, hold] = process.argv.slice(2);\n` +
     `while (!fs.existsSync(go)) await new Promise((r) => setTimeout(r, 2));\n` +
@@ -73,6 +80,79 @@ fs.writeFileSync(
     `catch (e) { process.stdout.write("LOST " + (e.name || e.code) + " " + String(e && e.message || "").split("\\n")[0].slice(0, 1000) + "\\n"); }\n` +
     `process.exit(0);\n`
 );
+// The HANDSHAKE racer (the single-owner row): coverage by handshake, never by timing. It signals READY once its lock
+// module has loaded, contends only on the parent's GO, and as the winner HOLDS until the parent RELEASES it (written
+// only after every other racer has lost). OWNER/RELEASE go to one append-only log in order (the acquire/release
+// ordinals): two OWNER lines with no RELEASE between them are two CONCURRENT owners. argv: db dir id slowImportMs
+// slowAttemptMs (a slow runner's start, and a slow attempt after GO, made deterministic).
+const RACER_HS = path.join(ROOT, "racer-handshake.mjs");
+fs.writeFileSync(
+  RACER_HS,
+  `const [db, dir, id, slowImport, slowAttempt, fault] = process.argv.slice(2);\n` +
+    `const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n` +
+    `if (Number(slowImport)) await sleep(Number(slowImport));\n` +
+    `const { acquirePrimitive } = await import(${JSON.stringify(LOCK_JS)});\n` +
+    `const fs = await import("fs");\n` +
+    `const log = (line) => fs.appendFileSync(dir + "/events.log", line + "\\n");\n` +
+    `fs.writeFileSync(dir + "/ready-" + id, "");\n` +
+    // A FAULT for the row's own tests: crash after READY, before any attempt.
+    `if (fault === "crash-after-ready") process.exit(3);\n` +
+    `while (!fs.existsSync(dir + "/go")) await sleep(2);\n` +
+    `if (Number(slowAttempt)) await sleep(Number(slowAttempt));\n` +
+    // FAULTS for the row's own tests: a racer descheduled past the settle deadline; a planted OWNER line that overlaps
+    // the real owner's hold (then a clean loss); a non-contention error from the acquire call (EIO).
+    `if (fault === "stall-before-attempt") await sleep(5000);\n` +
+    `if (fault === "crash-late") { await sleep(800); process.exit(3); }\n` +
+    `if (fault === "plant-owner") { await sleep(300); log("OWNER plant-" + id); await sleep(100); log("RELEASE plant-" + id); fs.writeFileSync(dir + "/lost-" + id, ""); process.exit(0); }\n` +
+    `let lock;\n` +
+    `try { lock = fault === "eio" ? await Promise.reject(Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" })) : await acquirePrimitive(db, { attempts: 1, initialBytes: new Uint8Array() }); }\n` +
+    // The LOST acknowledgement, written only after a FAILED attempt: an exit without it is not a completed loss.
+    // ONLY the contention refusal is a LOST; any other error from the acquire call (EIO, statfs, flock) is recorded.
+    `catch (e) {\n` +
+    `  const contention = e && e.name === "OwnerLockError" && /could not be locked for this process \\(held by another process\\)/.test(String(e.message));\n` +
+    `  if (contention) fs.writeFileSync(dir + "/lost-" + id, ""); else fs.writeFileSync(dir + "/error-" + id, String((e && (e.code || e.name)) || "error"));\n` +
+    `  process.stdout.write((contention ? "LOST " : "ERROR ") + (e.name || e.code) + "\\n");\n` +
+    `  process.exit(fault === "exit-1-after-lost" ? 1 : 0);\n` +
+    `}\n` +
+    `log("OWNER " + id);\n` +
+    `fs.writeFileSync(dir + "/owner-" + id, "");\n` +
+    // FAULTS: the owner crashes right after taking the lock (before RELEASE); or it releases EARLY on its own (logged,
+    // exit 0, before the parent's RELEASE).
+    `if (fault === "owner-exit-1") process.exit(1);\n` +
+    `if (fault === "owner-early-release") { log("RELEASE " + id); lock.release(); process.exit(0); }\n` +
+    `process.stdout.write("OWNER\\n");\n` +
+    `while (!fs.existsSync(dir + "/release")) await sleep(2);\n` +
+    // FAULT: the owner releases on the parent's RELEASE but never logs it (a silent release).
+    `if (fault !== "owner-silent-release") log("RELEASE " + id);\n` +
+    `lock.release();\n` +
+    `process.exit(fault === "owner-exit-1-after-release" ? 1 : 0);\n`
+);
+/**
+ * The acquire/release ordinals of one round. An overlap is PROVEN only between BOUNDED holds (an OWNER whose own
+ * RELEASE follows, or that was still ALIVE, holding, when the round ended): OWNER a, OWNER b, RELEASE a. An owner that
+ * exited on its own without logging its RELEASE (it crashed, freeing the lock) has an unprovable hold: it is counted in
+ * `unreleased` (a coverage problem for the caller), never as an overlap.
+ */
+export function ownership(events: readonly string[], heldToEnd: ReadonlySet<string> = new Set()): { owners: number; peak: number; unreleased: number } {
+  // heldToEnd: owners still ALIVE when the round ended (the parent stops them): they held through the whole log.
+  const released = new Set([...events.filter((e) => e.startsWith("RELEASE ")).map((e) => e.slice("RELEASE ".length)), ...heldToEnd]);
+  let now = 0;
+  let peak = 0;
+  let owners = 0;
+  let unreleased = 0;
+  for (const e of events) {
+    if (e.startsWith("OWNER ")) {
+      owners++;
+      if (!released.has(e.slice("OWNER ".length))) {
+        unreleased++;
+        continue;
+      }
+      now++;
+      peak = Math.max(peak, now);
+    } else if (e.startsWith("RELEASE ")) now--;
+  }
+  return { owners, peak, unreleased };
+}
 const HOLDER = path.join(ROOT, "holder.mjs");
 fs.writeFileSync(
   HOLDER,
@@ -94,6 +174,8 @@ fs.writeFileSync(
     `const { spawn } = await import("child_process");\n` +
     `await acquirePrimitive(process.argv[2], { initialBytes: new Uint8Array() });\n` +
     `const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true }); c.unref();\n` +
+    // The child's pid is RECORDED at once (argv[3]): a failed handshake can still kill and reap its process group.
+    `if (process.argv[3]) (await import("fs")).writeFileSync(process.argv[3], String(c.pid));\n` +
     `process.stdout.write("HELD " + process.pid + " " + c.pid + "\\n"); setInterval(() => {}, 1000);\n`
 );
 // Ruling 75be90fa (4): a SECOND open + close of the lock file in the owner's own process must not release the lock
@@ -147,36 +229,220 @@ async function oneTry(db: string): Promise<string> {
   return run(RACER, [db, go, "0"]).out;
 }
 
+type RoundResult = { kind: "observed"; owners: number; peak: number } | { kind: "not_evaluated"; why: string } | { kind: "failed"; why: string };
+type RoundsVerdict = { kind: "PASS" } | { kind: "FAIL"; why: string } | { kind: "NOT_EVALUATED"; why: string };
+
+/**
+ * A round's verdict, under ONE ordering rule: (1) VIOLATION evidence first: a proven overlap of two owners is FAIL,
+ * final, whatever else happened in the round; (2) then COVERAGE: anything that kept the round from being a valid test
+ * is NOT_EVALUATED with its reason; (3) then the result: exactly one owner, or FAIL.
+ */
+export function judgeRound(events: readonly string[], coverage: string | null, r: number, heldToEnd: ReadonlySet<string> = new Set()): RoundResult {
+  const o = ownership(events, heldToEnd);
+  if (o.peak >= 2) return { kind: "failed", why: `round ${r}: two CONCURRENT owners (a proven overlap, peak ${o.peak})` };
+  if (coverage) return { kind: "not_evaluated", why: coverage };
+  if (o.unreleased > 0) return { kind: "not_evaluated", why: `round ${r}: ${o.unreleased} owner(s) never logged a RELEASE` };
+  if (o.owners !== 1) return { kind: "failed", why: `round ${r}: ${o.owners} owner(s), not exactly one, with every racer accounted for` };
+  return { kind: "observed", owners: o.owners, peak: o.peak };
+}
+
+/**
+ * One round of the single-owner race (in `${tag}-${r}`); `fault(i)` is racer i's fault knob ("" = none). A racer
+ * completes its part only as the OWNER (live through settlement, exit 0 after RELEASE) or as a LOSER (the contention
+ * refusal acknowledged, exit 0). Anything else is a coverage problem. Every wait has its own deadline, and the
+ * recorded events are judged BEFORE any coverage outcome (judgeRound).
+ */
+async function raceRound(db: string, tag: string, r: number, fault: (i: number) => string = () => "", opts: { settleMs?: number } = {}): Promise<RoundResult> {
+  const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+  const h = await holding(db);
+  await h.kill();
+  const dir = path.join(ROOT, `${tag}-${r}`);
+  fs.mkdirSync(dir);
+  const racers = Array.from({ length: RACERS }, (_, i) => run(RACER_HS, [db, dir, String(i), i === 0 ? "800" : "0", i === 1 ? "800" : "0", fault(i)]));
+  const code: Array<number | null | undefined> = racers.map(() => undefined); // undefined: still running
+  racers.forEach((x, i) => x.child.once("exit", (c) => (code[i] = c)));
+  const has = (f: string) => fs.existsSync(path.join(dir, f));
+  const events = () => (has("events.log") ? fs.readFileSync(path.join(dir, "events.log"), "utf-8").split("\n").filter(Boolean) : []);
+  const allExitedWithin = (ms: number) => Promise.race([Promise.all(racers.map((x) => x.out)).then(() => true), sleep(ms).then(() => false)]);
+  const killAll = async (): Promise<void> => {
+    for (const x of racers) if (x.child.exitCode === null && x.child.signalCode === null) x.child.kill("SIGKILL");
+    await allExitedWithin(10_000);
+  };
+  const ended = async (coverage: string | null): Promise<RoundResult> => {
+    // Owners still alive NOW held through the whole log (they release only on our RELEASE): recorded BEFORE any kill.
+    const heldToEnd = new Set(racers.map((_, i) => i).filter((i) => has(`owner-${i}`) && code[i] === undefined).map(String));
+    if (coverage) await killAll();
+    return judgeRound(events(), coverage, r, heldToEnd);
+  };
+  const readyBy = Date.now() + 60_000;
+  while (Date.now() < readyBy && !racers.every((_, i) => has(`ready-${i}`))) await sleep(10);
+  if (!racers.every((_, i) => has(`ready-${i}`))) return ended(`round ${r}: ${racers.filter((_, i) => !has(`ready-${i}`)).length} racer(s) never got ready within 60 s`);
+  fs.writeFileSync(path.join(dir, "go"), "");
+  const owns = (i: number) => has(`owner-${i}`);
+  const lost = (i: number) => code[i] === 0 && has(`lost-${i}`);
+  const errored = (i: number) => has(`error-${i}`);
+  const brokeOff = (i: number) => errored(i) || (code[i] !== undefined && !owns(i) && !lost(i));
+  // The winner HOLDS until every racer has completed its part: only then is it released.
+  const settleMs = opts.settleMs ?? 60_000;
+  const settleBy = Date.now() + settleMs;
+  while (Date.now() < settleBy && !racers.every((_, i) => owns(i) || lost(i)) && !racers.some((_, i) => brokeOff(i))) await sleep(10);
+  const broke = racers.map((_, i) => i).filter(brokeOff);
+  if (broke.length > 0) {
+    const why = broke.map((i) => (errored(i) ? `racer ${i}: the acquire failed with ${fs.readFileSync(path.join(dir, `error-${i}`), "utf-8")} (not the contention refusal)` : `racer ${i} exited without a LOST acknowledgement (exit ${code[i]})`));
+    return ended(`round ${r}: ${why.join("; ")}`);
+  }
+  if (!racers.every((_, i) => owns(i) || lost(i))) return ended(`round ${r}: not every racer completed its attempt within ${settleMs} ms of GO (a deadline, not a verdict)`);
+  const owners = racers.map((_, i) => i).filter(owns);
+  const deadOwners = owners.filter((i) => code[i] !== undefined);
+  if (deadOwners.length > 0) return ended(`round ${r}: owner(s) ${deadOwners.join(",")} exited (exit ${deadOwners.map((i) => code[i]).join(",")}) before RELEASE`);
+  fs.writeFileSync(path.join(dir, "release"), "");
+  if (!(await allExitedWithin(30_000))) return ended(`round ${r}: a racer did not exit within 30 s of RELEASE`);
+  const badOwners = owners.filter((i) => code[i] !== 0);
+  if (badOwners.length > 0) return ended(`round ${r}: owner(s) ${badOwners.join(",")} exited ${badOwners.map((i) => code[i]).join(",")} after RELEASE`);
+  return ended(null);
+}
+
+/**
+ * Runs `n` rounds, judging EACH round as it ends: a violation or a failed round is FAIL at once (final: no later round
+ * can erase it); an unobserved round ends the run NOT_EVALUATED.
+ */
+async function runRounds(n: number, round: (r: number) => Promise<RoundResult>): Promise<RoundsVerdict> {
+  for (let r = 0; r < n; r++) {
+    const res = await round(r);
+    if (res.kind === "failed") return { kind: "FAIL", why: res.why };
+    if (res.kind === "not_evaluated") return { kind: "NOT_EVALUATED", why: res.why };
+    if (res.peak >= 2) return { kind: "FAIL", why: `round ${r}: two CONCURRENT owners (peak ${res.peak})` };
+    if (res.owners !== 1) return { kind: "FAIL", why: `round ${r}: ${res.owners} owner(s), not exactly one` };
+  }
+  return { kind: "PASS" };
+}
+
+describe("the ordinals tell SEQUENCE from OVERLAP (pure)", () => {
+  it("OWNER, RELEASE, OWNER, RELEASE: two owners, never at once (peak 1); OWNER, OWNER: two at once (peak 2)", () => {
+    expect(ownership(["OWNER 0", "RELEASE 0", "OWNER 1", "RELEASE 1"])).toEqual({ owners: 2, peak: 1, unreleased: 0 });
+    expect(ownership(["OWNER 0", "OWNER 1", "RELEASE 0", "RELEASE 1"])).toEqual({ owners: 2, peak: 2, unreleased: 0 });
+    expect(ownership(["OWNER 3", "RELEASE 3"])).toEqual({ owners: 1, peak: 1, unreleased: 0 });
+    expect(ownership([])).toEqual({ owners: 0, peak: 0, unreleased: 0 });
+  });
+  it("an owner that never logged its RELEASE (it crashed) is UNRELEASED: its hold is unprovable, never an overlap", () => {
+    expect(ownership(["OWNER 0", "OWNER 1", "RELEASE 1"])).toEqual({ owners: 2, peak: 1, unreleased: 1 });
+    expect(ownership(["OWNER 0", "OWNER 1", "RELEASE 1"], new Set(["0"])), "0 still ALIVE at the end: it held throughout").toEqual({ owners: 2, peak: 2, unreleased: 0 });
+  });
+});
+
 describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measured on ${process.platform}`, () => {
-  it(`exactly ONE owner in each of ${ROUNDS} rounds of ${RACERS} racers, each round after a SIGKILLed holder`, async () => {
+  /**
+   * COVERAGE BY HANDSHAKE (the standing rule for observer tests): every racer is READY (its lock module loaded) before
+   * GO, and the winner holds until every other racer has LOST, so each attempt provably falls inside the hold. Two
+   * OWNER lines without a RELEASE between them are two CONCURRENT owners: an INV-DB-01 violation, FINAL for the SHA. A
+   * racer that never gets ready leaves the round unobserved: NOT_EVALUATED (a visible coverage gap), never a pass.
+   * Each round has one racer with a SLOW IMPORT and one with a SLOW ATTEMPT after GO (a slow runner, deterministic).
+   */
+  it(`exactly ONE owner in each of ${ROUNDS} rounds of ${RACERS} racers, each round after a SIGKILLed holder`, async (ctx) => {
     const db = path.join(ROOT, "race.db");
-    const owners: number[] = [];
-    for (let r = 0; r < ROUNDS; r++) {
-      const h = await holding(db);
-      await h.kill();
-      const go = path.join(ROOT, `go-${r}`);
-      const racers = Array.from({ length: RACERS }, () => run(RACER, [db, go, "400"]));
-      await new Promise((res) => setTimeout(res, 150));
-      fs.writeFileSync(go, "");
-      const outs = await Promise.all(racers.map((x) => x.out));
-      owners.push(outs.filter((o) => o.includes("OWNER")).length);
+    const v = await runRounds(ROUNDS, (r) => raceRound(db, "round", r));
+    if (v.kind === "NOT_EVALUATED") {
+      reportCoverageGap("inv-db-01 single-owner race", v.why, "re-run on the same SHA (a coverage failure, not a verdict)");
+      ctx.skip(v.why);
     }
-    expect(owners, "owners per round").toEqual(Array(ROUNDS).fill(1));
+    expect(v, "exactly ONE owner per round, never two at once (a violation is FINAL)").toEqual({ kind: "PASS" });
   }, 240_000);
+
+  it("a racer that CRASHES after READY (no attempt) leaves its round NOT_EVALUATED, never an observed pass", async () => {
+    const res = await raceRound(path.join(ROOT, "crash.db"), "crash", 0, (i) => (i === 2 ? "crash-after-ready" : ""));
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+  }, 120_000);
+
+  it("a racer that writes LOST but exits NON-ZERO did not complete its part: the round is NOT_EVALUATED", async () => {
+    // Every racer but the winner loses; each carries the fault, so the losers all exit 1 after their acknowledgement.
+    const res = await raceRound(path.join(ROOT, "exit1.db"), "exit1", 0, () => "exit-1-after-lost");
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+    expect(JSON.stringify(res)).toMatch(/without a LOST acknowledgement \(exit 1/);
+  }, 120_000);
+
+  it("an EIO from the acquire call is not a LOST (only the contention refusal is): the round is NOT_EVALUATED", async () => {
+    const res = await raceRound(path.join(ROOT, "eio.db"), "eio", 0, (i) => (i === 3 ? "eio" : ""));
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+  }, 120_000);
+
+  it("an OWNER that exits 1 before RELEASE did not hold through settlement: the round is NOT_EVALUATED", async () => {
+    const res = await raceRound(path.join(ROOT, "ownerexit.db"), "ownerexit", 0, () => "owner-exit-1");
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+  }, 120_000);
+
+  it("an OWNER that RELEASEs but then exits 1 did not end cleanly: the round is NOT_EVALUATED", async () => {
+    const res = await raceRound(path.join(ROOT, "ownerexit2.db"), "ownerexit2", 0, () => "owner-exit-1-after-release");
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+    expect(JSON.stringify(res)).toMatch(/exited 1 after RELEASE/);
+  }, 120_000);
+
+  it("an OWNER that releases EARLY on its own (logged, exit 0, before the parent's RELEASE) did not hold through settlement: NOT_EVALUATED", async () => {
+    const res = await raceRound(path.join(ROOT, "early.db"), "early", 0, () => "owner-early-release");
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+    expect(JSON.stringify(res)).toMatch(/before RELEASE/);
+  }, 120_000);
+
+  it("an OWNER that releases WITHOUT logging its RELEASE has an unprovable hold: NOT_EVALUATED", async () => {
+    const res = await raceRound(path.join(ROOT, "silent.db"), "silent", 0, () => "owner-silent-release");
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+    expect(JSON.stringify(res)).toMatch(/never logged a RELEASE/);
+  }, 120_000);
+
+  it("a PLANTED overlap plus another racer crashing → FAIL: violation evidence is judged FIRST, before coverage", async () => {
+    // The plant logs a bounded hold INSIDE the real owner's (300-400 ms after GO); racer 3 then crashes (800 ms after GO).
+    const res = await raceRound(path.join(ROOT, "plant.db"), "plant", 0, (i) => (i === 2 ? "plant-owner" : i === 3 ? "crash-late" : ""));
+    expect(res.kind, JSON.stringify(res)).toBe("failed");
+  }, 120_000);
+
+  it("a racer descheduled past the settle deadline, with no overlap, is NOT_EVALUATED (a deadline is not a verdict)", async () => {
+    const res = await raceRound(path.join(ROOT, "stall.db"), "stall", 0, (i) => (i === 4 ? "stall-before-attempt" : ""), { settleMs: 1500 });
+    expect(res.kind, JSON.stringify(res)).toBe("not_evaluated");
+  }, 120_000);
+
+  it("a VIOLATION in round 0 then an unobserved round 1 → FAIL (final), never erased by the later skip", async () => {
+    const v = await runRounds(2, async (r) => (r === 0 ? { kind: "observed", owners: 2, peak: 2 } : { kind: "not_evaluated", why: "round 1: a racer never got ready" }));
+    expect(v.kind, JSON.stringify(v)).toBe("FAIL");
+  });
 
   it.skipIf(process.platform === "win32")("the lock is NEVER inherited by another child of the owner: the owner killed -9, its unrelated child still alive, a racer owns it within 2 s", async () => {
     const db = path.join(ROOT, "no-inherit.db");
-    const h = run(HOLDER_SPAWNS, [db]);
-    const [holderPid, childPid] = await new Promise<[number, number]>((res, rej) => {
-      const t = setTimeout(() => rej(new Error(`precondition: the holder did not hold within 30 s\n${h.stderr()}`)), 30_000);
-      h.child.stdout!.on("data", (d) => {
-        const m = /HELD (\d+) (\d+)/.exec(String(d));
-        if (m) {
-          clearTimeout(t);
-          res([Number(m[1]), Number(m[2])]);
+    const childPidFile = path.join(ROOT, "no-inherit.child.pid");
+    const h = run(HOLDER_SPAWNS, [db, childPidFile]);
+    /** The detached child is in its OWN process group: kill the group, then wait (bounded) until it is gone. */
+    const killChildGroup = async (pid: number): Promise<void> => {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      for (let i = 0; i < 100; i++) {
+        try {
+          process.kill(pid, 0);
+        } catch {
+          return;
         }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+    let holderPid: number;
+    let childPid: number;
+    try {
+      [holderPid, childPid] = await new Promise<[number, number]>((res, rej) => {
+        const t = setTimeout(() => rej(new Error(`precondition: the holder did not hold within 30 s\n${h.stderr()}`)), 30_000);
+        h.child.stdout!.on("data", (d) => {
+          const m = /HELD (\d+) (\d+)/.exec(String(d));
+          if (m) {
+            clearTimeout(t);
+            res([Number(m[1]), Number(m[2])]);
+          }
+        });
       });
-    });
+    } catch (err) {
+      // A FAILED handshake still kills and reaps: the holder, and its detached child by its recorded pid (as a group).
+      h.child.kill("SIGKILL");
+      if (fs.existsSync(childPidFile)) await killChildGroup(Number(fs.readFileSync(childPidFile, "utf-8")));
+      throw err;
+    }
     try {
       expect(await oneTry(db), "precondition: held").toMatch(/^LOST OwnerLockError .*held by another process/);
       process.kill(holderPid, "SIGKILL");
@@ -190,11 +456,7 @@ describe.skipIf(!PLATFORM_OK)(`INV-DB-01: the single-owner lock primitive, measu
       }
       expect(got, "the lock went with the owner, not with its child").toMatch(/^OWNER/);
     } finally {
-      try {
-        process.kill(childPid, "SIGKILL"); // the recorded pid
-      } catch {
-        /* already gone */
-      }
+      await killChildGroup(childPid); // the recorded pid, its whole group
     }
   }, 60_000);
 
