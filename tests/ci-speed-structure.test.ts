@@ -174,6 +174,8 @@ describe("ci.yml keeps the safety properties", () => {
       expect(J.test, `Node ${n}: its own parity check`).toMatch(new RegExp(`node scripts/ci-shard-parity\\.mjs 4 node${n}/\\.vitest-shard`));
       expect(J.test, `Node ${n}: its own merge`).toMatch(new RegExp(`npx vitest --merge-reports=node${n}/\\.vitest/blob --reporter=default`));
     }
+    // The required job's name still says Node 22 (branch protection names it): its run summary says what it covers.
+    expect(J.test).toMatch(/covers Node 22 and 24\." >> "\$GITHUB_STEP_SUMMARY"/);
   });
   it("a READY pull request cancels its superseded run; drafts, main and nightly never cancel", () => {
     expect(CI).toMatch(/cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' && !github\.event\.pull_request\.draft \}\}/);
