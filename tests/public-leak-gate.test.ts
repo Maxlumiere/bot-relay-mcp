@@ -168,7 +168,7 @@ describe("the public scanner copy", () => {
     git(work, "add", "-A");
     git(work, "commit", "-q", "-m", "publish");
     git(work, "push", "-q", "origin", "HEAD:main");
-    fs.writeFileSync(path.join(dir, "copies.tsv"), `fixture-repo\t${copy}\n`);
+    fs.writeFileSync(path.join(dir, "copies.tsv"), `fixture-repo\t${copy}\t${work}\n`);
     return { dir, list, copy, git, bare };
   }
   const privateSelfTest = (p: { dir: string; list: string }) =>
@@ -187,6 +187,104 @@ describe("the public scanner copy", () => {
     const r = privateSelfTest(p);
     expect(r.status, r.stdout + r.stderr).toBe(2);
     expect(r.stdout).toMatch(/^DRIFT: fixture-repo$/m);
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  });
+
+  /** The fixture repo's working tree becomes a DEPLOY TREE that predates the copy: an older branch with no tools/ at all. */
+  function behindWorkingTree(p: { copy: string; git: (cwd: string, ...a: string[]) => void }): string {
+    const work = path.dirname(path.dirname(path.dirname(p.copy)));
+    p.git(work, "checkout", "-q", "--orphan", "deploy-tree");
+    p.git(work, "rm", "-rq", "--cached", ".");
+    fs.rmSync(path.join(work, "tools"), { recursive: true, force: true });
+    fs.writeFileSync(path.join(work, "README.md"), "a deploy tree from before the scanner existed\n");
+    p.git(work, "add", "README.md");
+    p.git(work, "commit", "-q", "-m", "an older deploy tree");
+    expect(fs.existsSync(path.dirname(p.copy)), "precondition: the copy's directory is absent from the working tree").toBe(false);
+    return work;
+  }
+
+  it("the WORKING TREE never decides: a copy whose directory is absent locally, published IDENTICAL on main → PASS (main fetched)", () => {
+    const p = privateCopyWithRepo();
+    const work = behindWorkingTree(p);
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout.trim()).toBe("self-test: PASS");
+    const ref = spawnSync("git", ["-C", work, "rev-parse", "--verify", "-q", "refs/leak-scan/published-main"], { encoding: "utf-8" });
+    expect(ref.status, "the published main was fetched (the comparison used it)").toBe(0);
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  });
+
+  it("the twin: the copy's directory absent locally AND absent from the published main → DRIFT (exit 2)", () => {
+    const p = privateCopyWithRepo();
+    const other = path.join(p.dir, "other");
+    p.git(p.dir, "clone", "-q", p.bare, other);
+    p.git(other, "rm", "-rq", "tools");
+    p.git(other, "commit", "-q", "-m", "unpublish the copy");
+    p.git(other, "push", "-q", "origin", "HEAD:main");
+    behindWorkingTree(p);
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(2);
+    expect(r.stdout).toMatch(/^DRIFT: fixture-repo$/m);
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  });
+
+  it("REPO IDENTITY: the recorded checkout ABSENT while a PARENT repository holds identical bytes at the path → cannot evaluate, never a pass", () => {
+    const p = privateCopyWithRepo();
+    const work = path.dirname(path.dirname(path.dirname(p.copy)));
+    // The fixture repo plays a PARENT (a home directory under git) publishing identical bytes at checkout/tools/…; the
+    // intended checkout (checkout/) is absent locally, so a walk up from the copy reaches the parent.
+    const inner = path.join(work, "checkout", "tools", "public-leak-scan", "scan.mjs");
+    fs.mkdirSync(path.dirname(inner), { recursive: true });
+    fs.copyFileSync(SCAN, inner);
+    p.git(work, "add", "-A");
+    p.git(work, "commit", "-q", "-m", "a parent repo holds the bytes too");
+    p.git(work, "push", "-q", "origin", "HEAD:main");
+    fs.rmSync(path.join(work, "checkout"), { recursive: true, force: true });
+    fs.writeFileSync(path.join(p.dir, "copies.tsv"), `intended\t${inner}\t${path.join(work, "checkout")}\n`);
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(2);
+    expect(r.stdout).not.toContain("self-test: PASS");
+    expect(r.stderr).toMatch(/cannot evaluate \(a copy's recorded checkout/);
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  });
+
+  /** Is the filesystem under `dir` case-insensitive? (measured: a name created in lower case, looked up in upper case) */
+  const caseInsensitiveAt = (dir: string): boolean => {
+    const probe = path.join(dir, "case-probe-x");
+    fs.mkdirSync(probe);
+    const insensitive = fs.existsSync(path.join(dir, "CASE-PROBE-X"));
+    fs.rmdirSync(probe);
+    return insensitive;
+  };
+
+  it("REPO IDENTITY: the recorded root spelled in another CASE (a case-insensitive filesystem) is the same checkout → PASS", (ctx) => {
+    const p = privateCopyWithRepo();
+    const work = path.dirname(path.dirname(path.dirname(p.copy)));
+    if (!caseInsensitiveAt(p.dir)) {
+      console.log("skipped: this filesystem is case-sensitive (a case alias names another directory)");
+      fs.rmSync(p.dir, { recursive: true, force: true });
+      ctx.skip("case-sensitive filesystem");
+    }
+    const alias = path.join(path.dirname(work), path.basename(work).toUpperCase());
+    expect(alias, "precondition: the alias is spelled differently").not.toBe(work);
+    fs.writeFileSync(path.join(p.dir, "copies.tsv"), `fixture-repo\t${p.copy}\t${alias}\n`);
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout.trim()).toBe("self-test: PASS");
+    fs.rmSync(p.dir, { recursive: true, force: true });
+  });
+
+  it("REPO IDENTITY: ANOTHER checkout whose path is spelled the same below a different parent (a second clone) still REFUSES", () => {
+    const p = privateCopyWithRepo();
+    const work = path.dirname(path.dirname(path.dirname(p.copy)));
+    const otherParent = path.join(p.dir, "elsewhere");
+    fs.mkdirSync(otherParent);
+    const twin = path.join(otherParent, path.basename(work));
+    p.git(otherParent, "clone", "-q", p.bare, twin);
+    fs.writeFileSync(path.join(p.dir, "copies.tsv"), `fixture-repo\t${p.copy}\t${twin}\n`);
+    const r = privateSelfTest(p);
+    expect(r.status, r.stdout + r.stderr).toBe(2);
+    expect(r.stderr).toMatch(/cannot evaluate \(a copy's repository is not its recorded checkout/);
     fs.rmSync(p.dir, { recursive: true, force: true });
   });
 

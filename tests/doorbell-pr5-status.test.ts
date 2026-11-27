@@ -195,7 +195,9 @@ describe("open escalations: METADATA ONLY", () => {
 describe("Q6: the hook's lines (pure renderer)", () => {
   const base = (over: Partial<Status> = {}): Status => ({
     ok: true, state: "healthy", why: "cycling", build: { verdict: "CURRENT", reason: "" }, condition: "ok", heartbeat: null,
-    escalations: { open: 0, items: [] }, holder: null, state_dir: "/x", db_path: "/x/relay.db", resolution: null, ...over,
+    escalations: { open: 0, items: [] }, holder: null, state_dir: "/x", db_path: "/x/relay.db", resolution: null,
+    policy: { state: "policy_invalid", why: "missing" }, held: {}, // PR 8a: the pre-rollout state, quiet
+    ...over,
   });
   const esc = (k: number) => Array.from({ length: k }, (_, i) => ({ agent: `agent-${i}`, reason: "agent_unresponsive", operator: null, opened_at: iso(NOW), age_seconds: 3600 }));
   it("SILENT: not-installed; healthy + CURRENT + ok + 0 escalations", () => {
