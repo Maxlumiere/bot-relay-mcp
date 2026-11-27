@@ -118,6 +118,11 @@ export interface AgentCliProfile {
    * A plain regex-safe alternation token (no anchors) — the consumers wrap it.
    */
   processPattern: string;
+  /**
+   * The RUNTIMES that may host this CLI (node running its script). 8b's two judges agree only when the kernel's
+   * executable is this CLI's own binary OR one of these runtimes (ruling adf82e6b); any other runtime reads NULL.
+   */
+  runtimeHosts: readonly string[];
   hookInstall: HookInstall;
   /**
    * Doorbell PR 8b (ruling 9ac81564): does an agent on this CLI have an AUTOMATIC wake path at all (a hook, a watch
@@ -136,6 +141,7 @@ const CLAUDE: AgentCliProfile = {
   binary: "claude",
   displayName: "Claude Code",
   processPattern: "claude",
+  runtimeHosts: ["node", "bun"],
   hookInstall: {
     target: "~/.claude/settings.json",
     format: "claude-settings-json",
@@ -174,6 +180,7 @@ const CODEX: AgentCliProfile = {
   binary: "codex",
   displayName: "Codex CLI",
   processPattern: "codex",
+  runtimeHosts: ["node"],
   hookInstall: {
     target: "~/.codex/config.toml",
     format: "codex-config-toml",

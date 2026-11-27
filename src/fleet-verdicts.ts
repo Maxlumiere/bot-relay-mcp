@@ -32,6 +32,7 @@ import path from "path";
 import { checkInstall, parseStamp, UNBUILT, type InstallCheck } from "./build-id.js";
 import { isUtcStartToken, probePid, type PidState, type ProcEntry, type ProcessStart } from "./liveness.js";
 import { NODE_FLAGS, NODE_NO_SCRIPT, NODE_OPTIONS_WITH_VALUE } from "./node-options.js";
+import { isRuntimeThreadName } from "./proc-exe.js";
 
 export type ConnectorVerdict = "CURRENT" | "STALE" | "UNKNOWN" | "INSTALL INCONSISTENT";
 export type WindowVerdict = ConnectorVerdict | "NO CONNECTOR";
@@ -113,6 +114,8 @@ export interface ProcessView {
   start: string;
   command: string;
   comm?: string;
+  /** The kernel's executable (Linux), judged before comm (src/proc-exe.ts). */
+  exe?: string;
   cwd: string | null;
   argv: string[] | null;
 }
@@ -286,8 +289,13 @@ function relayEvidence(args: string[], exact: boolean, cwdReadable: boolean, abs
  */
 export function classifyProcess(p: ProcessView, listeners: ReadonlySet<number>, fsx: ClassifyFs = realClassifyFs): Classification {
   if (listeners.has(p.pid)) return { kind: "not-relay", why: "it holds a TCP listen socket (the daemon or another server)" };
-  const exe = p.comm ?? (p.argv ? p.argv[0] : p.command.split(" ")[0]);
-  if (!NODE_EXECUTABLES.test(path.basename(exe ?? ""))) return { kind: "not-relay", why: "not a node process" };
+  const exe = p.exe ?? p.comm ?? (p.argv ? p.argv[0] : p.command.split(" ")[0]);
+  if (!NODE_EXECUTABLES.test(path.basename(exe ?? ""))) {
+    // The executable unreadable and comm a runtime THREAD name (Linux Node 24's "MainThread"): it may be a relay
+    // process, so UNKNOWN, never not-relay (a live old relay read as "not a relay" is the unsafe direction).
+    if (p.exe === undefined && p.comm !== undefined && isRuntimeThreadName(p.comm)) return { kind: "unknown", reason: "its executable is unreadable and ps names a runtime thread, not an executable" };
+    return { kind: "not-relay", why: "not a node process" };
+  }
 
   let args: string[];
   let exact: boolean;
@@ -755,6 +763,7 @@ export function toProcessViews(
     start: e.startedAt,
     command: e.command,
     comm: e.comm,
+    ...(e.exe !== undefined ? { exe: e.exe } : {}),
     cwd: cwdOf(e.pid),
     argv: argvOf(e.pid),
   }));
@@ -825,7 +834,7 @@ export async function observeFleet(sys: SystemDeps, db: DbReads, port: number): 
         : toProcessViews(
           table,
           ((cwds) => (pid: number) => cwds.get(pid) ?? null)(
-            sys.cwds([...table.values()].filter((e) => NODE_EXECUTABLES.test(path.basename(e.comm ?? e.command.split(" ")[0]))).map((e) => e.pid)),
+            sys.cwds([...table.values()].filter((e) => NODE_EXECUTABLES.test(path.basename(e.exe ?? e.comm ?? e.command.split(" ")[0]))).map((e) => e.pid)),
           ),
           (pid) => sys.exactArgv(pid),
         );

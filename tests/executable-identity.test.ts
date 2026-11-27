@@ -75,10 +75,10 @@ describe("consumer 2: the process table carries the exe; findAgentProcess and cl
     expect(findAgentProcess(SELF, table as never)).toBeNull();
   });
   const view = (over: Record<string, unknown>) => ({ pid: 77, ppid: 1, start: START, command: "node /nowhere/dist/index.js", cwd: null, argv: ["node", "/nowhere/dist/index.js"], ...over });
-  const noFs = { realpath: () => { throw new Error("ENOENT"); }, readFile: () => { throw new Error("ENOENT"); }, isFile: () => false } as never;
+  const noFs = { isFile: () => false, realpath: () => null, packageName: () => null } as never;
   it("classifyProcess: comm MainThread + exe node → judged AS NODE (never \"not a node process\")", () => {
     const c = classifyProcess(view({ comm: "MainThread", exe: "/opt/node/bin/node" }) as never, new Set(), noFs);
-    expect(c.why ?? "").not.toMatch(/not a node process/);
+    expect(c.kind === "not-relay" ? c.why : "", "judged as node: past the executable check").not.toMatch(/not a node process/);
   });
   it("classifyProcess: exe UNREADABLE + comm a runtime THREAD name → UNKNOWN, NEVER not-relay (a live old relay must never read \"not a relay\")", () => {
     const c = classifyProcess(view({ comm: "MainThread" }) as never, new Set(), noFs);
@@ -93,6 +93,15 @@ describe("consumer 2: the process table carries the exe; findAgentProcess and cl
 describe("consumer 3: 8b's two judges (ruling adf82e6b): exe = the CLI, or exe = a runtime the REGISTRY lists as a host of that CLI", () => {
   it("native agree: command codex, exe codex → codex", () => {
     expect(agreedProfileOf("/usr/local/bin/codex --flag", "/usr/local/bin/codex")).toBe("codex");
+  });
+  it("native agree from the npx VENDOR directory (…/vendor/<triple>/bin/codex): judged by BASENAME, never rejected for its unusual directory", () => {
+    const vendored = "/home/u/.npm/_npx/0a1b2c/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/bin/codex";
+    expect(agreedProfileOf(`${vendored} --flag`, vendored)).toBe("codex");
+    const table = new Map([
+      [100, { pid: 100, ppid: 1, startedAt: START, command: `${vendored} --flag`, comm: "codex", exe: vendored }],
+      [300, { pid: 300, ppid: 100, startedAt: START, command: "node /r/dist/index.js", comm: "MainThread", exe: "/opt/node/bin/node" }],
+    ]);
+    expect(findAgentProcess(300, table as never)).toEqual({ pid: 100, startedAt: START, profile: "codex" });
   });
   it("runtime-hosted agree: node running claude (node is a registered host of claude) → claude; node running codex → codex", () => {
     expect(agreedProfileOf("node /usr/local/bin/claude", "/opt/node/bin/node")).toBe("claude");

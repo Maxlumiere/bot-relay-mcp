@@ -1056,7 +1056,7 @@ relay_ps() {
 }
 
 relay_agent_pid() {
-  local pid ppid comm args depth=0 pat
+  local pid ppid comm exe args depth=0 pat
   pat='claude|codex|node|bun|deno'
   [ -n "${RELAY_AGENT_PROCESS_PATTERN:-}" ] && pat="${pat}|${RELAY_AGENT_PROCESS_PATTERN}"
   case "$(uname -s 2>/dev/null)" in
@@ -1066,6 +1066,10 @@ relay_agent_pid() {
   # Each ps takes the seamed budget (relay_ps): a hung or slow chain ends where the budget does, named.
   while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
     comm=$(relay_ps -o comm= -p "$pid"); comm="${comm##*/}"
+    # The KERNEL's executable first (Linux): Node 24 names its main thread "MainThread", and comm IS that name
+    # there (MEASURED). macOS has no /proc: the readlink fails and ps's comm (the executable path) stands.
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null); exe="${exe% (deleted)}"
+    [ -n "$exe" ] && comm="${exe##*/}"
     if printf '%s' "$comm" | grep -qiE "^(${pat})$"; then
       args=$(relay_ps -o args= -p "$pid")
       case "$args" in *dist/index.js*) ;; *) printf '%s' "$pid"; return ;; esac
