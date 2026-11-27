@@ -39,6 +39,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { getFreePort } from "./_helpers/port.js";
 import cp from "child_process";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -203,10 +204,7 @@ describe("v2.7 Tether Phase 5 — SSE keepalive over real HTTP transport", () =>
         try { await client.close(); } catch { /* */ }
       }
     } finally {
-      daemon.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { daemon.kill("SIGKILL"); } catch { /* */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(daemon, ROOT);
     }
   }, 20_000);
 
@@ -257,10 +255,7 @@ describe("v2.7 Tether Phase 5 — SSE keepalive over real HTTP transport", () =>
         try { await client.close(); } catch { /* */ }
       }
     } finally {
-      daemon.kill("SIGTERM");
-      await new Promise((res) => setTimeout(res, 200));
-      try { daemon.kill("SIGKILL"); } catch { /* */ }
-      fs.rmSync(ROOT, { recursive: true, force: true });
+      await stopAndRemove(daemon, ROOT);
     }
   }, 15_000);
 });

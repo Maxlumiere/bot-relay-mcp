@@ -44,6 +44,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(HERE, "..");
@@ -122,15 +123,8 @@ async function spawnDaemon(): Promise<DaemonHandle> {
 }
 
 async function tearDownDaemon(handle: DaemonHandle): Promise<void> {
-  await new Promise<void>((resolve) => {
-    handle.child.once("exit", () => resolve());
-    handle.child.kill("SIGTERM");
-    setTimeout(() => {
-      handle.child.kill("SIGKILL");
-      resolve();
-    }, 2_000).unref?.();
-  });
-  fs.rmSync(handle.tmpDir, { recursive: true, force: true });
+  // stopAndRemove: SIGTERM, a bounded wait, SIGKILL, a bounded wait for the EXIT, then the removal (never before it).
+  await stopAndRemove(handle.child, handle.tmpDir, { graceMs: 2_000 });
 }
 
 async function registerAgentViaHttp(

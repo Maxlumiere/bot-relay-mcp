@@ -28,6 +28,7 @@ import { fileURLToPath } from "url";
 import Database from "better-sqlite3";
 import { getFreePort } from "./_helpers/port.js";
 import { mintHeaders } from "./_helpers/mint.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_INDEX = path.join(REPO, "dist", "index.js");
@@ -118,14 +119,7 @@ describe("SEC-20 through the REAL daemon and the REAL `relay send`", () => {
   }, 60_000);
 
   afterAll(async () => {
-    daemon?.kill("SIGTERM");
-    await new Promise((r) => setTimeout(r, 200));
-    try {
-      daemon?.kill("SIGKILL");
-    } catch {
-      /* gone */
-    }
-    fs.rmSync(root, { recursive: true, force: true });
+    await stopAndRemove([daemon], root);
   });
 
   it("TWIN: an ACTIVE agent sends through `relay send` (exit 0, the row lands)", async () => {

@@ -30,6 +30,7 @@ import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { budgetTree } from "./_helpers/hook-budget-tree.js";
+import { stopAndRemove } from "./_helpers/stop-and-remove.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Budgeted hook steps read a FIXED clock of 0 (RELAY_TEST_CLOCK, tests/_helpers/hook-budget-tree.ts): bash SECONDS
@@ -104,17 +105,8 @@ beforeAll(async () => {
   h = { port, root, dbPath, daemon };
 }, 20_000);
 
-afterAll(() => {
-  try {
-    h?.daemon.kill("SIGKILL");
-  } catch {
-    /* */
-  }
-  try {
-    if (h) fs.rmSync(h.root, { recursive: true, force: true });
-  } catch {
-    /* */
-  }
+afterAll(async () => {
+  if (h) await stopAndRemove(h.daemon, h.root);
 });
 
 /** Run check-relay.sh (first register, daemon mints the token). */
