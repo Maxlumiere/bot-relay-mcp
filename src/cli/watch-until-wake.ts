@@ -161,12 +161,42 @@ export async function agentWatchStatus(db: Handle, dbPath: string, agent: string
 }
 
 /** Open the relay DB read-only, waiting while no writer has created its WAL sidecars (never creating one). */
-async function openDbWaiting(dbPath: string, intervalMs: number, say: (l: string) => void, agent: string): Promise<Handle> {
+/**
+ * Open the relay DB read-only and take the identity of the file THIS HANDLE opened (Codex #447 R2 P1-b). The driver
+ * exposes no descriptor, so it is the codebase's lock pattern (doorbell-lock.ts): the identity is taken BEFORE the
+ * driver opens the path, and the path must still name it AFTER the open; a path that changed during the open closes
+ * the handle (null: try again). Never an identity read from the pathname after the fact.
+ */
+export async function openRelayDbBound(dbPath: string, duringOpen?: () => void, beforeOpen?: () => void): Promise<{ db: Handle; identity: string } | null> {
   const { openRelayDbIfWritten } = await import("../doorbell-run.js");
+  const { fileIdentityKey } = await import("../file-identity.js");
+  let pre: string;
+  try {
+    pre = fileIdentityKey(fs.statSync(dbPath, { bigint: true }));
+  } catch {
+    return null;
+  }
+  beforeOpen?.(); // a TEST seam: a path swapped between the identity and the driver's open (the window the re-check closes)
+  const r = await openRelayDbIfWritten(dbPath, duringOpen);
+  if ("waiting" in r) return null;
+  let post: string | null = null;
+  try {
+    post = fileIdentityKey(fs.statSync(dbPath, { bigint: true }));
+  } catch {
+    /* gone: not the file opened */
+  }
+  if (post !== pre) {
+    r.db.close();
+    return null;
+  }
+  return { db: r.db, identity: pre };
+}
+
+async function openDbWaiting(dbPath: string, intervalMs: number, say: (l: string) => void, agent: string): Promise<{ db: Handle; identity: string }> {
   for (;;) {
     try {
-      const r = await openRelayDbIfWritten(dbPath);
-      if (!("waiting" in r)) return r.db;
+      const r = await openRelayDbBound(dbPath);
+      if (r) return r;
     } catch (err) {
       say(`[sentinel] DEGRADED: the watch for ${agent} cannot open its relay DB yet (${err instanceof Error ? err.message : String(err)}): retrying`);
     }
@@ -191,6 +221,18 @@ export async function runArmCheck(agent: string): Promise<number> {
   const O = await import("../watch-owner.js");
   if (!W.watchableName(agent)) {
     emitLine(`no-mail: refused (not_watchable): ${JSON.stringify(agent)} cannot have a watch`);
+    return 2;
+  }
+  // PR 8a: the WAKE POLICY, before anything else is decided. No valid policy means no wakes: refuse loudly, never
+  // arm a watch that can wake nobody. An agent the policy does not opt in is refused the same way.
+  const { readWakePolicy } = await import("../wake-policy.js");
+  const policy = readWakePolicy(path.dirname(dbPath));
+  if (!policy.ok) {
+    emitLine(`no-mail: wake policy unreadable (${policy.why}). Do not start a watch for ${agent}.`);
+    return 2;
+  }
+  if (!policy.file.optIn.includes(agent)) {
+    emitLine(`no-mail: refused (not_opted_in): ${agent} is not opted in to wakes by this relay's doorbell policy. Do not start a watch for ${agent}.`);
     return 2;
   }
   const { openRelayDbIfWritten } = await import("../doorbell-run.js");
@@ -353,7 +395,7 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
   const { currentWakePolicy } = await import("../wake-policy.js");
   const { acquireInstanceLock, lockStillOurs, releaseInstanceLock } = await import("../doorbell-lock.js");
   const { ensurePrivateDir } = await import("../doorbell-log.js");
-  const { pendingMetadata } = await import("../db.js");
+  const { pendingMetadata, agentRegistered } = await import("../db.js");
   const O = await import("../watch-owner.js");
   const ownHost = me.host_id;
   const ownerDeps = await realOwnerDeps(ownHost);
@@ -370,7 +412,11 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
   };
 
   // PHASE 1 (no lock held): a readable relay DB, then OWNERSHIP (D1). It never creates a sidecar.
-  let db: Handle | null = await openDbWaiting(dbPath, intervalMs, say, agent);
+  // Codex #447 R1 P1 / R2 P1-b: the identity of the DB file this handle OPENED (taken around the open, never from
+  // the pathname afterwards); every policy read is bound to it, and it is re-taken with every reopen.
+  const first = await openDbWaiting(dbPath, intervalMs, say, agent);
+  let db: Handle | null = first.db;
+  let openedDb: string | null = first.identity;
   const closeDb = () => {
     try {
       db?.close();
@@ -492,7 +538,11 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
       if (!rightful()) return;
       const t = now();
       try {
-        if (!db) db = await openDbWaiting(dbPath, intervalMs, say, agent);
+        if (!db) {
+          const again = await openDbWaiting(dbPath, intervalMs, say, agent);
+          db = again.db;
+          openedDb = again.identity;
+        }
         // D1 (iii): the agent's ONE live window must still be this one (by pid + the kernel's start).
         const own = O.stillOwner(window, await agentBindings(db, agent), ownHost, ownerDeps, deadCache);
         if (!own.ok) {
@@ -526,7 +576,9 @@ export async function runUntilWake(agent: string, opts: { intervalMs?: number; d
         const meta = new Map(m.messages.map((x) => [x.id, { from: x.from, lane: "direct" as const }]));
         const read = { registered: true, reading_session: m.reading_session, ids: m.messages.map((x) => x.id), meta };
         const woken = W.readWoken(dir);
-        const d = W.decideWake(read, agent, woken, t, currentWakePolicy());
+        // PR 8a: the instance's policy, re-read at every check (a file made invalid while the watch runs wakes nobody).
+        const reader = db; // the handle this check read with (the closure below must not see a later reassignment)
+        const d = W.decideWake(read, agent, woken, t, currentWakePolicy(dbPath, (name) => agentRegistered(reader, name), openedDb));
         if (d.wake.length === 0) return; // nothing new to wake for (or a NULL session: keep waiting)
         const senders = d.wake.flatMap((id) => (meta.get(id)?.from ? [meta.get(id)!.from as string] : []));
         if (!rightful()) return;

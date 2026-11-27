@@ -1,0 +1,149 @@
+[
+ {
+  "name": "invalid-falls-back-to-allow",
+  "file": "src/wake-policy.ts",
+  "find": "  if (!read.ok) return { standing: DENY_INVALID, pairWakesPerHour: DEFAULT_PAIR_WAKES_PER_HOUR, read };",
+  "replace": "  if (!read.ok) return { standing: () => \"allowed\", pairWakesPerHour: DEFAULT_PAIR_WAKES_PER_HOUR, read };",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "allow-all-export-back",
+  "file": "src/wake-policy.ts",
+  "find": "export const DEFAULT_PAIR_WAKES_PER_HOUR = 4;",
+  "replace": "export const ALLOW_ALL: StandingCheck = () => \"allowed\";\nexport const DEFAULT_PAIR_WAKES_PER_HOUR = 4;",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "follows-links",
+  "file": "src/wake-policy.ts",
+  "find": "fs.constants.O_RDONLY | (posix ? fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK : 0)",
+  "replace": "fs.constants.O_RDONLY | (posix ? fs.constants.O_NONBLOCK : 0)",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "mode-unchecked",
+  "file": "src/wake-policy.ts",
+  "find": "      if ((st.mode & 0o077) !== 0) return { ok: false, why: \"mode too open (must be 0600)\" };\n",
+  "replace": "",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "owner-unchecked",
+  "file": "src/wake-policy.ts",
+  "find": "      if (uid !== undefined && st.uid !== uid) return { ok: false, why: \"not owned by this user\" };\n",
+  "replace": "",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "extra-field-allowed",
+  "file": "src/wake-policy.ts",
+  "find": "  for (const k of Object.keys(o)) if (!(FIELDS as readonly string[]).includes(k)) return bad(\"unexpected field\");\n",
+  "replace": "",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "wildcard-unregistered",
+  "file": "src/wake-policy.ts",
+  "find": "if (wildcard.has(recipient) && isRegistered(sender)) return \"allowed\";",
+  "replace": "if (wildcard.has(recipient)) return \"allowed\";",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "opt-in-ignored",
+  "file": "src/wake-policy.ts",
+  "find": "    if (!opted.has(recipient)) return { refused: \"not_opted_in\" };\n",
+  "replace": "",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "arm-check-skips-policy",
+  "file": "src/cli/watch-until-wake.ts",
+  "find": "  if (!policy.ok) {\n    emitLine(`no-mail: wake policy unreadable (${policy.why}). Do not start a watch for ${agent}.`);\n    return 2;\n  }\n  if (!policy.file.optIn.includes(agent)) {",
+  "replace": "  if (policy.ok && !policy.file.optIn.includes(agent)) {",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "arm-check-skips-opt-in",
+  "file": "src/cli/watch-until-wake.ts",
+  "find": "  if (!policy.file.optIn.includes(agent)) {\n    emitLine(`no-mail: refused (not_opted_in)",
+  "replace": "  if (false) {\n    emitLine(`no-mail: refused (not_opted_in)",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "watch-reads-wrong-dir",
+  "file": "src/cli/watch-until-wake.ts",
+  "find": "currentWakePolicy(dbPath, (name) => agentRegistered(reader, name), openedDb)",
+  "replace": "currentWakePolicy(path.dirname(dbPath), (name) => agentRegistered(reader, name), openedDb)",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "held-invalid-branch-dropped",
+  "file": "src/cli/doorbell.ts",
+  "find": "        if ((await agentWatchStatus(db, dbPath, agent)) !== \"live\") continue;",
+  "replace": "        continue;",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "held-counts-allowed-too",
+  "file": "src/cli/doorbell.ts",
+  "find": "standing({ sender: m.from, recipient: agent, kind: \"direct\", id: m.id }) !== \"allowed\");",
+  "replace": "true);",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "hook-loud-before-rollout",
+  "file": "src/cli/doorbell.ts",
+  "find": "(st.policy.why !== \"missing\" || stuck.length > 0)",
+  "replace": "true",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "policy-check-invalid-exits-0",
+  "file": "src/cli/doorbell.ts",
+  "find": "no agent can be woken\\n`);\n    return 1;",
+  "replace": "no agent can be woken\\n`);\n    return 0;",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "r1-unbound-policy-read",
+  "file": "src/wake-policy.ts",
+  "find": "  const sameInstance = (): boolean => !opts.bound || (opts.bound.identity !== null && dbIdentity(opts.bound.dbPath) === opts.bound.identity);",
+  "replace": "  const sameInstance = (): boolean => true;",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "r1-no-restat",
+  "file": "src/wake-policy.ts",
+  "find": "    if (off !== st.size || after.size !== st.size || after.mtimeMs !== st.mtimeMs) return { ok: false, why: \"changed while being read\" };\n",
+  "replace": "    void after;\n",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "r1-duplicate-keys-allowed",
+  "file": "src/wake-policy.ts",
+  "find": "    if (hasDuplicateKey(text)) return { ok: false, why: \"schema: a duplicate key\" };\n",
+  "replace": "",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "r1-held-plain-object",
+  "file": "src/cli/doorbell.ts",
+  "find": "  const held = Object.create(null) as DoorbellStatus[\"held\"];",
+  "replace": "  const held = {} as DoorbellStatus[\"held\"];",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "fifo-blocks",
+  "file": "src/wake-policy.ts",
+  "find": "fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK : 0)",
+  "replace": "fs.constants.O_NOFOLLOW : 0)",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ },
+ {
+  "name": "r2-no-post-open-check",
+  "file": "src/cli/watch-until-wake.ts",
+  "find": "  if (post !== pre) {\n    r.db.close();\n    return null;\n  }\n",
+  "replace": "",
+  "test": "tests/doorbell-pr8a-policy.test.ts"
+ }
+]
