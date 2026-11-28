@@ -17,6 +17,7 @@
  *   - local only: nothing of this reaches the off-machine snapshot.
  */
 import { describe, it, expect, afterAll } from "vitest";
+import { nodeOptionTable } from "../src/node-options.js";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -147,8 +148,12 @@ describe("classifyProcess (D3 + D9)", () => {
       });
     });
     it("EVERY value-taking option of node's own table, in the space form, skips its value (exact argv)", () => {
-      expect(V.NODE_OPTIONS_WITH_VALUE.size).toBeGreaterThan(60); // non-vacuous: the table, not a sample
-      for (const opt of V.NODE_OPTIONS_WITH_VALUE) {
+      // The RUNNING node's own table (ruling c076b9cb (3): derived at runtime, never pinned).
+      const table = nodeOptionTable();
+      expect(table.ok).toBe(true);
+      const withValue = table.ok ? table.withValue : new Set<string>();
+      expect(withValue.size).toBeGreaterThan(60); // non-vacuous: the table, not a sample
+      for (const opt of withValue) {
         if (V.NODE_NO_SCRIPT.has(opt)) continue; // --eval / --run: node runs no script file at all
         const c = V.classifyProcess(proc({ command: "x", argv: ["node", opt, "/tmp/config.env", `${SPACED}/dist/index.js`] }), new Set(), optFs);
         expect([opt, c.kind]).toEqual([opt, "connector"]);
@@ -199,26 +204,8 @@ describe("classifyProcess (D3 + D9)", () => {
       const c = V.classifyProcess(proc({ command: `node -r /tmp/a b.js ${SPACED}/dist/index.js`, cwd: "/w" }), new Set(), noPkg);
       expect(c).toMatchObject({ kind: "unknown", reason: expect.stringMatching(/cannot be identified|package\.json/) });
     });
-    it("node's OWN option table (`node --help` of the running node) is pinned: every option, with the same arity", () => {
-      const help = spawnSync(process.execPath, ["--help"], { encoding: "utf-8" }).stdout;
-      const value = new Set<string>();
-      const flag = new Set<string>();
-      for (const line of help.split("\n")) {
-        const m = /^ {2}(-[^ ].*?)(?: {2,}| [A-Z(]|$)/.exec(line);
-        if (!m) continue;
-        const aliases = m[1].split(/, /).map((s) => s.trim());
-        const lm = /^(-{1,2}[A-Za-z0-9][A-Za-z0-9.-]*)(.*)$/.exec(aliases[aliases.length - 1]);
-        if (!lm) continue; // "-" (stdin) and "--"
-        for (const a of aliases) {
-          const am = /^(-{1,2}[A-Za-z0-9][A-Za-z0-9.-]*)/.exec(a);
-          if (am) (lm[2].startsWith("=") ? value : flag).add(am[1]);
-        }
-      }
-      expect(value.size + flag.size).toBeGreaterThan(150); // non-vacuous: the parse read the real table
-      expect([...value].filter((o) => !V.NODE_OPTIONS_WITH_VALUE.has(o))).toEqual([]);
-      expect([...flag].filter((o) => !V.NODE_FLAGS.has(o) && !V.NODE_NO_SCRIPT.has(o))).toEqual([]);
-      expect([...flag].filter((o) => V.NODE_OPTIONS_WITH_VALUE.has(o))).toEqual([]);
-    });
+    // The table is no longer pinned here: it is derived at runtime (tests/node-option-table-runtime.test.ts holds the
+    // per-version snapshot row that replaced the pin).
   });
   describe("#297 #4 (architect b2a9ef30): POSITIVE EVIDENCE first; grammar only refines CONNECTOR vs UNKNOWN", () => {
     const N8N = "/Users/m/LLMs/Claude AI/n8n-mcp";
