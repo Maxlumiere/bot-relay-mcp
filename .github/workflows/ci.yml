@@ -109,7 +109,7 @@ jobs:
         run: test -n "$(ls -A .vitest/blob 2>/dev/null)" && ls -l .vitest/blob .vitest-shard/shard-${{ matrix.shard }}.json
       - name: Upload the shard's reports
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vitest-shard-${{ matrix.shard }}
           path: |
